@@ -13,7 +13,7 @@ use crate::device::Devices;
 use crate::drivers;
 use crate::error::{code, McpError, Result};
 use crate::hardware::Hardware;
-use crate::http::{Handler, Request, Response};
+use crate::http::{EventSink, EventStreamGate, EventStreamSlot, Handler, Request, Response, StreamBody};
 use crate::llm;
 use crate::llm::{ChatTransport, LlmConfig};
 use crate::logbuf::LogBuf;
@@ -27,8 +27,8 @@ use crate::tools as board_tools;
 use crate::tools::{fs as fs_tools, net as net_tools};
 use crate::web;
 use serde_json::{json, Value};
-use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, Mutex, Weak};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub type Shared = Arc<Mutex<App>>;
 
@@ -51,6 +51,33 @@ pub const MAX_RULES: usize = 8;
 /// The longest message the portal may queue: the same bound the agent applies to
 /// its own history, so a page can never enqueue what the loop would have to cut.
 pub const AGENT_TEXT_MAX: usize = crate::agent::MAX_USER_BYTES;
+
+/// The budget of one event stream, in one place so a test can shrink it instead of
+/// waiting two minutes for a close.
+#[derive(Clone, Copy, Debug)]
+pub struct StreamLimits {
+    /// Close after this long with no new journal event.
+    pub idle: Duration,
+    /// Close after this long whatever happens. `EventSource` reconnects on its own
+    /// with `after=<last id>`, so a bounded stream is the design, not a workaround.
+    pub total: Duration,
+    /// `: ping` cadence, well under the socket and proxy write timeouts.
+    pub ping: Duration,
+    /// Journal poll interval while waiting for the next event.
+    pub poll: Duration,
+}
+
+impl Default for StreamLimits {
+    /// The frozen contract: 30 s idle, 120 s total, a ping every 15 s.
+    fn default() -> Self {
+        Self {
+            idle: Duration::from_secs(30),
+            total: Duration::from_secs(120),
+            ping: Duration::from_secs(15),
+            poll: Duration::from_millis(100),
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct FwMeta {
@@ -99,6 +126,14 @@ pub struct App {
     /// Outbound HTTP for `net_*` and for the model call. The platform layer
     /// attaches it once; host tests leave it empty so nothing reaches the net.
     pub transport: Option<Box<dyn ChatTransport + Send>>,
+    /// Slots for `GET /api/agent/stream`. A stream holds an HTTP connection for its
+    /// whole life, so the cap is about the pool, not about this struct.
+    streams: EventStreamGate,
+    /// The `Arc` this `App` lives in, set by [`App::attach_shared`]. An event stream
+    /// outlives the request that opened it, so it polls the journal through this
+    /// instead of borrowing `&mut App`. `Weak` on purpose: the `App` must not keep
+    /// its own handle alive.
+    shared: Weak<Mutex<App>>,
     session_counter: u64,
 }
 
@@ -142,6 +177,8 @@ impl App {
             rules: Vec::new(),
             workspace: AppWorkspace::default(),
             transport: None,
+            streams: EventStreamGate::new(),
+            shared: Weak::new(),
             session_counter: 0,
         };
         app.log.info(
@@ -154,6 +191,21 @@ impl App {
         app.rebuild();
         app.load_agent_state();
         app
+    }
+
+    /// Hand an `App` the handle it lives in, so the event stream can poll its own
+    /// journal after the request that opened it has returned.
+    ///
+    /// Called by [`make_handler`], which is the composition root - the one place
+    /// where both halves exist. Host tests call it directly. Stored as `Weak`: the
+    /// `App` must not keep its own `Arc` alive.
+    pub fn attach_shared(app: &Shared) {
+        app_lock(app).shared = Arc::downgrade(app);
+    }
+
+    /// How many event streams hold a pool slot right now.
+    pub fn active_event_streams(&self) -> usize {
+        self.streams.active()
     }
 
     /// Re-run board resolution, manifest device instantiation, detection and the
@@ -691,6 +743,8 @@ impl App {
         let mut v = llm_json(&self.llm, false);
         v["api_key_set"] = json!(!self.llm.api_key.is_empty());
         v["endpoint_ok"] = json!(self.llm.base_url.starts_with("http://"));
+        // The platform tick, so the portal can show and edit it next to the model settings.
+        v["tick_ms"] = json!(self.cfg.agent.tick_ms);
         v["run"] = json!({
             "runs": self.agent.runs,
             "last_error": self.agent.last_error,
@@ -798,6 +852,39 @@ impl App {
         v
     }
 
+    /// `GET /api/agent/stream?after=<seq>`: the run journal as Server-Sent Events.
+    ///
+    /// The response carries a body that is written after the headers, so the
+    /// connection outlives this call. The app lock is taken per poll, never for the
+    /// life of the stream - that is the property the whole design is for.
+    fn agent_stream(&mut self, req: &Request) -> Response {
+        let after = req.query_get("after").and_then(|v| v.trim().parse().ok()).unwrap_or(0u64);
+        let resp = self.agent_stream_from(after, StreamLimits::default());
+        if resp.is_stream() {
+            let peer = req.peer.clone();
+            self.log.info("agent", format!("event stream opened for {peer} from seq {after}"));
+        }
+        resp
+    }
+
+    fn agent_stream_from(&self, after: u64, limits: StreamLimits) -> Response {
+        // Take the slot *before* the socket commits to a long write: a third console
+        // gets its 503 while the connection is still cheap to answer, and never
+        // consumes one of the six pool sockets for two minutes.
+        let Some(slot) = self.streams.acquire() else {
+            // `Connection: close`: a refused stream must not become a socket the pool
+            // has to wait out. The console reconnects on its own, or not at all.
+            return Response::error_json(503, "too many event streams").with_header("Connection", "close");
+        };
+        let Some(shared) = self.shared.upgrade() else {
+            // An `App` nobody handed its own handle to: the journal cannot be polled
+            // after this call returns. `make_handler` always wires it; a unit test
+            // has to call `App::attach_shared`.
+            return Response::error_json(503, "event streams unavailable: app handle not attached");
+        };
+        Response::streamed(200, "text/event-stream", event_stream_body(shared, slot, after, limits))
+    }
+
     fn agent_config_apply(&mut self, req: &Request) -> Response {
         let body = match req.json() {
             Ok(v) => v,
@@ -828,6 +915,15 @@ impl App {
             patch["base_url"] = json!(url);
         }
         llm_apply_json(&mut self.llm, &patch);
+        // The tick belongs to the device config, not the model config, but the portal
+        // edits both from one form: accept it here and clamp it the way the platform
+        // does, so an out-of-range value never reaches the thread.
+        if let Some(ms) = body.get("tick_ms").and_then(|v| v.as_u64()) {
+            let clamped = crate::config::clamp_tick_ms(ms.min(u32::MAX as u64) as u32);
+            self.cfg.agent.tick_ms = clamped;
+            self.runtime.config_dirty = true;
+            self.log.info("agent", format!("scheduler tick is now {clamped} ms"));
+        }
         self.persist_agent_cfg();
         self.log.info(
             "agent",
@@ -1367,6 +1463,9 @@ impl App {
                 let after = req.query_get("after").and_then(|v| v.parse().ok()).unwrap_or(0u64);
                 Response::json(&self.agent.events_json(after))
             }
+            // The same journal as a live stream: replay from `after`, then follow.
+            // Contract (frozen): docs/agent-stream.md §1.
+            ("GET", "/api/agent/stream") => self.agent_stream(req),
             ("POST", "/api/agent/message") => {
                 if let Err(r) = self.require_pin(req) {
                     return r;
@@ -2267,28 +2366,91 @@ pub fn drive_agent(
     app: &Mutex<App>,
     transport: &mut dyn ChatTransport,
 ) -> Option<std::result::Result<String, String>> {
-    fn lock(app: &Mutex<App>) -> std::sync::MutexGuard<'_, App> {
-        match app.lock() {
-            Ok(g) => g,
-            Err(poisoned) => poisoned.into_inner(),
-        }
-    }
-
-    let mut step = lock(app).agent_begin()?;
+    let mut step = app_lock(app).agent_begin()?;
     loop {
         match step {
             AgentStep::Ask { messages, tools } => {
-                let cfg = lock(app).llm.clone();
+                let cfg = app_lock(app).llm.clone();
                 // No lock held across this call: it is the one thing here that blocks.
                 let reply = llm::chat(transport, &cfg, &messages, &tools);
-                step = lock(app).agent_reply(reply);
+                step = app_lock(app).agent_reply(reply);
             }
             AgentStep::Done(result) => return Some(result),
         }
     }
 }
 
+/// Seal the app mutex: one place for the poisoned-lock fallback, so no route can
+/// turn a panic in one thread into a dead board.
+fn app_lock(app: &Mutex<App>) -> std::sync::MutexGuard<'_, App> {
+    match app.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+/// Poll the journal for events newer than `after`, already framed for SSE.
+///
+/// Returns the frames and the highest `seq` seen, so the next poll asks only for
+/// what is new. The lock is held for the scan and dropped with the guard.
+fn next_sse_frames(shared: &Mutex<App>, after: u64) -> (Vec<String>, u64) {
+    let app = app_lock(shared);
+    let mut frames = Vec::new();
+    let mut newest = after;
+    for event in app.agent.events.iter().filter(|e| e.seq > after) {
+        frames.push(crate::http::sse_frame(event.seq, event.kind, &event.json().to_string()));
+        newest = event.seq;
+    }
+    (frames, newest)
+}
+
+/// The body of `GET /api/agent/stream`: replay, then follow live, on a budget.
+///
+/// The app lock is taken once per poll and released at the end of each statement -
+/// never held across the life of the connection, so the portal, `/api/status` and
+/// the agent thread itself keep working while a console is open.
+fn event_stream_body(shared: Shared, slot: EventStreamSlot, after: u64, limits: StreamLimits) -> StreamBody {
+    Box::new(move |sink: &mut dyn EventSink| {
+        // Owned here so every exit path - idle close, total close, failed write -
+        // gives the pool slot back through `Drop`.
+        let _slot = slot;
+        let started = Instant::now();
+        let mut last_seq = after;
+        let mut last_event = started;
+        let mut last_ping = started;
+        loop {
+            let (frames, newest) = next_sse_frames(&shared, last_seq);
+            if !frames.is_empty() {
+                for frame in &frames {
+                    sink.send(frame.as_bytes())?;
+                }
+                last_seq = newest;
+                last_event = Instant::now();
+            }
+            let now = Instant::now();
+            // Bounded: an idle stream, or one that has had its two minutes. Either
+            // way the socket goes back to the pool and the client reconnects with
+            // `after=<last id>`, which is what the contract expects.
+            if now.saturating_duration_since(last_event) >= limits.idle
+                || now.saturating_duration_since(started) >= limits.total
+            {
+                return Ok(());
+            }
+            if now.saturating_duration_since(last_ping) >= limits.ping {
+                sink.send(crate::http::SSE_PING.as_bytes())?;
+                last_ping = now;
+            }
+            if frames.is_empty() {
+                std::thread::sleep(limits.poll);
+            }
+        }
+    })
+}
+
 pub fn make_handler(app: Shared) -> Handler {
+    // The stream endpoint polls its own journal after the request has returned, so
+    // it needs the handle it lives in. Weak, so this cannot become a cycle.
+    App::attach_shared(&app);
     Arc::new(move |req: &Request| {
         // The self-test model is answered *before* taking the lock. The agent thread
         // holds that lock for the whole model round trip, so an endpoint that needed
@@ -2410,6 +2572,279 @@ mod tests {
 
         assert_eq!(app.route(&post("/api/agent/message", r#"{"text":"   "}"#)).status, 400);
         assert_eq!(app.route(&post("/api/agent/message", r#"{}"#)).status, 400);
+    }
+
+    // ---- the live journal stream (docs/agent-stream.md §1) ----
+
+    /// An `App` in its `Arc`, wired exactly as `make_handler` wires it.
+    fn shared_app() -> Shared {
+        let app: Shared = Arc::new(Mutex::new(test_app()));
+        App::attach_shared(&app);
+        app
+    }
+
+    /// One journal entry, shaped like the agent's own.
+    fn journal_event(seq: u64, kind: &'static str, name: &str) -> crate::agent::Event {
+        crate::agent::Event {
+            seq,
+            kind,
+            at_ms: 1_000 + seq,
+            text: String::new(),
+            tool_call_id: Some("c1".into()),
+            name: Some(name.into()),
+            is_error: false,
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            phase: None,
+            elapsed_ms: None,
+        }
+    }
+
+    /// Stands in for the socket: what the stream writes, captured.
+    struct Sink(Vec<u8>);
+
+    impl EventSink for Sink {
+        fn send(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+            self.0.extend_from_slice(bytes);
+            Ok(())
+        }
+    }
+
+    /// Run a streamed response to completion and return what it wrote.
+    fn run_stream(resp: Response) -> String {
+        let body = resp.stream.expect("a streamed response");
+        let mut sink = Sink(Vec::new());
+        body(&mut sink).expect("the stream ended cleanly");
+        String::from_utf8_lossy(&sink.0).to_string()
+    }
+
+    /// The `id:` of every frame in a stream body, in the order it arrived. A `: ping`
+    /// comment has no id and so contributes nothing.
+    fn frame_ids(body: &str) -> Vec<u64> {
+        body.split("\n\n")
+            .filter_map(|frame| frame.lines().next())
+            .filter_map(|line| line.strip_prefix("id: "))
+            .filter_map(|id| id.trim().parse().ok())
+            .collect()
+    }
+
+    /// Short budgets, so the bounded-ness is tested in milliseconds rather than in
+    /// two minutes of waiting.
+    fn limits(idle: Duration, total: Duration, ping: Duration) -> StreamLimits {
+        StreamLimits { idle, total, ping, poll: Duration::from_millis(10) }
+    }
+
+    #[test]
+    fn the_stream_route_answers_text_event_stream_without_a_pin() {
+        let shared = shared_app();
+        let resp = shared.lock().unwrap().route(&get("/api/agent/stream?after=0"));
+        assert_eq!(resp.status, 200, "no pin gate, like the transcript");
+        assert!(resp.is_stream(), "the body is written after the headers");
+        let header = |name: &str| {
+            resp.headers.iter().find(|(k, _)| k == name).map(|(_, v)| v.clone()).unwrap_or_default()
+        };
+        assert_eq!(header("Content-Type"), "text/event-stream");
+        assert_eq!(header("Cache-Control"), "no-cache");
+        assert_eq!(shared.lock().unwrap().active_event_streams(), 1);
+        // Dropping the response without running the body still frees the slot.
+        drop(resp);
+        assert_eq!(shared.lock().unwrap().active_event_streams(), 0);
+    }
+
+    #[test]
+    fn the_stream_replays_after_the_given_seq_and_then_follows_live() {
+        let shared = shared_app();
+        {
+            let mut app = shared.lock().unwrap();
+            app.agent.events.push_back(journal_event(1, "message_start", ""));
+            app.agent.events.push_back(journal_event(2, "tool_use", "board_status"));
+            app.agent.events.push_back(journal_event(3, "tool_result", "board_status"));
+        }
+        let resp = shared.lock().unwrap().agent_stream_from(
+            1,
+            limits(Duration::from_millis(400), Duration::from_secs(5), Duration::from_secs(10)),
+        );
+        // The turn keeps running while the stream is open: the next event has to
+        // arrive without the client asking again.
+        let writer = shared.clone();
+        let turn = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(80));
+            writer.lock().unwrap().agent.events.push_back(journal_event(4, "run_end", ""));
+        });
+        let body = run_stream(resp);
+        turn.join().unwrap();
+
+        assert_eq!(frame_ids(&body), vec![2, 3, 4], "replay after seq 1, then live: {body}");
+        assert!(body.contains("event: tool_use"), "the frame names the kind: {body}");
+        assert!(body.contains("\"tool_call_id\":\"c1\""), "data is the journal JSON: {body}");
+        assert!(body.contains("\"seq\":2"), "data repeats the sequence number: {body}");
+    }
+
+    #[test]
+    fn a_third_event_stream_is_refused_with_503_and_the_slot_is_reusable() {
+        let shared = shared_app();
+        let quick = limits(Duration::from_millis(50), Duration::from_millis(50), Duration::from_secs(5));
+        let first = shared.lock().unwrap().agent_stream_from(0, quick);
+        let second = shared.lock().unwrap().agent_stream_from(0, quick);
+        let third = shared.lock().unwrap().agent_stream_from(0, quick);
+        assert_eq!(third.status, 503);
+        assert!(!third.is_stream(), "a refusal is an ordinary JSON body");
+        let err: Value = serde_json::from_slice(&third.body).unwrap();
+        assert_eq!(err["error"], "too many event streams");
+        // The refused request never took a slot, so a closed one is free again.
+        drop(first);
+        let fourth = shared.lock().unwrap().agent_stream_from(0, quick);
+        assert_eq!(fourth.status, 200, "a closed stream gives its slot back");
+        drop((second, fourth));
+        assert_eq!(shared.lock().unwrap().active_event_streams(), 0);
+    }
+
+    #[test]
+    fn a_quiet_stream_pings_and_then_closes_itself() {
+        let shared = shared_app();
+        let resp = shared.lock().unwrap().agent_stream_from(
+            0,
+            limits(Duration::from_millis(200), Duration::from_secs(5), Duration::from_millis(50)),
+        );
+        let started = Instant::now();
+        let body = run_stream(resp);
+        let took = started.elapsed();
+        assert!(took >= Duration::from_millis(190), "it must wait for the idle budget: {took:?}");
+        assert!(took < Duration::from_secs(2), "and then let go: {took:?}");
+        assert!(body.contains(": ping"), "a silent stream still says it is alive: {body}");
+        assert!(frame_ids(&body).is_empty(), "an empty journal has no frames: {body}");
+        assert_eq!(shared.lock().unwrap().active_event_streams(), 0);
+    }
+
+    #[test]
+    fn a_busy_stream_still_ends_at_the_total_budget() {
+        let shared = shared_app();
+        let resp = shared.lock().unwrap().agent_stream_from(
+            0,
+            // Idle is generous, the total is not: a stream that never goes quiet
+            // must still give the socket back so the client can reconnect.
+            limits(Duration::from_secs(30), Duration::from_millis(200), Duration::from_secs(30)),
+        );
+        let writer = shared.clone();
+        let turn = std::thread::spawn(move || {
+            for seq in 1..=40 {
+                std::thread::sleep(Duration::from_millis(20));
+                writer.lock().unwrap().agent.events.push_back(journal_event(seq, "tool_use", "x"));
+            }
+        });
+        let started = Instant::now();
+        let body = run_stream(resp);
+        let took = started.elapsed();
+        turn.join().unwrap();
+        assert!(took < Duration::from_secs(2), "the total budget ends a busy stream too: {took:?}");
+        assert!(!frame_ids(&body).is_empty(), "and what it saw was delivered: {body}");
+        assert_eq!(shared.lock().unwrap().active_event_streams(), 0);
+    }
+
+    /// The whole path over a real socket: the headers, the chunked framing, an event
+    /// that arrives while the client is still reading, and the 503 for a third
+    /// stream. This is the endpoint the portal and `curl -N` will actually meet.
+    #[test]
+    fn a_real_socket_receives_journal_events_as_they_happen() {
+        use std::io::Write;
+        let app = test_app();
+        let log = app.log.clone();
+        let shared: Shared = Arc::new(Mutex::new(app));
+        App::attach_shared(&shared);
+        let server =
+            crate::http::Server::start("127.0.0.1:0", make_handler(shared.clone()), log).expect("bind");
+        let addr = server.local_addr();
+
+        let mut first = std::net::TcpStream::connect(addr).unwrap();
+        first.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        first
+            .write_all(
+                b"GET /api/agent/stream?after=0 HTTP/1.1\r\nHost: x\r\nAccept: text/event-stream\r\n\r\n",
+            )
+            .unwrap();
+        let head = read_until(&mut first, "\r\n\r\n");
+        assert!(head.starts_with("HTTP/1.1 200 OK"), "got: {head}");
+        assert!(head.contains("Content-Type: text/event-stream"), "got: {head}");
+        assert!(head.contains("Cache-Control: no-cache"), "got: {head}");
+        assert!(head.contains("Transfer-Encoding: chunked"), "got: {head}");
+        assert!(!head.contains("Content-Length"), "a bounded stream announces no length: {head}");
+
+        // The agent emits mid-stream; the client is already reading and must see it.
+        shared.lock().unwrap().agent.events.push_back(journal_event(1, "tool_use", "board_status"));
+        let body = read_until(&mut first, "id: 1");
+        assert!(body.contains("event: tool_use"), "got: {body}");
+        assert!(body.contains("\"name\":\"board_status\""), "got: {body}");
+
+        // Two live streams are allowed, the third is refused on the spot.
+        let mut second = std::net::TcpStream::connect(addr).unwrap();
+        second
+            .write_all(b"GET /api/agent/stream HTTP/1.1\r\nHost: x\r\nAccept: text/event-stream\r\n\r\n")
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while shared.lock().unwrap().active_event_streams() < 2 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(shared.lock().unwrap().active_event_streams(), 2, "both streams hold a slot");
+
+        let mut third = std::net::TcpStream::connect(addr).unwrap();
+        third.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        third
+            .write_all(b"GET /api/agent/stream HTTP/1.1\r\nHost: x\r\nAccept: text/event-stream\r\n\r\n")
+            .unwrap();
+        let refused = read_until(&mut third, "too many event streams");
+        assert!(refused.starts_with("HTTP/1.1 503"), "got: {refused}");
+        assert!(refused.contains("too many event streams"), "got: {refused}");
+        assert!(refused.contains("Connection: close"), "a refusal frees its socket: {refused}");
+        assert_eq!(refused.matches("Connection:").count(), 1, "one Connection header: {refused}");
+        drop((first, second, third));
+        drop(server);
+    }
+
+    /// Read from a socket until `needle` shows up, the peer closes, or the read
+    /// times out; return everything read.
+    fn read_until(stream: &mut std::net::TcpStream, needle: &str) -> String {
+        use std::io::Read;
+        let mut acc = Vec::new();
+        let mut buf = [0u8; 1024];
+        loop {
+            if String::from_utf8_lossy(&acc).contains(needle) {
+                break;
+            }
+            match stream.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => acc.extend_from_slice(&buf[..n]),
+                Err(_) => break,
+            }
+        }
+        String::from_utf8_lossy(&acc).to_string()
+    }
+
+    /// The point of polling instead of blocking: an open stream must not hold the app
+    /// lock, or the portal freezes for two minutes every time a console is open.
+    #[test]
+    fn an_open_stream_leaves_the_app_lock_free_for_other_routes() {
+        let shared = shared_app();
+        let resp = shared.lock().unwrap().agent_stream_from(
+            0,
+            limits(Duration::from_millis(500), Duration::from_secs(5), Duration::from_secs(5)),
+        );
+        let body = resp.stream.expect("a streamed response");
+        let stream = std::thread::spawn(move || {
+            let mut sink = Sink(Vec::new());
+            body(&mut sink).expect("stream");
+        });
+        let started = Instant::now();
+        for _ in 0..5 {
+            let resp = shared.lock().unwrap().route(&get("/api/status"));
+            assert_eq!(resp.status, 200, "the portal must still answer");
+        }
+        let took = started.elapsed();
+        assert!(
+            took < Duration::from_millis(400),
+            "five routes took {took:?} while a stream was open: the poller is holding the lock"
+        );
+        stream.join().unwrap();
+        assert_eq!(shared.lock().unwrap().active_event_streams(), 0);
     }
 
     #[test]

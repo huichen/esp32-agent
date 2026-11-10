@@ -30,6 +30,14 @@ const I18N = {
     save: "保存",
     agent_link: "模型连接", agent_chat: "对话", agent_reset: "清空", agent_send: "发送",
     agent_max_steps: "最大步数",
+    agent_tick: "调度 tick",
+    agent_tick_note: "调度 tick 决定队列最快多久被取走一次（200–5000 ms，默认 1000）：板子每个 tick 重新读它，改完下一个 tick 就生效，不用重启。",
+    stream_title: "实时事件",
+    stream_empty: "还没有事件。停在这一页时，运行的每一步都会实时出现在这里。",
+    stream_note: "由 /api/agent/stream 推送（SSE）：板子空闲 30 秒或单条连接满 120 秒会主动断开，浏览器自己重连并从最后一条事件续上，页面不重发任何东西。",
+    stream_pause: "暂停", stream_resume: "继续", stream_clear: "清空",
+    stream_live: "实时", stream_connecting: "连接中", stream_offline: "未连接", stream_paused: "已暂停",
+    stream_skipped: "跳过 {n} 条",
     agent_note: "模型地址必须是 http://（板子上没有 TLS）；key 只写进 NVS，读回来时只显示是否已设置。",
     agent_key_set: "已设置，留空表示不改", agent_key_none: "没有 key（不发送 Authorization）",
     agent_queued: "已排队", agent_running: "运行中", agent_idle: "空闲", agent_empty: "还没有对话。发一条消息，模型会用板子自己的工具作答。",
@@ -67,6 +75,14 @@ const I18N = {
     save: "Save",
     agent_link: "Model link", agent_chat: "Conversation", agent_reset: "Clear", agent_send: "Send",
     agent_max_steps: "Max steps",
+    agent_tick: "Scheduler tick",
+    agent_tick_note: "The tick bounds how soon a queued turn is picked up (200–5000 ms, default 1000). The firmware reads it every tick, so an edit lands on the next tick, not on reboot.",
+    stream_title: "Live events",
+    stream_empty: "No events yet. While this tab is open, every step of a run shows up here as it happens.",
+    stream_note: "Pushed by /api/agent/stream (SSE). The board closes the stream after 30 s of silence or 120 s in total; the browser reconnects on its own and resumes from the last event, so the page never resends anything.",
+    stream_pause: "Pause", stream_resume: "Resume", stream_clear: "Clear",
+    stream_live: "live", stream_connecting: "connecting", stream_offline: "offline", stream_paused: "paused",
+    stream_skipped: "{n} skipped",
     agent_note: "The endpoint must be http:// — the board has no TLS. The key is stored in NVS and never read back.",
     agent_key_set: "set, leave empty to keep it", agent_key_none: "no key (no Authorization header)",
     agent_queued: "Queued", agent_running: "running", agent_idle: "idle", agent_empty: "No conversation yet. Send a message and the model works with the board's own tools.",
@@ -102,6 +118,7 @@ function applyLang() {
     el.textContent = t(el.getAttribute("data-i18n"));
   });
   $("lang-btn").textContent = state.lang === "zh" ? "EN" : "中";
+  syncStreamUi();
 }
 
 function toast(msg, bad) {
@@ -343,6 +360,7 @@ async function refreshAgentConfig() {
   $("agent-base-url").value = data.base_url || "";
   $("agent-model").value = data.model || "";
   $("agent-max-steps").value = data.max_steps || 4;
+  $("agent-tick").value = data.tick_ms || 1000;
   const key = $("agent-api-key");
   key.value = "";
   key.placeholder = data.api_key_set ? t("agent_key_set") : t("agent_key_none");
@@ -356,11 +374,17 @@ async function refreshAgentConfig() {
     ["model", data.model || "–"],
     ["api_key", data.api_key_set ? "__set__" : "–"],
     ["max_steps", data.max_steps],
+    ["tick_ms", (data.tick_ms || 1000) + " ms"],
     ["temperature", data.temperature],
     ["timeout_s", (data.timeout_s || 0) + " s"],
     ["history", run.history || 0],
     ["pending", run.pending ? "queued" : "–"],
   ]);
+}
+
+function clampTick(ms) {
+  if (!Number.isFinite(ms) || ms <= 0) return 1000;
+  return Math.min(5000, Math.max(200, Math.round(ms)));
 }
 
 async function sendAgentMessage() {
@@ -395,7 +419,11 @@ async function saveAgentConfig() {
     base_url: $("agent-base-url").value.trim(),
     model: $("agent-model").value.trim(),
     max_steps: Number($("agent-max-steps").value) || 4,
+    // Clamped here as well as on the board, so the field never shows a value the
+    // board would silently replace.
+    tick_ms: clampTick(Number($("agent-tick").value)),
   };
+  $("agent-tick").value = body.tick_ms;
   const key = $("agent-api-key").value;
   if (key) body.api_key = key; // empty field = keep the stored key
   const { status, data } = await api("/api/agent/config", { method: "POST", body });
@@ -581,6 +609,268 @@ function addRule() {
   });
 }
 
+// ---------------------------------------------------------------- live journal
+// /api/agent/stream is server-sent events: one frame per journal entry, with `id`
+// and `event` set so a plain EventSource can do the work. The board ends the
+// stream on purpose (30 s silent, or 120 s in total) and EventSource reconnects by
+// itself, sending Last-Event-ID; the `after=` in the URL is only the starting
+// point, so this page never resends or replays an event on its own.
+
+const STREAM_KINDS = [
+  "message_start", "thinking_start", "thinking_delta", "thinking_end",
+  "text_start", "text_delta", "text_end",
+  "tool_use", "tool_progress", "tool_result",
+  "usage", "message_end", "error", "run_end",
+];
+const STREAM_MAX_LINES = 200;
+const STREAM_MAX_CHARS = 240;
+
+const stream = {
+  es: null,
+  state: "off", // off | connecting | live | offline
+  lastSeq: 0,
+  count: 0,
+  skipped: 0,
+  paused: false,
+  lastAt: 0,
+  timer: null,
+  backoff: 3000,
+};
+
+function stampNow() {
+  const d = new Date();
+  const p = (n, w) => String(n).padStart(w || 2, "0");
+  return p(d.getHours()) + ":" + p(d.getMinutes()) + ":" + p(d.getSeconds()) + "." + p(d.getMilliseconds(), 3);
+}
+
+/// The gap to the previous event, from the board's own monotonic clock: a run that
+/// takes 40 s and one that takes 4 s look the same otherwise.
+function streamDelta(ev) {
+  const at = Number(ev.at_ms);
+  if (!Number.isFinite(at)) return "";
+  const out = stream.lastAt && at >= stream.lastAt ? "+" + ((at - stream.lastAt) / 1000).toFixed(2) + "s" : "";
+  stream.lastAt = at;
+  return out;
+}
+
+function streamClass(kind) {
+  if (kind === "tool_progress") return "progress";
+  if (kind === "tool_use" || kind === "tool_result") return "tool";
+  if (kind.indexOf("thinking_") === 0) return "thinking";
+  if (kind.indexOf("text_") === 0) return "text";
+  if (kind === "usage") return "usage";
+  if (kind === "error") return "error";
+  if (kind === "run_end") return "run";
+  return "mark";
+}
+
+/// One line of the log. Every field the board sends has a place, and an event kind
+/// this page does not know still shows up raw instead of vanishing.
+function streamBody(ev) {
+  const kind = String(ev.event || "");
+  let text = "";
+  if (kind === "tool_use") {
+    text = (ev.name || "?") + "(" + (ev.text || "{}") + ")";
+  } else if (kind === "tool_progress") {
+    text = (ev.name || "?") + " · " + (ev.phase || "?") +
+      (ev.elapsed_ms != null ? " · " + ev.elapsed_ms + " ms" : "");
+  } else if (kind === "tool_result") {
+    text = (ev.name ? ev.name + " → " : "") + (ev.text || (ev.is_error ? "error" : "ok"));
+  } else if (kind === "usage") {
+    text = "prompt " + (ev.prompt_tokens || 0) + " · completion " + (ev.completion_tokens || 0) +
+      " · total " + (ev.total_tokens || 0);
+  } else {
+    text = ev.text || "";
+  }
+  const full = String(text);
+  if (full.length > STREAM_MAX_CHARS) return full.slice(0, STREAM_MAX_CHARS) + "…";
+  return full;
+}
+
+function streamAppend(ev) {
+  const box = $("agent-stream");
+  if (!box || !ev) return;
+  const kind = String(ev.event || "?");
+  if (stream.paused) {
+    stream.skipped += 1;
+    syncStreamUi();
+    return;
+  }
+  if (box.dataset.empty === "1") {
+    box.innerHTML = "";
+    delete box.dataset.empty;
+  }
+  // Only follow the tail when the reader is already there; scrolling up to read
+  // must not be yanked back by the next event.
+  const atBottom = box.scrollTop + box.clientHeight >= box.scrollHeight - 24;
+  const line = document.createElement("div");
+  line.className = "ev ev-" + streamClass(kind);
+  const ts = document.createElement("span");
+  ts.className = "ts";
+  ts.textContent = stampNow();
+  const dt = document.createElement("span");
+  dt.className = "dt";
+  dt.textContent = streamDelta(ev);
+  const name = document.createElement("span");
+  name.className = "kind";
+  name.textContent = kind;
+  const msg = document.createElement("span");
+  msg.className = "msg";
+  msg.textContent = streamBody(ev);
+  line.append(ts, dt, name, msg);
+  line.title = JSON.stringify(ev);
+  box.append(line);
+  while (box.childElementCount > STREAM_MAX_LINES) box.removeChild(box.firstElementChild);
+  if (atBottom) box.scrollTop = box.scrollHeight;
+  stream.count += 1;
+  syncStreamUi();
+}
+
+function onStreamEvent(frame) {
+  // `error` is both a journal kind and the browser's own connection-error event: a
+  // frame with no data string is the latter, and belongs to onerror, not to the log.
+  if (!frame || typeof frame.data !== "string" || !frame.data) return;
+  let ev = null;
+  try { ev = JSON.parse(frame.data); } catch (e) { return; }
+  // A frame on the wire is proof the stream is up: don't leave the badge on
+  // "connecting" just because `open` has not been dispatched yet.
+  if (ev && stream.state !== "live") setStreamState("live");
+  if (ev && typeof ev.seq === "number" && ev.seq >= stream.lastSeq) stream.lastSeq = ev.seq;
+  streamAppend(ev);
+  const kind = ev && ev.event;
+  if (kind === "error") toast(String(ev.text || "run failed").slice(0, 140), true);
+  if (kind === "message_end" || kind === "run_end" || kind === "error") {
+    // The journal says where the run is; the transcript is still the readable
+    // shape of it, so refresh it once per message instead of polling.
+    refreshAgentHistory().catch(() => {});
+    if (kind === "run_end" || kind === "error") refreshAgentConfig().catch(() => {});
+  }
+}
+
+function setStreamState(next) {
+  stream.state = next;
+  syncStreamUi();
+}
+
+function streamOpen() {
+  if (stream.es) return;
+  clearTimeout(stream.timer);
+  stream.timer = null;
+  const es = new EventSource("/api/agent/stream?after=" + (stream.lastSeq || 0));
+  stream.es = es;
+  setStreamState("connecting");
+  es.onopen = () => {
+    if (stream.es !== es) return; // a replaced stream cannot speak for this one
+    stream.backoff = 3000;
+    setStreamState("live");
+  };
+  es.onerror = () => {
+    // 2 is CLOSED in every implementation of the spec; compared as a number so a
+    // missing static (or a shim) cannot turn a refusal into an endless retry.
+    if (stream.es !== es) {
+      try { es.close(); } catch (err) { /* already gone */ }
+      return;
+    }
+    if (es.readyState === 2) {
+      // Not a transient drop: the board refused the stream (it allows two) or the
+      // endpoint is gone. EventSource gives up for good on that, so retry slowly —
+      // but close this object first, so nothing keeps reconnecting behind our back.
+      try { es.close(); } catch (err) { /* already gone */ }
+      stream.es = null;
+      setStreamState("offline");
+      scheduleStreamReopen();
+    } else {
+      setStreamState("connecting"); // EventSource is already retrying
+    }
+  };
+  STREAM_KINDS.forEach((kind) =>
+    es.addEventListener(kind, (frame) => {
+      // Frames from a superseded stream are dropped: only the current one may
+      // advance the log, or a stale socket could replay the run a second time.
+      if (stream.es !== es) return;
+      onStreamEvent(frame);
+    })
+  );
+}
+
+function scheduleStreamReopen() {
+  if (state.tab !== "agent" || document.hidden) return;
+  clearTimeout(stream.timer);
+  stream.timer = setTimeout(() => {
+    stream.timer = null;
+    streamOpen();
+    stream.backoff = Math.min(stream.backoff * 2, 30000);
+  }, stream.backoff);
+}
+
+/// Close the connection, not the panel: the board serves six connections and two
+/// streams is its whole budget, so leaving the tab gives one back.
+function streamClose() {
+  clearTimeout(stream.timer);
+  stream.timer = null;
+  if (stream.es) {
+    stream.es.close();
+    stream.es = null;
+  }
+  setStreamState("off");
+}
+
+function toggleStreamPause() {
+  stream.paused = !stream.paused;
+  // The skipped count describes the pause that just ended, not the log as a whole.
+  if (!stream.paused) stream.skipped = 0;
+  syncStreamUi();
+}
+
+function streamClear() {
+  const box = $("agent-stream");
+  stream.count = 0;
+  stream.skipped = 0;
+  stream.lastAt = 0;
+  if (box) {
+    box.innerHTML = '<p class="hint">' + esc(t("stream_empty")) + "</p>";
+    box.dataset.empty = "1";
+  }
+  syncStreamUi();
+}
+
+function syncStreamUi() {
+  const badge = $("agent-stream-badge");
+  if (!badge) return;
+  // Pause outranks the transport state: it is what the user did, and it is what
+  // governs the log. Where the socket is while paused goes in the note instead of
+  // hiding either fact.
+  let cls = "off";
+  let label = t("stream_offline");
+  if (stream.paused) {
+    cls = "paused";
+    label = t("stream_paused");
+  } else if (stream.state === "live") {
+    cls = "live";
+    label = t("stream_live");
+  } else if (stream.state === "connecting") {
+    cls = "retry";
+    label = t("stream_connecting");
+  } else if (stream.state === "offline") {
+    cls = "bad";
+    label = t("stream_offline");
+  }
+  badge.className = "badge " + cls;
+  badge.textContent = label;
+  const note = $("agent-stream-note");
+  if (note) {
+    let text = "seq " + stream.lastSeq + " · " + stream.count + " ev";
+    if (stream.paused) {
+      if (stream.state === "connecting") text += " · " + t("stream_connecting");
+      else if (stream.state !== "live") text += " · " + t("stream_offline");
+      if (stream.skipped) text += " · " + t("stream_skipped").replace("{n}", stream.skipped);
+    }
+    note.textContent = text;
+  }
+  const pause = $("agent-stream-pause");
+  if (pause) pause.textContent = stream.paused ? t("stream_resume") : t("stream_pause");
+}
+
 async function refreshAgent() {
   await refreshAgentConfig().catch(() => {});
   await refreshAgentHistory().catch(() => {});
@@ -651,7 +941,12 @@ function showTab(name) {
   if (name === "devices") refreshDevices();
   if (name === "tools") refreshTools();
   if (name === "manifest") refreshManifest();
-  if (name === "agent") refreshAgent();
+  if (name === "agent") {
+    refreshAgent();
+    streamOpen();
+  } else {
+    streamClose();
+  }
   if (name === "clients") refreshClients();
   if (name === "logs") refreshLogs();
 }
@@ -755,6 +1050,8 @@ function bind() {
     if ((e.ctrlKey || e.metaKey) && e.key === "Enter") sendAgentMessage();
   });
   $("agent-reset").addEventListener("click", resetAgent);
+  $("agent-stream-pause").addEventListener("click", toggleStreamPause);
+  $("agent-stream-clear").addEventListener("click", streamClear);
   $("agent-config-save").addEventListener("click", saveAgentConfig);
   $("sched-refresh").addEventListener("click", refreshSched);
   $("sched-task-add").addEventListener("click", addTask);
@@ -780,8 +1077,11 @@ function bind() {
   }, 5000);
   setInterval(() => {
     if (state.tab !== "agent") return;
+    refreshSched().catch(() => {});
+    // While the stream is up it carries the run as it happens; the transcript is
+    // refreshed on message_end instead of on a timer.
+    if (stream.state === "live") return;
     refreshAgentHistory().catch(() => {});
     refreshAgentConfig().catch(() => {});
-    refreshSched().catch(() => {});
   }, 4000);
 })();

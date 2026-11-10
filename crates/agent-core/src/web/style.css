@@ -162,3 +162,56 @@ td.row { gap: 6px; flex-wrap: nowrap; }
 .msg-think summary { cursor: pointer; color: #8a94a6; }
 .msg-think div { white-space: pre-wrap; border-left: 2px solid #2b3546; padding-left: 8px; margin-top: 4px; }
 .msg-error .msg-body { color: #ff8b8b; }
+
+/* ---------------------------------------------------------------- live journal */
+/* One line per journal event: arrival time, the gap to the previous event from the
+   board's own clock, the kind, then the payload. The colour is the kind, so a run
+   reads as thinking → tool → answer without labels being re-read. */
+.stream {
+  display: block; max-height: 320px; overflow-y: auto; padding: 6px 8px;
+  background: #0a1017; border: 1px solid var(--line); border-radius: 10px;
+  font-family: var(--mono); font-size: 12px; line-height: 1.5;
+}
+.stream .hint { margin: 4px 0; }
+.ev {
+  display: grid; grid-template-columns: max-content 56px max-content minmax(0, 1fr); gap: 8px;
+  padding: 0 0 0 6px; border-left: 2px solid transparent;
+  white-space: pre-wrap; word-break: break-word;
+}
+.ev .ts, .ev .dt, .ev .kind { white-space: nowrap; }
+.ev .ts { color: #66798f; }
+.ev .dt { color: #4d5b70; text-align: right; }
+.ev .kind { font-weight: 600; letter-spacing: .01em; color: var(--muted); }
+.ev .msg { color: var(--text); }
+.ev-thinking { border-left-color: #7c6cf0; }
+.ev-thinking .kind, .ev-thinking .msg { color: #a99cff; }
+.ev-thinking .msg { font-style: italic; }
+.ev-text { border-left-color: #1f7a55; }
+.ev-text .kind { color: var(--ok); }
+.ev-tool { border-left-color: #1d6f8c; }
+.ev-tool .kind { color: var(--accent); }
+.ev-progress { border-left-color: #4a3a10; }
+.ev-progress .kind, .ev-progress .msg { color: var(--warn); }
+.ev-usage { border-left-color: #2b3546; }
+.ev-usage .msg { color: var(--muted); }
+.ev-mark { border-left-color: #22304a; }
+.ev-mark .kind { color: #7d8ea6; }
+.ev-run { border-left-color: var(--ok); }
+.ev-run .kind, .ev-run .msg { color: var(--ok); }
+.ev-error { border-left-color: var(--bad); background: #1c1114; }
+.ev-error .kind, .ev-error .msg { color: var(--bad); }
+.badge.live { color: var(--ok); border-color: #14532d; }
+.badge.live::before {
+  content: ""; display: inline-block; width: 6px; height: 6px; border-radius: 50%;
+  background: var(--ok); margin-right: 5px; box-shadow: 0 0 6px var(--ok);
+  animation: pulse 1.6s ease-in-out infinite;
+}
+.badge.retry { color: var(--warn); border-color: #4a3a10; }
+.badge.paused { color: var(--warn); border-color: #4a3a10; }
+.badge.off { color: var(--muted); }
+.unit { color: var(--muted); font-size: 12px; }
+@keyframes pulse { 50% { opacity: 0.3; } }
+@media (max-width: 560px) {
+  .ev { grid-template-columns: max-content 44px minmax(0, 1fr); }
+  .ev .kind { grid-column: 1 / -1; }
+}

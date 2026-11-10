@@ -184,9 +184,10 @@ pub struct Agent {
 
 /// One journal entry. The kinds are the host agent's event names on purpose
 /// (`message_start`, `thinking_start|delta|end`, `text_start|delta|end`, `tool_use`,
-/// `tool_result`, `usage`, `message_end`, `error`, `run_end`): a client that reads one
-/// console can read the other. The board does not stream token by token, so a delta
-/// carries the whole block; the names and the order are what stay identical.
+/// `tool_progress`, `tool_result`, `usage`, `message_end`, `error`, `run_end`): a
+/// client that reads one console can read the other. The board does not stream token
+/// by token, so a delta carries the whole block; the names and the order are what
+/// stay identical.
 #[derive(Clone, Debug)]
 pub struct Event {
     pub seq: u64,
@@ -198,6 +199,10 @@ pub struct Event {
     pub is_error: bool,
     pub prompt_tokens: u32,
     pub completion_tokens: u32,
+    /// `tool_progress` only: which boundary of one tool call this entry marks.
+    pub phase: Option<&'static str>,
+    /// `tool_progress` on the end boundary only: how long that call took.
+    pub elapsed_ms: Option<u64>,
 }
 
 impl Event {
@@ -212,6 +217,8 @@ impl Event {
             is_error: false,
             prompt_tokens: 0,
             completion_tokens: 0,
+            phase: None,
+            elapsed_ms: None,
         }
     }
 
@@ -231,6 +238,12 @@ impl Event {
         }
         if self.is_error {
             v.insert("is_error".into(), json!(true));
+        }
+        if let Some(phase) = self.phase {
+            v.insert("phase".into(), json!(phase));
+        }
+        if let Some(elapsed_ms) = self.elapsed_ms {
+            v.insert("elapsed_ms".into(), json!(elapsed_ms));
         }
         if self.kind == "usage" {
             v.insert("prompt_tokens".into(), json!(self.prompt_tokens));
@@ -413,6 +426,14 @@ impl Agent {
         ));
         for call in &reply.tool_calls {
             let at = now_ms();
+            // The board cannot report progress *within* a tool, so the pair marks the
+            // boundaries of one call and the end carries how long it took. A client
+            // that ignores it loses nothing; one that pairs it gets a latency.
+            self.emit("tool_progress", at, |ev| {
+                ev.tool_call_id = Some(call.id.clone());
+                ev.name = Some(call.name.clone());
+                ev.phase = Some("start");
+            });
             let mut is_error = false;
             let result = match llm::arguments_error(call) {
                 // The model's argument string was not JSON: report it as a
@@ -438,6 +459,13 @@ impl Agent {
                 ev.name = Some(call.name.clone());
                 ev.text = result.clone();
                 ev.is_error = is_error;
+            });
+            let ended = now_ms();
+            self.emit("tool_progress", ended, |ev| {
+                ev.tool_call_id = Some(call.id.clone());
+                ev.name = Some(call.name.clone());
+                ev.phase = Some("end");
+                ev.elapsed_ms = Some(ended.saturating_sub(at));
             });
             // `Message::tool_result` owns the 2 KB cut; the marker tells the model
             // the result it sees is incomplete.
@@ -765,6 +793,20 @@ mod tests {
         1_000
     }
 
+    thread_local! {
+        /// A clock that advances by 1 ms per read, so a duration is observable in a
+        /// test without sleeping. One per test thread, which is how cargo runs them.
+        static TICKING_CLOCK: std::cell::Cell<u64> = const { std::cell::Cell::new(1_000) };
+    }
+
+    fn ticking_clock() -> u64 {
+        TICKING_CLOCK.with(|cell| {
+            let next = cell.get().saturating_add(1);
+            cell.set(next);
+            next
+        })
+    }
+
     /// The shape the host agent streams, in the same order: reasoning, text, tool use,
     /// tool result, usage. The board cannot stream token by token, so a delta carries
     /// the whole block - the vocabulary and the ordering are what stay identical.
@@ -805,6 +847,99 @@ mod tests {
         assert_eq!(agent.usage_run.prompt_tokens, 42);
         assert_eq!(agent.usage_run.completion_tokens, 12);
         assert_eq!(agent.usage_total.total(), 54);
+    }
+
+    /// `tool_progress` brackets exactly one tool call, in the order the frozen contract
+    /// in `docs/agent-stream.md` asks for, with the elapsed time on the closing half.
+    #[test]
+    fn a_tool_call_is_bracketed_by_tool_progress_events() {
+        let mut agent = Agent::new();
+        let mut host = StubHost::returning(r#"{"ok":true}"#);
+        let mut transport = StubTransport::new(vec![
+            tool_call_reply("c1", "board_status", "{}"),
+            answer_reply("the board answered"),
+        ]);
+        agent.push_user("is the board ok?", "http", 1);
+        agent.run_pending(&mut host, &mut transport, &cfg(), ticking_clock).expect("answer");
+
+        let kinds: Vec<&str> = agent.events.iter().map(|e| e.kind).collect();
+        let at = kinds
+            .iter()
+            .position(|k| *k == "tool_use")
+            .unwrap_or_else(|| panic!("tool_use missing in {kinds:?}"));
+        assert_eq!(
+            &kinds[at..at + 4],
+            &["tool_use", "tool_progress", "tool_result", "tool_progress"],
+            "one tool call journals exactly this window: {kinds:?}"
+        );
+
+        let start = &agent.events[at + 1];
+        let result = &agent.events[at + 2];
+        let end = &agent.events[at + 3];
+        assert!(start.seq < result.seq && result.seq < end.seq, "the journal is ordered by seq");
+        assert_eq!(start.phase, Some("start"));
+        assert_eq!(start.tool_call_id.as_deref(), Some("c1"));
+        assert_eq!(start.name.as_deref(), Some("board_status"));
+        assert_eq!(start.elapsed_ms, None, "a start has no duration yet");
+        assert_eq!(end.phase, Some("end"));
+        assert_eq!(end.tool_call_id.as_deref(), Some("c1"));
+        assert_eq!(end.name.as_deref(), Some("board_status"));
+        let elapsed = end.elapsed_ms.expect("the end half carries elapsed_ms");
+        assert!(elapsed > 0, "the clock advanced during the call, so elapsed_ms cannot be 0");
+
+        // A start and its end stamp the same call, and the pair carries no text: the
+        // client reads the result from `tool_result`.
+        assert!(start.text.is_empty() && end.text.is_empty());
+        let start_json = start.json();
+        assert_eq!(start_json["event"], "tool_progress");
+        assert_eq!(start_json["seq"], json!(start.seq));
+        assert_eq!(start_json["at_ms"], json!(start.at_ms));
+        assert_eq!(start_json["tool_call_id"], "c1");
+        assert_eq!(start_json["name"], "board_status");
+        assert_eq!(start_json["phase"], "start");
+        assert!(start_json.get("elapsed_ms").is_none(), "no duration before the call ran");
+        let end_json = end.json();
+        assert_eq!(end_json["phase"], "end");
+        assert_eq!(end_json["elapsed_ms"], json!(elapsed));
+
+        // `events_json(after)` is the frame source for the stream: both halves are in
+        // the tail a polling client asks for.
+        let tail_json = agent.events_json(start.seq);
+        let tail: Vec<&str> = tail_json["events"]
+            .as_array()
+            .expect("events array")
+            .iter()
+            .map(|e| e["event"].as_str().unwrap_or_default())
+            .collect();
+        assert!(tail.contains(&"tool_progress"), "{tail:?}");
+        assert_eq!(tail.iter().filter(|e| **e == "tool_progress").count(), 1, "{tail:?}");
+    }
+
+    /// A call that fails before it reaches the host (bad arguments, no name) is still
+    /// bracketed, so a client pairing the two halves never sees an unmatched start.
+    #[test]
+    fn a_tool_call_that_fails_before_the_host_is_still_bracketed() {
+        let mut agent = Agent::new();
+        let mut host = StubHost::returning("should not run");
+        let mut transport = StubTransport::new(vec![
+            tool_call_reply("c1", "fs_write", "{\"path\": \"/a.txt\""),
+            answer_reply("I could not write the file"),
+        ]);
+        agent.push_user("write a file", "http", 1);
+        agent
+            .run_pending(&mut host, &mut transport, &cfg(), ticking_clock)
+            .expect("the loop still ends with an answer");
+        assert!(host.calls.is_empty(), "the tool must not be called");
+
+        let kinds: Vec<&str> = agent.events.iter().map(|e| e.kind).collect();
+        let at = kinds.iter().position(|k| *k == "tool_use").expect("tool_use");
+        assert_eq!(
+            &kinds[at..at + 4],
+            &["tool_use", "tool_progress", "tool_result", "tool_progress"],
+            "{kinds:?}"
+        );
+        assert!(agent.events[at + 2].is_error, "the result is flagged as an error");
+        assert!(agent.events[at + 3].elapsed_ms.is_some(), "the pair is closed anyway");
     }
 
     #[test]

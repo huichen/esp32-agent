@@ -15,6 +15,25 @@ pub const NVS_KEY_CONFIG: &str = "config";
 pub const DEFAULT_PORT: u16 = 8080;
 pub const DEFAULT_PATH: &str = "/mcp";
 
+/// Default interval of the platform scheduler tick, and therefore the default
+/// queue-drain latency.
+pub const DEFAULT_TICK_MS: u32 = 1000;
+/// Below this the board spends its time scheduling instead of working.
+pub const MIN_TICK_MS: u32 = 200;
+/// Above this a queued message waits long enough to look dropped.
+pub const MAX_TICK_MS: u32 = 5000;
+
+/// Clamp a requested tick interval into the range the scheduler can honour. `0`
+/// means "not set" (a partial patch or an untouched field), so it takes the
+/// default rather than the floor.
+pub fn clamp_tick_ms(ms: u32) -> u32 {
+    if ms == 0 {
+        DEFAULT_TICK_MS
+    } else {
+        ms.clamp(MIN_TICK_MS, MAX_TICK_MS)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct Config {
@@ -30,6 +49,8 @@ pub struct Config {
     pub auth: AuthCfg,
     pub ui: UiCfg,
     pub log: LogCfg,
+    /// The platform half of the agent: how often its loop wakes up.
+    pub agent: AgentCfg,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -126,6 +147,24 @@ pub struct LogCfg {
     pub level: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct AgentCfg {
+    /// Interval of the platform scheduler tick, in milliseconds: how often the
+    /// schedule is evaluated and the depth-1 queue is drained, so it is the
+    /// worst-case latency between a trigger and the run that answers it.
+    ///
+    /// The platform reads it on every tick instead of once at boot, so a portal edit
+    /// takes effect on the next tick.
+    pub tick_ms: u32,
+}
+
+impl Default for AgentCfg {
+    fn default() -> Self {
+        Self { tick_ms: DEFAULT_TICK_MS }
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -139,6 +178,7 @@ impl Default for Config {
             auth: AuthCfg::default(),
             ui: UiCfg::default(),
             log: LogCfg::default(),
+            agent: AgentCfg::default(),
         }
     }
 }
@@ -423,6 +463,13 @@ impl Config {
                 touched.push("log.level".into());
             }
         }
+        if let Some(a) = patch.get("agent").and_then(|v| v.as_object()) {
+            if let Some(n) = a.get("tick_ms").and_then(|v| v.as_u64()) {
+                // The tick does not need a reboot: the platform re-reads it every tick.
+                self.agent.tick_ms = clamp_tick_ms(n.min(u32::MAX as u64) as u32);
+                touched.push("agent.tick_ms".into());
+            }
+        }
         *self = self.clone().sanitized();
         Ok(touched)
     }
@@ -453,6 +500,7 @@ impl Config {
             self.bus.i2c = BusCfg::default().i2c;
         }
         self.log.ring = self.log.ring.clamp(16, 1024);
+        self.agent.tick_ms = clamp_tick_ms(self.agent.tick_ms);
         if self.ui.lang != "en" {
             self.ui.lang = "zh".into();
         }
@@ -535,5 +583,44 @@ mod tests {
         c.apply_patch(&json!({ "mcp": { "port": 70000, "max_sessions": 999 } })).unwrap();
         assert_eq!(c.mcp.port, 65535);
         assert_eq!(c.mcp.max_sessions, 16);
+    }
+
+    #[test]
+    fn the_agent_tick_defaults_to_one_second() {
+        let c = Config::default().sanitized();
+        assert_eq!(c.agent.tick_ms, DEFAULT_TICK_MS);
+        assert_eq!(DEFAULT_TICK_MS, 1000);
+        // A config stored by a firmware that predates the field still loads.
+        let old = Config::from_json_str(r#"{"device_name":"lab","mcp":{"port":9000}}"#).unwrap();
+        assert_eq!(old.agent.tick_ms, DEFAULT_TICK_MS);
+        assert_eq!(old.mcp.port, 9000);
+        // `0` means "not set", not "as fast as possible".
+        assert_eq!(clamp_tick_ms(0), DEFAULT_TICK_MS);
+    }
+
+    #[test]
+    fn a_tick_patch_is_clamped_and_survives_a_roundtrip() {
+        let mut c = Config::default();
+        c.apply_patch(&json!({ "agent": { "tick_ms": 500 } })).unwrap();
+        assert_eq!(c.agent.tick_ms, 500);
+        c.apply_patch(&json!({ "agent": { "tick_ms": 50 } })).unwrap();
+        assert_eq!(c.agent.tick_ms, MIN_TICK_MS, "a 50 ms tick would starve the board");
+        c.apply_patch(&json!({ "agent": { "tick_ms": 90_000 } })).unwrap();
+        assert_eq!(c.agent.tick_ms, MAX_TICK_MS, "a 90 s tick reads as a dropped message");
+        // Out of range at deserialization time is clamped too, not just through a patch.
+        let stored = Config::from_json_str(r#"{"agent":{"tick_ms":100}}"#).unwrap();
+        assert_eq!(stored.agent.tick_ms, MIN_TICK_MS);
+
+        // The value is stored and reported as JSON, so a GET can echo what a POST took.
+        c.apply_patch(&json!({ "agent": { "tick_ms": 250 } })).unwrap();
+        let json = c.public_json();
+        assert_eq!(json["agent"]["tick_ms"], 250);
+        let back = Config::from_json_str(&c.to_json_string()).unwrap();
+        assert_eq!(back.agent.tick_ms, 250);
+
+        // And it needs no reboot: the platform loop re-reads it every tick.
+        let mut faster = back.clone();
+        faster.apply_patch(&json!({ "agent": { "tick_ms": 200 } })).unwrap();
+        assert!(!back.needs_network_restart(&faster));
     }
 }

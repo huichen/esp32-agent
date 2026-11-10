@@ -10,10 +10,11 @@
 //!   handshake nobody can read.
 //! * [`attach`] — hands that transport to the `App`, which owns the only place the
 //!   rest of the firmware looks for it.
-//! * [`start`] — one thread, one tick per second: fire what the schedule says is
-//!   due, then run the queued turn if there is one. The queue is depth-1 and
-//!   coalescing, so a trigger that arrives mid-run is merged into the next turn
-//!   instead of starting a second model call.
+//! * [`start`] — one thread, one tick per configured interval (`agent.tick_ms`, re-read
+//!   on every tick, so a portal edit takes effect on the next tick rather than on
+//!   reboot): fire what the schedule says is due, then run the queued turn if there is
+//!   one. The queue is depth-1 and coalescing, so a trigger that arrives mid-run is
+//!   merged into the next turn instead of starting a second model call.
 //!
 //! Two consequences of the core design are visible here and are deliberate, not
 //! accidents:
@@ -37,11 +38,9 @@ use std::sync::{Arc, MutexGuard};
 use std::time::{Duration, Instant};
 
 use esp32_agent_core::app::{now_ms, App, Shared};
+use esp32_agent_core::config::clamp_tick_ms;
 use esp32_agent_core::llm::{self, ChatTransport};
 use esp32_agent_core::logbuf::LogBuf;
-
-/// How often the schedule is evaluated and the queue is drained.
-pub const TICK_MS: u64 = 1000;
 
 /// The agent thread's stack. It holds a `TcpStream`, a JSON request body and
 /// `serde_json`'s recursive parser; 32 KB matches the main thread.
@@ -457,7 +456,10 @@ fn run_loop(
     timeout_s: Arc<AtomicU32>,
     mut transport: EspHttpTransport,
 ) {
-    log.info("agent", format!("agent thread up: tick {TICK_MS} ms, scheduler clock {}", clock_note()));
+    // The interval is config, not a constant: it is the queue-drain latency, so the
+    // portal is allowed to trade latency against scheduling overhead without a reflash.
+    let mut tick_ms = tick_interval(&shared);
+    log.info("agent", format!("agent thread up: tick {tick_ms} ms, scheduler clock {}", clock_note()));
     if now_ms() / 1000 < CLOCK_SET_AFTER_S {
         log.warn(
             "agent",
@@ -466,16 +468,31 @@ fn run_loop(
     }
 
     loop {
-        std::thread::sleep(Duration::from_millis(TICK_MS));
+        // Re-read every tick: a portal edit to `agent.tick_ms` applies to the next
+        // sleep, not to the next boot.
+        let configured = tick_interval(&shared);
+        if configured != tick_ms {
+            log.info("agent", format!("tick is now {configured} ms (queued work waits at most that long)"));
+            tick_ms = configured;
+        }
+        std::thread::sleep(Duration::from_millis(tick_ms));
         let now = now_ms();
         let minute = minute_of_day(now);
         tick(&shared, &mut transport, now, minute, &timeout_s, &log);
     }
 }
 
+/// The configured tick under a short lock of its own, clamped the way the config layer
+/// clamps it (so an out-of-range value cannot make the loop spin or stall), because what
+/// the loop sleeps on has to be what the portal last stored.
+fn tick_interval(shared: &Shared) -> u64 {
+    let app = lock(shared);
+    u64::from(clamp_tick_ms(app.cfg.agent.tick_ms))
+}
+
 // ============================ tick (App only) ============================
 
-/// What one second of the agent thread does: sync the timeout, fire what came due,
+/// What one tick of the agent thread does: sync the model timeout, fire what came due,
 /// then run the queued turn.
 ///
 /// Kept apart from the loop for one reason: this is the part with a decision in it,
@@ -511,6 +528,24 @@ fn tick(
         // Schedule first: a task that comes due on this tick runs on this tick.
         for source in app.sched_tick(now, minute) {
             log.info("agent", format!("scheduler queued {source}"));
+        }
+
+        // Thread stacks come from internal RAM, and the heap figure the portal shows
+        // counts PSRAM. A board that cannot spawn an HTTP connection thread reports
+        // nothing useful, so say the number that matters *before* it gets there.
+        let internal_kb = unsafe { esp_idf_svc::sys::esp_get_free_internal_heap_size() } / 1024;
+        // xtensa has no 64-bit atomics, so this counts seconds: 32 bits is 136 years.
+        static LAST_WARN_S: AtomicU32 = AtomicU32::new(0);
+        let now_s = (now / 1000) as u32;
+        let last = LAST_WARN_S.load(Ordering::Relaxed);
+        if internal_kb < 40 && now_s.saturating_sub(last) > 60 {
+            LAST_WARN_S.store(now_s, Ordering::Relaxed);
+            log.warn(
+                "agent",
+                format!(
+                    "internal free heap is {internal_kb} kB: a connection thread needs ~10 kB of it, so streams and requests start failing here"
+                ),
+            );
         }
 
         app.agent.pending.as_ref().map(|pending| {

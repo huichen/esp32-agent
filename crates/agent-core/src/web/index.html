@@ -153,8 +153,14 @@
           <span data-i18n="agent_max_steps">最大步数</span>
           <input id="agent-max-steps" type="number" min="1" max="12" step="1" value="4" style="width:72px;flex:0 0 72px">
         </label>
+        <label class="row small">
+          <span data-i18n="agent_tick">调度 tick</span>
+          <input id="agent-tick" type="number" min="200" max="5000" step="100" value="1000" style="width:88px;flex:0 0 88px">
+          <span class="unit">ms</span>
+        </label>
       </div>
       <p class="hint" data-i18n="agent_note">模型地址必须是明文的 http 地址（板子上没有 TLS）；key 只写进 NVS，读回来时只显示是否已设置。</p>
+      <p class="hint" data-i18n="agent_tick_note">调度 tick 就是队列最快多久被取走一次（200–5000 ms，默认 1000）：板子每个 tick 重新读它，所以改完下一个 tick 就生效，不用重启。</p>
       <div id="agent-config-state" class="kv"></div>
     </div>
 
@@ -172,6 +178,22 @@
         <span class="hint" id="agent-hint"></span>
         <button class="btn primary" id="agent-send" data-i18n="agent_send">发送</button>
       </div>
+    </div>
+
+    <div class="card">
+      <div class="row spread">
+        <h3 data-i18n="stream_title">实时事件</h3>
+        <div class="row">
+          <span class="badge off" id="agent-stream-badge">–</span>
+          <span class="hint" id="agent-stream-note"></span>
+          <button class="btn ghost" id="agent-stream-pause" data-i18n="stream_pause">暂停</button>
+          <button class="btn ghost" id="agent-stream-clear" data-i18n="stream_clear">清空</button>
+        </div>
+      </div>
+      <div id="agent-stream" class="stream" data-empty="1">
+        <p class="hint" data-i18n="stream_empty">还没有事件。停在这一页时，运行的每一步都会实时出现在这里。</p>
+      </div>
+      <p class="hint" data-i18n="stream_note">由 /api/agent/stream 推送（SSE）：板子空闲 30 秒或单条连接满 120 秒会主动断开，浏览器自己重连并从最后一条事件续上，页面不重发任何东西。</p>
     </div>
 
     <div class="card">

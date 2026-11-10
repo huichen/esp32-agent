@@ -22,6 +22,93 @@ pub const MAX_BODY_BYTES: usize = 128 * 1024;
 const MAX_CONNECTIONS: usize = 6;
 const IDLE_TIMEOUT: Duration = Duration::from_secs(20);
 
+/// How many sockets a long-lived event stream may hold.
+///
+/// A stream keeps one pool slot for its whole life, so this is a slice of
+/// `MAX_CONNECTIONS` rather than a number of its own: the portal, MCP and
+/// `/api/status` share those six sockets, and the board has to keep answering
+/// while a console is open. Two streams is already a third of the pool.
+pub const MAX_EVENT_STREAMS: usize = 2;
+
+// The board answers HTTP from `MAX_CONNECTIONS` sockets and streams take a slice of
+// that pool, never the pool itself: with the portal, MCP and `/api/status` sharing
+// six sockets, two streams is already a third of them. Asserted at compile time so
+// a smaller pool or a larger cap cannot pass review silently.
+const _: () = assert!(MAX_EVENT_STREAMS * 2 < MAX_CONNECTIONS);
+
+/// The comment heart-beat an event stream writes between events. It keeps a
+/// proxy (and the socket write timeout) from declaring a quiet stream dead.
+pub const SSE_PING: &str = ": ping\n\n";
+
+/// One Server-Sent Events frame: `id:`, `event:`, `data:` and the blank line that
+/// terminates it.
+///
+/// `data` must already be a single line (the JSON `Event::json()` renders is);
+/// a raw newline inside a field would split the frame and confuse `EventSource`.
+pub fn sse_frame(id: u64, event: &str, data: &str) -> String {
+    debug_assert!(!event.contains('\n') && !data.contains('\n'), "an SSE field must be one line");
+    format!("id: {id}\nevent: {event}\ndata: {data}\n\n")
+}
+
+/// Where a [`Response`] with a `stream` body writes its frames.
+///
+/// The HTTP layer implements this over the socket (chunked); a test implements it
+/// over a `Vec`. Both see bytes, so what is tested is what the board sends.
+pub trait EventSink {
+    fn send(&mut self, bytes: &[u8]) -> std::io::Result<()>;
+}
+
+/// The body of a streamed response: called once the headers are on the wire, and
+/// allowed to keep the connection for as long as its own budget says.
+pub type StreamBody = Box<dyn FnOnce(&mut dyn EventSink) -> std::io::Result<()> + Send>;
+
+/// The cap on concurrent event streams, shared by everything that opens one.
+///
+/// A slot is taken before the socket commits to a long write, so a third client is
+/// refused while its request is still cheap to answer with a 503.
+#[derive(Clone, Default)]
+pub struct EventStreamGate {
+    taken: Arc<AtomicUsize>,
+}
+
+impl EventStreamGate {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// How many streams hold a slot right now.
+    pub fn active(&self) -> usize {
+        self.taken.load(Ordering::SeqCst)
+    }
+
+    /// Take a slot, or `None` when [`MAX_EVENT_STREAMS`] are already open.
+    pub fn acquire(&self) -> Option<EventStreamSlot> {
+        let mut cur = self.taken.load(Ordering::SeqCst);
+        loop {
+            if cur >= MAX_EVENT_STREAMS {
+                return None;
+            }
+            match self.taken.compare_exchange(cur, cur + 1, Ordering::SeqCst, Ordering::SeqCst) {
+                Ok(_) => return Some(EventStreamSlot { gate: self.clone() }),
+                Err(now) => cur = now,
+            }
+        }
+    }
+}
+
+/// One held stream slot. Dropping it gives the slot back, whatever ended the
+/// stream — the idle budget, the total budget, a failed write or a dropped
+/// response that never ran its body.
+pub struct EventStreamSlot {
+    gate: EventStreamGate,
+}
+
+impl Drop for EventStreamSlot {
+    fn drop(&mut self) {
+        self.gate.taken.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 /// Thread stacks. The board has kilobytes to spare per task, the host has
 /// megabytes and a debug build with deep serde_json frames — so the numbers
 /// differ by target rather than by wishful thinking.
@@ -31,7 +118,7 @@ const ACCEPT_STACK: usize = 6 * 1024;
 const ACCEPT_STACK: usize = 256 * 1024;
 
 #[cfg(target_os = "espidf")]
-const CONN_STACK: usize = 20 * 1024;
+const CONN_STACK: usize = 10 * 1024;
 #[cfg(not(target_os = "espidf"))]
 const CONN_STACK: usize = 512 * 1024;
 
@@ -73,16 +160,56 @@ impl Request {
     }
 }
 
-#[derive(Debug, Clone)]
 pub struct Response {
     pub status: u16,
     pub headers: Vec<(String, String)>,
     pub body: Vec<u8>,
+    /// A body that keeps writing after the headers are sent, for
+    /// `text/event-stream`. A response either has `body` or `stream`; when a
+    /// stream is present the connection is spent on it and closed afterwards.
+    pub stream: Option<StreamBody>,
+}
+
+impl std::fmt::Debug for Response {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Response")
+            .field("status", &self.status)
+            .field("headers", &self.headers)
+            .field("body_len", &self.body.len())
+            .field("streaming", &self.stream.is_some())
+            .finish()
+    }
 }
 
 impl Response {
     pub fn new(status: u16, content_type: &str, body: impl Into<Vec<u8>>) -> Self {
-        Self { status, headers: vec![("Content-Type".into(), content_type.into())], body: body.into() }
+        Self {
+            status,
+            headers: vec![("Content-Type".into(), content_type.into())],
+            body: body.into(),
+            stream: None,
+        }
+    }
+
+    /// A response whose body is written by `body` once the headers are out.
+    ///
+    /// `Content-Type: text/event-stream` and `Cache-Control: no-cache` are the
+    /// contract; the transfer framing is the HTTP layer's business.
+    pub fn streamed(status: u16, content_type: &str, body: StreamBody) -> Self {
+        Self {
+            status,
+            headers: vec![
+                ("Content-Type".into(), content_type.into()),
+                ("Cache-Control".into(), "no-cache".into()),
+            ],
+            body: Vec::new(),
+            stream: Some(body),
+        }
+    }
+
+    /// True when this response keeps the connection after its headers.
+    pub fn is_stream(&self) -> bool {
+        self.stream.is_some()
     }
 
     pub fn json(value: &serde_json::Value) -> Self {
@@ -111,11 +238,16 @@ impl Response {
     }
 
     pub fn empty(status: u16) -> Self {
-        Self { status, headers: vec![], body: Vec::new() }
+        Self { status, headers: vec![], body: Vec::new(), stream: None }
     }
 
     pub fn redirect(location: &str) -> Self {
-        Self { status: 302, headers: vec![("Location".into(), location.into())], body: Vec::new() }
+        Self {
+            status: 302,
+            headers: vec![("Location".into(), location.into())],
+            body: Vec::new(),
+            stream: None,
+        }
     }
 
     pub fn error_json(status: u16, message: &str) -> Self {
@@ -373,6 +505,14 @@ fn write_response(
     keep_alive: bool,
     head_only: bool,
 ) -> std::io::Result<()> {
+    // A handler may pin the connection shut by sending its own `Connection: close`
+    // (the event-stream refusal does: a refused stream must not park a pool socket).
+    // Then that header is the one that goes out, exactly once.
+    let explicit_close = resp
+        .headers
+        .iter()
+        .any(|(k, v)| k.eq_ignore_ascii_case("connection") && v.eq_ignore_ascii_case("close"));
+    let keep_alive = keep_alive && !explicit_close;
     let mut out = String::with_capacity(256);
     out.push_str(&format!("HTTP/1.1 {} {}\r\n", resp.status, Response::reason(resp.status)));
     for (k, v) in &resp.headers {
@@ -381,12 +521,72 @@ fn write_response(
     if resp.status != 204 && resp.status != 304 {
         out.push_str(&format!("Content-Length: {}\r\n", resp.body.len()));
     }
-    out.push_str(&format!("Connection: {}\r\n\r\n", if keep_alive { "keep-alive" } else { "close" }));
+    if !explicit_close {
+        out.push_str(&format!("Connection: {}\r\n", if keep_alive { "keep-alive" } else { "close" }));
+    }
+    out.push_str("\r\n");
     stream.write_all(out.as_bytes())?;
     if !head_only && resp.status != 204 && resp.status != 304 && !resp.body.is_empty() {
         stream.write_all(&resp.body)?;
     }
     stream.flush()
+}
+
+/// A socket as an [`EventSink`]: every `send` becomes one chunk.
+struct ChunkedSink<'a> {
+    stream: &'a mut TcpStream,
+}
+
+impl EventSink for ChunkedSink<'_> {
+    fn send(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        self.stream.write_all(format!("{:x}\r\n", bytes.len()).as_bytes())?;
+        self.stream.write_all(bytes)?;
+        self.stream.write_all(b"\r\n")?;
+        // Flush per frame: an event that sits in a buffer is an event the console
+        // does not see, and this is the one route where latency is the product.
+        self.stream.flush()
+    }
+}
+
+/// Write a streamed response: headers, then whatever the body writes, then the
+/// chunked terminator.
+///
+/// No `Content-Length` can exist ahead of time and the stream ends when it decides
+/// to, so the body is chunked and the connection closed afterwards. `EventSource`
+/// reconnects on its own with `after=<last id>`; that is the contract's design, not
+/// a failure mode.
+fn write_stream_response(
+    stream: &mut TcpStream,
+    resp: &Response,
+    body: StreamBody,
+    head_only: bool,
+) -> std::io::Result<()> {
+    let mut out = String::with_capacity(256);
+    out.push_str(&format!("HTTP/1.1 {} {}\r\n", resp.status, Response::reason(resp.status)));
+    for (k, v) in &resp.headers {
+        out.push_str(&format!("{k}: {v}\r\n"));
+    }
+    out.push_str("Transfer-Encoding: chunked\r\n");
+    // One stream per socket: the connection is spent, and saying so keeps a client
+    // from trying to reuse it after the body ends.
+    out.push_str("Connection: close\r\n\r\n");
+    stream.write_all(out.as_bytes())?;
+    stream.flush()?;
+    if head_only {
+        return Ok(());
+    }
+    let result = {
+        let mut sink = ChunkedSink { stream };
+        body(&mut sink)
+    };
+    // Terminate the body even when the stream reported an error: a clean end beats
+    // a truncated one for a client that is about to reconnect anyway.
+    let _ = stream.write_all(b"0\r\n\r\n");
+    let _ = stream.flush();
+    result
 }
 
 /// A running server. Dropping it stops the accept loop.
@@ -509,7 +709,7 @@ fn serve_connection(stream: TcpStream, peer: String, handler: Handler, log: Arc<
                 };
                 let head_only = req.method == "HEAD";
                 let started = std::time::Instant::now();
-                let resp = handler(&req);
+                let mut resp = handler(&req);
                 if started.elapsed().as_millis() > 500 {
                     log.warn(
                         "http",
@@ -517,6 +717,12 @@ fn serve_connection(stream: TcpStream, peer: String, handler: Handler, log: Arc<
                     );
                 }
                 conn.stream.set_write_timeout(Some(IDLE_TIMEOUT)).ok();
+                if let Some(body) = resp.stream.take() {
+                    // The handler has returned, so whatever lock it took is released:
+                    // the stream polls the app from here on, without holding it.
+                    let _ = write_stream_response(&mut conn.stream, &resp, body, head_only);
+                    return;
+                }
                 if write_response(&mut conn.stream, &resp, keep_alive, head_only).is_err() {
                     return;
                 }
@@ -646,5 +852,180 @@ mod tests {
         let resp = raw_request(addr, raw);
         assert!(resp.contains("{\\\"a\\\":1}") || resp.contains("\"a\":1"), "got: {resp}");
         drop(server);
+    }
+
+    // ---- event streams ----
+
+    /// One parsed `text/event-stream` frame.
+    #[derive(Debug, PartialEq)]
+    struct Frame {
+        id: u64,
+        event: String,
+        data: String,
+    }
+
+    /// Parse the frames out of an event-stream body, the way `EventSource` does:
+    /// `field: value` lines, a blank line ends the frame, a line starting with `:`
+    /// is a comment and belongs to no frame.
+    fn parse_frames(body: &str) -> Vec<Frame> {
+        let mut frames = Vec::new();
+        let mut id = 0u64;
+        let mut event = String::new();
+        let mut data = String::new();
+        let mut open = false;
+        for line in body.split('\n') {
+            let line = line.strip_suffix('\r').unwrap_or(line);
+            if line.is_empty() {
+                if open {
+                    frames.push(Frame {
+                        id,
+                        event: std::mem::take(&mut event),
+                        data: std::mem::take(&mut data),
+                    });
+                    open = false;
+                }
+                continue;
+            }
+            if line.starts_with(':') {
+                continue; // comment / heart-beat
+            }
+            let Some((field, value)) = line.split_once(": ") else { continue };
+            match field {
+                "id" => id = value.parse().unwrap_or(0),
+                "event" => event = value.to_string(),
+                "data" => data.push_str(value),
+                _ => {}
+            }
+            open = true;
+        }
+        frames
+    }
+
+    fn test_frame(seq: u64) -> String {
+        let data = serde_json::json!({ "seq": seq, "event": "tool_use", "tool_call_id": "c1" }).to_string();
+        sse_frame(seq, "tool_use", &data)
+    }
+
+    #[test]
+    fn an_sse_frame_parses_back_to_the_seq_kind_and_json_it_was_built_from() {
+        let frame = test_frame(42);
+        assert_eq!(
+            frame,
+            "id: 42\nevent: tool_use\ndata: {\"event\":\"tool_use\",\"seq\":42,\"tool_call_id\":\"c1\"}\n\n"
+        );
+        let frames = parse_frames(&format!("{}{}{}", test_frame(1), SSE_PING, test_frame(7)));
+        assert_eq!(frames.len(), 2, "the ping is a comment, not a frame: {frames:?}");
+        assert_eq!(frames[0].id, 1);
+        assert_eq!(frames[0].event, "tool_use");
+        assert_eq!(frames[1].id, 7);
+        let data: serde_json::Value = serde_json::from_str(&frames[1].data).expect("data is JSON");
+        assert_eq!(data["seq"], 7);
+        assert_eq!(data["event"], "tool_use");
+        assert_eq!(data["tool_call_id"], "c1");
+    }
+
+    #[test]
+    fn event_stream_slots_are_capped_and_given_back_when_dropped() {
+        let gate = EventStreamGate::new();
+        let first = gate.acquire().expect("first slot");
+        let second = gate.acquire().expect("second slot");
+        assert_eq!(gate.active(), 2);
+        assert!(gate.acquire().is_none(), "a third stream must be refused");
+        drop(first);
+        assert_eq!(gate.active(), 1);
+        let again = gate.acquire().expect("the freed slot is reusable");
+        assert_eq!(gate.active(), 2);
+        drop((second, again));
+        assert_eq!(gate.active(), 0, "every slot comes back");
+    }
+
+    /// A streamed response cannot know its length, so it is chunked, it says
+    /// `Connection: close`, and the socket is released when the body returns.
+    #[test]
+    fn a_streamed_response_is_chunked_without_a_content_length() {
+        let log = LogBuf::new(32);
+        let handler: Handler = Arc::new(|req: &Request| {
+            if req.path == "/stream" {
+                let body: StreamBody = Box::new(|sink: &mut dyn EventSink| {
+                    sink.send(test_frame(1).as_bytes())?;
+                    sink.send(SSE_PING.as_bytes())?;
+                    sink.send(test_frame(2).as_bytes())?;
+                    Ok(())
+                });
+                Response::streamed(200, "text/event-stream", body)
+            } else {
+                Response::text("hello")
+            }
+        });
+        let server = Server::start("127.0.0.1:0", handler, log).expect("bind");
+        let addr = server.local_addr();
+        let raw = raw_request_until_close(
+            addr,
+            "GET /stream?after=0 HTTP/1.1\r\nHost: x\r\nAccept: text/event-stream\r\n\r\n",
+        );
+        assert!(raw.starts_with("HTTP/1.1 200 OK"), "got: {raw}");
+        assert!(raw.contains("Content-Type: text/event-stream"));
+        assert!(raw.contains("Cache-Control: no-cache"));
+        assert!(raw.contains("Transfer-Encoding: chunked"));
+        assert!(raw.contains("Connection: close"));
+        assert!(!raw.contains("Content-Length"), "a stream has no length up front: {raw}");
+        let frames = parse_frames(&dechunk(&raw));
+        assert_eq!(frames.len(), 2, "both frames arrived: {raw}");
+        assert_eq!((frames[0].id, frames[1].id), (1, 2));
+        drop(server);
+    }
+
+    /// A HEAD on a stream sends the headers and closes without a body.
+    #[test]
+    fn a_head_on_a_stream_sends_headers_and_no_frames() {
+        let log = LogBuf::new(32);
+        let handler: Handler = Arc::new(|_req: &Request| {
+            let body: StreamBody = Box::new(|sink: &mut dyn EventSink| sink.send(test_frame(1).as_bytes()));
+            Response::streamed(200, "text/event-stream", body)
+        });
+        let server = Server::start("127.0.0.1:0", handler, log).expect("bind");
+        let raw = raw_request_until_close(
+            server.local_addr(),
+            "HEAD /api/agent/stream HTTP/1.1\r\nHost: x\r\n\r\n",
+        );
+        assert!(raw.starts_with("HTTP/1.1 200 OK"), "got: {raw}");
+        assert!(!raw.contains("id: 1"), "no frames for HEAD: {raw}");
+        drop(server);
+    }
+
+    /// Read until the server closes the connection - the only way a chunked body
+    /// with no announced length ends.
+    fn raw_request_until_close(addr: SocketAddr, raw: &str) -> String {
+        let mut s = TcpStream::connect(addr).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        s.write_all(raw.as_bytes()).unwrap();
+        s.flush().unwrap();
+        let mut out = Vec::new();
+        let mut buf = [0u8; 4096];
+        loop {
+            match s.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => out.extend_from_slice(&buf[..n]),
+                Err(_) => break,
+            }
+        }
+        String::from_utf8_lossy(&out).to_string()
+    }
+
+    /// Undo `Transfer-Encoding: chunked`.
+    fn dechunk(raw: &str) -> String {
+        let Some(split) = raw.find("\r\n\r\n") else { return String::new() };
+        let mut rest = &raw[split + 4..];
+        let mut out = String::new();
+        while let Some((line, tail)) = rest.split_once("\r\n") {
+            let size = usize::from_str_radix(line.trim(), 16).unwrap_or(0);
+            rest = tail;
+            if size == 0 || rest.len() < size {
+                break;
+            }
+            out.push_str(&rest[..size]);
+            rest = rest.get(size + 2..).unwrap_or("");
+        }
+        out
     }
 }
