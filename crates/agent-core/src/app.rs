@@ -987,7 +987,8 @@ impl App {
     pub fn agent_config_json(&self) -> Value {
         let mut v = llm_json(&self.llm, false);
         v["api_key_set"] = json!(!self.llm.api_key.is_empty());
-        v["endpoint_ok"] = json!(self.llm.base_url.starts_with("http://"));
+        v["endpoint_ok"] =
+            json!(self.llm.base_url.starts_with("http://") || self.llm.base_url.starts_with("https://"));
         // The platform tick, so the portal can show and edit it next to the model settings.
         v["tick_ms"] = json!(self.cfg.agent.tick_ms);
         v["run"] = json!({
@@ -1139,20 +1140,15 @@ impl App {
             Ok(v) => v,
             Err(e) => return Response::error_json(400, &format!("invalid JSON: {e}")),
         };
-        // No TLS on the board: an https:// endpoint would hang until the timeout,
-        // so it is refused with the reason rather than accepted and forgotten.
+        // Both schemes are carried by the platform transport (TLS on the board via
+        // esp-tls, on the host via rustls), so https:// is accepted here. Anything that
+        // is not HTTP at all is still refused by name.
         if let Some(url) = body.get("base_url").and_then(|u| u.as_str()) {
             let url = url.trim();
-            if url.starts_with("https://") {
+            if !url.is_empty() && !url.starts_with("http://") && !url.starts_with("https://") {
                 return Response::json_status(
                     400,
-                    &json!({ "error": "https:// is not supported: the board has no TLS. Use an http:// endpoint (a LAN proxy is the expected setup)." }),
-                );
-            }
-            if !url.is_empty() && !url.starts_with("http://") {
-                return Response::json_status(
-                    400,
-                    &json!({ "error": "`base_url` must start with http:// and point at the chat completions endpoint" }),
+                    &json!({ "error": "`base_url` must start with http:// or https:// and point at the chat completions endpoint" }),
                 );
             }
             self.llm.base_url = url.to_string();
@@ -3165,7 +3161,7 @@ mod tests {
     }
 
     #[test]
-    fn the_model_key_is_never_echoed_and_https_is_refused() {
+    fn the_model_key_is_never_echoed_and_https_is_accepted() {
         let mut app = test_app();
         let saved = body_json(&app.route(&post(
             "/api/agent/config",
@@ -3184,14 +3180,20 @@ mod tests {
         app.route(&post("/api/agent/config", r#"{"api_key":"__set__"}"#));
         assert_eq!(app.llm.api_key, "sk-test-dummy");
 
-        // No TLS on the board: https is refused with a reason, not accepted.
-        let bad = app.route(&post(
+        // https is a normal endpoint, not a special case: the transport carries TLS.
+        let ok = app.route(&post(
             "/api/agent/config",
             r#"{"base_url":"https://api.example.com/v1/chat/completions"}"#,
         ));
+        assert_eq!(ok.status, 200, "https must be accepted: {}", String::from_utf8_lossy(&ok.body));
+        assert_eq!(app.llm.base_url, "https://api.example.com/v1/chat/completions");
+        assert_eq!(body_json(&ok)["endpoint_ok"], true);
+
+        // Something that is not HTTP at all still gets a reason.
+        let bad = app.route(&post("/api/agent/config", r#"{"base_url":"ftp://example.com/x"}"#));
         assert_eq!(bad.status, 400);
-        assert!(String::from_utf8_lossy(&bad.body).contains("TLS"));
-        assert_eq!(app.llm.base_url, "http://192.0.2.10:8899/v1/chat/completions");
+        assert!(String::from_utf8_lossy(&bad.body).contains("http://"));
+        assert_eq!(app.llm.base_url, "https://api.example.com/v1/chat/completions");
         assert_eq!(app.route(&post("/api/agent/config", r#"{"max_steps":99}"#)).status, 200);
         assert_eq!(app.llm.max_steps, 12, "max_steps is clamped, not trusted");
     }

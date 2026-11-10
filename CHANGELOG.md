@@ -55,6 +55,10 @@ version numbering follows semantic versioning.
   `192.168.4.1`, and answers DNS for everything
 - Host simulator `agent-sim`: a virtual register board running the same services, and it
   drives the agent loop and the scheduler too
+- **`https://` for model and `net_*` calls**: the firmware's transport carries the scheme
+  — plain `http://` over `std::net`, `https://` over esp-tls with the ESP-IDF
+  certificate bundle (no skip-verification switch) — and the simulator uses rustls with
+  the webpki roots, so the same endpoint can be tried on the desk before it is flashed
 - Documentation: architecture, the manifest specification, the capability table, the HTTP
   API, adding a device, flashing, troubleshooting, the roadmap, AGENTS.md
 
@@ -76,6 +80,15 @@ version numbering follows semantic versioning.
 
 ### Fixed
 
+- Manifest tool names are checked against the wire charset (`^[a-zA-Z0-9_-]+$`) when the
+  manifest is applied, not when the request is built: a dotted name such as `pump.pulse`
+  was accepted by the board and then rejected by every OpenAI-compatible endpoint, and
+  because each request carries the whole tool list it failed **every** call — including
+  the one that would have repaired the manifest. A name already stored in NVS is dropped
+  at load, with a log line, so an affected board recovers on reboot
+- `manifest_validate` / `manifest_apply` name the document shape and a JSON Pointer when
+  the body does not fit (`invalid type: sequence, expected a map` cost a model six steps
+  of guessing), and refuse a mistyped top-level field instead of silently ignoring it
 - `tools/list` serialises tool by tool instead of building one `Value` tree first: the
   tree for 28 tools exhausted the heap on an S3 and aborted (the board rebooted on a
   client's first `tools/list`)
@@ -126,8 +139,6 @@ version numbering follows semantic versioning.
 ### Known gaps
 
 - `net_*` pointing at one of the board's own routes deadlocks on the App lock
-- The model interface supports `http://` only (`https://` is refused with a clear error);
-  a LAN proxy is the expected deployment
 - The file workspace lives in memory and persists as one NVS blob (≤ 2 KB per file, ≤ 8 KB
   total); SPIFFS is still to come
 - `fs_grep` has host tests but has not been driven through the loop on hardware;

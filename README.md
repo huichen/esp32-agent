@@ -101,9 +101,10 @@ board's own tools.
 - Send a message: `POST /api/agent/message {"text":"what is on this board?"}` → 202
   (queued); the loop can call tools across several steps, and the final text lands in
   `/api/agent/history?after=`
-- Model: any OpenAI-compatible `/chat/completions` over plain `http://`; fill in
+- Model: any OpenAI-compatible `/chat/completions` over `http://` or `https://`; fill in
   `base_url` / `model` / `api_key` in the portal's agent panel (the key is stored in
-  NVS and never echoed back)
+  NVS and never echoed back). `https://` is carried by esp-tls with the ESP-IDF
+  certificate bundle; `http://` stays for a LAN endpoint and the board's own `/selftest`
 - Tools: every MCP tool on the board, plus the file tools
   `fs_ls/fs_read/fs_write/fs_edit/fs_grep` over an NVS workspace, plus `net_get` /
   `net_post`. There is no shell — `ls` and `grep` are the parts of one that matter here

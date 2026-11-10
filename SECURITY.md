@@ -6,8 +6,10 @@ page.
 
 ## Deployment recommendations
 
-1. **Trusted LAN only**: there is no TLS by default; do not expose `8080` to the
-   internet. For remote access use a VPN or a reverse proxy that terminates TLS.
+1. **Trusted LAN only**: the portal and `/mcp` on `8080` have no TLS of their own; do
+   not expose `8080` to the internet. For remote access use a VPN or a reverse proxy
+   that terminates TLS. (Outbound model and `net_*` calls *do* support `https://`,
+   verified against the ESP-IDF certificate bundle — that is a different direction.)
 2. **Turn on the token and the PIN**:
    ```json
    { "auth": { "mcp_token": "<32 random bytes>", "portal_pin": "123456" } }
@@ -26,7 +28,8 @@ page.
 | Risk | Current state | Mitigation |
 |---|---|---|
 | Prompt injection leading to physical action | no approval step | `safety.confirm`, rate limits, LAN isolation |
-| Plaintext HTTP | no TLS | intranet plus a reverse proxy; never map the port to the internet |
+| Plaintext HTTP (inbound) | no TLS on the portal/`/mcp` | intranet plus a reverse proxy; never map the port to the internet |
+| Untrusted upstream (outbound) | `https://` is verified against the ESP-IDF CA bundle; there is no "skip verification" switch | point the model endpoint at an `https://` provider rather than a plain `http://` one on an untrusted network |
 | Credentials in plaintext NVS | ESP-IDF NVS is not encrypted by default | NVS encryption (`CONFIG_NVS_ENCRYPTION`) is available but needs keys flashed first |
 | Arbitrary I2C writes | `i2c_write` and the manifest primitive are by design | point it at trusted models only; omit the write primitive when you do not need it |
 | No firmware signature check | OTA is not implemented | see ROADMAP; flashing is over serial today |

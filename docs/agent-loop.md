@@ -6,7 +6,7 @@ the supervisor integrates, builds and verifies on the bench board.
 ## 1. What is being built
 
 An agent loop that runs **on the ESP32** and talks to an OpenAI-compatible chat
-endpoint over plain HTTP, using the board's own tools as its tool set:
+endpoint over HTTP or HTTPS, using the board's own tools as its tool set:
 
     user message / scheduled task / sensor rule
         -> queue (depth 1, coalesce)
@@ -22,8 +22,13 @@ endpoint over plain HTTP, using the board's own tools as its tool set:
 - **One agent run at a time.** The queue holds exactly one pending message; a new
   trigger while a run is in flight *coalesces* into it (newest text wins, source
   list appended). Never two concurrent model calls.
-- **No TLS in v1.** The endpoint is `http://`. A LAN proxy is the expected
-  deployment; `https://` is rejected with a clear error rather than hanging.
+- **TLS for `https://`, on the board.** The transport carries the scheme: plain
+  `http://` over a socket (a LAN endpoint, and the board's own
+  `/selftest/chat/completions`), `https://` over esp-tls with the ESP-IDF certificate
+  bundle. There is no "skip verification" switch. A handshake costs roughly 40 KB of
+  heap for the session, which is why the board has PSRAM and why one run still happens
+  at a time. Inbound traffic — the portal and `/mcp` on port 8080 — stays HTTP;
+  see `SECURITY.md` for why that is a reverse-proxy decision, not an oversight.
 - **Bounded everything.** History ring (<= 48 messages / <= 24 KB), tool result
   <= 2 KB (truncated with a marker), model reply <= 8 KB, `max_steps` default 4.
 - **No new ESP-IDF components.** The workspace for the file tools is an in-RAM
@@ -38,7 +43,8 @@ endpoint over plain HTTP, using the board's own tools as its tool set:
 ```rust
 pub trait ChatTransport {
     /// POST `body` to `url` with `headers`; return the response body.
-    /// Plain HTTP only; implementation enforces its own timeout.
+    /// POST `body` to `url` (http:// or https://); the scheme is the transport's business.
+    /// Implementation enforces its own timeout.
     fn post_json(&mut self, url: &str, headers: &[(&str, &str)], body: &str)
         -> Result<String, String>;
 }

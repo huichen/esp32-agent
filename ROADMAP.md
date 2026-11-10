@@ -36,7 +36,9 @@ what is not done or not verified.
 2. **mDNS**: register `_mcp._tcp` so a client does not have to know the IP first.
 3. **File workspace on SPIFFS** (the 1 MB `storage` partition); today the workspace is a
    single 8 KB NVS blob.
-4. **TLS**: `https://` for model calls and `net_*` (currently refused with a clear error).
+4. **Inbound TLS**: the portal and `/mcp` on 8080 are HTTP and a reverse proxy terminates
+   TLS today (`SECURITY.md`); serving them from the board itself needs a certificate
+   story (per-device self-signed plus pinning, or a provisioned cert in NVS).
 5. **Manifest snapshots**: keep the previous version before each apply so a bad manifest
    is one click to undo.
 6. **SSE on `/mcp`**: the long-lived `GET /mcp` stream (currently 405, which the spec

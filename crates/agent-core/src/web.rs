@@ -22,9 +22,14 @@ mod tests {
         assert!(APP_JS.contains("/api/manifest"));
         assert!(APP_JS.contains("/api/wifi/connect"));
         assert!(STYLE_CSS.contains("--accent"));
-        // No external CDN or font: the board must work on a captive-portal LAN.
-        assert!(!INDEX_HTML.contains("http://"));
-        assert!(!INDEX_HTML.contains("https://"));
+        // No external CDN or font: the board must work on a captive-portal LAN. Checked
+        // on the attributes that fetch rather than on the bare scheme, because the agent
+        // panel's hint spells out `http://` and `https://` as instructions to the user.
+        let lower = INDEX_HTML.to_ascii_lowercase();
+        for needle in ["=\"http://", "='http://", "=\"https://", "='https://", "url(http"] {
+            assert!(!lower.contains(needle), "the portal fetches something external: {needle}");
+        }
+        assert!(!STYLE_CSS.to_ascii_lowercase().contains("url(http"), "an external font or image in CSS");
     }
 
     #[test]

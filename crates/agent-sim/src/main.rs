@@ -8,13 +8,15 @@
 use esp32_agent_core::app::{drive_agent, make_handler, App, FwMeta, Shared};
 use esp32_agent_core::config::clamp_tick_ms;
 use esp32_agent_core::http::Server;
-use esp32_agent_core::llm::ChatTransport;
 use esp32_agent_core::logbuf::LogBuf;
 use esp32_agent_core::store::FileStore;
 use esp32_agent_core::virtual_board::{FakeKind, VirtualBoard};
-use std::io::{Read, Write};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+
+mod net;
+
+use net::HostTransport;
 
 /// Minute of the day for `at_hhmm` scheduling.
 ///
@@ -23,56 +25,6 @@ use std::time::Duration;
 /// things out, so it schedules in UTC and says so.
 fn minute_of_day(now_ms: u64) -> u32 {
     ((now_ms / 1000 / 60) % 1_440) as u32
-}
-
-/// The model transport for the simulator: plain HTTP over `std::net`.
-///
-/// The firmware has the same thing over esp-idf's client. Without it a message queued
-/// in the simulator sat `pending` forever - the transcript stayed empty and the portal's
-/// agent panel could not be tried without a board on the desk.
-struct HostTransport {
-    timeout: Duration,
-}
-
-impl ChatTransport for HostTransport {
-    fn post_json(&mut self, url: &str, headers: &[(&str, &str)], body: &str) -> Result<String, String> {
-        let rest = url.strip_prefix("http://").ok_or_else(|| format!("only http:// is supported: {url}"))?;
-        let (authority, path) = match rest.find('/') {
-            Some(i) => (&rest[..i], &rest[i..]),
-            None => (rest, "/"),
-        };
-        let addr = if authority.contains(':') { authority.to_string() } else { format!("{authority}:80") };
-        let mut stream =
-            std::net::TcpStream::connect(&addr).map_err(|e| format!("connect {addr} failed: {e}"))?;
-        stream.set_read_timeout(Some(self.timeout)).ok();
-        stream.set_write_timeout(Some(self.timeout)).ok();
-
-        let mut head = format!(
-            "POST {path} HTTP/1.1\r\nHost: {authority}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n",
-            body.len()
-        );
-        for (k, v) in headers {
-            head.push_str(&format!("{k}: {v}\r\n"));
-        }
-        head.push_str("\r\n");
-        stream.write_all(head.as_bytes()).map_err(|e| format!("write failed: {e}"))?;
-        stream.write_all(body.as_bytes()).map_err(|e| format!("write failed: {e}"))?;
-
-        let mut raw = Vec::new();
-        stream.read_to_end(&mut raw).map_err(|e| format!("read failed: {e}"))?;
-        let split = raw
-            .windows(4)
-            .position(|w| w == b"\r\n\r\n")
-            .ok_or_else(|| "response has no header block".to_string())?;
-        let head_text = String::from_utf8_lossy(&raw[..split]).to_string();
-        let status: u16 = head_text.split_whitespace().nth(1).and_then(|s| s.parse().ok()).unwrap_or(0);
-        let payload = String::from_utf8_lossy(&raw[split + 4..]).to_string();
-        if (200..300).contains(&status) {
-            Ok(payload)
-        } else {
-            Err(format!("HTTP {status}: {}", payload.chars().take(200).collect::<String>()))
-        }
-    }
 }
 
 struct Args {
@@ -106,6 +58,8 @@ fn parse_args() -> Args {
 
 fn main() {
     let args = parse_args();
+    // Before any request: rustls 0.23 will not pick a crypto provider on its own.
+    net::install_crypto_provider();
     let log = LogBuf::new(512);
     let store = FileStore::open(&args.state);
 
@@ -154,7 +108,7 @@ fn main() {
         let guard = app.lock().expect("app lock");
         u64::from(clamp_tick_ms(guard.cfg.agent.tick_ms))
     };
-    let mut transport = HostTransport { timeout: Duration::from_secs(45) };
+    let mut transport = HostTransport::new(Duration::from_secs(45));
 
     loop {
         std::thread::sleep(Duration::from_millis(tick_ms));
