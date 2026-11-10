@@ -51,12 +51,23 @@ the firmware itself prints the real table again through `esp_partition_find`.
 
 `esp-idf-sys` rejects an output path longer than 88 characters, so build from a short
 clone (e.g. `D:\e`) rather than a deep directory: the path is canonicalised, so `subst`
-does not help. `scripts/build-firmware.ps1` handles the three traps this sets — it selects
+does not help. `scripts/build-firmware.ps1` handles the four traps this sets — it selects
 the `esp` toolchain, points `LIBCLANG_PATH` at the **directory** holding `esp-clang\bin`,
-and keeps the artifacts in `<clone>\target` instead of `firmware\target` (pass
-`-TargetDir D:\t` if the clone path is still too long). A machine-level
+keeps the artifacts in `<clone>\target` instead of `firmware\target` (pass
+`-TargetDir D:\t` if the clone path is still too long), and rewrites
+`firmware/.cargo/config.toml` only when a chip setting actually changed. A machine-level
 `rustc-wrapper = "sccache"` in the cargo config cannot spawn the ESP toolchain's rustc;
 move that config aside for the build and restore it afterwards.
+
+What each of those looks like when it is wrong, so the next person recognises the error
+instead of re-deriving the fix:
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `error[E0463]: can't find crate for core`, plus "the target may not be installed" | `cargo build` on the default toolchain: it has neither the xtensa target nor `build-std` | build with `cargo +esp` (the script does) |
+| `couldn't find libclang` / bindgen failing on the first build | `export-esp.ps1` sets `LIBCLANG_PATH` to `libclang.dll`; bindgen wants the directory that holds it | set `LIBCLANG_PATH` to `…\esp-clang\bin` (the script does) |
+| `Too long output directory: … Shorten your project path down to no more than 10 characters` | `esp-idf-sys` refuses an output directory over 88 characters on Windows; `firmware\target\…` passes that in any clone with a name of its own | point `CARGO_TARGET_DIR` at a short path (`<clone>\target`, or `-TargetDir D:\t`) |
+| A one-line diff in `firmware/.cargo/config.toml` after every build, or all of it rewritten | PowerShell 5.1's `Set-Content -Encoding utf8` writes a BOM, and the script rewrote the file unconditionally | write only when the text changed, through `[System.IO.File]::WriteAllText` with `UTF8Encoding($false)` (the script does) |
 
 ## 3. Partition table
 
