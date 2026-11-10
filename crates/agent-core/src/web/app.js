@@ -41,6 +41,16 @@ const I18N = {
     agent_note: "模型地址必须是 http://（板子上没有 TLS）；key 只写进 NVS，读回来时只显示是否已设置。",
     agent_key_set: "已设置，留空表示不改", agent_key_none: "没有 key（不发送 Authorization）",
     agent_queued: "已排队", agent_running: "运行中", agent_idle: "空闲", agent_empty: "还没有对话。发一条消息，模型会用板子自己的工具作答。",
+    goal_title: "自主目标", goal_start: "开始", goal_stop: "停止",
+    goal_objective: "目标", goal_objective_ph: "比如：把工作台温度稳定在 25 °C 以下",
+    goal_max_iterations: "最多迭代", goal_iter: "第 {i} / {m} 轮",
+    goal_failures: "连续失败", goal_last: "上一轮", goal_reason: "停止原因",
+    goal_notes: "笔记（最新在最后）", goal_no_notes: "还没有笔记：第一轮跑完才会写进来。",
+    goal_idle: "还没有目标。写一句想让它做成的事，再点“开始”。",
+    goal_need_objective: "先写一个目标", goal_started: "已开始",
+    goal_status_idle: "空闲", goal_status_running: "运行中", goal_status_met: "已达成",
+    goal_status_blocked: "受阻", goal_status_exhausted: "轮次用尽", goal_status_stopped: "已停止",
+    goal_note: "写下一个目标，板子会自己一轮一轮地做：每轮只走一小步，把结果写成一条笔记，下一轮带着这些笔记继续。回复里出现 GOAL MET 就结束，出现 GOAL BLOCKED、连续失败 3 轮或者迭代次数用完也会停。同一时间只能有一个目标，笔记存在 NVS 里，所以都很短。",
     sched_tasks: "定时任务", sched_rules: "传感器规则", sched_add: "添加",
     sched_enable: "启用", sched_disable: "停用", del: "删除", none: "（空）",
     sched_note: "“每 N 秒”和“HH:MM”二选一：填秒数按周期触发，填 HH:MM 每天触发一次；到点的提示词会排进同一条智能体队列。",
@@ -86,6 +96,16 @@ const I18N = {
     agent_note: "The endpoint must be http:// — the board has no TLS. The key is stored in NVS and never read back.",
     agent_key_set: "set, leave empty to keep it", agent_key_none: "no key (no Authorization header)",
     agent_queued: "Queued", agent_running: "running", agent_idle: "idle", agent_empty: "No conversation yet. Send a message and the model works with the board's own tools.",
+    goal_title: "Goal", goal_start: "Start", goal_stop: "Stop",
+    goal_objective: "Objective", goal_objective_ph: "e.g. keep the bench below 25 °C",
+    goal_max_iterations: "Max iterations", goal_iter: "iteration {i} of {m}",
+    goal_failures: "consecutive failures", goal_last: "Last round", goal_reason: "Stop reason",
+    goal_notes: "Notes (newest last)", goal_no_notes: "No notes yet — the first iteration writes one.",
+    goal_idle: "No goal yet. Describe what it should achieve, then press Start.",
+    goal_need_objective: "Write an objective first", goal_started: "Started",
+    goal_status_idle: "idle", goal_status_running: "running", goal_status_met: "met",
+    goal_status_blocked: "blocked", goal_status_exhausted: "exhausted", goal_status_stopped: "stopped",
+    goal_note: "State one objective and the board works through it alone: one small step per iteration, each result written down as a note that the next iteration is prompted with. A reply saying GOAL MET ends it; GOAL BLOCKED, three failures in a row or the iteration budget ends it too. One goal at a time, and the notes live in NVS, so they are short.",
     sched_tasks: "Scheduled tasks", sched_rules: "Sensor rules", sched_add: "Add",
     sched_enable: "Enable", sched_disable: "Disable", del: "Delete", none: "(none)",
     sched_note: "Use either every-N-seconds or HH:MM: the first repeats, the second fires once a day. A due prompt joins the same agent queue.",
@@ -103,6 +123,7 @@ const state = {
   tools: [],
   manifest: { revision: 0, manifest: { version: 1, devices: [], tools: [] } },
   agent: { seq: 0, messages: [], config: null, tasks: [], rules: [], usage: null },
+  goal: null,
   tab: "overview",
 };
 
@@ -117,8 +138,16 @@ function applyLang() {
   document.querySelectorAll("[data-i18n]").forEach((el) => {
     el.textContent = t(el.getAttribute("data-i18n"));
   });
+  // Placeholders are translated too, or a language switch would leave the form in
+  // the language it was rendered in.
+  document.querySelectorAll("[data-i18n-ph]").forEach((el) => {
+    el.placeholder = t(el.getAttribute("data-i18n-ph"));
+  });
   $("lang-btn").textContent = state.lang === "zh" ? "EN" : "中";
   syncStreamUi();
+  // The goal card is built by renderGoal, not by the [data-i18n] pass, so its
+  // status word and labels have to be redrawn on a language switch.
+  if (state.goal) renderGoal();
 }
 
 function toast(msg, bad) {
@@ -429,6 +458,137 @@ async function saveAgentConfig() {
   const { status, data } = await api("/api/agent/config", { method: "POST", body });
   toast(status === 200 ? t("saved") : (data && data.error) || t("failed"), status !== 200);
   if (status === 200) refreshAgentConfig().catch(() => {});
+}
+
+// ---------------------------------------------------------------- goal loop
+// One objective the board works through on its own. The card never drives the loop
+// itself: the agent thread does, and this only starts/stops it and shows
+// GET /api/goal, which is the board's own record of where the loop is.
+
+const GOAL_BADGE = { running: "core", met: "ok", blocked: "bad", exhausted: "warn", stopped: "warn" };
+
+function goalStatusLabel(status) {
+  const key = "goal_status_" + status;
+  const label = t(key);
+  return label === key ? status : label;
+}
+
+function renderGoalNotes(notes) {
+  const box = $("goal-notes");
+  box.innerHTML = "";
+  const label = document.createElement("p");
+  label.className = "hint";
+  label.textContent = t("goal_notes");
+  box.append(label);
+  const list = document.createElement("div");
+  list.className = "list";
+  if (!notes.length) {
+    list.innerHTML = '<p class="hint">' + esc(t("goal_no_notes")) + "</p>";
+    box.append(list);
+    return;
+  }
+  notes.forEach((note, i) => {
+    const item = document.createElement("div");
+    item.className = "list-item";
+    // A note is text, not a target: the hover border is for the WiFi list.
+    item.style.cursor = "default";
+    const n = document.createElement("span");
+    n.className = "mono";
+    n.textContent = String(i + 1);
+    const text = document.createElement("span");
+    text.style.flex = "1";
+    text.textContent = note;
+    item.append(n, text);
+    list.append(item);
+  });
+  box.append(list);
+}
+
+function renderGoal() {
+  const data = state.goal || {};
+  const status = String(data.status || "idle");
+  const active = status === "running";
+  const iteration = Number(data.iteration) || 0;
+  const maxIterations = Number(data.max_iterations) || 0;
+
+  const badge = $("goal-badge");
+  badge.className = "badge " + (GOAL_BADGE[status] || "off");
+  badge.textContent = goalStatusLabel(status);
+
+  // The board answers 409 to a second goal and leaves a finished one untouched by a
+  // stop, so the buttons only offer what the board will actually do.
+  $("goal-start").disabled = active;
+  $("goal-stop").disabled = !active;
+
+  const box = $("goal-state");
+  if (!data.objective) {
+    box.innerHTML = '<p class="hint">' + esc(t("goal_idle")) + "</p>";
+  } else {
+    // One line carries both facts: which round the loop is on, and where it stands.
+    // kv drops empty values, so every row here needs a value to be drawn at all.
+    kv(box, [
+      [t("goal_objective"), data.objective],
+      [t("goal_iter").replace("{i}", iteration).replace("{m}", maxIterations), goalStatusLabel(status)],
+      [t("goal_failures"), data.failures ? data.failures : ""],
+      [t("goal_last"), data.last_result],
+      [t("goal_reason"), data.stop_reason],
+    ]);
+  }
+  renderGoalNotes(data.notes || []);
+}
+
+async function refreshGoal() {
+  const { data } = await api("/api/goal");
+  if (!data) return;
+  // This runs on every 4 s poll. Redraw only when the board's document actually
+  // changed, so a text selection inside the notes survives the next tick.
+  if (JSON.stringify(data) === JSON.stringify(state.goal)) return;
+  state.goal = data;
+  renderGoal();
+}
+
+function clampGoalIterations(n) {
+  if (!Number.isFinite(n) || n <= 0) return 10;
+  return Math.min(100, Math.max(1, Math.round(n)));
+}
+
+async function startGoal() {
+  const objective = $("goal-objective").value.trim();
+  if (!objective) return toast(t("goal_need_objective"), true);
+  // Clamped here as well as on the board, so the field never shows a value the
+  // board would silently replace.
+  const maxIterations = clampGoalIterations(Number($("goal-max-iterations").value));
+  $("goal-max-iterations").value = maxIterations;
+  const { status, data } = await api("/api/goal", {
+    method: "POST",
+    body: { objective, max_iterations: maxIterations },
+  });
+  if (status !== 200) {
+    toast((data && data.error) || t("failed"), true);
+    // A 409 carries the goal that is already running: show it instead of a stale one.
+    if (data && data.goal) {
+      state.goal = data.goal;
+      renderGoal();
+    }
+    return;
+  }
+  $("goal-objective").value = "";
+  state.goal = data;
+  renderGoal();
+  toast(t("goal_started"));
+}
+
+async function stopGoal() {
+  // No confirm: the board keeps the objective and the notes, and the badge says what
+  // happened, so a stop costs a re-statement, not the record.
+  const { status, data } = await api("/api/goal/stop", { method: "POST", body: {} });
+  if (status !== 200) {
+    toast((data && data.error) || t("failed"), true);
+    return;
+  }
+  state.goal = data;
+  renderGoal();
+  toast(t("goal_status_stopped"));
 }
 
 function schedButton(label, onClick) {
@@ -875,6 +1035,7 @@ async function refreshAgent() {
   await refreshAgentConfig().catch(() => {});
   await refreshAgentHistory().catch(() => {});
   await refreshSched().catch(() => {});
+  await refreshGoal().catch(() => {});
 }
 
 async function refreshManifest() {
@@ -1053,6 +1214,12 @@ function bind() {
   $("agent-stream-pause").addEventListener("click", toggleStreamPause);
   $("agent-stream-clear").addEventListener("click", streamClear);
   $("agent-config-save").addEventListener("click", saveAgentConfig);
+  $("goal-start").addEventListener("click", startGoal);
+  $("goal-stop").addEventListener("click", stopGoal);
+  $("goal-objective").addEventListener("keydown", (e) => {
+    // Starting a goal is the one thing this field can do, so Enter does it.
+    if (e.key === "Enter") startGoal();
+  });
   $("sched-refresh").addEventListener("click", refreshSched);
   $("sched-task-add").addEventListener("click", addTask);
   $("sched-rule-add").addEventListener("click", addRule);
@@ -1078,6 +1245,9 @@ function bind() {
   setInterval(() => {
     if (state.tab !== "agent") return;
     refreshSched().catch(() => {});
+    // The loop advances one iteration per tick on the board, so the card follows the
+    // same 4 s poll the schedule does, not the stream.
+    refreshGoal().catch(() => {});
     // While the stream is up it carries the run as it happens; the transcript is
     // refreshed on message_end instead of on a timer.
     if (stream.state === "live") return;

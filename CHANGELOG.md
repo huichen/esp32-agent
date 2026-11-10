@@ -7,6 +7,11 @@ version numbering follows semantic versioning.
 
 ### Added
 
+- **Goal loop**: state one objective (`POST /api/goal`) and the board iterates on its own
+  — each iteration is one small step, its result becomes a note that the next iteration
+  reads, and a reply saying `GOAL MET` / `GOAL BLOCKED` ends the run; the goal lives in
+  NVS across reboots, is capped by `max_iterations`, aborts after three consecutive
+  failures, and is one at a time. Contract: `docs/agent-goal.md`
 - **On-board agent**: a model loop that runs on the ESP32 (`llm.rs` + `agent.rs`) against
   an OpenAI-compatible `/chat/completions`; one turn may call tools in several steps, and
   history is persisted to NVS and visible in the portal
@@ -114,6 +119,9 @@ version numbering follows semantic versioning.
   portal's heap figure hid because it counts PSRAM
 - The simulator actually drives the agent loop and the scheduler, so a queued message no
   longer sits `pending` forever
+- The self-test model matches its script keywords as whole words: it is fed back its own
+  output, so a goal note quoting `board_profile` used to look like a request about files
+  and burn the step budget on the wrong tool
 
 ### Known gaps
 

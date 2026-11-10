@@ -1,7 +1,14 @@
 # esp32-agent
 
-Turn an ESP32 into an MCP server that **discovers what is wired to it and lets a model
-reconfigure it while it runs**.
+An ESP32 that **runs an agent of its own**, not only an MCP server. The board carries a
+model loop: it is handed the board's tools, discovers what is wired to it, and
+reconfigures the hardware while it runs. Those same tools are also offered to other
+clients over MCP — but the device does not need a host agent to act.
+
+It does not even need a message. Given an **objective** instead of a prompt, the board
+runs a goal: one small step per iteration, each result written down as a note, the next
+iteration starting from those notes, until the objective is met, the board is blocked,
+or the iteration budget is spent — [docs/agent-goal.md](docs/agent-goal.md).
 
 The firmware serves a Streamable HTTP MCP endpoint and a bilingual web console. It is
 usable before it has any WiFi credentials: the board raises its own access point, a

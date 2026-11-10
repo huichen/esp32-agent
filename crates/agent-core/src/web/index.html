@@ -182,6 +182,25 @@
 
     <div class="card">
       <div class="row spread">
+        <h3 data-i18n="goal_title">自主目标</h3>
+        <span class="badge off" id="goal-badge">–</span>
+      </div>
+      <div class="row">
+        <input id="goal-objective" data-i18n-ph="goal_objective_ph" autocomplete="off" spellcheck="false">
+        <label class="row small">
+          <span data-i18n="goal_max_iterations">最多迭代</span>
+          <input id="goal-max-iterations" type="number" min="1" max="100" step="1" value="10" style="width:72px;flex:0 0 72px">
+        </label>
+        <button class="btn primary" id="goal-start" data-i18n="goal_start">开始</button>
+        <button class="btn ghost" id="goal-stop" data-i18n="goal_stop">停止</button>
+      </div>
+      <div id="goal-state" class="kv"></div>
+      <div id="goal-notes"></div>
+      <p class="hint" data-i18n="goal_note">写下一个目标，板子会自己一轮一轮地做：每轮只走一小步，把结果写成一条笔记，下一轮带着这些笔记继续。回复里出现 GOAL MET 就结束，出现 GOAL BLOCKED、连续失败 3 轮或者迭代次数用完也会停。同一时间只能有一个目标，笔记存在 NVS 里，所以都很短。</p>
+    </div>
+
+    <div class="card">
+      <div class="row spread">
         <h3 data-i18n="stream_title">实时事件</h3>
         <div class="row">
           <span class="badge off" id="agent-stream-badge">–</span>
