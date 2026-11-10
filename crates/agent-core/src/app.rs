@@ -459,11 +459,14 @@ impl App {
     }
 
     /// True while the board is waiting to be told which WiFi to join.
-    pub fn setup_needed(&mut self) -> bool {
-        let wifi = self.hw.wifi_status();
-        let ap = wifi.state.contains("ap");
-        let sta = wifi.state.contains("connected");
-        ap && !sta
+    pub fn setup_needed(&self) -> bool {
+        // Setup mode means "no credentials stored", which is what the portal and the MCP
+        // instructions claim. The access point being up is a different fact: with
+        // `wifi.ap_fallback` it keeps running after the board joins a network, and the
+        // station is briefly down after every reconnect. Keying the answer to either of
+        // those told a joined board to announce "waiting for credentials", while a board
+        // that had never been provisioned could report the opposite.
+        self.cfg.wifi.ssid.trim().is_empty()
     }
 
     /// The address a phone should open. The setup AP always answers on the
@@ -3060,6 +3063,38 @@ mod tests {
             ToolHost::call_tool(&mut app, "fs_grep", &json!({ "pattern": "brown fox", "path": "/bench" }))
                 .expect("grep");
         assert!(grep.contains("\"count\":1"), "grep must find the file it can read: {grep}");
+    }
+
+    /// A board that has joined a network must not tell a model it is waiting for
+    /// credentials.
+    ///
+    /// `setup_needed` used to ask the radio: is the access point up and the station
+    /// not "connected". The station reports the state `ap+sta` while genuinely
+    /// joined, so `contains("connected")` was false and every board with
+    /// `wifi.ap_fallback` on announced setup mode forever — in `/api/status` and in
+    /// the instructions handed to each MCP client, which is the sentence a model
+    /// reads before deciding what to do. The question the field answers is whether
+    /// credentials exist, so it is answered from the stored configuration.
+    #[test]
+    fn a_joined_board_does_not_claim_it_is_in_setup_mode() {
+        let mut app = test_app();
+        assert!(app.setup_needed(), "a board with no SSID is in setup mode");
+        assert!(app.instructions().contains("setup mode"), "with no credentials the instructions say so");
+
+        let resp = app.route(&post("/api/config", r#"{"wifi":{"ssid":"home"}}"#));
+        assert_eq!(resp.status, 200, "the config write must be accepted");
+
+        assert!(!app.setup_needed(), "holding an SSID means the board is not waiting for credentials");
+        let status = body_json(&app.route(&get("/api/status")));
+        assert_eq!(
+            status["setup"]["needed"],
+            json!(false),
+            "/api/status must agree with the instruction text"
+        );
+        assert!(
+            !app.instructions().contains("setup mode"),
+            "a joined board must not be described to a model as unprovisioned"
+        );
     }
 
     /// A turn in flight must not own the app while the model is thinking.

@@ -5,7 +5,7 @@ what is not done or not verified.
 
 ## Verified / unverified
 
-- ✅ `agent-core`: 184 tests (protocol, HTTP, manifest validation, driver conversion,
+- ✅ `agent-core`: 185 tests (protocol, HTTP, manifest validation, driver conversion,
   capability filtering, auth, hot reload, the agent loop, fs/net/sched, SSE streams)
 - ✅ Simulator end to end: `scripts/smoke.ps1`
 - ✅ Firmware runs on real hardware (ESP32-S3-DevKitC-1 N16R8, ESP-IDF v5.5.2):

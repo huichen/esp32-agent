@@ -91,6 +91,10 @@ version numbering follows semantic versioning.
   candidate bus too, and whichever answers decides the board profile
 - `uptime_s` waits for a real wall clock before counting (it used to report decades after
   SNTP set the clock)
+- `setup.needed` and the instructions handed to an MCP client follow the stored
+  credentials: a joined board used to announce "setup mode … waiting for credentials"
+  whenever `wifi.ap_fallback` kept the access point up, because the station reports its
+  state as `ap+sta`; a board that had never been provisioned could report the opposite
 - Changing I2C pins or the board profile now really requires a restart: the comparison is
   against the **effective** configuration (`before.bus != cfg.bus || before.board !=
   cfg.board`), which sets `restart_requested` and returns `restart_required: true`. A
