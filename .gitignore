@@ -32,9 +32,13 @@ firmware/.espressif/
 # root when CARGO_TARGET_DIR points outside the crate (see docs/flashing.md).
 /.embuild/
 
-# Local build scratch from the short-path clone
+# Local scratch: build scripts, logs, backups and one-off helpers that must never be
+# committed. The firmware build script here carries the WiFi credentials, which is
+# exactly why this directory stays out of the repository (see docs/flashing.md).
+/.local/
+
+# Older scratch locations, kept so a stray file from a previous session is still ignored
 /b[0-9]*.txt
-/build.log
 /build*.ps1
 /patch*.ps1
 /*.py
