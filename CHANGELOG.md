@@ -89,6 +89,10 @@ version numbering follows semantic versioning.
 - `manifest_validate` / `manifest_apply` name the document shape and a JSON Pointer when
   the body does not fit (`invalid type: sequence, expected a map` cost a model six steps
   of guessing), and refuse a mistyped top-level field instead of silently ignoring it
+- `scripts/build-firmware.ps1` actually builds: it ran the default toolchain (`can't find
+  crate for core`), pointed `LIBCLANG_PATH` at a file instead of its directory, kept
+  artifacts under `firmware/target` (too long for esp-idf-sys' 88-character check on
+  Windows), and stamped a BOM into `firmware/.cargo/config.toml` on every run
 - `tools/list` serialises tool by tool instead of building one `Value` tree first: the
   tree for 28 tools exhausted the heap on an S3 and aborted (the board rebooted on a
   client's first `tools/list`)

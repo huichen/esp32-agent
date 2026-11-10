@@ -40,17 +40,23 @@ espflash flash --chip esp32s3 --port COM3 --baud 921600 --flash-size 16mb `
   target/xtensa-esp32s3-espidf/release/esp32-agent
 ```
 
+The path is `<clone>\target\…` because that is where the build script keeps it; with
+`-TargetDir` elsewhere, use that directory instead.
+
 After flashing, check the serial output: the bootloader's `Partition Table:` must list
 seven entries (`nvs`, `otadata`, `phy_init`, `factory`, `ota_0`, `ota_1`, `storage`), and
 the firmware itself prints the real table again through `esp_partition_find`.
 
 ### On Windows, build from a short path
 
-`esp-idf-sys` rejects long paths, so build from a short clone (e.g. `D:\e`) rather than a
-deep directory: the path is canonicalised, so `subst` does not help. A machine-level
+`esp-idf-sys` rejects an output path longer than 88 characters, so build from a short
+clone (e.g. `D:\e`) rather than a deep directory: the path is canonicalised, so `subst`
+does not help. `scripts/build-firmware.ps1` handles the three traps this sets — it selects
+the `esp` toolchain, points `LIBCLANG_PATH` at the **directory** holding `esp-clang\bin`,
+and keeps the artifacts in `<clone>\target` instead of `firmware\target` (pass
+`-TargetDir D:\t` if the clone path is still too long). A machine-level
 `rustc-wrapper = "sccache"` in the cargo config cannot spawn the ESP toolchain's rustc;
-move that config aside for the build and restore it afterwards. `LIBCLANG_PATH` must point
-at the **directory** holding `esp-clang\bin`.
+move that config aside for the build and restore it afterwards.
 
 ## 3. Partition table
 
