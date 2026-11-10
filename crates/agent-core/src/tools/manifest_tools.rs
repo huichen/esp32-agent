@@ -24,6 +24,17 @@ fn validate_ctx<'b>(ctx: &mut ToolCtx<'b>) -> ValidateCtx<'b> {
     }
 }
 
+/// The parts [`manifest_describe`] can return, one per call.
+const DESCRIBE_SECTIONS: &[&str] = &["overview", "schema", "exec", "examples", "drivers"];
+
+/// The names in [`examples`], so the model can ask for one by name.
+fn example_names() -> Vec<String> {
+    match examples() {
+        Value::Object(map) => map.keys().cloned().collect(),
+        _ => Vec::new(),
+    }
+}
+
 /// What a manifest document looks like, quoted in errors so the model has a shape to
 /// copy instead of a guess to make.
 const MANIFEST_SHAPE: &str = "{\"version\":1,\"devices\":[{\"id\":\"pump\",\"pins\":{\"out\":12}}],\
@@ -158,47 +169,143 @@ pub fn manifest_tools() -> Vec<ToolDef> {
         }),
         ToolDef::new(
             "manifest_describe",
-            "Everything needed to write a manifest: JSON schema, primitive exec types with their fields, driver catalogue, limits, detected hardware and worked examples",
+            "The manifest reference, one section per call: overview (default), schema, exec, examples, drivers. Each section arrives whole; the full reference does not fit one tool result, and a truncated reference is worse than none",
         )
         .title("Describe manifest")
         .category("manifest")
         .core()
-        .schema(object_schema(&[], &[]))
-        .bind(|ctx, _args| {
-            let devices = ctx.devices.infos();
-            let driver_actions: Vec<Value> = devices
-                .iter()
-                .map(|d| json!({ "device": d.id, "driver": d.kind, "actions": d.tools, "address": d.address, "pins": d.pins }))
-                .collect();
-            Ok(json!({
-                "manifest_schema": manifest_schema(),
-                "primitives": primitives_doc(),
-                "drivers": drivers::catalog_json(),
-                "available_driver_actions": driver_actions,
-                "limits": {
-                    "max_tools": MAX_TOOLS,
-                    "max_sequence_steps": MAX_STEPS,
-                    "max_total_delay_ms": MAX_TOTAL_DELAY_MS,
-                    "pin_range": [0, 48],
-                    "i2c_address_range": [1, 127],
+        .schema(object_schema(
+            &[
+                (
+                    "section",
+                    enumeration(
+                        DESCRIBE_SECTIONS,
+                        "which part to return: overview (default), schema, exec, examples, drivers",
+                    ),
+                ),
+                (
+                    "example",
+                    json!({ "type": "string", "description": "with section=examples: the one example to return in full" }),
+                ),
+                (
+                    "driver",
+                    json!({ "type": "string", "description": "with section=drivers: the one driver to return in full" }),
+                ),
+            ],
+            &[],
+        ))
+        .bind(|ctx, args| {
+            let section = j::opt_str(args, "section").unwrap_or_default().trim().to_ascii_lowercase();
+            match section.as_str() {
+                // The first call a model makes: what the document is, the shape to copy,
+                // the field names, the limits, and where to go next — deliberately small
+                // enough to arrive in one piece.
+                "" | "overview" => {
+                    let devices = ctx.devices.infos();
+                    Ok(json!({
+                        "section": "overview",
+                        "what": "The manifest is the document you rewrite with manifest_apply: `devices` declares hardware, `tools` declares what the model may call. It lives in NVS and applies without a reboot.",
+                        "shape": {
+                            "version": 1,
+                            "devices": [{ "id": "pump", "kind": "actuator", "pins": { "out": 12 } }],
+                            "tools": [{
+                                "name": "pump_pulse",
+                                "params": [{ "name": "ms", "type": "integer", "min": 10, "max": 5000, "required": true }],
+                                "exec": { "type": "gpio_write", "pin": 12, "level": 1 }
+                            }]
+                        },
+                        "tool_fields": ["name", "title", "description", "device", "enabled", "params", "exec", "safety"],
+                        "device_fields": ["id", "kind", "driver", "pins", "bus", "address", "options", "enabled", "note"],
+                        "param_fields": ["name", "type", "description", "required", "min", "max", "unit", "enum", "default"],
+                        "safety_fields": ["min", "max", "max_calls_per_min", "confirm"],
+                        "limits": {
+                            "max_tools": MAX_TOOLS,
+                            "max_sequence_steps": MAX_STEPS,
+                            "max_total_delay_ms": MAX_TOTAL_DELAY_MS,
+                            "pin_range": [0, 48],
+                            "i2c_address_range": [1, 127],
+                        },
+                        "next": {
+                            "section": DESCRIBE_SECTIONS,
+                            "example": example_names(),
+                            "note": "exec types are in section=exec; the JSON Schema for devices/tools/params/safety is in section=schema",
+                        },
+                        "detected": { "devices": devices.len(), "capabilities": ctx.caps.to_json() },
+                    }))
+                }
+                "schema" => Ok(json!({ "section": "schema", "manifest_schema": manifest_schema() })),
+                "exec" => Ok(json!({
+                    "section": "exec",
+                    "primitives": primitives_doc(),
+                    "note": "every value may be a literal or {\"param\":\"name\"} to read a call argument",
+                })),
+                "examples" => match j::opt_str(args, "example") {
+                    Some(name) => {
+                        let all = examples();
+                        match all.get(name.trim()) {
+                            Some(one) => Ok(json!({ "section": "examples", "name": name.trim(), "manifest": one })),
+                            None => Err(McpError::invalid_params(format!(
+                                "no example `{}`; the examples are {}",
+                                name.trim(),
+                                example_names().join(", ")
+                            ))),
+                        }
+                    }
+                    None => Ok(json!({
+                        "section": "examples",
+                        "names": example_names(),
+                        "hint": "call again with example=<name> for one in full",
+                    })),
                 },
-                "current": {
-                    "manifest": ctx.manifest,
-                    "capabilities": ctx.caps.to_json(),
-                    "buses": ctx.cfg.bus.i2c,
-                    "declared_pins": ctx.cfg.pins,
-                    "devices": devices,
-                    "unidentified_addresses": ctx.probe.unknown,
-                },
-                "workflow": [
-                    "1. inventory / devices_list / i2c_scan to see what is really wired.",
-                    "2. i2c_identify {addr} for an address no driver claimed.",
-                    "3. manifest_apply {mode:\"merge\", manifest:{...}} with the new device and tools.",
-                    "4. tools/list now contains the new tools (no reboot, no reflash).",
-                    "5. call the new tool; if the result looks wrong, edit the manifest and apply again.",
-                ],
-                "examples": examples(),
-            }))
+                "drivers" => {
+                    // The catalogue is ~3.5 KB for fourteen drivers, so it is listed and
+                    // then asked for one entry at a time: a truncated catalogue is the
+                    // same bug as a truncated schema.
+                    match j::opt_str(args, "driver") {
+                        Some(kind) => {
+                            let kind = kind.trim();
+                            let entry = drivers::catalog_json()
+                                .as_array()
+                                .and_then(|all| all.iter().find(|d| d["kind"] == kind).cloned());
+                            match entry {
+                                Some(one) => {
+                                    let actions: Vec<Value> = ctx
+                                        .devices
+                                        .infos()
+                                        .iter()
+                                        .filter(|d| d.kind == kind)
+                                        .map(|d| json!({ "device": d.id, "actions": d.tools, "address": d.address, "pins": d.pins }))
+                                        .collect();
+                                    Ok(json!({ "section": "drivers", "driver": one, "detected_actions": actions }))
+                                }
+                                None => Err(McpError::invalid_params(format!(
+                                    "no driver `{kind}` in the catalogue"
+                                ))),
+                            }
+                        }
+                        None => {
+                            let entries = drivers::catalog_json();
+                            let brief: Vec<Value> = entries
+                                .as_array()
+                                .map(|all| {
+                                    all.iter()
+                                        .map(|d| json!({ "kind": d["kind"], "status": d["status"] }))
+                                        .collect()
+                                })
+                                .unwrap_or_default();
+                            Ok(json!({
+                                "section": "drivers",
+                                "drivers": brief,
+                                "hint": "call again with driver=<kind> for one in full (detection, capabilities, source)",
+                            }))
+                        }
+                    }
+                }
+                other => Err(McpError::invalid_params(format!(
+                    "unknown section `{other}`; use {} (overview when omitted)",
+                    DESCRIBE_SECTIONS.join(", ")
+                ))),
+            }
         }),
         ToolDef::new(
             "manifest_apply",

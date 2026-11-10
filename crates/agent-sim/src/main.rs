@@ -90,6 +90,11 @@ fn main() {
     {
         let mut guard = app.lock().expect("app lock");
         guard.lan_url = format!("http://127.0.0.1:{}", server.local_addr().port());
+        // The loop's client drives the model call (`drive_agent` takes it); the tools
+        // need one of their own, or `net_get`/`net_post` answer "no transport". The
+        // firmware has attached this since it got the agent; the simulator never did,
+        // which is why a `net_*` call inside a turn failed here and worked on a board.
+        guard.attach_tool_transport(Box::new(HostTransport::new(Duration::from_secs(45))));
     }
 
     println!();
@@ -136,8 +141,9 @@ fn main() {
             // the browser tab and its state survive the round trip.
             log.info("sim", "restart requested; the simulator keeps running");
         }
-        // Unlike the board, the simulator has no HTTP client of its own to keep for
-        // `net_*`, so one transport serves both uses.
+        // Unlike the board, the simulator has no separate HTTP client to keep for
+        // `net_*`: the App holds the tools' transport (attached above) and the loop
+        // holds the model one, which is why one `HostTransport` is not enough here.
         if let Some(outcome) = drive_agent(&app, &mut transport) {
             match outcome {
                 Ok(text) => log.info(

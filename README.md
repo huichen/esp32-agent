@@ -134,7 +134,7 @@ event names: `message_start`, `thinking_*`, `text_*`, `tool_use`, `tool_progress
 | Step | Tool | What it gives |
 |---|---|---|
 | Discover | `inventory`, `devices_list`, `i2c_scan`, `i2c_identify` | chip, buses, recognised devices, and **addresses that answer but have no driver** |
-| Model | `manifest_describe` | the manifest JSON Schema, the eleven primitives, the driver catalogue, limits, examples |
+| Model | `manifest_describe` | the manifest reference, one section per call — `overview` (shape, fields, limits), `schema`, `exec`, `examples`, `drivers`, each sized to arrive whole (a tool result is capped at 2 KB) |
 | Write | `manifest_apply` (`mode: merge/replace`, optional `dry_run`) | validated and applied **immediately**; failures come back as issues with a JSON Pointer |
 | Verify | `tools/list`, `mcp://manifest` | the new tool is listed; call it |
 | Iterate | edit the JSON, `manifest_apply` again | the tool list is rebuilt without a restart or a reflash |

@@ -111,10 +111,11 @@ try {
   $missing = Rpc '{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"lcd_text","arguments":{"text":"hi"}}}'
   Check 'a tool for absent hardware is not callable' { $missing.result.isError -eq $true }
 
-  $describe = Rpc '{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"manifest_describe","arguments":{}}}'
-  Check 'manifest_describe hands the model a schema and examples' {
-    $describe.result.structuredContent.manifest_schema.properties.tools -ne $null -and
-    $describe.result.structuredContent.primitives.Count -ge 8
+  $schema = Rpc '{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"manifest_describe","arguments":{"section":"schema"}}}'
+  $exec = Rpc '{"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"manifest_describe","arguments":{"section":"exec"}}}'
+  Check 'manifest_describe hands the model a schema and the exec types' {
+    $schema.result.structuredContent.manifest_schema.properties.tools -ne $null -and
+    $exec.result.structuredContent.primitives.Count -ge 8
   }
 
   $sessions = Invoke-RestMethod "http://127.0.0.1:$Port/api/sessions" -TimeoutSec 5

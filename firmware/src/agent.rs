@@ -508,10 +508,10 @@ pub fn attach(shared: &Shared, log: &LogBuf) -> (Arc<AtomicU32>, EspHttpTranspor
     let model = app.llm.model.clone();
     let url = app.llm.base_url.clone();
     // One client stays in the `App` for the `net_*` tools.
-    app.attach_transport(Box::new(EspHttpTransport::new()));
+    app.attach_tool_transport(Box::new(EspHttpTransport::new()));
     drop(app);
 
-    log.info("agent", "HTTP transport attached to the agent (plain http only, no TLS)");
+    log.info("agent", "HTTP transport attached to the agent for the net_* tools (http and https)");
     if url.trim().is_empty() || model.trim().is_empty() {
         log.warn(
             "agent",

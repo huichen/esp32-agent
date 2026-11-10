@@ -160,6 +160,13 @@ occurrence of `find`, otherwise it errors (that is the safety property).
 `net_get {url}` and `net_post {url, body}`; response body truncated to 2 KB;
 non-2xx returns the status plus body prefix as `Err`.
 
+The transport passed here is the `App`'s **tool transport** (`App::tool_transport`),
+which is a different client from the one the model call uses. That is deliberate: the
+model request borrows the driver's client for the length of the turn, so a shared one
+would leave `net_*` with nothing to send on — which is exactly what happened while the
+simulator never attached one: every `net_get` inside a turn answered "no HTTP transport
+is attached". `attach_tool_transport` is what the platform layer calls once at boot.
+
 ### 3.5 `crates/agent-core/src/sched.rs` (worker B)
 
 ```rust

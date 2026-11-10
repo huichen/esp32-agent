@@ -149,9 +149,15 @@ pub struct App {
     /// the message itself is gone by the time the reply comes back. `agent_begin` and
     /// `agent_run_once` set it; `finish_turn` reads it.
     turn_source: String,
-    /// Outbound HTTP for `net_*` and for the model call. The platform layer
-    /// attaches it once; host tests leave it empty so nothing reaches the net.
-    pub transport: Option<Box<dyn ChatTransport + Send>>,
+    /// Outbound HTTP for the `net_*` tools. The platform layer attaches it once; host
+    /// tests leave it empty so nothing reaches the net. It is deliberately **not** the
+    /// transport the model call uses: that one is owned by whoever drives the turn
+    /// (`drive_agent`), so a `net_get` inside a turn and the model request never
+    /// compete for one client — and a turn can still reach the network.
+    pub tool_transport: Option<Box<dyn ChatTransport + Send>>,
+    /// The transport `agent_run_once` uses when nobody drives the turn from outside.
+    /// Platforms use [`drive_agent`] and pass their own, leaving this empty.
+    pub model_transport: Option<Box<dyn ChatTransport + Send>>,
     /// Slots for `GET /api/agent/stream`. A stream holds an HTTP connection for its
     /// whole life, so the cap is about the pool, not about this struct.
     streams: EventStreamGate,
@@ -221,7 +227,8 @@ impl App {
             workspace: AppWorkspace::default(),
             goal: idle_goal(),
             turn_source: String::new(),
-            transport: None,
+            tool_transport: None,
+            model_transport: None,
             streams: EventStreamGate::new(),
             shared: Weak::new(),
             session_counter: 0,
@@ -719,9 +726,18 @@ impl App {
 
     /// Hand over the HTTP client the `net_*` tools use. The model call has its own,
     /// owned by whoever drives the turn (`drive_agent`), so a `net_*` call inside a
-    /// turn and the model request never compete for one client.
-    pub fn attach_transport(&mut self, transport: Box<dyn ChatTransport + Send>) {
-        self.transport = Some(transport);
+    /// turn and the model request never compete for one client — and, unlike a client
+    /// the turn borrows, this one is still there while the turn runs.
+    pub fn attach_tool_transport(&mut self, transport: Box<dyn ChatTransport + Send>) {
+        self.tool_transport = Some(transport);
+    }
+
+    /// Hand over the client `agent_run_once` should call the model with.
+    ///
+    /// Only for a runner with no driver loop of its own (the host tests); the firmware
+    /// and the simulator both use [`drive_agent`] and pass their client in there.
+    pub fn attach_model_transport(&mut self, transport: Box<dyn ChatTransport + Send>) {
+        self.model_transport = Some(transport);
     }
 
     /// Phase 1 of a turn, and the answer to "is there work": take the queued message,
@@ -1349,16 +1365,17 @@ impl App {
         // The agent lives in `self` and needs `self` as its tool host, so it is
         // moved out for the duration of the run and put back afterwards.
         let mut agent = std::mem::replace(&mut self.agent, Agent::new());
-        let mut transport = self.transport.take();
+        let mut transport = self.model_transport.take();
         let (out, ran) = match transport.as_mut() {
             Some(t) => (agent.run_pending(self, t.as_mut(), &cfg, now_ms), true),
             None => {
-                let why = "no HTTP transport is attached, so the model cannot be reached".to_string();
+                let why = "no HTTP transport is attached for the model call, so the model cannot be reached"
+                    .to_string();
                 agent.last_error = why.clone();
                 (Err(why), false)
             }
         };
-        self.transport = transport;
+        self.model_transport = transport;
         self.agent = agent;
         // Only a turn that actually ran is an iteration: a missing transport leaves the
         // message queued for a later attempt, and counting it would spend the goal's
@@ -1672,11 +1689,25 @@ impl App {
                 self.apply_manifest_http(req)
             }
             ("GET", "/api/manifest/schema") => {
-                let describe = self.call_tool("manifest_describe", &json!({}));
-                match describe {
-                    Ok(v) => Response::json(&v),
-                    Err(e) => Response::json_status(500, &json!({ "error": e.message })),
+                // An HTTP response has no 2 KB cap, so this route hands over the part of
+                // the reference needed to write a manifest in one go; the model asks for
+                // the same content one section at a time (`manifest_describe`).
+                let mut out = json!({});
+                for section in ["schema", "exec"] {
+                    match self.call_tool("manifest_describe", &json!({ "section": section })) {
+                        Ok(v) => {
+                            if let (Some(dst), Some(src)) = (out.as_object_mut(), v.as_object()) {
+                                for (key, value) in src {
+                                    if key != "section" && key != "note" {
+                                        dst.insert(key.clone(), value.clone());
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) => return Response::json_status(500, &json!({ "error": e.message })),
+                    }
                 }
+                Response::json(&out)
             }
             ("GET", "/api/devices") => Response::json(&json!({
                 "devices": self.devices.infos(),
@@ -2115,14 +2146,18 @@ impl ToolHost for App {
             return Ok(text);
         }
         if name.starts_with("net_") {
-            let mut transport = self.transport.take();
+            // The turn's own client is elsewhere, so this one is free to be used from
+            // inside a tool call — which is what lets the agent reach the network
+            // mid-run instead of only between turns.
+            let mut transport = self.tool_transport.take();
             let result = match transport.as_mut() {
                 Some(t) => net_tools::call(t.as_mut(), name, arguments),
                 None => {
-                    Some(Err("no HTTP transport is attached on this build, so net_* cannot run".to_string()))
+                    Some(Err("no HTTP transport is attached for the network tools, so net_* cannot run"
+                        .to_string()))
                 }
             };
-            self.transport = transport;
+            self.tool_transport = transport;
             return result
                 .unwrap_or_else(|| Err(format!("`{name}` starts with net_ but no such HTTP tool exists")));
         }
@@ -3298,6 +3333,95 @@ mod tests {
         assert!(!names.contains(&"mpu6050_read"));
     }
 
+    /// A turn has to be able to reach the network while it runs.
+    ///
+    /// The client the model call borrows is not the one `net_*` uses: the App owns a
+    /// separate tool transport. That split existed in name only — the simulator never
+    /// attached one, so every `net_get` inside a turn answered "no HTTP transport is
+    /// attached" on the desk while the same firmware code worked on a board.
+    #[test]
+    fn a_turn_can_use_the_network_tools_while_it_is_running() {
+        struct Fetching {
+            urls: Arc<Mutex<Vec<String>>>,
+            body: String,
+        }
+
+        impl ChatTransport for Fetching {
+            fn post_json(
+                &mut self,
+                url: &str,
+                _headers: &[(&str, &str)],
+                _body: &str,
+            ) -> std::result::Result<String, String> {
+                self.urls.lock().unwrap().push(url.to_string());
+                Ok(self.body.clone())
+            }
+        }
+
+        struct AsksForThePage {
+            seen: Arc<Mutex<Vec<String>>>,
+            calls: usize,
+        }
+
+        impl ChatTransport for AsksForThePage {
+            fn post_json(
+                &mut self,
+                _url: &str,
+                _headers: &[(&str, &str)],
+                body: &str,
+            ) -> std::result::Result<String, String> {
+                self.seen.lock().unwrap().push(body.to_string());
+                self.calls += 1;
+                if self.calls == 1 {
+                    Ok(json!({ "choices": [{ "message": {
+                        "role": "assistant", "content": null, "tool_calls": [{
+                            "id": "call_1", "type": "function",
+                            "function": { "name": "net_get", "arguments": "{\"url\":\"http://example.com/\"}" }
+                        }] } }] })
+                    .to_string())
+                } else {
+                    Ok(json!({ "choices": [{ "message": { "role": "assistant", "content": "fetched" } }] })
+                        .to_string())
+                }
+            }
+        }
+
+        let shared: Shared = Arc::new(Mutex::new(test_app()));
+        let urls = Arc::new(Mutex::new(Vec::new()));
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        {
+            let mut app = shared.lock().unwrap();
+            app.attach_tool_transport(Box::new(Fetching {
+                urls: urls.clone(),
+                body: "{\"page\":\"hello\"}".to_string(),
+            }));
+            app.route(&post(
+                "/api/agent/config",
+                r#"{"base_url":"http://127.0.0.1:9/v1/chat/completions","model":"stub","api_key":""}"#,
+            ));
+            assert_eq!(app.route(&post("/api/agent/message", r#"{"text":"fetch the page"}"#)).status, 202);
+        }
+
+        let mut model = AsksForThePage { seen: seen.clone(), calls: 0 };
+        let outcome = drive_agent(&shared, &mut model).expect("a queued turn");
+        assert!(matches!(outcome, Ok(_)), "the turn failed: {outcome:?}");
+
+        assert_eq!(
+            urls.lock().unwrap().as_slice(),
+            ["http://example.com/"],
+            "the tool transport was never used"
+        );
+        let sent = seen.lock().unwrap();
+        let second: Value = serde_json::from_str(&sent[1]).unwrap();
+        let tool_message = second["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["role"] == "tool")
+            .expect("the fetched body never reached the model");
+        assert!(tool_message["content"].as_str().unwrap().contains("hello"), "got {tool_message}");
+    }
+
     #[test]
     fn an_unknown_fs_or_net_tool_says_so_instead_of_reaching_the_board() {
         let mut app = test_app();
@@ -3514,7 +3638,7 @@ mod tests {
     fn a_queued_message_runs_the_loop_through_the_board_tools() {
         let mut app = test_app();
         let seen = Arc::new(Mutex::new(Vec::new()));
-        app.attach_transport(Box::new(StubModel { seen: seen.clone(), calls: 0 }));
+        app.attach_model_transport(Box::new(StubModel { seen: seen.clone(), calls: 0 }));
         app.route(&post(
             "/api/agent/config",
             r#"{"base_url":"http://127.0.0.1:9/v1/chat/completions","model":"stub","api_key":"sk-1"}"#,
@@ -3819,6 +3943,73 @@ mod tests {
         }] } })
     }
 
+    /// Every section of the reference has to arrive whole.
+    ///
+    /// A tool result is capped at `MAX_TOOL_RESULT_BYTES`; `manifest_describe` used to
+    /// return the schema, the exec primitives, the driver catalogue, the live device dump
+    /// and every example in one object. On a board the model therefore received the first
+    /// ~2 KB and nothing else — it guessed `exec` types and spent its step budget doing it.
+    #[test]
+    fn every_describe_section_arrives_without_being_cut() {
+        use crate::agent::MAX_TOOL_RESULT_BYTES;
+
+        let mut app = test_app();
+        for section in ["overview", "schema", "exec", "examples", "drivers"] {
+            let text = ToolHost::call_tool(&mut app, "manifest_describe", &json!({ "section": section }))
+                .unwrap_or_else(|e| panic!("section {section} failed: {e}"));
+            assert!(
+                text.len() <= MAX_TOOL_RESULT_BYTES,
+                "section {section} is {} bytes, over the {MAX_TOOL_RESULT_BYTES} the model sees",
+                text.len()
+            );
+            assert!(!text.contains("truncated"), "section {section} was cut: {text}");
+        }
+        for name in ["relay_with_safety", "servo_angle", "sensor_driver", "led_then_read_back"] {
+            let text = ToolHost::call_tool(
+                &mut app,
+                "manifest_describe",
+                &json!({ "section": "examples", "example": name }),
+            )
+            .unwrap();
+            assert!(text.len() <= MAX_TOOL_RESULT_BYTES, "example {name} is {} bytes", text.len());
+            assert!(text.contains("exec"), "example {name} arrived empty: {text}");
+        }
+
+        // The overview is the entry point: it names the sections and the examples.
+        let overview = ToolHost::call_tool(&mut app, "manifest_describe", &json!({})).unwrap();
+        for needle in ["exec", "schema", "relay_with_safety", "max_tools"] {
+            assert!(overview.contains(needle), "the overview does not mention {needle}: {overview}");
+        }
+
+        // The driver catalogue is paged for the same reason: fourteen entries in one
+        // result would be cut, so each one is asked for by name.
+        let listed =
+            ToolHost::call_tool(&mut app, "manifest_describe", &json!({ "section": "drivers" })).unwrap();
+        let listed: Value = serde_json::from_str(&listed).unwrap();
+        let kinds: Vec<String> = listed["drivers"]
+            .as_array()
+            .expect("a driver list")
+            .iter()
+            .filter_map(|d| d["kind"].as_str().map(|s| s.to_string()))
+            .collect();
+        assert!(kinds.len() >= 10, "the catalogue lost entries: {kinds:?}");
+        assert!(listed["hint"].as_str().unwrap().contains("driver="), "{listed}");
+        for kind in kinds {
+            let text = ToolHost::call_tool(
+                &mut app,
+                "manifest_describe",
+                &json!({ "section": "drivers", "driver": kind }),
+            )
+            .unwrap();
+            assert!(text.len() <= MAX_TOOL_RESULT_BYTES, "driver {kind} is {} bytes", text.len());
+            assert!(!text.contains("truncated"), "driver {kind} was cut");
+        }
+        // A section name that does not exist is refused with the list, not guessed at.
+        let err =
+            ToolHost::call_tool(&mut app, "manifest_describe", &json!({ "section": "nope" })).unwrap_err();
+        assert!(err.contains("overview"), "{err}");
+    }
+
     /// A manifest must not be able to name a tool the endpoint will refuse.
     ///
     /// `apply` is where the refusal has to happen: a name that reaches the wire fails
@@ -3863,7 +4054,7 @@ mod tests {
         // And a model round still happens. The recorded request is the wire payload
         // the endpoint would have refused.
         let seen = Arc::new(Mutex::new(Vec::new()));
-        app.attach_transport(Box::new(StubModel { seen: seen.clone(), calls: 0 }));
+        app.attach_model_transport(Box::new(StubModel { seen: seen.clone(), calls: 0 }));
         app.route(&post(
             "/api/agent/config",
             r#"{"base_url":"http://127.0.0.1:9/v1/chat/completions","model":"stub","api_key":""}"#,
@@ -4200,13 +4391,25 @@ mod tests {
     }
 
     #[test]
-    fn manifest_describe_carries_schema_primitives_and_examples() {
+    fn manifest_describe_carries_a_schema_primitives_and_examples() {
+        // One section per call: the whole reference does not fit a tool result, so it is
+        // split rather than truncated (the model used to receive 2 KB of an 8 KB answer).
         let mut app = test_app();
-        let v = app.call_tool("manifest_describe", &json!({})).unwrap();
-        assert!(v["manifest_schema"]["properties"]["tools"].is_object());
-        assert!(v["primitives"].as_array().unwrap().len() >= 8);
-        assert!(v["examples"]["relay_with_safety"].is_object());
-        assert!(v["drivers"].as_array().unwrap().iter().any(|d| d["kind"] == "bme280"));
+        let schema = app.call_tool("manifest_describe", &json!({ "section": "schema" })).unwrap();
+        assert!(schema["manifest_schema"]["properties"]["tools"].is_object());
+        let exec = app.call_tool("manifest_describe", &json!({ "section": "exec" })).unwrap();
+        assert!(exec["primitives"].as_array().unwrap().len() >= 8);
+        let examples = app.call_tool("manifest_describe", &json!({ "section": "examples" })).unwrap();
+        assert!(examples["names"].as_array().unwrap().iter().any(|n| n == "relay_with_safety"));
+        let drivers = app.call_tool("manifest_describe", &json!({ "section": "drivers" })).unwrap();
+        assert!(drivers["drivers"].as_array().unwrap().iter().any(|d| d["kind"] == "bme280"));
+        let one =
+            app.call_tool("manifest_describe", &json!({ "section": "drivers", "driver": "bme280" })).unwrap();
+        assert_eq!(one["driver"]["kind"], "bme280");
+        // The overview is what a first call gets, and it points at the rest.
+        let overview = app.call_tool("manifest_describe", &json!({})).unwrap();
+        assert_eq!(overview["section"], "overview");
+        assert!(overview["shape"]["tools"].is_array());
     }
 
     #[test]
@@ -4254,7 +4457,7 @@ mod tests {
     fn goal_app(text: &str, fail: bool) -> (App, Seen) {
         let seen: Seen = Arc::new(Mutex::new(Vec::new()));
         let mut app = test_app();
-        app.attach_transport(Box::new(FixedModel { text: text.to_string(), fail, seen: seen.clone() }));
+        app.attach_model_transport(Box::new(FixedModel { text: text.to_string(), fail, seen: seen.clone() }));
         app.route(&post(
             "/api/agent/config",
             r#"{"base_url":"http://127.0.0.1:9/v1/chat/completions","model":"stub","max_steps":3,"api_key":""}"#,
