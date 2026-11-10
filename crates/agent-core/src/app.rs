@@ -2563,11 +2563,24 @@ fn selftest_completion(req: &Request) -> Value {
     const READ: (&str, &str) = ("fs_read", r#"{"path":"/bench/hello.txt"}"#);
     const EDIT: (&str, &str) =
         ("fs_edit", r#"{"path":"/bench/hello.txt","find":"self-test","replace":"edited"}"#);
-    const GREP: (&str, &str) = ("fs_grep", r#"{"pattern":"edited","path":"/bench"}"#);
+    const GREP: (&str, &str) = ("fs_grep", r#"{"pattern":"written","path":"/bench"}"#);
+    // The workflow the device exists for: discover what is wired, learn the manifest
+    // schema, add a tool that was not there before, then call it. Six rounds, so the
+    // bench has to raise agent.max_steps to run it.
+    const INVENTORY: (&str, &str) = ("inventory", "{}");
+    const I2C_SCAN: (&str, &str) = ("i2c_scan", "{}");
+    const DESCRIBE: (&str, &str) = ("manifest_describe", "{}");
+    const APPLY: (&str, &str) = (
+        "manifest_apply",
+        r#"{"mode":"merge","manifest":{"tools":[{"name":"bench.mcp_probe","description":"Read the boot button on GPIO0 as a level, 1 released and 0 pressed","params":[],"exec":{"type":"gpio_read","pin":0}}]}}"#,
+    );
+    const CALL_NEW: (&str, &str) = ("bench.mcp_probe", "{}");
     let steps: &[(&str, &str)] = if has_word(&ask, "edit") || ask.contains("改") {
         &[WRITE, EDIT, READ]
     } else if has_word(&ask, "file") || ask.contains("文件") {
         &[WRITE, READ, GREP]
+    } else if has_word(&ask, "mcp") {
+        &[INVENTORY, I2C_SCAN, DESCRIBE, APPLY, CALL_NEW, ("board_status", "{}")]
     } else if has_word(&ask, "net") || has_word(&ask, "http") {
         &[("net_get", r#"{"url":"http://example.com/"}"#)]
     } else {
