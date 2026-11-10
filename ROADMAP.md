@@ -5,7 +5,7 @@ what is not done or not verified.
 
 ## Verified / unverified
 
-- ✅ `agent-core`: 218 tests (protocol, HTTP, manifest validation, driver conversion,
+- ✅ `agent-core`: 220 tests (protocol, HTTP, manifest validation, driver conversion,
   capability filtering, auth, hot reload, the agent loop, fs/net/sched, SSE streams, the
   goal loop)
 - ✅ Simulator end to end: `scripts/smoke.ps1`
