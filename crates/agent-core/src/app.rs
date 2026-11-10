@@ -874,7 +874,11 @@ impl App {
         let Some(slot) = self.streams.acquire() else {
             // `Connection: close`: a refused stream must not become a socket the pool
             // has to wait out. The console reconnects on its own, or not at all.
-            return Response::error_json(503, "too many event streams").with_header("Connection", "close");
+            return Response::error_json(503, "too many event streams")
+                .with_header("Connection", "close")
+                // A console that retries immediately would burn the next slot as soon as
+                // one frees; the streams close on their own, so tell it how long to wait.
+                .with_header("Retry-After", "5");
         };
         let Some(shared) = self.shared.upgrade() else {
             // An `App` nobody handed its own handle to: the journal cannot be polled
