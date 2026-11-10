@@ -480,6 +480,12 @@ impl Agent {
             self.emit("run_end", now_ms(), |ev| ev.is_error = true);
             return AgentStep::Done(Err(err));
         }
+        // Rebuild the tool list for the next round, instead of reusing the one captured
+        // at the start of the turn. The board's premise is that a model can apply a
+        // manifest and then call the tool it just declared; a list frozen for the whole
+        // turn makes that impossible until the next user message, and it also keeps
+        // showing a tool that a manifest change removed.
+        self.turn_tools = host.tool_specs();
         self.ask()
     }
 
@@ -1117,6 +1123,67 @@ mod tests {
         // The gathered results are kept so the next turn can continue.
         assert_eq!(agent.history.iter().filter(|m| m.role == Role::Tool).count(), 2);
         assert_eq!(agent.last_error, err);
+    }
+
+    /// A manifest change inside one turn must show up in the very next request.
+    ///
+    /// The model applies a manifest and then calls the tool it just declared. While the
+    /// tool list was captured at the start of the turn, that second call was rejected as
+    /// "not on the tool list": the feature only worked across turns, which is not what
+    /// the device promises. Found on the board, not by a test.
+    #[test]
+    fn a_tool_created_mid_turn_is_offered_in_the_next_request() {
+        struct GrowingHost {
+            specs: Value,
+            calls: Vec<String>,
+        }
+
+        impl ToolHost for GrowingHost {
+            fn tool_specs(&self) -> Value {
+                self.specs.clone()
+            }
+
+            fn call_tool(&mut self, name: &str, _args: &Value) -> Result<String, String> {
+                self.calls.push(name.to_string());
+                if name == "manifest_apply" {
+                    self.specs = json!([
+                        { "type": "function", "function": { "name": "manifest_apply" } },
+                        { "type": "function", "function": { "name": "bench.new" } },
+                    ]);
+                }
+                Ok("{}".to_string())
+            }
+        }
+
+        let mut host = GrowingHost {
+            specs: json!([{ "type": "function", "function": { "name": "manifest_apply" } }]),
+            calls: Vec::new(),
+        };
+        let mut transport = StubTransport::new(vec![
+            tool_call_reply("c1", "manifest_apply", "{}"),
+            tool_call_reply("c2", "bench.new", "{}"),
+            answer_reply("both ran"),
+        ]);
+        let mut agent = Agent::new();
+        let mut config = cfg();
+        config.max_steps = 4;
+
+        agent.push_user("add a tool and then use it", "http", 1);
+        let text = agent.run_pending(&mut host, &mut transport, &config, clock).expect("answer");
+        assert_eq!(text, "both ran");
+        assert_eq!(host.calls, vec!["manifest_apply", "bench.new"]);
+
+        let second: Value = serde_json::from_str(&transport.bodies[1]).expect("json");
+        let names: Vec<&str> = second["tools"]
+            .as_array()
+            .expect("tools array")
+            .iter()
+            .filter_map(|t| t["function"]["name"].as_str())
+            .collect();
+        assert!(
+            names.contains(&"bench.new"),
+            "the tool the model just declared must be advertised: {names:?}"
+        );
     }
 
     #[test]
