@@ -2126,9 +2126,11 @@ impl ToolHost for App {
             })
             .collect();
         tools.sort_by_key(|t| t["function"]["name"].as_str().unwrap_or("").to_string());
-        // File, HTTP, and knowledge tools gate on nothing the hardware must provide, so
-        // they are not MCP tools; they are appended after the board's own list.
-        for group in [fs_tools::specs(), net_tools::specs(), crate::tools::knowledge::specs()] {
+        // File and HTTP tools gate on nothing the hardware must provide, so they are not
+        // MCP tools; they are appended after the board's own list. Skills and
+        // `/AGENTS.md` are deliberately absent: they are files, and `fs_*` already reads
+        // and writes them — a wrapper per verb would only grow every request.
+        for group in [fs_tools::specs(), net_tools::specs()] {
             tools.extend(openai_tools(&group));
         }
         Value::Array(tools)
@@ -2145,20 +2147,6 @@ impl ToolHost for App {
     }
 
     fn call_tool(&mut self, name: &str, arguments: &Value) -> std::result::Result<String, String> {
-        if matches!(name, "skill_list" | "skill_read" | "skill_write" | "skill_delete" | "agents_md") {
-            let result = crate::tools::knowledge::call(&mut self.workspace, name, arguments)
-                .unwrap_or_else(|| Err(format!("`{name}` is a knowledge tool but is not routed")));
-            // Only a write changes the stored blob; a read must not cost an NVS write.
-            let mutates = match name {
-                "skill_write" | "skill_delete" => true,
-                "agents_md" => arguments.get("action").and_then(|v| v.as_str()).unwrap_or("get") == "set",
-                _ => false,
-            };
-            if mutates && result.is_ok() {
-                self.persist_workspace();
-            }
-            return result;
-        }
         if name.starts_with("fs_") {
             let result = fs_tools::call(&mut self.workspace, name, arguments)
                 .ok_or_else(|| format!("`{name}` starts with fs_ but no such file tool exists"))?;
@@ -4044,10 +4032,10 @@ mod tests {
         let mut app = test_app();
         ToolHost::call_tool(
             &mut app,
-            "agents_md",
-            &json!({ "action": "set", "text": "Pin 12 is the pump relay, active low.\nAsk before switching it." }),
+            "fs_write",
+            &json!({ "path": "/AGENTS.md", "text": "Pin 12 is the pump relay, active low.\nAsk before switching it." }),
         )
-        .expect("agents_md set");
+        .expect("instructions written");
         ToolHost::call_tool(
             &mut app,
             "fs_write",
@@ -4071,7 +4059,11 @@ mod tests {
         assert!(system.contains("Pin 12 is the pump relay"), "the instructions are missing: {system}");
         assert!(system.contains("roll the portal forward safely"), "the skill index is missing: {system}");
         assert!(!system.contains("1. snapshot"), "the skill *body* must not be in the prompt: {system}");
-        assert!(system.contains("skill_read"), "the prompt does not say how to load a skill: {system}");
+        assert!(system.contains("fs_read"), "the prompt does not say how to load a skill: {system}");
+        assert!(
+            system.contains("/skills/<name>.md"),
+            "the prompt does not say where the skills are: {system}"
+        );
     }
 
     /// A long file is carried as its head: the rest stays readable with `fs_read`.
@@ -4079,20 +4071,22 @@ mod tests {
     fn a_long_agents_md_is_cut_in_the_prompt_but_still_readable() {
         let mut app = test_app();
         let long = format!("rule: {}\n", "x".repeat(1600));
-        ToolHost::call_tool(&mut app, "agents_md", &json!({ "action": "set", "text": long }))
-            .expect("agents_md set");
+        ToolHost::call_tool(&mut app, "fs_write", &json!({ "path": "/AGENTS.md", "text": long }))
+            .expect("instructions written");
 
         let prompt = app.project_instructions().expect("instructions");
         assert!(prompt.len() < 1600, "the prompt carried the whole file: {} bytes", prompt.len());
         assert!(prompt.contains("truncated"), "{prompt}");
-        // ... and the tool still hands the model the whole thing when it asks.
-        let text = ToolHost::call_tool(&mut app, "agents_md", &json!({})).expect("read back");
+        // ... and the file still holds everything for `fs_read` to return.
+        let text =
+            ToolHost::call_tool(&mut app, "fs_read", &json!({ "path": "/AGENTS.md" })).expect("read back");
         assert!(text.len() > 1600, "the stored copy lost bytes: {}", text.len());
     }
 
-    /// The three knowledge tools are on the wire and answer through the tool host.
+    /// No dedicated tools for skills or instructions: they are files, and `fs_*` already
+    /// reaches them. One wrapper per verb would cost a definition in every request.
     #[test]
-    fn the_knowledge_tools_are_listed_and_answer() {
+    fn skills_and_instructions_have_no_tools_of_their_own() {
         let mut app = test_app();
         let names: Vec<String> = ToolHost::tool_specs(&app)
             .as_array()
@@ -4100,29 +4094,26 @@ mod tests {
             .iter()
             .filter_map(|t| t["function"]["name"].as_str().map(|s| s.to_string()))
             .collect();
-        for needle in ["skill_list", "skill_read", "skill_write", "skill_delete", "agents_md"] {
-            assert!(names.contains(&needle.to_string()), "{needle} is missing: {names:?}");
+        for absent in ["skill_list", "skill_read", "skill_write", "skill_delete", "agents_md"] {
+            assert!(!names.contains(&absent.to_string()), "{absent} is back in the tool list: {names:?}");
+        }
+        // The file tools that do reach them are still there.
+        for present in ["fs_ls", "fs_read", "fs_write"] {
+            assert!(names.contains(&present.to_string()), "{present} is missing: {names:?}");
         }
 
-        // The whole cycle through the tool host: write, list, read, delete.
-        let written = ToolHost::call_tool(
+        // And the path works end to end: write a skill with fs_write, see it in the index.
+        ToolHost::call_tool(
             &mut app,
-            "skill_write",
-            &json!({ "name": "pins", "description": "GPIO map for the bench", "text": "12 relay\n" }),
+            "fs_write",
+            &json!({ "path": "/skills/pins.md", "text": "# pins\ndescription: GPIO map for the bench\n12 relay\n" }),
         )
-        .expect("skill_write");
-        assert!(written.contains("GPIO map for the bench"), "{written}");
-
-        let listed = ToolHost::call_tool(&mut app, "skill_list", &json!({})).unwrap();
-        assert!(listed.contains("pins") && listed.contains("GPIO map"), "{listed}");
-        let body = ToolHost::call_tool(&mut app, "skill_read", &json!({ "name": "pins" })).unwrap();
-        assert!(body.contains("12 relay"), "{body}");
-        let err = ToolHost::call_tool(&mut app, "skill_read", &json!({ "name": "missing" })).unwrap_err();
-        assert!(err.contains("pins"), "the error must list what exists: {err}");
-        let gone = ToolHost::call_tool(&mut app, "skill_delete", &json!({ "name": "pins", "confirm": true }))
-            .expect("skill_delete");
-        assert!(gone.contains("deleted"), "{gone}");
-        assert!(!ToolHost::call_tool(&mut app, "skill_list", &json!({})).unwrap().contains("pins"));
+        .expect("skill written");
+        let index = app.skills();
+        assert_eq!(index, vec![("pins".to_string(), "GPIO map for the bench".to_string())]);
+        let read =
+            ToolHost::call_tool(&mut app, "fs_read", &json!({ "path": "/skills/pins.md" })).expect("fs_read");
+        assert!(read.contains("12 relay"), "{read}");
     }
 
     /// A manifest must not be able to name a tool the endpoint will refuse.

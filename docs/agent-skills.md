@@ -35,11 +35,11 @@ Written from anywhere:
 
 ```bash
 # the agent itself, mid-turn
-agents_md {"action":"set","text":"GPIO12 is the pump relay, active low."}
+fs_write {"path":"/AGENTS.md","text":"GPIO12 is the pump relay, active low."}
 
 # a skill, written the same way
-skill_write {"name":"pulse_pump","description":"switch the pump for a measured pulse",
-             "text":"1. confirm the request names a duration\n2. bench_pulse {ms}\n3. read power_read before and after"}
+fs_write {"path":"/skills/pulse_pump.md",
+          "text":"# pulse_pump\ndescription: switch the pump for a measured pulse\n1. confirm the request names a duration\n2. bench_pulse {ms}\n3. read power_read before and after\n"}
 ```
 
 ## Skills
@@ -77,29 +77,33 @@ curl -sS -X POST http://<board>:8080/mcp -H 'Content-Type: application/json' -d 
      "text":"# deploy\ndescription: roll the portal forward\n1. snapshot\n2. flash\n"}}}'
 ```
 
-### Tools
+### No tools of their own
 
-| Tool | Arguments | Returns |
-|---|---|---|
-| `skill_list` | — | `{count, skills:[{name, description, bytes}]}` |
-| `skill_read` | `{name}` | `{name, path, bytes, text}`; an unknown name lists the ones that exist |
-| `skill_write` | `{name, text, description?, replace?}` | writes `/skills/<name>.md` with a `# name` header and the description line; **an existing skill needs `replace: true`** |
-| `skill_delete` | `{name, confirm: true}` | removes the file; the index follows on the next turn |
-| `agents_md` | `{action: get\|set, text?}` | the stored text, how many bytes reach the prompt, and whether the file exists |
+Deliberately. `fs_ls`, `fs_read` and `fs_write` already reach both paths, and a wrapper
+per verb would add a definition to every request and one more choice for a small model —
+the same reason `net_*` and `fs_*` are not MCP tools either.
 
-`skill_write` composes the header itself, so a skill written this way is always
-findable: the description you pass (or the `description:` line in `text`, or the first
-prose line) becomes the line in the prompt index. Refusals are specific — a name outside
-the charset, a file over 2 KB, or an existing skill without `replace: true` each say what
-to change. `skill_delete` needs `confirm: true` because the file does not come back.
+| Task | How |
+|---|---|
+| see the skills | `fs_ls {path:"/skills"}` — the prompt already lists them by name and description |
+| load one | `fs_read {path:"/skills/deploy.md"}` |
+| add or change one | `fs_write {path:"/skills/deploy.md", text}` with the header above |
+| remove one | the file goes away with the workspace (`fs_write` on an empty file leaves an empty skill, so an empty file is not a deletion) |
+| change the instructions | `fs_write {path:"/AGENTS.md", text}` |
 
-Writing one by hand is still allowed and still works — `fs_write /skills/deploy.md` with
-the same header — but nothing in that path checks the name, the size, or that a
-`description:` line exists.
+What you give up without the wrappers: nothing checks the name or that a `description:`
+line exists. The index is forgiving (it falls back to the first prose line), so a
+hand-written file still shows up — but a file named `Deploy Notes.md` is invisible
+because the stem has a space. Keep names to `a-z A-Z 0-9 _ -`.
 
-These are **agent tools only** — they are not in the board's MCP `tools/list`, the
-same way `fs_*` and `net_*` are not. An MCP client that wants to read or write them can
-call `fs_ls` / `fs_read` / `fs_write` on the same paths, which is what the paths are for.
+From an MCP client, the same call, since these paths are ordinary files:
+
+```bash
+curl -sS -X POST http://<board>:8080/mcp -H 'Content-Type: application/json' -d \
+  '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"fs_write","arguments":
+    {"path":"/skills/deploy.md",
+     "text":"# deploy\ndescription: roll the portal forward\n1. snapshot\n2. flash\n"}}}'
+```
 
 ## Why not just put everything in the system prompt
 

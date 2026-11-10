@@ -609,9 +609,9 @@ impl Agent {
         let skills = host.skills();
         if !skills.is_empty() {
             text.push_str(
-                "\n\n## Skills\nEach line is `name: description`. When one matches the task, call \
-                 skill_read {name} first and follow the text you get; do not reconstruct a procedure \
-                 from its description.\n",
+                "\n\n## Skills\nEach line is `name: description`, and each one is a file at \
+                 /skills/<name>.md. When one matches the task, read it with fs_read before \
+                 following it; do not reconstruct a procedure from its description.\n",
             );
             for (name, description) in &skills {
                 text.push_str(&format!("- {name}: {description}\n"));

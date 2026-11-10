@@ -110,9 +110,8 @@ board's own tools.
   `net_post`. There is no shell — `ls` and `grep` are the parts of one that matter here
 - **Instructions and skills**: `/AGENTS.md` is injected into the system prompt (first
   1 KB, the rest read with `fs_read`), and each `/skills/<name>.md` is listed by name and
-  one-line description until the model calls `skill_read` for it; `skill_write` adds one,
-  `skill_delete` removes it. Both live in the same workspace, so the agent can write its
-  own — [docs/agent-skills.md](docs/agent-skills.md)
+  one-line description until the model opens it. No tools of their own — they are files,
+  and `fs_*` already reaches them — [docs/agent-skills.md](docs/agent-skills.md)
 - Orchestration: `POST /api/sched` adds a scheduled prompt (`every_s` or `at_hhmm`
   plus the prompt) or a sensor rule (`tool` + `path` + `op` + `value`, rate limited);
   either way it enters the same one-slot queue as a user message

@@ -61,9 +61,9 @@ version numbering follows semantic versioning.
   the webpki roots, so the same endpoint can be tried on the desk before it is flashed
 - **Instructions and skills on the board**: `/AGENTS.md` is injected into the system
   prompt (first 1 KB, the rest readable with `fs_read`), and each `/skills/<name>.md` is
-  indexed by name and one-line description until the model loads it with `skill_read`;
-  `skill_write` composes the header and refuses a silent overwrite, `skill_delete` needs
-  `confirm: true`. Contract: `docs/agent-skills.md`
+  indexed by name and one-line description until the model opens it. Deliberately no
+  dedicated tools: the paths are ordinary files, and `fs_ls`/`fs_read`/`fs_write`
+  already reach them. Contract: `docs/agent-skills.md`
 - Documentation: architecture, the manifest specification, the capability table, the HTTP
   API, adding a device, flashing, troubleshooting, the roadmap, AGENTS.md
 
