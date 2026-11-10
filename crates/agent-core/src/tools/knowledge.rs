@@ -44,25 +44,35 @@ pub const SKILL_INDEX_MAX: usize = 12;
 const DESCRIPTION_MAX: usize = 80;
 const NAME_MAX: usize = 32;
 
-/// One skill as the index sees it: enough to decide whether to read it.
+/// One skill as the index sees it: enough to open it without guessing the shape.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Skill {
     pub name: String,
     pub description: String,
     pub bytes: usize,
+    /// `/skills/<name>/SKILL.md`, or `/skills/<name>.md` for a skill that is one file.
+    pub path: String,
 }
 
-/// A name that can be printed and asked for without quoting. The file stem is the name,
-/// so this is also what a path segment looks like.
+/// A name that can be printed and asked for without quoting. It is also the directory
+/// (or file) name, so it is what a path segment looks like.
 pub fn is_skill_name(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= NAME_MAX
         && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
 }
 
-/// The skill index: name, description and size for every `/skills/*.md`.
+/// The skill index: name, description, size and path for everything under `/skills`.
 ///
-/// Unreadable or misnamed files are skipped rather than reported as errors: the index
+/// Two shapes, because a skill is sometimes a procedure and sometimes a procedure with
+/// files next to it:
+///
+/// * `/skills/<name>/SKILL.md` — the canonical one; anything else in that directory is
+///   the skill's own material (a pinout, a table, an acceptance script the model runs by
+///   hand with `gpio_write`).
+/// * `/skills/<name>.md` — a skill that needs nothing else.
+///
+/// Unreadable or misnamed entries are skipped rather than reported as errors: the index
 /// feeds the system prompt, and a prompt that fails is a turn that never happens.
 pub fn index(ws: &dyn Workspace) -> Vec<Skill> {
     let names = match ws.list(SKILLS_DIR) {
@@ -71,14 +81,16 @@ pub fn index(ws: &dyn Workspace) -> Vec<Skill> {
     };
     let mut out: Vec<Skill> = names
         .into_iter()
-        .filter(|n| n.ends_with(".md"))
-        .filter_map(|file| {
-            let name = file.trim_end_matches(".md").to_string();
+        .filter_map(|entry| {
+            let (name, path) = match entry.strip_suffix(".md") {
+                Some(stem) => (stem.to_string(), format!("{SKILLS_DIR}/{entry}")),
+                None => (entry.clone(), format!("{SKILLS_DIR}/{entry}/SKILL.md")),
+            };
             if !is_skill_name(&name) {
                 return None;
             }
-            let text = ws.read(&format!("{SKILLS_DIR}/{file}")).ok()?;
-            Some(Skill { description: describe(&text), bytes: text.len(), name })
+            let text = ws.read(&path).ok()?;
+            Some(Skill { description: describe(&text), bytes: text.len(), name, path })
         })
         .collect();
     out.sort_by(|a, b| a.name.cmp(&b.name));
@@ -86,21 +98,50 @@ pub fn index(ws: &dyn Workspace) -> Vec<Skill> {
     out
 }
 
-/// The `description:` line of a skill, or its first prose line.
+/// Split a leading `---` block off a document.
+///
+/// The host's skills use YAML front matter; on the board this is read line by line rather
+/// than parsed, because the only keys that matter are `name` and `description` and a YAML
+/// parser is more heap than the whole feature is worth.
+fn split_front_matter(text: &str) -> (&str, &str) {
+    let Some(rest) = text.strip_prefix("---") else { return ("", text) };
+    let Some(end) = rest.find("\n---") else { return ("", text) };
+    (rest[..end].trim_matches('\n'), rest[end + 4..].trim_start_matches(['\n', '\r']))
+}
+
+/// One `key: value` line out of a front-matter block.
+fn meta_value<'a>(meta: &'a str, key: &str) -> Option<&'a str> {
+    for line in meta.lines() {
+        let Some((name, value)) = line.split_once(':') else { continue };
+        if name.trim().eq_ignore_ascii_case(key) {
+            let value = value.trim().trim_matches(['"', '\'']).trim();
+            if !value.is_empty() {
+                return Some(value);
+            }
+        }
+    }
+    None
+}
+
+/// The description: front matter first, then a `description:` line, then the first prose
+/// line.
 ///
 /// Forgiving on purpose: a skill that is useful but has no header should still appear in
-/// the index, because the index is how the model finds it at all — and with `fs_write`
-/// as the only way to create one, there is no writer to enforce a header.
+/// the index, because the index is how the model finds it at all.
 fn describe(text: &str) -> String {
-    for line in text.lines().take(8) {
+    let (meta, body) = split_front_matter(text);
+    if let Some(value) = meta_value(meta, "description") {
+        return clip(value, DESCRIPTION_MAX);
+    }
+    for line in body.lines().take(8) {
         let line = line.trim();
         if let Some(rest) = line.strip_prefix("description:") {
             return clip(rest.trim(), DESCRIPTION_MAX);
         }
     }
-    for line in text.lines() {
+    for line in body.lines() {
         let line = line.trim();
-        if line.is_empty() || line.starts_with('#') || line.ends_with(':') {
+        if line.is_empty() || line.starts_with('#') || line.ends_with(':') || line.starts_with("---") {
             continue;
         }
         return clip(line, DESCRIPTION_MAX);
@@ -190,29 +231,39 @@ mod tests {
     }
 
     #[test]
-    fn the_index_reads_the_header_and_falls_back_to_the_first_prose_line() {
+    fn the_index_reads_a_skill_directory_a_flat_file_and_both_header_styles() {
         let ws = ws_with(&[
-            ("/skills/deploy.md", "# deploy\ndescription: roll the portal forward\nbody\n"),
-            // Written with plain fs_write, so there is no header to parse.
-            ("/skills/notes.md", "# notes\n\nWiring notes for the bench.\n"),
-            ("/skills/ignored.txt", "not a skill"),
-            ("/skills/bad name.md", "a space is not a skill name"),
+            // The canonical shape: a directory with SKILL.md and the host's front matter.
+            (
+                "/skills/deploy/SKILL.md",
+                "---\nname: deploy\ndescription: roll the portal forward\n---\n# Deploy\n1. snapshot\n",
+            ),
+            // Supporting material next to it: part of the skill, not a skill itself.
+            ("/skills/deploy/pinout.md", "GPIO12 relay\n"),
+            // A skill that needs nothing else.
+            ("/skills/notes.md", "# notes\n\ndescription: wiring notes for the bench\n"),
+            // No header at all: still indexed, from its first prose line.
+            ("/skills/bare/SKILL.md", "# bare\nnothing but prose here\n"),
+            // Not skills: a wrong name, and a directory with no SKILL.md.
+            ("/skills/bad name/SKILL.md", "nope"),
+            ("/skills/empty/readme.md", "nope"),
         ]);
         let index = index(&ws);
-        assert_eq!(index.len(), 2, "only .md files with legal names are skills: {index:?}");
-        assert_eq!(index[0].name, "deploy");
-        assert_eq!(index[0].description, "roll the portal forward");
-        assert_eq!(index[1].description, "Wiring notes for the bench.");
+        let names: Vec<&str> = index.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, vec!["bare", "deploy", "notes"], "{index:?}");
+        assert_eq!(index[1].description, "roll the portal forward");
+        assert_eq!(index[1].path, "/skills/deploy/SKILL.md");
+        assert_eq!(index[2].description, "wiring notes for the bench");
+        assert_eq!(index[2].path, "/skills/notes.md");
+        assert_eq!(index[0].description, "nothing but prose here");
     }
 
     #[test]
     fn the_index_is_bounded() {
-        let files: Vec<(String, String)> = (0..SKILL_INDEX_MAX + 5)
-            .map(|i| (format!("/skills/s{i:02}.md"), format!("# s{i:02}\ndescription: d{i}\n")))
-            .collect();
         let mut ws = Mem::default();
-        for (path, text) in &files {
-            ws.write(path, text).unwrap();
+        for i in 0..SKILL_INDEX_MAX + 5 {
+            ws.write(&format!("/skills/s{i:02}/SKILL.md"), &format!("---\ndescription: d{i}\n---\nbody\n"))
+                .unwrap();
         }
         assert_eq!(index(&ws).len(), SKILL_INDEX_MAX, "the prompt index must stay bounded");
     }

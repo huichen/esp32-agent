@@ -95,6 +95,11 @@ fn size(text: &str) -> usize {
     text.len()
 }
 
+/// The board has no trash: a destructive tool asks for a boolean, not a default.
+fn confirmed(args: &Value) -> bool {
+    args.get("confirm").and_then(|v| v.as_bool()).unwrap_or(false)
+}
+
 // ---------------------------------------------------------------- tool schemas
 
 fn params(properties: Value, required: &[&str]) -> Value {
@@ -164,6 +169,17 @@ pub fn specs() -> Value {
             ),
         ),
         function(
+            "fs_rm",
+            "Delete one file from the workspace. Needs confirm=true: there is no trash on the board. Deleting a skill's SKILL.md is how the skill leaves the prompt index.",
+            params(
+                json!({
+                    "path": { "type": "string", "description": "file path to delete" },
+                    "confirm": { "type": "boolean", "description": "must be true" },
+                }),
+                &["path", "confirm"],
+            ),
+        ),
+        function(
             "fs_grep",
             "Search the workspace for lines containing a literal substring. Walks files under `path` recursively.",
             params(
@@ -187,9 +203,24 @@ pub fn call(ws: &mut dyn Workspace, name: &str, args: &Value) -> Option<Result<S
         "fs_read" => Some(read(ws, args)),
         "fs_write" => Some(write(ws, args)),
         "fs_edit" => Some(edit(ws, args)),
+        "fs_rm" => Some(rm(ws, args)),
         "fs_grep" => Some(grep(ws, args)),
         _ => None,
     }
+}
+
+/// Delete one file.
+///
+/// The workspace had no way to remove anything: a wrong skill or a stale note stayed in
+/// every future prompt. It is `confirm: true` because there is no trash and no undo on a
+/// board — and because a model that means to rewrite a file should say so.
+fn rm(ws: &mut dyn Workspace, args: &Value) -> Result<String, String> {
+    let path = normalize(&req_str(args, "path")?)?;
+    if !confirmed(args) {
+        return Err(format!("set confirm=true to delete `{path}`"));
+    }
+    ws.remove(&path)?;
+    Ok(to_text(json!({ "removed": path, "ok": true })))
 }
 
 fn ls(ws: &mut dyn Workspace, args: &Value) -> Result<String, String> {
@@ -447,6 +478,23 @@ mod tests {
         serde_json::from_str(&text).map_err(|e| format!("tool result is not JSON: {e}"))
     }
 
+    #[test]
+    fn fs_rm_deletes_one_file_and_asks_first() {
+        let mut ws = Mem::default();
+        run(&mut ws, "fs_write", json!({"path": "/notes/a.txt", "text": "hi"})).unwrap();
+
+        let err = run(&mut ws, "fs_rm", json!({"path": "/notes/a.txt"})).unwrap_err();
+        assert!(err.contains("confirm=true"), "{err}");
+        assert!(ws.read("/notes/a.txt").is_ok(), "the file went without a confirmation");
+
+        run(&mut ws, "fs_rm", json!({"path": "/notes/a.txt", "confirm": true})).unwrap();
+        assert!(ws.read("/notes/a.txt").is_err(), "the file is still there");
+        // A second delete says the file is gone rather than pretending it worked.
+        assert!(run(&mut ws, "fs_rm", json!({"path": "/notes/a.txt", "confirm": true})).is_err());
+        // Path rules still apply: no traversal out of the workspace.
+        assert!(run(&mut ws, "fs_rm", json!({"path": "../escape", "confirm": true})).is_err());
+    }
+
     // ------------------------------------------------------------ path rules
 
     #[test]
@@ -619,7 +667,7 @@ mod tests {
         let specs = specs();
         let list = specs.as_array().expect("tools array");
         let names: Vec<&str> = list.iter().map(|t| t["function"]["name"].as_str().unwrap()).collect();
-        assert_eq!(names, vec!["fs_ls", "fs_read", "fs_write", "fs_edit", "fs_grep"]);
+        assert_eq!(names, vec!["fs_ls", "fs_read", "fs_write", "fs_edit", "fs_rm", "fs_grep"]);
         for t in list {
             assert_eq!(t["type"], "function");
             assert_eq!(t["function"]["parameters"]["type"], "object");

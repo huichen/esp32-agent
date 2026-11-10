@@ -2142,8 +2142,15 @@ impl ToolHost for App {
     }
 
     /// The skill index: name and one line each, never the bodies.
-    fn skills(&self) -> Vec<(String, String)> {
-        crate::tools::knowledge::index(&self.workspace).into_iter().map(|s| (s.name, s.description)).collect()
+    /// The skill index: name, one line, and the path to read — never the bodies.
+    ///
+    /// Both shapes reach here: `/skills/<name>/SKILL.md` (a skill with material next to
+    /// it) and `/skills/<name>.md` (a skill that is one file).
+    fn skills(&self) -> Vec<crate::agent::SkillRef> {
+        crate::tools::knowledge::index(&self.workspace)
+            .into_iter()
+            .map(|s| crate::agent::SkillRef { name: s.name, description: s.description, path: s.path })
+            .collect()
     }
 
     fn call_tool(&mut self, name: &str, arguments: &Value) -> std::result::Result<String, String> {
@@ -2152,7 +2159,7 @@ impl ToolHost for App {
                 .ok_or_else(|| format!("`{name}` starts with fs_ but no such file tool exists"))?;
             let text = result?;
             // Only the mutating tools dirty the stored blob.
-            if matches!(name, "fs_write" | "fs_edit" | "fs_remove") {
+            if matches!(name, "fs_write" | "fs_edit" | "fs_rm") {
                 self.persist_workspace();
             }
             return Ok(text);
@@ -4039,7 +4046,7 @@ mod tests {
         ToolHost::call_tool(
             &mut app,
             "fs_write",
-            &json!({ "path": "/skills/deploy.md", "text": "# deploy\ndescription: roll the portal forward safely\n1. snapshot\n2. flash\n" }),
+            &json!({ "path": "/skills/deploy/SKILL.md", "text": "---\ndescription: roll the portal forward safely\n---\n1. snapshot\n2. flash\n" }),
         )
         .expect("skill written");
 
@@ -4061,8 +4068,8 @@ mod tests {
         assert!(!system.contains("1. snapshot"), "the skill *body* must not be in the prompt: {system}");
         assert!(system.contains("fs_read"), "the prompt does not say how to load a skill: {system}");
         assert!(
-            system.contains("/skills/<name>.md"),
-            "the prompt does not say where the skills are: {system}"
+            system.contains("/skills/deploy/SKILL.md"),
+            "the index must carry the path to open, not just a name: {system}"
         );
     }
 
@@ -4102,18 +4109,73 @@ mod tests {
             assert!(names.contains(&present.to_string()), "{present} is missing: {names:?}");
         }
 
-        // And the path works end to end: write a skill with fs_write, see it in the index.
+        // And the path works end to end: a skill directory written with `fs_write`,
+        // material next to it, seen by the index with the path to open.
         ToolHost::call_tool(
             &mut app,
             "fs_write",
-            &json!({ "path": "/skills/pins.md", "text": "# pins\ndescription: GPIO map for the bench\n12 relay\n" }),
+            &json!({
+                "path": "/skills/pins/SKILL.md",
+                "text": "---\ndescription: GPIO map for the bench\n---\n12 relay\n"
+            }),
+        )
+        .expect("skill written");
+        ToolHost::call_tool(
+            &mut app,
+            "fs_write",
+            &json!({ "path": "/skills/pins/notes.md", "text": "relay is active low\n" }),
+        )
+        .expect("supporting file written");
+        let index = app.skills();
+        assert_eq!(index.len(), 1, "{index:?}");
+        assert_eq!(index[0].name, "pins");
+        assert_eq!(index[0].description, "GPIO map for the bench");
+        assert_eq!(index[0].path, "/skills/pins/SKILL.md");
+
+        let read = ToolHost::call_tool(&mut app, "fs_read", &json!({ "path": "/skills/pins/SKILL.md" }))
+            .expect("fs_read");
+        assert!(read.contains("12 relay"), "{read}");
+        let sibling = ToolHost::call_tool(&mut app, "fs_read", &json!({ "path": "/skills/pins/notes.md" }))
+            .expect("fs_read sibling");
+        assert!(sibling.contains("active low"), "{sibling}");
+    }
+
+    /// A flat file is still a skill: the shape for one that needs nothing else.
+    #[test]
+    fn a_one_file_skill_still_lands_in_the_index() {
+        let mut app = test_app();
+        ToolHost::call_tool(
+            &mut app,
+            "fs_write",
+            &json!({ "path": "/skills/quick.md", "text": "# quick\ndescription: one-file skill\nbody\n" }),
         )
         .expect("skill written");
         let index = app.skills();
-        assert_eq!(index, vec![("pins".to_string(), "GPIO map for the bench".to_string())]);
-        let read =
-            ToolHost::call_tool(&mut app, "fs_read", &json!({ "path": "/skills/pins.md" })).expect("fs_read");
-        assert!(read.contains("12 relay"), "{read}");
+        assert_eq!(index.len(), 1, "{index:?}");
+        assert_eq!(index[0].path, "/skills/quick.md");
+    }
+
+    /// Deleting the SKILL.md is how a skill leaves the prompt, which is why the workspace
+    /// needed a delete at all.
+    #[test]
+    fn deleting_a_skill_file_removes_it_from_the_index() {
+        let mut app = test_app();
+        ToolHost::call_tool(
+            &mut app,
+            "fs_write",
+            &json!({ "path": "/skills/pins/SKILL.md", "text": "---\ndescription: GPIO map\n---\n12 relay\n" }),
+        )
+        .unwrap();
+        assert_eq!(app.skills().len(), 1);
+
+        let gone = ToolHost::call_tool(
+            &mut app,
+            "fs_rm",
+            &json!({ "path": "/skills/pins/SKILL.md", "confirm": true }),
+        )
+        .expect("fs_rm");
+        assert!(gone.contains("removed"), "{gone}");
+        assert!(app.skills().is_empty(), "the index still lists a deleted skill: {:?}", app.skills());
     }
 
     /// A manifest must not be able to name a tool the endpoint will refuse.

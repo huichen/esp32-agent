@@ -161,13 +161,22 @@ pub trait ToolHost {
         None
     }
 
-    /// Skills the model may load on demand, as `(name, one-line description)`.
+    /// Skills the model may open on demand. Only the index goes into the prompt; the
+    /// body arrives when the model reads `path`.
     ///
-    /// Only the index goes into the prompt; the body arrives when the model calls
-    /// `skill_read`. A host that has no skills returns nothing.
-    fn skills(&self) -> Vec<(String, String)> {
+    /// A host with no skills returns nothing, which is the state a fresh board is in.
+    fn skills(&self) -> Vec<SkillRef> {
         Vec::new()
     }
+}
+
+/// A skill as the prompt needs it: what it is called, the line that says when to open
+/// it, and where its text lives.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SkillRef {
+    pub name: String,
+    pub description: String,
+    pub path: String,
 }
 
 /// One step of a turn: ask the model, or finish.
@@ -609,12 +618,14 @@ impl Agent {
         let skills = host.skills();
         if !skills.is_empty() {
             text.push_str(
-                "\n\n## Skills\nEach line is `name: description`, and each one is a file at \
-                 /skills/<name>.md. When one matches the task, read it with fs_read before \
-                 following it; do not reconstruct a procedure from its description.\n",
+                "\n\n## Skills\nEach line is `name: description` followed by the file to read. \
+                 When one matches the task, open that file with fs_read before following it; a \
+                 directory may hold other files next to SKILL.md (diagrams, tables, a pinout) and \
+                 those are readable the same way. Do not reconstruct a procedure from its \
+                 description.\n",
             );
-            for (name, description) in &skills {
-                text.push_str(&format!("- {name}: {description}\n"));
+            for skill in &skills {
+                text.push_str(&format!("- {}: {} ({})\n", skill.name, skill.description, skill.path));
             }
         }
         text

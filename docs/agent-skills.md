@@ -8,9 +8,10 @@ agent itself — there is no second store to keep in sync.
 | Path | Role | Cost in the prompt |
 |---|---|---|
 | `/AGENTS.md` | project instructions, always applied | first 1024 bytes, every turn |
-| `/skills/<name>.md` | one skill per file | its `description:` line only |
+| `/skills/<name>/SKILL.md` | one skill per directory, with its own files | `name: description (path)` |
+| `/skills/<name>.md` | a skill that needs no other file | the same line |
 
-The body of a skill reaches the model only when it calls `skill_read`. On a board with
+The body of a skill reaches the model only when it opens the file. On a board with
 roughly 300 KB of usable heap that matters twice: the prompt has to stay small, and the
 tool descriptions are what make a small model useful — a prompt that carries every
 procedure crowds them out.
@@ -44,38 +45,44 @@ fs_write {"path":"/skills/pulse_pump.md",
 
 ## Skills
 
-One file per skill, at most 2 KB (the workspace's per-file limit):
+A skill is a **directory** (`/skills/<name>/`) with a `SKILL.md`, and whatever else it
+needs next to it. That is the shape the host uses, and it is the reason a skill is not
+just a paragraph: a pinout, a table of registers, an acceptance script the model runs by
+hand with `gpio_write` all belong to the procedure, and they are `fs_read` away.
 
 ```markdown
-# deploy
+/skills/deploy/SKILL.md
+---
+name: deploy
 description: roll the portal forward without losing the transcript
+---
 1. Read `/AGENTS.md` and confirm the board is not mid-goal.
 2. `fs_write` a note to `/notes/deploy-<date>.md` first.
 3. Build, flash, then `board_status` and one `bme280_read`.
-Acceptance: `board_status.uptime_s` is small and both reads succeed.
+The pinout to check after flashing is in `pinout.md` next to this file.
+
+/skills/deploy/pinout.md
+GPIO12 relay (active low), GPIO0 boot button, GPIO48 RGB.
 ```
+
+A skill that needs nothing else can be one file: `/skills/quick.md`. Both shapes are
+indexed the same way; the index line carries the path, so the model does not have to
+guess which one it is looking at.
 
 Rules, such as they are:
 
-- The **name is the file stem** (`deploy`), and it must be `a-z A-Z 0-9 _ -`, at most 32
-  characters. It is what the model asks for and what appears in the prompt.
-- `description:` is the one line the model sees before deciding. Without one, the first
-  prose line is used, so a plain Markdown note still appears in the index.
-- The index carries at most 12 skills; the rest are on the workspace but unnamed, and
-  `skill_list` shows what is there.
-- No YAML front matter, no subdirectories, no includes. A skill is a procedure, not an
-  interpreter.
+- The **name is the directory** (`deploy`), and it must be `a-z A-Z 0-9 _ -`, at most 32
+  characters. It is what appears in the prompt and what the model asks for.
+- `description:` comes from YAML front matter (`---` block), from a `description:` line,
+  or from the first prose line — in that order. With none of those the skill is still
+  indexed, with an empty description.
+- Any other file in that directory is the skill's own material. It is not indexed and not
+  injected; the procedure tells the model when to read it.
+- The index carries at most 12 skills. The rest are on the workspace but unnamed.
+- No includes, no scripts that run by themselves. A skill is a procedure and its
+  attachments, read by an agent with the file and GPIO tools it already has.
 
-Write one with `skill_write` (it composes the header and refuses to overwrite by
-accident). From an MCP client — where these are not tools — write the file itself, which
-is the same bytes:
-
-```bash
-curl -sS -X POST http://<board>:8080/mcp -H 'Content-Type: application/json' -d \
-  '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"fs_write","arguments":
-    {"path":"/skills/deploy.md",
-     "text":"# deploy\ndescription: roll the portal forward\n1. snapshot\n2. flash\n"}}}'
-```
+Write one with `fs_write` — there are no dedicated tools (see below).
 
 ### No tools of their own
 
@@ -85,16 +92,17 @@ the same reason `net_*` and `fs_*` are not MCP tools either.
 
 | Task | How |
 |---|---|
-| see the skills | `fs_ls {path:"/skills"}` — the prompt already lists them by name and description |
-| load one | `fs_read {path:"/skills/deploy.md"}` |
-| add or change one | `fs_write {path:"/skills/deploy.md", text}` with the header above |
-| remove one | the file goes away with the workspace (`fs_write` on an empty file leaves an empty skill, so an empty file is not a deletion) |
+| see the skills | `fs_ls {path:"/skills"}` — the prompt already names each one with its path |
+| load one | `fs_read {path:"/skills/deploy/SKILL.md"}`, and any file next to it |
+| add or change one | `fs_write {path:"/skills/deploy/SKILL.md", text}` — parent directories are created |
+| remove one | `fs_rm {path:"/skills/deploy/SKILL.md", confirm:true}`; the index drops it on the next turn |
 | change the instructions | `fs_write {path:"/AGENTS.md", text}` |
 
-What you give up without the wrappers: nothing checks the name or that a `description:`
-line exists. The index is forgiving (it falls back to the first prose line), so a
-hand-written file still shows up — but a file named `Deploy Notes.md` is invisible
-because the stem has a space. Keep names to `a-z A-Z 0-9 _ -`.
+What you give up without the wrappers: nothing checks a name, a header, or that a skill
+directory has a `SKILL.md`. The index is forgiving (front matter, then a `description:`
+line, then the first prose line), so a hand-written file still shows up — but a directory
+named `Deploy Notes` is invisible, because the name has a space. Keep names to
+`a-z A-Z 0-9 _ -`.
 
 From an MCP client, the same call, since these paths are ordinary files:
 

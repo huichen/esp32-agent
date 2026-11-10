@@ -106,7 +106,7 @@ board's own tools.
   NVS and never echoed back). `https://` is carried by esp-tls with the ESP-IDF
   certificate bundle; `http://` stays for a LAN endpoint and the board's own `/selftest`
 - Tools: every MCP tool on the board, plus the file tools
-  `fs_ls/fs_read/fs_write/fs_edit/fs_grep` over an NVS workspace, plus `net_get` /
+  `fs_ls/fs_read/fs_write/fs_edit/fs_rm/fs_grep` over an NVS workspace, plus `net_get` /
   `net_post`. There is no shell — `ls` and `grep` are the parts of one that matter here
 - **Instructions and skills**: `/AGENTS.md` is injected into the system prompt (first
   1 KB, the rest read with `fs_read`), and each `/skills/<name>.md` is listed by name and

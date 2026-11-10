@@ -16,7 +16,7 @@ version numbering follows semantic versioning.
   an OpenAI-compatible `/chat/completions`; one turn may call tools in several steps, and
   history is persisted to NVS and visible in the portal
 - **Agent tools**: every MCP tool the board already had, plus file tools
-  (`fs_ls/fs_read/fs_write/fs_edit/fs_grep` over an NVS workspace) and network tools
+  (`fs_ls/fs_read/fs_write/fs_edit/fs_rm/fs_grep` over an NVS workspace) and network tools
   (`net_get/net_post`); there is no shell, because the device does not have one
 - **Orchestration layer**: scheduled tasks (`every_s` or `at_hhmm`, once a day, never
   twice in the same minute) and sensor rules (a tool, a JSON path in its result, a
@@ -60,10 +60,10 @@ version numbering follows semantic versioning.
   certificate bundle (no skip-verification switch) — and the simulator uses rustls with
   the webpki roots, so the same endpoint can be tried on the desk before it is flashed
 - **Instructions and skills on the board**: `/AGENTS.md` is injected into the system
-  prompt (first 1 KB, the rest readable with `fs_read`), and each `/skills/<name>.md` is
-  indexed by name and one-line description until the model opens it. Deliberately no
-  dedicated tools: the paths are ordinary files, and `fs_ls`/`fs_read`/`fs_write`
-  already reach them. Contract: `docs/agent-skills.md`
+  prompt (first 1 KB, the rest readable with `fs_read`), and each
+  `/skills/<name>/SKILL.md` is indexed with its path — a skill may keep other files next
+  to it. Deliberately no dedicated tools: the paths are ordinary files, and
+  `fs_ls`/`fs_read`/`fs_write`/`fs_rm` reach them. Contract: `docs/agent-skills.md`
 - Documentation: architecture, the manifest specification, the capability table, the HTTP
   API, adding a device, flashing, troubleshooting, the roadmap, AGENTS.md
 
@@ -82,6 +82,9 @@ version numbering follows semantic versioning.
   unchanged (it is the transport now), tool names are unchanged (renaming them would break
   stored manifests and prompts), and the storage namespace stays `esp32mcp` (renaming it
   would wipe the settings and history of an already-flashed board)
+
+- **`fs_rm`**: deleting one workspace file (`confirm: true`). The workspace could write
+  and edit but never remove, so a wrong skill stayed in every future prompt
 
 ### Fixed
 
