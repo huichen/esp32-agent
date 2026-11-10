@@ -57,3 +57,7 @@ firmware/.espressif/
 
 # scratch patch drop from worker sessions
 /patches/
+
+# The agent's own memory index, next to the topic files it points at (already ignored
+# through /.future/). Local to one machine, not part of the repository.
+/FUTURE.md
