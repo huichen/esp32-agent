@@ -1148,7 +1148,7 @@ mod tests {
                 if name == "manifest_apply" {
                     self.specs = json!([
                         { "type": "function", "function": { "name": "manifest_apply" } },
-                        { "type": "function", "function": { "name": "bench.new" } },
+                        { "type": "function", "function": { "name": "bench_new" } },
                     ]);
                 }
                 Ok("{}".to_string())
@@ -1161,7 +1161,7 @@ mod tests {
         };
         let mut transport = StubTransport::new(vec![
             tool_call_reply("c1", "manifest_apply", "{}"),
-            tool_call_reply("c2", "bench.new", "{}"),
+            tool_call_reply("c2", "bench_new", "{}"),
             answer_reply("both ran"),
         ]);
         let mut agent = Agent::new();
@@ -1171,7 +1171,7 @@ mod tests {
         agent.push_user("add a tool and then use it", "http", 1);
         let text = agent.run_pending(&mut host, &mut transport, &config, clock).expect("answer");
         assert_eq!(text, "both ran");
-        assert_eq!(host.calls, vec!["manifest_apply", "bench.new"]);
+        assert_eq!(host.calls, vec!["manifest_apply", "bench_new"]);
 
         let second: Value = serde_json::from_str(&transport.bodies[1]).expect("json");
         let names: Vec<&str> = second["tools"]
@@ -1181,7 +1181,7 @@ mod tests {
             .filter_map(|t| t["function"]["name"].as_str())
             .collect();
         assert!(
-            names.contains(&"bench.new"),
+            names.contains(&"bench_new"),
             "the tool the model just declared must be advertised: {names:?}"
         );
     }

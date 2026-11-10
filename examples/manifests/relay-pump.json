@@ -12,7 +12,7 @@
     ],
     "tools": [
       {
-        "name": "pump.set",
+        "name": "pump_set",
         "title": "Pump on/off",
         "description": "Switch the pump relay (GPIO12, active-low). Returns the level that was applied.",
         "params": [{ "name": "on", "type": "boolean", "required": true, "description": "true = energised" }],
@@ -20,7 +20,7 @@
         "safety": { "max_calls_per_min": 20 }
       },
       {
-        "name": "pump.pulse",
+        "name": "pump_pulse",
         "title": "Pump pulse",
         "description": "Energise the pump relay for `ms` milliseconds, then release. Blocks the call.",
         "params": [

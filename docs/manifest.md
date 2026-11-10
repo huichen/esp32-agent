@@ -35,12 +35,16 @@ Limits: `tools ≤ 48`, `sequence.steps ≤ 8`, cumulative `delay ≤ 5000 ms` p
 ## 3. tools
 
 ```json
-{ "name": "pump.pulse", "title": "Pump pulse", "description": "…",
+{ "name": "pump_pulse", "title": "Pump pulse", "description": "…",
   "device": "pump", "enabled": true,
   "params": [ … ], "exec": { … }, "safety": { … } }
 ```
 
-- `name`: `a-z0-9_-` and `.`, at most 48 characters, must be unique.
+- `name`: `a-z A-Z 0-9 _ -` (no `.`, which OpenAI-compatible endpoints reject), at most
+  48 characters, must be unique. The restriction is the wire charset, not a style
+  choice: `function.name` is validated against `^[a-zA-Z0-9_-]+$`, and every request
+  carries the whole tool list — one name outside it fails **every** call, including the
+  `manifest_apply` call that would repair the manifest.
 - `description` is the only natural language the model sees; state **units and side
   effects**.
 - `params`: `{name, type: integer|number|string|boolean, required, min, max, unit, enum, default, description}`.

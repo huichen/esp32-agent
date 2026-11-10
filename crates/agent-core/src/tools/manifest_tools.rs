@@ -24,6 +24,120 @@ fn validate_ctx<'b>(ctx: &mut ToolCtx<'b>) -> ValidateCtx<'b> {
     }
 }
 
+/// What a manifest document looks like, quoted in errors so the model has a shape to
+/// copy instead of a guess to make.
+const MANIFEST_SHAPE: &str = "{\"version\":1,\"devices\":[{\"id\":\"pump\",\"pins\":{\"out\":12}}],\
+     \"tools\":[{\"name\":\"pump_pulse\",\"exec\":{\"type\":\"gpio_write\",\"pin\":12,\"level\":1}}]}";
+
+fn json_kind(v: &Value) -> &'static str {
+    match v {
+        Value::Null => "null",
+        Value::Bool(_) => "a bool",
+        Value::Number(_) => "a number",
+        Value::String(_) => "a string",
+        Value::Array(_) => "an array",
+        Value::Object(_) => "an object",
+    }
+}
+
+/// Parse a manifest document, or say which field has the wrong shape.
+///
+/// `serde` answers a top-level array with `invalid type: sequence, expected a map`:
+/// it names neither the document the board wants nor the field that stopped fitting,
+/// so the only thing a model can do with it is guess again — and every guess costs a
+/// tool round. The checks below name the expected document and a JSON Pointer to the
+/// offender, the same vocabulary `issues` uses.
+fn parse_manifest(value: &Value) -> std::result::Result<Manifest, McpError> {
+    let expected = || {
+        format!("expected an object like {MANIFEST_SHAPE}, where `devices` and `tools` are arrays of objects")
+    };
+    let bad =
+        |path: &str, what: &str| McpError::invalid_params(format!("manifest{path} {what}; {}", expected()));
+    let Some(doc) = value.as_object() else {
+        return Err(bad("", &format!("must be a JSON object, not {}", json_kind(value))));
+    };
+    for key in doc.keys() {
+        if !matches!(key.as_str(), "version" | "devices" | "tools") {
+            return Err(bad(
+                &format!("/{key}"),
+                "is not a field of a manifest; the fields are `version`, `devices` and `tools`",
+            ));
+        }
+    }
+    for (field, shape) in [
+        ("devices", "{\"id\":\"pump\",\"pins\":{\"out\":12}}"),
+        ("tools", "{\"name\":\"pump_pulse\",\"exec\":{...}}"),
+    ] {
+        let Some(items) = doc.get(field) else { continue };
+        let Some(items) = items.as_array() else {
+            return Err(bad(
+                &format!("/{field}"),
+                &format!("must be an array of objects like {shape}, not {}", json_kind(items)),
+            ));
+        };
+        for (i, item) in items.iter().enumerate() {
+            if !item.is_object() {
+                return Err(bad(
+                    &format!("/{field}/{i}"),
+                    &format!("must be an object like {shape}, not {}", json_kind(item)),
+                ));
+            }
+        }
+    }
+    if let Some(tools) = doc.get("tools").and_then(Value::as_array) {
+        for (i, tool) in tools.iter().enumerate() {
+            let tool = tool.as_object().expect("checked above");
+            match tool.get("name") {
+                Some(Value::String(_)) => {}
+                Some(other) => {
+                    return Err(bad(
+                        &format!("/tools/{i}/name"),
+                        &format!("must be a string, not {}", json_kind(other)),
+                    ))
+                }
+                None => return Err(bad(&format!("/tools/{i}/name"), "is required")),
+            }
+            match tool.get("exec") {
+                Some(Value::Object(_)) => {}
+                Some(other) => {
+                    return Err(bad(
+                        &format!("/tools/{i}/exec"),
+                        &format!("must be an object with a `type`, not {}", json_kind(other)),
+                    ))
+                }
+                None => {
+                    return Err(bad(
+                        &format!("/tools/{i}/exec"),
+                        "is required, e.g. {\"type\":\"gpio_write\",\"pin\":12,\"level\":1}",
+                    ))
+                }
+            }
+            if let Some(params) = tool.get("params") {
+                let Some(params) = params.as_array() else {
+                    return Err(bad(
+                        &format!("/tools/{i}/params"),
+                        &format!("must be an array of objects, not {}", json_kind(params)),
+                    ));
+                };
+                for (k, param) in params.iter().enumerate() {
+                    if !param.is_object() {
+                        return Err(bad(
+                            &format!("/tools/{i}/params/{k}"),
+                            &format!(
+                                "must be an object like {{\"name\":\"ms\",\"type\":\"integer\"}}, not {}",
+                                json_kind(param)
+                            ),
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    serde_json::from_value::<Manifest>(value.clone()).map_err(|e| {
+        McpError::invalid_params(format!("manifest does not match the schema: {e}; {}", expected()))
+    })
+}
+
 pub fn manifest_tools() -> Vec<ToolDef> {
     vec![
         ToolDef::new(
@@ -108,8 +222,7 @@ pub fn manifest_tools() -> Vec<ToolDef> {
                 .ok_or_else(|| McpError::invalid_params("`manifest` is required"))?;
             let mode = j::opt_str(args, "mode").unwrap_or_else(|| "replace".into());
             let dry = j::opt_bool(args, "dry_run").unwrap_or(false);
-            let patch = serde_json::from_value::<Manifest>(value)
-                .map_err(|e| McpError::invalid_params(format!("manifest does not match the schema: {e}")))?;
+            let patch = parse_manifest(&value)?;
             let candidate = if mode == "merge" { ctx.manifest.merged_with(&patch) } else { patch };
             let issues = candidate.validate(&validate_ctx(ctx));
             if !issues.is_empty() {
@@ -155,8 +268,7 @@ pub fn manifest_tools() -> Vec<ToolDef> {
             let value = j::field(args, "manifest")
                 .cloned()
                 .ok_or_else(|| McpError::invalid_params("`manifest` is required"))?;
-            let m = serde_json::from_value::<Manifest>(value)
-                .map_err(|e| McpError::invalid_params(format!("schema mismatch: {e}")))?;
+            let m = parse_manifest(&value)?;
             let issues: Vec<Issue> = m.validate(&validate_ctx(ctx));
             Ok(json!({ "valid": issues.is_empty(), "issues": issues }))
         }),
@@ -287,7 +399,7 @@ fn manifest_schema() -> Value {
                     "type": "object",
                     "required": ["name", "exec"],
                     "properties": {
-                        "name": { "type": "string", "description": "a-z0-9_-., e.g. led.set" },
+                        "name": { "type": "string", "description": "a-z, A-Z, 0-9, _ and - (no `.`), max 48, e.g. led_set — it has to match the OpenAI tool-name charset ^[a-zA-Z0-9_-]+$" },
                         "title": { "type": "string" },
                         "description": { "type": "string" },
                         "device": { "type": "string" },
@@ -359,7 +471,7 @@ fn examples() -> Value {
         "relay_with_safety": {
             "devices": [{ "id": "pump", "kind": "actuator", "pins": { "out": 12 }, "note": "5 V relay board, active low" }],
             "tools": [{
-                "name": "pump.set",
+                "name": "pump_set",
                 "description": "Switch the pump relay. Refuses to run more than 20 times a minute.",
                 "params": [{ "name": "on", "type": "boolean", "required": true }],
                 "exec": { "type": "gpio_write", "pin": 12, "level": { "param": "on" } },
@@ -368,7 +480,7 @@ fn examples() -> Value {
         },
         "servo_angle": {
             "tools": [{
-                "name": "servo.angle",
+                "name": "servo_angle",
                 "description": "Servo angle in degrees",
                 "params": [{ "name": "deg", "type": "number", "min": 0, "max": 180, "unit": "deg", "required": true }],
                 "exec": { "type": "pwm", "pin": 7, "freq_hz": 50,
@@ -378,12 +490,12 @@ fn examples() -> Value {
         },
         "sensor_driver": {
             "devices": [{ "id": "bme280", "kind": "sensor", "driver": "bme280", "bus": 0, "address": 118 }],
-            "tools": [{ "name": "climate.read", "device": "bme280", "description": "Temperature, pressure and humidity",
+            "tools": [{ "name": "climate_read", "device": "bme280", "description": "Temperature, pressure and humidity",
                         "params": [], "exec": { "type": "driver", "driver": "bme280", "action": "bme280_read" } }]
         },
         "led_then_read_back": {
             "tools": [{
-                "name": "led.probe",
+                "name": "led_probe",
                 "description": "Blink the LED, then report the ADC level of a light sensor",
                 "params": [],
                 "exec": { "type": "sequence", "steps": [

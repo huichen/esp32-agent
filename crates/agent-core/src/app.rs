@@ -170,7 +170,7 @@ impl App {
             .get(crate::config::NVS_KEY_CONFIG)
             .and_then(|s| Config::from_json_str(&s))
             .unwrap_or_default();
-        let (manifest, manifest_source) = match store.get(NVS_KEY_MANIFEST) {
+        let (mut manifest, manifest_source) = match store.get(NVS_KEY_MANIFEST) {
             Some(s) => match Manifest::from_json_str(&s) {
                 Ok(m) => (m, "nvs"),
                 Err(e) => {
@@ -180,8 +180,25 @@ impl App {
             },
             None => (Manifest::default(), "default"),
         };
+        // A manifest stored by an older build may name a tool the wire will not carry.
+        // It has to go before the first model call, because that is the call a repair
+        // would have to travel on (see `Manifest::drop_tools_with_unusable_names`).
+        let dropped_names = manifest.drop_tools_with_unusable_names();
+        if !dropped_names.is_empty() {
+            log.warn(
+                "manifest",
+                format!(
+                    "dropped {} stored tool(s) whose names no model endpoint accepts: {} — \
+                     re-add them with `_` instead of `.`",
+                    dropped_names.len(),
+                    dropped_names.join(", ")
+                ),
+            );
+        }
         let mut runtime = Runtime::new(now, &firmware.version, &firmware.build);
         runtime.manifest_rev = 1;
+        // Write the cleaned manifest back, so dropping happens once and not every boot.
+        runtime.manifest_dirty = !dropped_names.is_empty();
         let mut app = Self {
             cfg,
             manifest,
@@ -2572,9 +2589,9 @@ fn selftest_completion(req: &Request) -> Value {
     const DESCRIBE: (&str, &str) = ("manifest_describe", "{}");
     const APPLY: (&str, &str) = (
         "manifest_apply",
-        r#"{"mode":"merge","manifest":{"tools":[{"name":"bench.mcp_probe","description":"Read the boot button on GPIO0 as a level, 1 released and 0 pressed","params":[],"exec":{"type":"gpio_read","pin":0}}]}}"#,
+        r#"{"mode":"merge","manifest":{"tools":[{"name":"bench_mcp_probe","description":"Read the boot button on GPIO0 as a level, 1 released and 0 pressed","params":[],"exec":{"type":"gpio_read","pin":0}}]}}"#,
     );
-    const CALL_NEW: (&str, &str) = ("bench.mcp_probe", "{}");
+    const CALL_NEW: (&str, &str) = ("bench_mcp_probe", "{}");
     let steps: &[(&str, &str)] = if has_word(&ask, "edit") || ask.contains("改") {
         &[WRITE, EDIT, READ]
     } else if has_word(&ask, "file") || ask.contains("文件") {
@@ -3730,14 +3747,14 @@ mod tests {
     #[test]
     fn a_manifest_is_applied_live_and_its_tool_works() {
         let mut app = test_app();
-        assert!(!app.is_visible("pin.led"));
+        assert!(!app.is_visible("pin_led"));
         let v = app
             .call_tool(
                 "manifest_apply",
                 &json!({
                     "manifest": {
                         "tools": [{
-                            "name": "pin.led",
+                            "name": "pin_led",
                             "description": "Drive the onboard LED pin",
                             "params": [{ "name": "on", "type": "boolean", "required": true }],
                             "exec": { "type": "gpio_write", "pin": 48, "level": { "param": "on" } }
@@ -3747,11 +3764,11 @@ mod tests {
             )
             .unwrap();
         assert_eq!(v["applied"], true);
-        assert!(app.is_visible("pin.led"), "no reboot, tool is live");
+        assert!(app.is_visible("pin_led"), "no reboot, tool is live");
         let names = tool_names(&mut app);
-        assert!(names.contains(&"pin.led".to_string()));
+        assert!(names.contains(&"pin_led".to_string()));
 
-        let out = app.call_tool("pin.led", &json!({ "on": true })).unwrap();
+        let out = app.call_tool("pin_led", &json!({ "on": true })).unwrap();
         assert_eq!(out["level"], 1);
         assert_eq!(out["pin"], 48);
     }
@@ -3772,13 +3789,165 @@ mod tests {
         assert!(!app.is_visible("bad name"));
     }
 
+    /// The name a model call is allowed to carry. Not a style rule: OpenAI-compatible
+    /// endpoints validate `function.name` against this class, and every request carries
+    /// the whole tool list.
+    fn wire_tool_name(name: &str) -> bool {
+        !name.is_empty()
+            && name.len() <= 64
+            && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    }
+
+    fn wire_names(app: &App) -> Vec<String> {
+        let specs = ToolHost::tool_specs(app);
+        specs
+            .as_array()
+            .expect("tool_specs is an array")
+            .iter()
+            .map(|t| t["function"]["name"].as_str().unwrap_or_default().to_string())
+            .collect()
+    }
+
+    fn dotted_pump() -> Value {
+        json!({ "manifest": { "tools": [{
+            "name": "pump.pulse",
+            "description": "Energise the pump relay for ms milliseconds",
+            "params": [{ "name": "ms", "type": "integer", "min": 10, "max": 5000, "required": true }],
+            "exec": { "type": "gpio_write", "pin": 12, "level": 1 }
+        }] } })
+    }
+
+    /// A manifest must not be able to name a tool the endpoint will refuse.
+    ///
+    /// `apply` is where the refusal has to happen: a name that reaches the wire fails
+    /// the *model call*, and every later call with it, so the board cannot even ask the
+    /// model to fix the manifest. Remove the charset check and this assertion fails.
+    #[test]
+    fn a_dotted_tool_name_is_refused_by_name_and_charset() {
+        let mut app = test_app();
+        let v = app.call_tool("manifest_apply", &dotted_pump()).unwrap();
+        assert_eq!(v["applied"], false, "`pump.pulse` must not be applied: {v}");
+        let issues = v["issues"].as_array().expect("issues");
+        let issue = issues
+            .iter()
+            .find(|i| i["path"] == "/tools/0/name")
+            .unwrap_or_else(|| panic!("no /tools/0/name issue: {v}"));
+        let message = issue["message"].as_str().unwrap_or_default();
+        let hint = issue["hint"].as_str().unwrap_or_default();
+        assert!(message.contains("pump.pulse"), "the offender is not named: {message}");
+        for needle in ["a-z", "`_`", "`-`", "led_set"] {
+            assert!(hint.contains(needle), "the charset is not spelled out ({needle}): {hint}");
+        }
+        assert!(!app.is_visible("pump.pulse"), "the refused tool still answers");
+    }
+
+    /// A refused manifest leaves nothing behind: the list, a call and a model round
+    /// all still work. Turn the refusal into a pass-through and the wire carries
+    /// `pump.pulse`, which is what fails here.
+    #[test]
+    fn a_refused_manifest_poisons_nothing() {
+        let mut app = test_app();
+        let refused = app.call_tool("manifest_apply", &dotted_pump()).unwrap();
+        assert_eq!(refused["applied"], false);
+
+        // tools/list still answers, and the board's own tools are still in it.
+        let list = app.handle_rpc(r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#, None).unwrap();
+        let listed = list["result"]["tools"].as_array().expect("tools array");
+        assert!(listed.iter().any(|t| t["name"] == "board_status"), "tools/list lost the built-ins");
+
+        // A normal call still reaches the hardware.
+        assert!(app.call_tool("board_status", &json!({})).is_ok(), "the board stopped answering");
+
+        // And a model round still happens. The recorded request is the wire payload
+        // the endpoint would have refused.
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        app.attach_transport(Box::new(StubModel { seen: seen.clone(), calls: 0 }));
+        app.route(&post(
+            "/api/agent/config",
+            r#"{"base_url":"http://127.0.0.1:9/v1/chat/completions","model":"stub","api_key":""}"#,
+        ));
+        app.agent.push_user("is the board ok?", "http", 0);
+        let answer = app.agent_run_once().expect("the model call must still go out");
+        assert_eq!(answer, "The board is fine.");
+
+        for (_, _, body) in seen.lock().unwrap().iter() {
+            let sent: Value = serde_json::from_str(body).unwrap();
+            for tool in sent["tools"].as_array().expect("tools array") {
+                let name = tool["function"]["name"].as_str().unwrap_or_default();
+                assert!(wire_tool_name(name), "`{name}` would fail the model call: {body}");
+            }
+        }
+    }
+
+    /// Everything the board can put on the wire, manifest tools and built-ins alike.
+    #[test]
+    fn every_tool_name_on_the_wire_is_one_an_openai_endpoint_accepts() {
+        let mut app = test_app();
+        let refused = app.call_tool("manifest_apply", &dotted_pump()).unwrap();
+        assert_eq!(refused["applied"], false);
+        let applied = app
+            .call_tool(
+                "manifest_apply",
+                &json!({ "manifest": { "tools": [{
+                    "name": "pump_pulse",
+                    "params": [{ "name": "ms", "type": "integer", "required": true }],
+                    "exec": { "type": "gpio_write", "pin": 12, "level": 1 }
+                }] } }),
+            )
+            .unwrap();
+        assert_eq!(applied["applied"], true);
+
+        let names = wire_names(&app);
+        assert!(names.contains(&"pump_pulse".to_string()), "got {names:?}");
+        assert!(names.contains(&"board_status".to_string()), "got {names:?}");
+        for name in &names {
+            assert!(wire_tool_name(name), "`{name}` would be refused by the endpoint: {names:?}");
+        }
+    }
+
+    /// The shape error has to be actionable: deepseek-flash sent the tools array as the
+    /// whole document, got `schema mismatch: invalid type: sequence, expected a map`
+    /// back, and spent six steps guessing. Put that wording back and this fails.
+    #[test]
+    fn a_manifest_of_the_wrong_shape_is_told_which_shape_it_needs() {
+        let mut app = test_app();
+
+        let err = app
+            .call_tool("manifest_validate", &json!({ "manifest": [{ "name": "pump_pulse" }] }))
+            .unwrap_err();
+        let text = err.message;
+        for needle in ["must be a JSON object", "devices", "tools", "pump_pulse"] {
+            assert!(text.contains(needle), "the expected shape is not in the error ({needle}): {text}");
+        }
+
+        let err = app
+            .call_tool("manifest_validate", &json!({ "manifest": { "tools": [{ "name": 7, "exec": {} }] } }))
+            .unwrap_err();
+        assert!(err.message.contains("/tools/0/name"), "no field path: {}", err.message);
+        assert!(err.message.contains("devices") && err.message.contains("tools"), "{}", err.message);
+
+        let err = app.call_tool("manifest_validate", &json!({ "manifest": { "tool": [] } })).unwrap_err();
+        assert!(err.message.contains("/tool"), "a typo in a field name must be named: {}", err.message);
+
+        // A document of the right shape still validates.
+        let ok = app
+            .call_tool(
+                "manifest_validate",
+                &json!({ "manifest": { "tools": [{
+                    "name": "pump_pulse", "params": [],
+                    "exec": { "type": "gpio_write", "pin": 12, "level": 1 } }] } }),
+            )
+            .unwrap();
+        assert_eq!(ok["valid"], true, "{ok}");
+    }
+
     #[test]
     fn safety_limits_are_enforced_on_the_board() {
         let mut app = test_app();
         app.call_tool(
             "manifest_apply",
             &json!({ "manifest": { "tools": [{
-                "name": "servo.set",
+                "name": "servo_set",
                 "params": [{ "name": "deg", "type": "number", "required": true, "min": 0, "max": 180 }],
                 "exec": { "type": "pwm", "pin": 7, "freq_hz": 50, "duty_pct": { "param": "deg" } },
                 "safety": { "min": 5, "max": 175 }
@@ -3786,10 +3955,10 @@ mod tests {
         )
         .unwrap();
         // Schema range would allow 180; the safety range does not.
-        let err = app.call_tool("servo.set", &json!({ "deg": 180 })).unwrap_err();
+        let err = app.call_tool("servo_set", &json!({ "deg": 180 })).unwrap_err();
         assert_eq!(err.code, code::FORBIDDEN);
         assert!(err.message.contains("safety range"));
-        assert!(app.call_tool("servo.set", &json!({ "deg": 90 })).is_ok());
+        assert!(app.call_tool("servo_set", &json!({ "deg": 90 })).is_ok());
     }
 
     #[test]
@@ -3798,16 +3967,16 @@ mod tests {
         app.call_tool(
             "manifest_apply",
             &json!({ "manifest": { "tools": [{
-                "name": "relay.pulse",
+                "name": "relay_pulse",
                 "params": [],
                 "exec": { "type": "gpio_write", "pin": 5, "level": 1 },
                 "safety": { "confirm": true }
             }] } }),
         )
         .unwrap();
-        let err = app.call_tool("relay.pulse", &json!({})).unwrap_err();
+        let err = app.call_tool("relay_pulse", &json!({})).unwrap_err();
         assert_eq!(err.code, code::FORBIDDEN);
-        assert!(app.call_tool("relay.pulse", &json!({ "confirm": true })).is_ok());
+        assert!(app.call_tool("relay_pulse", &json!({ "confirm": true })).is_ok());
     }
 
     #[test]
@@ -3821,14 +3990,14 @@ mod tests {
         app.call_tool(
             "manifest_apply",
             &json!({ "manifest": { "tools": [{
-                "name": "p.keep", "params": [],
+                "name": "p_keep", "params": [],
                 "exec": { "type": "gpio_read", "pin": 3 } }] } }),
         )
         .unwrap();
         assert_eq!(app.runtime.manifest_rev, 2, "one for boot, one for the save");
         let saved = app.manifest.to_json_string();
         let reloaded = Manifest::from_json_str(&saved).unwrap();
-        assert_eq!(reloaded.tool_names(), vec!["p.keep".to_string()]);
+        assert_eq!(reloaded.tool_names(), vec!["p_keep".to_string()]);
     }
 
     #[test]
@@ -3912,7 +4081,7 @@ mod tests {
             .call_tool(
                 "manifest_apply",
                 &json!({ "manifest": { "tools": [{
-                    "name": "climate.read",
+                    "name": "climate_read",
                     "description": "blocking read, needs an explicit confirmation",
                     "params": [],
                     "exec": { "type": "driver", "driver": "bme280", "action": "bme280_read" },
@@ -3948,7 +4117,7 @@ mod tests {
         app.call_tool(
             "manifest_apply",
             &json!({ "manifest": { "tools": [{
-                "name": "climate.window",
+                "name": "climate_window",
                 "params": [{ "name": "ms", "type": "integer", "min": 10, "max": 5000, "required": true }],
                 "exec": { "type": "driver", "driver": "bme280", "action": "bme280_read" }
             }] } }),
@@ -3975,25 +4144,25 @@ mod tests {
         app.call_tool(
             "manifest_apply",
             &json!({ "manifest": { "tools": [{
-                "name": "imu.read",
+                "name": "imu_read",
                 "params": [],
                 "exec": { "type": "driver", "driver": "mpu6050", "action": "mpu6050_read" }
             }] } }),
         )
         .unwrap();
-        assert!(!app.is_visible("imu.read"), "no IMU on this board");
-        assert!(!tool_names(&mut app).contains(&"imu.read".to_string()));
+        assert!(!app.is_visible("imu_read"), "no IMU on this board");
+        assert!(!tool_names(&mut app).contains(&"imu_read".to_string()));
         // A tool for a device that *is* present stays listed.
         app.call_tool(
             "manifest_apply",
             &json!({ "mode": "merge", "manifest": { "tools": [{
-                "name": "climate.read",
+                "name": "climate_read",
                 "params": [],
                 "exec": { "type": "driver", "driver": "bme280", "action": "bme280_read" }
             }] } }),
         )
         .unwrap();
-        assert!(tool_names(&mut app).contains(&"climate.read".to_string()));
+        assert!(tool_names(&mut app).contains(&"climate_read".to_string()));
     }
 
     #[test]

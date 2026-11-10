@@ -144,7 +144,7 @@ One manifest fragment turns a relay nobody wrote code for into a tool:
 {
   "devices": [{ "id": "pump", "kind": "actuator", "pins": { "out": 12 }, "note": "active-low relay" }],
   "tools": [{
-    "name": "pump.pulse",
+    "name": "pump_pulse",
     "description": "Energise the pump relay for `ms` milliseconds",
     "params": [{ "name": "ms", "type": "integer", "min": 10, "max": 5000, "unit": "ms", "required": true }],
     "exec": { "type": "sequence", "steps": [
