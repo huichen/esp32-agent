@@ -55,7 +55,6 @@ pub struct LlmConfig {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct ToolCall { pub id: String, pub name: String, pub arguments: serde_json::Value }
-
 #[derive(Clone, Debug, Default)]
 pub struct ModelReply { pub content: String, pub tool_calls: Vec<ToolCall> }
 
@@ -202,6 +201,22 @@ Both functions must be pure (no clock access) — the caller passes time in.
 - Portal (`src/web/`): an "Agent" panel with a textarea, a send button, the
   transcript rendered as `role: text`, and a schedule table with enable/disable.
   Same vanilla-JS style as the existing panel; no new dependencies.
+
+### 3.6a Whose endpoint and whose key
+
+All three of `base_url`, `model` and `api_key` are **empty in a build**, and the board
+cannot reach a model until whoever owns it fills them in at the portal. Nothing is
+compiled in and nothing ships in the image.
+
+That is a rule, not an accident of defaults: the endpoint and the credential belong to
+the person running the board. This repository's own bench work never points a board at a
+maintainer's or an assistant's model provider, and never puts that provider's key on the
+device — a bench run uses the board's own `/selftest/chat/completions` endpoint, which
+needs no key and never leaves the device. If a demonstration seems to need a real key,
+the answer is a scripted endpoint on the board, not somebody else's credential in flash.
+
+`the_firmware_ships_with_no_endpoint_and_no_key` in `llm.rs` pins the default, so
+hard-coding an endpoint has to be a deliberate act with a failing test to justify it.
 
 ### 3.7 `firmware/src/agent.rs` (worker D, second wave)
 

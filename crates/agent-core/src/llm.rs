@@ -317,6 +317,21 @@ fn json_kind(value: &Value) -> &'static str {
 mod tests {
     use super::*;
 
+    /// A build must never carry somebody's model endpoint, and never their key.
+    ///
+    /// The owner configures `base_url`/`model`/`api_key` at the portal; the firmware
+    /// ships with all three empty, so nothing leaves the board until a person decides
+    /// where it should go. This is also the guard against a convenient "just point it at
+    /// the endpoint I already have" — that endpoint and its credential belong to whoever
+    /// runs the board, not to the assistant or maintainer building it.
+    #[test]
+    fn the_firmware_ships_with_no_endpoint_and_no_key() {
+        let cfg = LlmConfig::default();
+        assert!(cfg.base_url.is_empty(), "a build must not carry a model endpoint: {}", cfg.base_url);
+        assert!(cfg.model.is_empty(), "a build must not carry a model name: {}", cfg.model);
+        assert!(cfg.api_key.is_empty(), "a build must not carry an api key");
+    }
+
     struct StubTransport {
         urls: Vec<String>,
         headers: Vec<Vec<(String, String)>>,
