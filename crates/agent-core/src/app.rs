@@ -513,7 +513,7 @@ impl App {
              Tools whose hardware is missing are not listed, so anything you can see is usable.\n\
              This board is self-configuring: use `inventory` / `i2c_identify` to find what is wired, \
              `manifest_describe` for the device+tools schema, and `manifest_apply` to add hardware and tools. \
-             A manifest change takes effect immediately 鈥?no reboot and no reflash 鈥?so you can iterate: \
+             A manifest change takes effect immediately - no reboot and no reflash - so you can iterate: \
              apply, call the new tool, and fix the manifest if the result is wrong.\n\
              Endpoint: {url}.{setup_note}",
             ver = self.firmware.version,

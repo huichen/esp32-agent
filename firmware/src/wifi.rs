@@ -2,9 +2,9 @@
 //!
 //! Two modes matter for the product:
 //!
-//! * **setup** 鈥?no credentials yet: start an access point on 192.168.4.1 and let
+//! * **setup** - no credentials yet: start an access point on 192.168.4.1 and let
 //!   a phone open the portal there. Nothing is burned into the firmware.
-//! * **joined** 鈥?credentials are in NVS: connect as a station. The access point
+//! * **joined** - credentials are in NVS: connect as a station. The access point
 //!   stays up as well when `wifi.ap_fallback` is set, so the portal is reachable
 //!   even if the router hands out an address the phone cannot reach.
 

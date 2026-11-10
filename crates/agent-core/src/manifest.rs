@@ -5,18 +5,18 @@
 //! ```text
 //! drivers (compiled)   register-level code for a chip; only needed for timing,
 //!                      calibration or a state machine
-//!        閳?resolved by id
+//!                     resolved by id
 //! manifest (this file, JSON in NVS)   which devices exist and which tools expose
 //!                      them; primitives (gpio/pwm/adc/i2c/rgb/delay) compose into
 //!                      composite tools without any new firmware
-//!        閳?compiled into ToolDef
+//!                     compiled into ToolDef
 //! MCP (protocol.rs, app.rs)           device-independent glue, written once
 //! ```
 //!
 //! A model can read the schema and the driver catalogue, write a new manifest and
 //! call it: the tool list is rebuilt in place, so no reboot and no reflash. Every
-//! limit is enforced here, on the board, before anything touches a pin 閳?a schema
-//! is documentation, not security.
+//! limit is enforced here, on the board, before anything touches a pin: a schema is
+//! documentation, not security.
 
 use crate::error::{McpError, Result};
 use crate::hardware::PinMode;
