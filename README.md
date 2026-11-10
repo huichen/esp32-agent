@@ -1,21 +1,33 @@
 # esp32-agent
 
-An ESP32 that **runs an agent of its own**, not only an MCP server. The board carries a
-model loop: it is handed the board's tools, discovers what is wired to it, and
-reconfigures the hardware while it runs. Those same tools are also offered to other
-clients over MCP — but the device does not need a host agent to act.
+An **agent that runs on an ESP32**. Not a remote model steering a dumb peripheral: the
+board carries its own model loop, its own tools and its own memory, and it keeps working
+when nothing is connected to it.
 
-It does not even need a message. Given an **objective** instead of a prompt, the board
-runs a goal: one small step per iteration, each result written down as a note, the next
-iteration starting from those notes, until the objective is met, the board is blocked,
-or the iteration budget is spent — [docs/agent-goal.md](docs/agent-goal.md).
+Three things it does that a plain MCP server does not:
 
-The firmware serves a Streamable HTTP MCP endpoint and a bilingual web console. It is
-usable before it has any WiFi credentials: the board raises its own access point, a
-phone joins it, fills in the home network at the fixed address `192.168.4.1`, and the
-board joins it — **no password is ever compiled into the firmware**.
+- **Talk and act.** A message arrives — from a browser, an MCP client, a timer or a
+  sensor — and the board answers it by calling its own tools.
+- **Configure itself.** Its tool surface is not compiled in: it is a JSON manifest in
+  NVS. The agent can look at what is wired up, declare a peripheral it just found, and
+  call the tool it created **in the same turn**. The MCP server that other clients see
+  is built from that same manifest, so there is one description of the hardware, not
+  two.
+- **Work towards a goal.** Given an objective instead of a prompt, the board iterates on
+  its own: one small step per iteration, each result written down as a note that the
+  next iteration reads, until the objective is met, the board is blocked, or the budget
+  is spent — [docs/agent-goal.md](docs/agent-goal.md).
 
-The point is not another gadget: it is the split between **drivers, the capability
+So MCP is an interface here, not the product: an outside agent can drive the board's
+tools over MCP, and the board can drive itself without one — including the case where
+the thing it is driving is the MCP surface it just configured.
+
+The firmware also serves a bilingual web console. It is usable before it has any WiFi
+credentials: the board raises its own access point, a phone joins it, fills in the home
+network at the fixed address `192.168.4.1`, and the board joins it — **no password is
+ever compiled into the firmware**.
+
+What makes the self-configuration work is the split between **drivers, the capability
 description and the MCP glue**:
 
 ```
@@ -23,16 +35,18 @@ drivers      compiled into the firmware, written only when timing,
              calibration or a state machine is needed
       ↑ looked up by id
 manifest     JSON in NVS: which devices exist, which tools they expose;
-             primitives compose
+             primitives compose — the agent edits this, and the tool
+             list is rebuilt from it in place
       ↑ compiled to ToolDef
 MCP layer    device independent, written once: JSON-RPC, HTTP,
              sessions, auth, capability filtering
 ```
 
-Adding a peripheral therefore needs no reflash: the model runs `inventory` /
+Adding a peripheral therefore needs no reflash: the agent runs `inventory` /
 `i2c_identify` to see the wiring, writes a JSON manifest, `manifest_apply` rebuilds the
 tool list on the spot — **no restart, no reflash** — calls the new tool, checks the
-result, and adjusts. A session can tune the hardware it has.
+result, and adjusts. A session can tune the hardware it has, and a goal can spend an
+hour doing it.
 
 ---
 
@@ -79,7 +93,42 @@ enter the password, save. The board joins it as a station and the console is rea
 at the new address too. The access point stays up by default (`wifi.ap_fallback`), so
 the configuration page remains reachable when the network is not.
 
-## How a model uses this
+## The agent on the board
+
+The board does the work itself: a model loop runs on the ESP32 and is handed the
+board's own tools.
+
+- Send a message: `POST /api/agent/message {"text":"what is on this board?"}` → 202
+  (queued); the loop can call tools across several steps, and the final text lands in
+  `/api/agent/history?after=`
+- Model: any OpenAI-compatible `/chat/completions` over plain `http://`; fill in
+  `base_url` / `model` / `api_key` in the portal's agent panel (the key is stored in
+  NVS and never echoed back)
+- Tools: every MCP tool on the board, plus the file tools
+  `fs_ls/fs_read/fs_write/fs_edit/fs_grep` over an NVS workspace, plus `net_get` /
+  `net_post`. There is no shell — `ls` and `grep` are the parts of one that matter here
+- Orchestration: `POST /api/sched` adds a scheduled prompt (`every_s` or `at_hhmm`
+  plus the prompt) or a sensor rule (`tool` + `path` + `op` + `value`, rate limited);
+  either way it enters the same one-slot queue as a user message
+- **Goals**: `POST /api/goal {"objective":"...","max_iterations":10}` and the board
+  stops waiting to be asked. It iterates on its own — one small step per iteration, the
+  result of each kept as a note the next iteration reads — calling the same tools above,
+  until the objective is met, it reports itself blocked, or the budget is spent; also
+  `POST /api/goal/stop` and `DELETE /api/goal`. The differences from gnhf (no git, no
+  rollback of a physical action, notes sized for NVS, one goal at a time) are in
+  [docs/agent-goal.md](docs/agent-goal.md)
+- No key needed to try it: `POST /selftest/chat/completions` on the board is a scripted
+  model — point `base_url` at it and the whole loop runs; the host-side equivalent is
+  `tools/stub_model.py` with `tools/agent_smoke.ps1`
+
+Single-process trade-offs: one agent thread, one tick, one run at a time, a one-slot
+queue that coalesces. The turn is split into phases so the model call happens **without
+holding the app lock** — the portal keeps answering while the model thinks. The agent's
+journal streams over `GET /api/agent/stream` (Server-Sent Events) with the host agent's
+event names: `message_start`, `thinking_*`, `text_*`, `tool_use`, `tool_progress`,
+`tool_result`, `usage`, `message_end`, `run_end`.
+
+## How it configures itself
 
 | Step | Tool | What it gives |
 |---|---|---|
@@ -121,34 +170,6 @@ and there are tests that call out of range on purpose.
   - `generic`: device tools collapse into `device_invoke`, leaving a few dozen core
     tools — the answer once there are many peripherals.
 - Individual tools can also be disabled by name.
-
-## The agent on the board
-
-The board does the work itself: a model loop runs on the ESP32 and is handed the
-board's own tools.
-
-- Send a message: `POST /api/agent/message {"text":"what is on this board?"}` → 202
-  (queued); the loop can call tools across several steps, and the final text lands in
-  `/api/agent/history?after=`
-- Model: any OpenAI-compatible `/chat/completions` over plain `http://`; fill in
-  `base_url` / `model` / `api_key` in the portal's agent panel (the key is stored in
-  NVS and never echoed back)
-- Tools: every MCP tool on the board, plus the file tools
-  `fs_ls/fs_read/fs_write/fs_edit/fs_grep` over an NVS workspace, plus `net_get` /
-  `net_post`. There is no shell — `ls` and `grep` are the parts of one that matter here
-- Orchestration: `POST /api/sched` adds a scheduled prompt (`every_s` or `at_hhmm`
-  plus the prompt) or a sensor rule (`tool` + `path` + `op` + `value`, rate limited);
-  either way it enters the same one-slot queue as a user message
-- No key needed to try it: `POST /selftest/chat/completions` on the board is a scripted
-  model — point `base_url` at it and the whole loop runs; the host-side equivalent is
-  `tools/stub_model.py` with `tools/agent_smoke.ps1`
-
-Single-process trade-offs: one agent thread, one tick, one run at a time, a one-slot
-queue that coalesces. The turn is split into phases so the model call happens **without
-holding the app lock** — the portal keeps answering while the model thinks. The agent's
-journal streams over `GET /api/agent/stream` (Server-Sent Events) with the host agent's
-event names: `message_start`, `thinking_*`, `text_*`, `tool_use`, `tool_progress`,
-`tool_result`, `usage`, `message_end`, `run_end`.
 
 ## Repository layout
 
