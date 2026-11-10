@@ -1,0 +1,27 @@
+{
+  "mode": "merge",
+  "manifest": {
+    "version": 1,
+    "tools": [
+      {
+        "name": "sensor.raw",
+        "title": "Raw I2C read",
+        "description": "Read 2 bytes from register 0x10 of the I2C device at 0x40 (raw counts, divide by 1.2 for lux).",
+        "params": [],
+        "exec": { "type": "i2c_read", "addr": 64, "reg": 16, "length": 2 },
+        "safety": { "max_calls_per_min": 30 }
+      },
+      {
+        "name": "light.level",
+        "title": "Light level",
+        "description": "Ambient light in lux, computed from the sensor's raw 2-byte reading (raw / 1.2).",
+        "params": [],
+        "exec": {
+          "type": "sequence",
+          "steps": [{ "ms": 0, "exec": { "type": "i2c_read", "addr": 64, "reg": 16, "length": 2 } }]
+        },
+        "safety": { "max_calls_per_min": 30 }
+      }
+    ]
+  }
+}

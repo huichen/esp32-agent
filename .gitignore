@@ -1,0 +1,55 @@
+# Rust
+/target/
+**/target/
+Cargo.lock.bak
+
+# ESP-IDF / Rust on ESP32
+firmware/sdkconfig
+firmware/sdkconfig.old
+firmware/build/
+firmware/.embuild/
+firmware/partitions.bin
+firmware/bootloader.bin
+firmware/*.bin
+firmware/esp-idf/
+firmware/.espressif/
+.DS_Store
+
+# Local simulator state
+/sim-config.json
+/sim-state/
+
+# Editing tools
+.vscode/
+.idea/
+*.swp
+*~
+
+# Worktrees created by the future-versioning workflow
+/.worktrees/
+
+# esp-idf-sys installs its toolchain under <workspace>/.embuild, which is the clone
+# root when CARGO_TARGET_DIR points outside the crate (see docs/flashing.md).
+/.embuild/
+
+# Local build scratch from the short-path clone
+/b[0-9]*.txt
+/build.log
+/build*.ps1
+/patch*.ps1
+/*.py
+/*.err
+/*.patch
+/mon.txt
+/tail.txt
+/app.bak
+/dm.bak
+/stub.log
+/dispatch_*.log
+/monitor.log*
+
+# Local memory and goal state
+.future/
+
+# scratch patch drop from worker sessions
+/patches/

@@ -1,0 +1,7 @@
+# Normalise line endings so the repo does not churn on Windows checkouts.
+* text=auto eol=lf
+
+*.ps1 text eol=crlf
+*.bin binary
+*.png binary
+*.jpg binary

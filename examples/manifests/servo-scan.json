@@ -1,0 +1,33 @@
+{
+  "mode": "merge",
+  "manifest": {
+    "version": 1,
+    "tools": [
+      {
+        "name": "servo.angle",
+        "title": "Servo angle",
+        "description": "Move a hobby servo on GPIO7 to an angle in degrees (0-180). 50 Hz PWM, 500-2500 us pulse.",
+        "params": [
+          { "name": "deg", "type": "number", "min": 0, "max": 180, "unit": "deg", "required": true }
+        ],
+        "exec": { "type": "pwm", "pin": 7, "freq_hz": 50, "duty_pct": { "param": "deg" } },
+        "safety": { "min": 5, "max": 175, "max_calls_per_min": 60 }
+      },
+      {
+        "name": "servo.sweep",
+        "title": "Servo sweep",
+        "description": "Sweep the servo 30 -> 150 -> 30 degrees to show the travel is free.",
+        "params": [],
+        "exec": {
+          "type": "sequence",
+          "steps": [
+            { "ms": 300, "exec": { "type": "pwm", "pin": 7, "freq_hz": 50, "duty_pct": 30 } },
+            { "ms": 300, "exec": { "type": "pwm", "pin": 7, "freq_hz": 50, "duty_pct": 150 } },
+            { "ms": 300, "exec": { "type": "pwm", "pin": 7, "freq_hz": 50, "duty_pct": 30 } }
+          ]
+        },
+        "safety": { "max_calls_per_min": 6 }
+      }
+    ]
+  }
+}

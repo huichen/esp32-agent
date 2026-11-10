@@ -1,0 +1,16 @@
+[package]
+name = "esp32-agent-sim"
+description = "Host simulator for esp32-agent: the real portal and MCP endpoint backed by a virtual board"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "esp32-agent-sim"
+path = "src/main.rs"
+
+[dependencies]
+esp32-agent-core = { path = "../agent-core" }
+serde_json.workspace = true

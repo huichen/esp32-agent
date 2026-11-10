@@ -1,0 +1,45 @@
+name: New device support
+description: 请求支持一个新外设
+labels: [device]
+body:
+  - type: input
+    id: name
+    attributes:
+      label: 设备型号
+      placeholder: 例如 BH1750、RC522、SGP30
+    validations:
+      required: true
+  - type: input
+    id: datasheet
+    attributes:
+      label: 数据手册链接
+      description: 至少给出 ID 寄存器/命令表所在页，维护者需要用它写 probe
+    validations:
+      required: true
+  - type: textarea
+    id: wiring
+    attributes:
+      label: 接线
+      description: 总线（I2C/SPI/1-Wire/GPIO）、地址、引脚、上拉、供电电压
+    validations:
+      required: true
+  - type: textarea
+    id: tools
+    attributes:
+      label: 期望的工具
+      description: 想读到什么/做什么，单位是什么。例如 `bh1750_read → {lux}`
+    validations:
+      required: true
+  - type: dropdown
+    id: path
+    attributes:
+      label: 你打算怎么加
+      options:
+        - 只写清单（不需要时序/校准）
+        - 我写驱动并提 PR
+        - 我不会写 Rust，只能提供测试数据
+  - type: textarea
+    id: sample
+    attributes:
+      label: 实测样本（可选但很有用）
+      description: 寄存器原始值 + 对应的真实物理量，便于写单元测试

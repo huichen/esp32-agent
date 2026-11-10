@@ -1,0 +1,36 @@
+# esp32-agent defaults for ESP32-S3 (N16R8: 16 MB flash, 8 MB octal PSRAM)
+#
+# Read only when embuild can find the workspace directory - see CARGO_WORKSPACE_DIR in
+# .cargo/config.toml. Once a build has written `sdkconfig` next to this file, that
+# file wins: delete it to make an edit here take effect again.
+CONFIG_IDF_TARGET="esp32s3"
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+
+# PSRAM: the octal part on N16R8. Drop these three lines on a board without PSRAM.
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_OCT=y
+CONFIG_SPIRAM_SPEED_80M=y
+
+# Room for the HTTP request line and the JSON frames that go over it.
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=12288
+CONFIG_FREERTOS_HZ=1000
+CONFIG_HTTPD_MAX_URI_LEN=512
+
+# Console: the DevKitC-1 carries two USB ports. Primary stays on UART0 (the USB-UART
+# bridge, COM3 on the bench, which is what the flashing and monitoring scripts read),
+# secondary on the native USB-Serial/JTAG port so either cable shows the log. Do not
+# make the JTAG port primary: on the bench machine that silently cuts the console the
+# build scripts capture.
+CONFIG_ESP_CONSOLE_UART_DEFAULT=y
+CONFIG_ESP_CONSOLE_SECONDARY_USB_SERIAL_JTAG=y
+CONFIG_LOG_DEFAULT_LEVEL_INFO=y
+
+# WiFi: needed for both the setup access point and the station link.
+CONFIG_ESP_WIFI_SOFTAP_SUPPORT=y
+# 6 HTTP connections (http.rs MAX_CONNECTIONS) plus the captive DNS socket and slack.
+CONFIG_LWIP_MAX_SOCKETS=12
+
+# Partition table from partitions.csv - factory app plus a two-slot OTA rotation with
+# the otadata record that selects between them.
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"

@@ -1,0 +1,43 @@
+# Firmware builds for one chip and one chip only. Change the target, MCU and
+# ESP-IDF version together: `esp32s3` / `esp32` / `esp32c3` / `esp32c6`.
+[build]
+target = "xtensa-esp32s3-espidf"
+
+[target.xtensa-esp32s3-espidf]
+linker = "ldproxy"
+runner = "espflash flash --monitor"
+rustflags = ["--cfg", "espidf_time64"]
+
+[target.xtensa-esp32s3-espidf.env]
+MCU = "esp32s3"
+ESP_IDF_VERSION = "v5.5.2"
+
+[unstable]
+build-std = ["std", "panic_abort"]
+
+[env]
+MCU = "esp32s3"
+ESP_IDF_VERSION = "v5.5.2"
+# Keep the ESP-IDF build out of the parent workspace's target directory.
+CARGO_TARGET_DIR = "target"
+# embuild - and therefore esp-idf-sys - locates the crate/workspace root by walking
+# up from OUT_DIR, and that gives up when the target directory lives outside the
+# crate. Building this on Windows needs exactly that (`esp-idf-sys` rejects long
+# output paths, so the build script points CARGO_TARGET_DIR at a short path), and the
+# silent consequence was that `sdkconfig.defaults` next to this file was never read:
+# the firmware came out as `Project name: libespidf` on IDF's stock single-app
+# partition table. Pinning the workspace directory makes the defaults apply.
+CARGO_WORKSPACE_DIR = { value = "", relative = true }
+# Name the defaults file explicitly. It is also what esp-idf-sys tracks as a build
+# input, so editing the file - or this line - re-runs the configuration instead of
+# silently reusing a cached one.
+ESP_IDF_SDKCONFIG_DEFAULTS = "sdkconfig.defaults"
+# Pinning the workspace directory above also moves esp-idf-sys's default tooling
+# location to <workspace>/.embuild, which would re-clone ESP-IDF and the toolchain
+# inside firmware/. Both already live one level up, next to the clone itself.
+ESP_IDF_TOOLS_INSTALL_DIR = "custom:../.embuild/espressif"
+# The partition CSV is resolved relative to the C project that esp-idf-sys generates,
+# not to this crate, so hand it over with the supported glob mechanism: BASE is the
+# directory to search, every other ESP_IDF_GLOB_<NAME>_* value is a mask inside it.
+ESP_IDF_GLOB_FIRMWARE_BASE = { value = "", relative = true }
+ESP_IDF_GLOB_FIRMWARE_PARTITIONS = "partitions.csv"

@@ -1,0 +1,43 @@
+{
+  "mode": "merge",
+  "manifest": {
+    "version": 1,
+    "tools": [
+      {
+        "name": "led.notify",
+        "title": "LED notify",
+        "description": "Show a status colour on the onboard RGB LED (GPIO48): idle=green, busy=amber, error=red, off=black. Accepts any #rrggbb.",
+        "params": [
+          {
+            "name": "state",
+            "type": "string",
+            "required": true,
+            "enum": ["idle", "busy", "error", "off", "custom"],
+            "description": "preset, or `custom` to use the color argument"
+          },
+          { "name": "color", "type": "string", "description": "#rrggbb, used when state=custom" }
+        ],
+        "exec": { "type": "rgb", "pin": 48, "color": { "param": "color" } },
+        "safety": { "max_calls_per_min": 120 }
+      },
+      {
+        "name": "led.blink",
+        "title": "LED blink",
+        "description": "Blink the LED three times as an attention cue.",
+        "params": [],
+        "exec": {
+          "type": "sequence",
+          "steps": [
+            { "ms": 0, "exec": { "type": "rgb", "pin": 48, "color": "#3050ff" } },
+            { "ms": 150, "exec": { "type": "rgb", "pin": 48, "color": "#000000" } },
+            { "ms": 150, "exec": { "type": "rgb", "pin": 48, "color": "#3050ff" } },
+            { "ms": 150, "exec": { "type": "rgb", "pin": 48, "color": "#000000" } },
+            { "ms": 150, "exec": { "type": "rgb", "pin": 48, "color": "#3050ff" } },
+            { "ms": 150, "exec": { "type": "rgb", "pin": 48, "color": "#000000" } }
+          ]
+        },
+        "safety": { "max_calls_per_min": 20 }
+      }
+    ]
+  }
+}

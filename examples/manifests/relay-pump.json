@@ -1,0 +1,41 @@
+{
+  "mode": "merge",
+  "manifest": {
+    "version": 1,
+    "devices": [
+      {
+        "id": "pump",
+        "kind": "actuator",
+        "pins": { "out": 12 },
+        "note": "5V relay board, active-low: level 0 energises the coil"
+      }
+    ],
+    "tools": [
+      {
+        "name": "pump.set",
+        "title": "Pump on/off",
+        "description": "Switch the pump relay (GPIO12, active-low). Returns the level that was applied.",
+        "params": [{ "name": "on", "type": "boolean", "required": true, "description": "true = energised" }],
+        "exec": { "type": "gpio_write", "pin": 12, "level": { "param": "on" } },
+        "safety": { "max_calls_per_min": 20 }
+      },
+      {
+        "name": "pump.pulse",
+        "title": "Pump pulse",
+        "description": "Energise the pump relay for `ms` milliseconds, then release. Blocks the call.",
+        "params": [
+          { "name": "ms", "type": "integer", "min": 10, "max": 5000, "unit": "ms", "required": true }
+        ],
+        "exec": {
+          "type": "sequence",
+          "steps": [
+            { "ms": 0, "exec": { "type": "gpio_write", "pin": 12, "level": 0 } },
+            { "ms": 0, "exec": { "type": "delay", "ms": { "param": "ms" } } },
+            { "ms": 0, "exec": { "type": "gpio_write", "pin": 12, "level": 1 } }
+          ]
+        },
+        "safety": { "max_calls_per_min": 10, "confirm": true }
+      }
+    ]
+  }
+}
