@@ -2126,15 +2126,36 @@ impl ToolHost for App {
             })
             .collect();
         tools.sort_by_key(|t| t["function"]["name"].as_str().unwrap_or("").to_string());
-        // File and HTTP tools gate on nothing the hardware must provide, so they
-        // are not MCP tools; they are appended after the board's own list.
-        for group in [fs_tools::specs(), net_tools::specs()] {
+        // File, HTTP, and knowledge tools gate on nothing the hardware must provide, so
+        // they are not MCP tools; they are appended after the board's own list.
+        for group in [fs_tools::specs(), net_tools::specs(), crate::tools::knowledge::specs()] {
             tools.extend(openai_tools(&group));
         }
         Value::Array(tools)
     }
 
+    /// `/AGENTS.md`, bounded to what a small prompt can carry.
+    fn project_instructions(&self) -> Option<String> {
+        crate::tools::knowledge::instructions(&self.workspace)
+    }
+
+    /// The skill index: name and one line each, never the bodies.
+    fn skills(&self) -> Vec<(String, String)> {
+        crate::tools::knowledge::index(&self.workspace).into_iter().map(|s| (s.name, s.description)).collect()
+    }
+
     fn call_tool(&mut self, name: &str, arguments: &Value) -> std::result::Result<String, String> {
+        if matches!(name, "skill_list" | "skill_read" | "agents_md") {
+            let result = crate::tools::knowledge::call(&mut self.workspace, name, arguments)
+                .unwrap_or_else(|| Err(format!("`{name}` is a knowledge tool but is not routed")));
+            // Only a write changes the stored blob; a read must not cost an NVS write.
+            if name == "agents_md"
+                && arguments.get("action").and_then(|v| v.as_str()).unwrap_or("get") == "set"
+            {
+                self.persist_workspace();
+            }
+            return result;
+        }
         if name.starts_with("fs_") {
             let result = fs_tools::call(&mut self.workspace, name, arguments)
                 .ok_or_else(|| format!("`{name}` starts with fs_ but no such file tool exists"))?;
@@ -4008,6 +4029,90 @@ mod tests {
         let err =
             ToolHost::call_tool(&mut app, "manifest_describe", &json!({ "section": "nope" })).unwrap_err();
         assert!(err.contains("overview"), "{err}");
+    }
+
+    /// `/AGENTS.md` and the skill index have to reach the model, or they are just files.
+    ///
+    /// The prompt is rebuilt every turn from the workspace, so editing the instructions
+    /// or adding a skill takes effect on the next turn — no restart, no transcript
+    /// rewrite, which is the only reason they are stored as files at all.
+    #[test]
+    fn the_instructions_and_the_skill_index_reach_the_system_prompt() {
+        let mut app = test_app();
+        ToolHost::call_tool(
+            &mut app,
+            "agents_md",
+            &json!({ "action": "set", "text": "Pin 12 is the pump relay, active low.\nAsk before switching it." }),
+        )
+        .expect("agents_md set");
+        ToolHost::call_tool(
+            &mut app,
+            "fs_write",
+            &json!({ "path": "/skills/deploy.md", "text": "# deploy\ndescription: roll the portal forward safely\n1. snapshot\n2. flash\n" }),
+        )
+        .expect("skill written");
+
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        app.attach_model_transport(Box::new(StubModel { seen: seen.clone(), calls: 0 }));
+        app.route(&post(
+            "/api/agent/config",
+            r#"{"base_url":"http://127.0.0.1:9/v1/chat/completions","model":"stub","api_key":""}"#,
+        ));
+        app.agent.push_user("what is on pin 12?", "http", 0);
+        app.agent_run_once().expect("the turn should run");
+
+        let sent = seen.lock().unwrap();
+        let body: Value = serde_json::from_str(&sent[0].2).unwrap();
+        let system = body["messages"][0]["content"].as_str().expect("a system message");
+        assert_eq!(body["messages"][0]["role"], "system");
+        assert!(system.contains("Pin 12 is the pump relay"), "the instructions are missing: {system}");
+        assert!(system.contains("roll the portal forward safely"), "the skill index is missing: {system}");
+        assert!(!system.contains("1. snapshot"), "the skill *body* must not be in the prompt: {system}");
+        assert!(system.contains("skill_read"), "the prompt does not say how to load a skill: {system}");
+    }
+
+    /// A long file is carried as its head: the rest stays readable with `fs_read`.
+    #[test]
+    fn a_long_agents_md_is_cut_in_the_prompt_but_still_readable() {
+        let mut app = test_app();
+        let long = format!("rule: {}\n", "x".repeat(1600));
+        ToolHost::call_tool(&mut app, "agents_md", &json!({ "action": "set", "text": long }))
+            .expect("agents_md set");
+
+        let prompt = app.project_instructions().expect("instructions");
+        assert!(prompt.len() < 1600, "the prompt carried the whole file: {} bytes", prompt.len());
+        assert!(prompt.contains("truncated"), "{prompt}");
+        // ... and the tool still hands the model the whole thing when it asks.
+        let text = ToolHost::call_tool(&mut app, "agents_md", &json!({})).expect("read back");
+        assert!(text.len() > 1600, "the stored copy lost bytes: {}", text.len());
+    }
+
+    /// The three knowledge tools are on the wire and answer through the tool host.
+    #[test]
+    fn the_knowledge_tools_are_listed_and_answer() {
+        let mut app = test_app();
+        let names: Vec<String> = ToolHost::tool_specs(&app)
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|t| t["function"]["name"].as_str().map(|s| s.to_string()))
+            .collect();
+        for needle in ["skill_list", "skill_read", "agents_md"] {
+            assert!(names.contains(&needle.to_string()), "{needle} is missing: {names:?}");
+        }
+
+        ToolHost::call_tool(
+            &mut app,
+            "fs_write",
+            &json!({ "path": "/skills/pins.md", "text": "# pins\ndescription: GPIO map for the bench\n12 relay\n" }),
+        )
+        .unwrap();
+        let listed = ToolHost::call_tool(&mut app, "skill_list", &json!({})).unwrap();
+        assert!(listed.contains("pins") && listed.contains("GPIO map"), "{listed}");
+        let body = ToolHost::call_tool(&mut app, "skill_read", &json!({ "name": "pins" })).unwrap();
+        assert!(body.contains("12 relay"), "{body}");
+        let err = ToolHost::call_tool(&mut app, "skill_read", &json!({ "name": "missing" })).unwrap_err();
+        assert!(err.contains("pins"), "the error must list what exists: {err}");
     }
 
     /// A manifest must not be able to name a tool the endpoint will refuse.

@@ -104,6 +104,10 @@ pub trait ToolHost {
     fn tool_specs(&self) -> serde_json::Value;
     /// Run one tool call; the result is JSON text (<= 2 KB enforced here).
     fn call_tool(&mut self, name: &str, arguments: &serde_json::Value) -> Result<String, String>;
+    /// `/AGENTS.md`, already bounded by the host; `None` when there is none.
+    fn project_instructions(&self) -> Option<String> { None }
+    /// Skills the model may load on demand, as `(name, one-line description)`.
+    fn skills(&self) -> Vec<(String, String)> { Vec::new() }
 }
 
 pub struct Agent {

@@ -5,6 +5,7 @@
 //! their driver in [`crate::drivers`].
 
 pub mod fs;
+pub mod knowledge;
 pub mod net;
 
 use crate::capability::{cap, CapSet};

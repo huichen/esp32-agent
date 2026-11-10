@@ -108,6 +108,10 @@ board's own tools.
 - Tools: every MCP tool on the board, plus the file tools
   `fs_ls/fs_read/fs_write/fs_edit/fs_grep` over an NVS workspace, plus `net_get` /
   `net_post`. There is no shell — `ls` and `grep` are the parts of one that matter here
+- **Instructions and skills**: `/AGENTS.md` is injected into the system prompt (first
+  1 KB, the rest read with `fs_read`), and each `/skills/<name>.md` is listed by name and
+  one-line description until the model calls `skill_read` for it. Both live in the same
+  workspace, so the agent can write its own — [docs/agent-skills.md](docs/agent-skills.md)
 - Orchestration: `POST /api/sched` adds a scheduled prompt (`every_s` or `at_hhmm`
   plus the prompt) or a sensor rule (`tool` + `path` + `op` + `value`, rate limited);
   either way it enters the same one-slot queue as a user message
@@ -210,6 +214,7 @@ docs/                   architecture, manifest, capabilities, HTTP API, devices,
 - [Flashing and first setup](docs/flashing.md) — toolchain, partitions, the setup flow
 - [Troubleshooting](docs/troubleshooting.md) — dark panel, empty I2C scan, missing tools
 - [Agent loop contract](docs/agent-loop.md) and [agent stream](docs/agent-stream.md) — the on-board loop and its API
+- [Instructions and skills](docs/agent-skills.md) — `/AGENTS.md` and `/skills/<name>.md`
 
 ## Contributing
 

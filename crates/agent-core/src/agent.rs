@@ -152,6 +152,22 @@ pub trait ToolHost {
     fn tool_specs(&self) -> Value;
     /// Run one tool call; the result is JSON text (<= 2 KB enforced here).
     fn call_tool(&mut self, name: &str, arguments: &Value) -> Result<String, String>;
+
+    /// Project instructions that always apply, already bounded by the host.
+    ///
+    /// `None` is the normal state: a board with no `/AGENTS.md` behaves exactly as it
+    /// did before the file existed.
+    fn project_instructions(&self) -> Option<String> {
+        None
+    }
+
+    /// Skills the model may load on demand, as `(name, one-line description)`.
+    ///
+    /// Only the index goes into the prompt; the body arrives when the model calls
+    /// `skill_read`. A host that has no skills returns nothing.
+    fn skills(&self) -> Vec<(String, String)> {
+        Vec::new()
+    }
 }
 
 /// One step of a turn: ask the model, or finish.
@@ -346,7 +362,7 @@ impl Agent {
         self.turn_limit = max_steps.max(1);
         self.turn_tools = host.tool_specs();
         self.emit("message_start", now_ms(), |_| {});
-        Some(self.ask())
+        Some(self.ask(host))
     }
 
     /// Consume one model reply: journal it, run the tool calls it asked for, and say
@@ -486,12 +502,12 @@ impl Agent {
         // turn makes that impossible until the next user message, and it also keeps
         // showing a tool that a manifest change removed.
         self.turn_tools = host.tool_specs();
-        self.ask()
+        self.ask(host)
     }
 
     /// The request for the next model call, from the current transcript.
-    fn ask(&self) -> AgentStep {
-        AgentStep::Ask { messages: self.openai_messages(), tools: self.turn_tools.clone() }
+    fn ask(&self, host: &dyn ToolHost) -> AgentStep {
+        AgentStep::Ask { messages: self.openai_messages(host), tools: self.turn_tools.clone() }
     }
 
     /// Drain `pending`, run the loop, append messages. Returns the final text.
@@ -567,14 +583,41 @@ impl Agent {
             .sum()
     }
 
-    /// The request payload: the generated system prompt followed by the history.
-    fn openai_messages(&self) -> Value {
+    /// The request payload: the generated system prompt, the host's own context, and
+    /// then the history.
+    fn openai_messages(&self, host: &dyn ToolHost) -> Value {
         let mut out = Vec::with_capacity(self.history.len() + 1);
-        out.push(json!({ "role": Role::System.as_str(), "content": system_prompt() }));
+        out.push(json!({ "role": Role::System.as_str(), "content": self.system_message(host) }));
         for message in &self.history {
             out.push(openai_message(message));
         }
         Value::Array(out)
+    }
+
+    /// The static prompt plus whatever the host contributes: project instructions and
+    /// the skill index.
+    ///
+    /// It is kept per run rather than in NVS because it must follow the files: editing
+    /// `/AGENTS.md` or adding a skill takes effect on the next turn, with no restart and
+    /// no transcript rewrite.
+    fn system_message(&self, host: &dyn ToolHost) -> String {
+        let mut text = String::from(system_prompt());
+        if let Some(instructions) = host.project_instructions() {
+            text.push_str("\n\n## Project instructions (/AGENTS.md)\nThese are the rules for this installation; follow them.\n");
+            text.push_str(&instructions);
+        }
+        let skills = host.skills();
+        if !skills.is_empty() {
+            text.push_str(
+                "\n\n## Skills\nEach line is `name: description`. When one matches the task, call \
+                 skill_read {name} first and follow the text you get; do not reconstruct a procedure \
+                 from its description.\n",
+            );
+            for (name, description) in &skills {
+                text.push_str(&format!("- {name}: {description}\n"));
+            }
+        }
+        text
     }
 }
 
