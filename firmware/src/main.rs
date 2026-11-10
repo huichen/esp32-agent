@@ -266,11 +266,11 @@ fn run() -> anyhow::Result<()> {
     // The agent runs on its own thread: one tick a second for the schedule, and the
     // queued turn if there is one. The transport has to exist before the first tick,
     // because both the model call and the `net_*` tools draw on it.
-    let agent_timeout = agent::attach(&app, &log);
+    let (agent_timeout, agent_transport) = agent::attach(&app, &log);
     // A board that cannot start the agent thread is still a working board: the
     // portal, the MCP endpoint and the tools do not depend on it. Say so on the
     // serial console instead of taking the whole firmware down with it.
-    if let Err(e) = agent::start(app.clone(), log.clone(), agent_timeout) {
+    if let Err(e) = agent::start(app.clone(), log.clone(), agent_timeout, agent_transport) {
         log::error!("agent thread did not start: {e}");
         log.error("agent", format!("agent thread did not start: {e}"));
     }

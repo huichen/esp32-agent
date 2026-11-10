@@ -154,6 +154,14 @@ pub trait ToolHost {
     fn call_tool(&mut self, name: &str, arguments: &Value) -> Result<String, String>;
 }
 
+/// One step of a turn: ask the model, or finish.
+pub enum AgentStep {
+    /// Carry these to the model, then hand the reply back to [`Agent::apply`].
+    Ask { messages: Value, tools: Value },
+    /// The turn ended, with the final text or the error that stopped it.
+    Done(Result<String, String>),
+}
+
 /// The transcript plus the queue. Lives behind the app mutex.
 #[derive(Default)]
 pub struct Agent {
@@ -168,6 +176,10 @@ pub struct Agent {
     /// Token accounting, per run and cumulative.
     pub usage_run: llm::Usage,
     pub usage_total: llm::Usage,
+    /// Per-turn bookkeeping, set by `begin` so `apply` can stop at the limit.
+    turn_steps: u8,
+    turn_limit: u8,
+    turn_tools: Value,
 }
 
 /// One journal entry. The kinds are the host agent's event names on purpose
@@ -301,11 +313,159 @@ impl Agent {
         self.runs = 0;
     }
 
+    /// One step of a turn, as handed back to whoever drives it.
+    ///
+    /// `Ask` carries everything a model call needs and nothing that borrows the agent,
+    /// which is the whole point: the caller can drop its lock, make the call, and come
+    /// back with [`Agent::apply`].
+    pub fn begin(
+        &mut self,
+        host: &mut dyn ToolHost,
+        now_ms: fn() -> u64,
+        max_steps: u8,
+    ) -> Option<AgentStep> {
+        let user = self.pending.take()?;
+        self.runs = self.runs.saturating_add(1);
+        self.history.push(user);
+        self.trim();
+        self.usage_run = llm::Usage::default();
+        self.turn_steps = 0;
+        self.turn_limit = max_steps.max(1);
+        self.turn_tools = host.tool_specs();
+        self.emit("message_start", now_ms(), |_| {});
+        Some(self.ask())
+    }
+
+    /// Consume one model reply: journal it, run the tool calls it asked for, and say
+    /// what to do next.
+    pub fn apply(
+        &mut self,
+        host: &mut dyn ToolHost,
+        reply: Result<llm::ModelReply, String>,
+        now_ms: fn() -> u64,
+    ) -> AgentStep {
+        let reply = match reply {
+            Ok(reply) => reply,
+            Err(e) => {
+                self.last_error = e.clone();
+                self.emit("error", now_ms(), |ev| ev.text = e.clone());
+                self.emit("run_end", now_ms(), |ev| ev.is_error = true);
+                return AgentStep::Done(Err(e));
+            }
+        };
+        self.turn_steps = self.turn_steps.saturating_add(1);
+
+        // Journal in the host agent's order: usage, reasoning, then the visible text,
+        // then one `tool_use` per call it asked for.
+        self.usage_run.prompt_tokens = self.usage_run.prompt_tokens.saturating_add(reply.usage.prompt_tokens);
+        self.usage_run.completion_tokens =
+            self.usage_run.completion_tokens.saturating_add(reply.usage.completion_tokens);
+        self.usage_total.prompt_tokens =
+            self.usage_total.prompt_tokens.saturating_add(reply.usage.prompt_tokens);
+        self.usage_total.completion_tokens =
+            self.usage_total.completion_tokens.saturating_add(reply.usage.completion_tokens);
+        self.emit("usage", now_ms(), |ev| {
+            ev.prompt_tokens = reply.usage.prompt_tokens;
+            ev.completion_tokens = reply.usage.completion_tokens;
+        });
+        if !reply.reasoning.is_empty() {
+            let reasoning = reply.reasoning.clone();
+            self.emit("thinking_start", now_ms(), |_| {});
+            self.emit("thinking_delta", now_ms(), |ev| ev.text = reasoning.clone());
+            self.emit("thinking_end", now_ms(), |_| {});
+        }
+        if !reply.content.is_empty() {
+            let text = reply.content.clone();
+            self.emit("text_start", now_ms(), |_| {});
+            self.emit("text_delta", now_ms(), |ev| ev.text = text.clone());
+            self.emit("text_end", now_ms(), |_| {});
+        }
+
+        if reply.tool_calls.is_empty() {
+            let text = llm::truncate_bytes(&reply.content, MAX_REPLY_BYTES);
+            self.history.push(Message::assistant_with_reasoning(
+                &text,
+                &reply.reasoning,
+                Vec::new(),
+                now_ms(),
+            ));
+            self.trim();
+            self.last_error.clear();
+            self.emit("message_end", now_ms(), |_| {});
+            self.emit("run_end", now_ms(), |_| {});
+            return AgentStep::Done(Ok(text));
+        }
+
+        for call in &reply.tool_calls {
+            let call_id = call.id.clone();
+            let name = call.name.clone();
+            self.emit("tool_use", now_ms(), |ev| {
+                ev.tool_call_id = Some(call_id.clone());
+                ev.name = Some(name.clone());
+                ev.text = call.arguments.to_string();
+            });
+        }
+        self.history.push(Message::assistant_with_reasoning(
+            &reply.content,
+            &reply.reasoning,
+            reply.tool_calls.clone(),
+            now_ms(),
+        ));
+        for call in &reply.tool_calls {
+            let at = now_ms();
+            let mut is_error = false;
+            let result = match llm::arguments_error(call) {
+                // The model's argument string was not JSON: report it as a
+                // tool error and do not guess at what it meant.
+                Some(err) => {
+                    is_error = true;
+                    json!({ "error": format!("arguments: {err}") }).to_string()
+                }
+                None if call.name.trim().is_empty() => {
+                    is_error = true;
+                    json!({ "error": "tool call without a name" }).to_string()
+                }
+                None => match host.call_tool(&call.name, &call.arguments) {
+                    Ok(text) => text,
+                    Err(e) => {
+                        is_error = true;
+                        json!({ "error": e }).to_string()
+                    }
+                },
+            };
+            self.emit("tool_result", at, |ev| {
+                ev.tool_call_id = Some(call.id.clone());
+                ev.name = Some(call.name.clone());
+                ev.text = result.clone();
+                ev.is_error = is_error;
+            });
+            // `Message::tool_result` owns the 2 KB cut; the marker tells the model
+            // the result it sees is incomplete.
+            self.history.push(Message::tool_result(&call.id, &result, is_error, at));
+        }
+        self.trim();
+
+        if self.turn_steps >= self.turn_limit {
+            let err = format!("agent: step limit {} reached before a final answer", self.turn_limit);
+            self.last_error = err.clone();
+            self.emit("error", now_ms(), |ev| ev.text = err.clone());
+            self.emit("run_end", now_ms(), |ev| ev.is_error = true);
+            return AgentStep::Done(Err(err));
+        }
+        self.ask()
+    }
+
+    /// The request for the next model call, from the current transcript.
+    fn ask(&self) -> AgentStep {
+        AgentStep::Ask { messages: self.openai_messages(), tools: self.turn_tools.clone() }
+    }
+
     /// Drain `pending`, run the loop, append messages. Returns the final text.
     ///
-    /// A run with nothing queued is `Ok("")`: the scheduler may tick every
-    /// second without producing work. On error the tool results already gathered
-    /// stay in the history, so the next turn can continue from them.
+    /// This holds the host for the whole turn, which is what a test or the simulator
+    /// wants. A platform that has other things to answer (the firmware's HTTP server)
+    /// uses [`Agent::begin`]/[`Agent::apply`] through `App::drive_agent` instead, so the
+    /// model call happens with nothing locked.
     pub fn run_pending(
         &mut self,
         host: &mut dyn ToolHost,
@@ -313,129 +473,19 @@ impl Agent {
         cfg: &LlmConfig,
         now_ms: fn() -> u64,
     ) -> Result<String, String> {
-        let Some(user) = self.pending.take() else {
-            return Ok(String::new());
+        let mut step = match self.begin(host, now_ms, cfg.max_steps) {
+            Some(step) => step,
+            None => return Ok(String::new()),
         };
-        self.runs = self.runs.saturating_add(1);
-        self.history.push(user);
-        self.trim();
-        self.usage_run = llm::Usage::default();
-        self.emit("message_start", now_ms(), |_| {});
-
-        let tools = host.tool_specs();
-        // A zeroed config still deserves one model call rather than a silent
-        // empty answer.
-        let max_steps = cfg.max_steps.max(1);
-
-        for _ in 0..max_steps {
-            let messages = self.openai_messages();
-            let reply = match llm::chat(transport, cfg, &messages, &tools) {
-                Ok(reply) => reply,
-                Err(e) => {
-                    self.last_error = e.clone();
-                    self.emit("error", now_ms(), |ev| ev.text = e.clone());
-                    self.emit("run_end", now_ms(), |ev| ev.is_error = true);
-                    return Err(e);
+        loop {
+            match step {
+                AgentStep::Ask { messages, tools } => {
+                    let reply = llm::chat(transport, cfg, &messages, &tools);
+                    step = self.apply(host, reply, now_ms);
                 }
-            };
-
-            // Journal in the host agent's order: reasoning first, then the visible
-            // text, then one `tool_use` per call it asked for.
-            self.usage_run.prompt_tokens =
-                self.usage_run.prompt_tokens.saturating_add(reply.usage.prompt_tokens);
-            self.usage_run.completion_tokens =
-                self.usage_run.completion_tokens.saturating_add(reply.usage.completion_tokens);
-            self.usage_total.prompt_tokens =
-                self.usage_total.prompt_tokens.saturating_add(reply.usage.prompt_tokens);
-            self.usage_total.completion_tokens =
-                self.usage_total.completion_tokens.saturating_add(reply.usage.completion_tokens);
-            self.emit("usage", now_ms(), |ev| {
-                ev.prompt_tokens = reply.usage.prompt_tokens;
-                ev.completion_tokens = reply.usage.completion_tokens;
-            });
-            if !reply.reasoning.is_empty() {
-                let reasoning = reply.reasoning.clone();
-                self.emit("thinking_start", now_ms(), |_| {});
-                self.emit("thinking_delta", now_ms(), |ev| ev.text = reasoning.clone());
-                self.emit("thinking_end", now_ms(), |_| {});
+                AgentStep::Done(result) => return result,
             }
-            if !reply.content.is_empty() {
-                let text = reply.content.clone();
-                self.emit("text_start", now_ms(), |_| {});
-                self.emit("text_delta", now_ms(), |ev| ev.text = text.clone());
-                self.emit("text_end", now_ms(), |_| {});
-            }
-
-            if reply.tool_calls.is_empty() {
-                let text = llm::truncate_bytes(&reply.content, MAX_REPLY_BYTES);
-                self.history.push(Message::assistant_with_reasoning(
-                    &text,
-                    &reply.reasoning,
-                    Vec::new(),
-                    now_ms(),
-                ));
-                self.trim();
-                self.last_error.clear();
-                self.emit("message_end", now_ms(), |_| {});
-                self.emit("run_end", now_ms(), |_| {});
-                return Ok(text);
-            }
-
-            for call in &reply.tool_calls {
-                let call_id = call.id.clone();
-                let name = call.name.clone();
-                self.emit("tool_use", now_ms(), |ev| {
-                    ev.tool_call_id = Some(call_id.clone());
-                    ev.name = Some(name.clone());
-                    ev.text = call.arguments.to_string();
-                });
-            }
-            self.history.push(Message::assistant_with_reasoning(
-                &reply.content,
-                &reply.reasoning,
-                reply.tool_calls.clone(),
-                now_ms(),
-            ));
-            for call in &reply.tool_calls {
-                let at = now_ms();
-                let mut is_error = false;
-                let result = match llm::arguments_error(call) {
-                    // The model's argument string was not JSON: report it as a
-                    // tool error and do not guess at what it meant.
-                    Some(err) => {
-                        is_error = true;
-                        json!({ "error": format!("arguments: {err}") }).to_string()
-                    }
-                    None if call.name.trim().is_empty() => {
-                        is_error = true;
-                        json!({ "error": "tool call without a name" }).to_string()
-                    }
-                    None => match host.call_tool(&call.name, &call.arguments) {
-                        Ok(text) => text,
-                        Err(e) => {
-                            is_error = true;
-                            json!({ "error": e }).to_string()
-                        }
-                    },
-                };
-                self.emit("tool_result", at, |ev| {
-                    ev.tool_call_id = Some(call.id.clone());
-                    ev.name = Some(call.name.clone());
-                    ev.text = result.clone();
-                    ev.is_error = is_error;
-                });
-                // `Message::tool_result` owns the 2 KB cut; the marker tells the
-                // model the result it sees is incomplete.
-                self.history.push(Message::tool_result(&call.id, &result, is_error, at));
-            }
-            self.trim();
         }
-
-        let err = format!("agent: step limit {max_steps} reached before a final answer");
-        self.last_error = err.clone();
-        self.emit("error", now_ms(), |ev| ev.text = err.clone());
-        self.emit("run_end", now_ms(), |ev| ev.is_error = true);
-        Err(err)
     }
 
     /// Append one journal entry, keeping the ring bounded.

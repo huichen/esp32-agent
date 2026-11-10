@@ -5,7 +5,7 @@
 //! I2C bus, one display), so serialising tool calls costs nothing real and
 //! removes a whole class of concurrency bugs.
 
-use crate::agent::{Agent, ToolHost};
+use crate::agent::{Agent, AgentStep, ToolHost};
 use crate::boards::{self, BoardProfile};
 use crate::capability::CapSet;
 use crate::config::Config;
@@ -14,6 +14,7 @@ use crate::drivers;
 use crate::error::{code, McpError, Result};
 use crate::hardware::Hardware;
 use crate::http::{Handler, Request, Response};
+use crate::llm;
 use crate::llm::{ChatTransport, LlmConfig};
 use crate::logbuf::LogBuf;
 use crate::manifest::{Manifest, NVS_KEY_MANIFEST};
@@ -98,10 +99,6 @@ pub struct App {
     /// Outbound HTTP for `net_*` and for the model call. The platform layer
     /// attaches it once; host tests leave it empty so nothing reaches the net.
     pub transport: Option<Box<dyn ChatTransport + Send>>,
-    /// The model call moves this one out, so `transport` stays available to the
-    /// `net_*` tools while a turn is in flight; sharing one instance made every
-    /// `net_*` call inside the loop report that no transport was attached.
-    pub model_transport: Option<Box<dyn ChatTransport + Send>>,
     session_counter: u64,
 }
 
@@ -145,7 +142,6 @@ impl App {
             rules: Vec::new(),
             workspace: AppWorkspace::default(),
             transport: None,
-            model_transport: None,
             session_counter: 0,
         };
         app.log.info(
@@ -591,46 +587,37 @@ impl App {
         }
     }
 
-    /// Hand over the HTTP client the model call and the `net_*` tools use.
+    /// Hand over the HTTP client the `net_*` tools use. The model call has its own,
+    /// owned by whoever drives the turn (`drive_agent`), so a `net_*` call inside a
+    /// turn and the model request never compete for one client.
     pub fn attach_transport(&mut self, transport: Box<dyn ChatTransport + Send>) {
         self.transport = Some(transport);
     }
 
-    /// The loop's own transport. A platform that can build two cheap clients should
-    /// call this too: the turn moves its transport out of `App`, so a `net_*` call
-    /// inside that same turn would otherwise find none.
-    pub fn attach_model_transport(&mut self, transport: Box<dyn ChatTransport + Send>) {
-        self.model_transport = Some(transport);
+    /// Phase 1 of a turn, and the answer to "is there work": take the queued message,
+    /// journal it, and hand back the request the model should be asked.
+    ///
+    /// Nothing here touches the network, so the caller holds the lock for a few
+    /// microseconds. `None` means nothing was queued.
+    pub fn agent_begin(&mut self) -> Option<AgentStep> {
+        let max_steps = self.llm.max_steps;
+        self.with_agent(move |agent, host| agent.begin(host, now_ms, max_steps))
     }
 
-    /// Run one queued agent turn, if there is one.
-    ///
-    /// The transcript and the tool host both live on `App`, so the borrow has to be
-    /// split here rather than at the call site: the agent is moved out, the transport
-    /// is moved out, and both go back afterwards. Returns `None` when nothing is
-    /// queued, so a platform thread can call this every second without cost.
-    pub fn run_agent_turn(&mut self) -> Option<std::result::Result<String, String>> {
-        self.agent.pending.as_ref()?;
+    /// Phase 2: fold one model reply back in (journal, tool calls, transcript) and say
+    /// whether to ask again.
+    pub fn agent_reply(&mut self, reply: std::result::Result<llm::ModelReply, String>) -> AgentStep {
+        self.with_agent(move |agent, host| agent.apply(host, reply, now_ms))
+    }
+
+    /// Run a closure with the agent moved out of the app, so it can borrow the app
+    /// itself as the tool host. It goes back afterwards, which is why the portal still
+    /// sees the transcript between phases.
+    fn with_agent<R>(&mut self, run: impl FnOnce(&mut Agent, &mut App) -> R) -> R {
         let mut agent = std::mem::replace(&mut self.agent, Agent::new());
-        let llm = self.llm.clone();
-        let mut transport = match self.model_transport.take() {
-            Some(t) => Some(t),
-            None => self.transport.take(),
-        };
-        let outcome = match transport.as_deref_mut() {
-            Some(t) => agent.run_pending(self, t, &llm, now_ms),
-            None => Err("no HTTP transport attached to the board".to_string()),
-        };
-        if self.model_transport.is_none() && transport.is_some() {
-            self.model_transport = transport;
-        } else {
-            self.transport = transport;
-        }
+        let out = run(&mut agent, self);
         self.agent = agent;
-        if let Err(e) = &outcome {
-            self.agent.last_error = e.clone();
-        }
-        Some(outcome)
+        out
     }
 
     /// Evaluate the schedule once and queue whatever came due.
@@ -2119,6 +2106,12 @@ pub fn now_ms() -> u64 {
 /// round, and a final answer quoting the tool result once one is present.
 fn selftest_completion(req: &Request) -> Value {
     let body = req.json().unwrap_or(Value::Null);
+    // `model: "selftest-slow"` makes this endpoint take 2.5 s to answer. It exists so a
+    // bench run can measure what the rest of the board does *while* a model is
+    // thinking: with the turn split into phases, the portal should not notice at all.
+    if body.get("model").and_then(Value::as_str).map(|m| m.contains("slow")).unwrap_or(false) {
+        std::thread::sleep(std::time::Duration::from_millis(2500));
+    }
     let empty = Vec::new();
     let messages = body.get("messages").and_then(|m| m.as_array()).unwrap_or(&empty);
     let has_tool = |name: &str| {
@@ -2260,6 +2253,41 @@ fn seed() -> u64 {
 }
 
 /// Wrap an `App` in the HTTP handler the server expects.
+/// Run one queued agent turn against a shared `App`, holding the lock only for the
+/// parts that need it.
+///
+/// This is the shape a platform wants: the model call - seconds of network - happens
+/// with nothing locked, so the portal, `/api/status` and every other handler keep
+/// answering while the model thinks. Before this split the whole turn ran inside the
+/// lock and a slow model stalled the board's own UI.
+///
+/// Returns `None` when nothing is queued, `Some(Ok(text))` for a finished turn and
+/// `Some(Err(why))` for a turn that failed (already journaled by the agent).
+pub fn drive_agent(
+    app: &Mutex<App>,
+    transport: &mut dyn ChatTransport,
+) -> Option<std::result::Result<String, String>> {
+    fn lock(app: &Mutex<App>) -> std::sync::MutexGuard<'_, App> {
+        match app.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+
+    let mut step = lock(app).agent_begin()?;
+    loop {
+        match step {
+            AgentStep::Ask { messages, tools } => {
+                let cfg = lock(app).llm.clone();
+                // No lock held across this call: it is the one thing here that blocks.
+                let reply = llm::chat(transport, &cfg, &messages, &tools);
+                step = lock(app).agent_reply(reply);
+            }
+            AgentStep::Done(result) => return Some(result),
+        }
+    }
+}
+
 pub fn make_handler(app: Shared) -> Handler {
     Arc::new(move |req: &Request| {
         // The self-test model is answered *before* taking the lock. The agent thread
@@ -2593,6 +2621,76 @@ mod tests {
             ToolHost::call_tool(&mut app, "fs_grep", &json!({ "pattern": "brown fox", "path": "/bench" }))
                 .expect("grep");
         assert!(grep.contains("\"count\":1"), "grep must find the file it can read: {grep}");
+    }
+
+    /// A turn in flight must not own the app while the model is thinking.
+    ///
+    /// This is the whole reason the turn is split into phases: with the model call
+    /// inside the lock, a slow answer stalled the portal, `/api/status` and every
+    /// other handler. The assertion is on wall time, because that is what the user
+    /// feels.
+    #[test]
+    fn a_run_in_flight_does_not_hold_the_app_lock() {
+        use std::sync::{Arc, Mutex};
+        use std::time::{Duration, Instant};
+
+        /// A model that takes 600 ms and then answers plainly.
+        struct SlowModel;
+        impl crate::llm::ChatTransport for SlowModel {
+            fn post_json(
+                &mut self,
+                _url: &str,
+                _headers: &[(&str, &str)],
+                _body: &str,
+            ) -> std::result::Result<String, String> {
+                std::thread::sleep(Duration::from_millis(600));
+                Ok(json!({
+                    "choices": [{ "message": { "role": "assistant", "content": "slow answer" } }]
+                })
+                .to_string())
+            }
+        }
+
+        let app = Arc::new(Mutex::new(test_app()));
+        {
+            let mut guard = app.lock().unwrap();
+            guard.route(&post(
+                "/api/agent/config",
+                r#"{"base_url":"http://192.0.2.10:8899/v1/chat/completions","model":"slow","max_steps":3,"api_key":""}"#,
+            ));
+            guard.agent.push_user("how is the board?", "http", 1);
+        }
+
+        let app_for_run = app.clone();
+        let run = std::thread::spawn(move || {
+            let mut model = SlowModel;
+            drive_agent(&app_for_run, &mut model)
+        });
+
+        // Let the run get as far as the model call, then act like the portal.
+        std::thread::sleep(Duration::from_millis(150));
+        let started = Instant::now();
+        let resp = {
+            let mut guard = app.lock().unwrap();
+            guard.route(&get("/api/status"))
+        };
+        let waited = started.elapsed();
+        assert_eq!(resp.status, 200, "the portal must still answer");
+        assert!(
+            waited < Duration::from_millis(300),
+            "the app lock was held for {waited:?} while the model was thinking"
+        );
+
+        // The transcript is readable mid-run too: the agent is only moved out for the
+        // duration of a phase, not for the whole call.
+        let mid_run = {
+            let mut guard = app.lock().unwrap();
+            guard.route(&get("/api/agent/history?after=0"))
+        };
+        assert_eq!(mid_run.status, 200);
+
+        let outcome = run.join().expect("the run thread");
+        assert!(matches!(outcome, Some(Ok(_))), "the turn still finishes");
     }
 
     #[test]

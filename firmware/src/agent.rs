@@ -405,11 +405,18 @@ fn read_error(e: &std::io::Error, timeout: Duration) -> String {
 /// Called once from `main` after the radio and the HTTP server are up: a board with
 /// no address can neither reach a model nor be reached by the portal, and a thread
 /// that ticks earlier would only produce connection errors.
-pub fn start(shared: Shared, log: Arc<LogBuf>, timeout_s: Arc<AtomicU32>) -> Result<(), String> {
+pub fn start(
+    shared: Shared,
+    log: Arc<LogBuf>,
+    timeout_s: Arc<AtomicU32>,
+    transport: EspHttpTransport,
+) -> Result<(), String> {
     std::thread::Builder::new()
         .name("mcp-agent".into())
         .stack_size(STACK_BYTES)
-        .spawn(move || run_loop(shared, log, timeout_s))
+        // The model transport lives on this thread, not in the `App`: a turn is run in
+        // phases precisely so that the model call happens with the app lock released.
+        .spawn(move || run_loop(shared, log, timeout_s, transport))
         .map(|_| ())
         .map_err(|e| format!("could not start the agent thread: {e}"))
 }
@@ -418,17 +425,15 @@ pub fn start(shared: Shared, log: Arc<LogBuf>, timeout_s: Arc<AtomicU32>) -> Res
 ///
 /// Returns the timeout handle the thread keeps, so a portal edit takes effect on the
 /// next tick instead of on the next reboot.
-pub fn attach(shared: &Shared, log: &LogBuf) -> Arc<AtomicU32> {
+pub fn attach(shared: &Shared, log: &LogBuf) -> (Arc<AtomicU32>, EspHttpTransport) {
     let transport = EspHttpTransport::new();
     let handle = transport.timeout_handle();
     let mut app = lock(shared);
     handle.store(clamp_timeout(app.llm.timeout_s), Ordering::Relaxed);
     let model = app.llm.model.clone();
     let url = app.llm.base_url.clone();
+    // One client stays in the `App` for the `net_*` tools.
     app.attach_transport(Box::new(EspHttpTransport::new()));
-    // A second client for the loop itself: during a turn the model call owns its
-    // transport, and the `net_*` tools need one that is still there.
-    app.attach_model_transport(Box::new(EspHttpTransport::new()));
     drop(app);
 
     log.info("agent", "HTTP transport attached to the agent (plain http only, no TLS)");
@@ -440,12 +445,18 @@ pub fn attach(shared: &Shared, log: &LogBuf) -> Arc<AtomicU32> {
     } else {
         log.info("agent", format!("model `{model}` at {}", llm::body_prefix(&url, 96)));
     }
-    handle
+    // ...and this one belongs to the agent thread, which owns it for the model call.
+    (handle, transport)
 }
 
 // ---------------------------------------------------------------- the thread
 
-fn run_loop(shared: Shared, log: Arc<LogBuf>, timeout_s: Arc<AtomicU32>) {
+fn run_loop(
+    shared: Shared,
+    log: Arc<LogBuf>,
+    timeout_s: Arc<AtomicU32>,
+    mut transport: EspHttpTransport,
+) {
     log.info("agent", format!("agent thread up: tick {TICK_MS} ms, scheduler clock {}", clock_note()));
     if now_ms() / 1000 < CLOCK_SET_AFTER_S {
         log.warn(
@@ -458,8 +469,7 @@ fn run_loop(shared: Shared, log: Arc<LogBuf>, timeout_s: Arc<AtomicU32>) {
         std::thread::sleep(Duration::from_millis(TICK_MS));
         let now = now_ms();
         let minute = minute_of_day(now);
-        let mut app = lock(&shared);
-        tick(&mut app, now, minute, &timeout_s, &log);
+        tick(&shared, &mut transport, now, minute, &timeout_s, &log);
     }
 }
 
@@ -472,37 +482,55 @@ fn run_loop(shared: Shared, log: Arc<LogBuf>, timeout_s: Arc<AtomicU32>) {
 /// and it takes an `App` plus an explicit clock rather than doing its own sleeping,
 /// so the same function can be driven on the host with a virtual board and a stub
 /// model instead of only on the bench.
-fn tick(app: &mut App, now: u64, minute: u32, timeout_s: &AtomicU32, log: &LogBuf) {
-    // The wall clock only becomes real when SNTP lands, a second or two in. Until then
-    // `uptime_s` reports zero rather than the decades between 1970 and now; this is
-    // where it gets re-anchored, once.
-    if app.runtime.rebase_uptime(now) {
-        log.info("agent", "wall clock set; uptime counts from this tick onwards");
-    }
-    // A portal edit to the timeout must reach the next request, not the next boot.
-    let configured = clamp_timeout(app.llm.timeout_s);
-    if timeout_s.load(Ordering::Relaxed) != configured {
-        timeout_s.store(configured, Ordering::Relaxed);
-        log.info("agent", format!("model timeout is now {configured} s"));
-    }
+fn tick(
+    shared: &Shared,
+    transport: &mut EspHttpTransport,
+    now: u64,
+    minute: u32,
+    timeout_s: &AtomicU32,
+    log: &LogBuf,
+) {
+    // Everything that needs the transcript or the tools happens in a short phase under
+    // the lock; the model call below happens with it released, so the portal keeps
+    // answering while the model thinks.
+    let queued = {
+        let mut app = lock(shared);
+        // The wall clock only becomes real when SNTP lands, a second or two in. Until
+        // then `uptime_s` reports zero rather than the decades between 1970 and now;
+        // this is where it gets re-anchored, once.
+        if app.runtime.rebase_uptime(now) {
+            log.info("agent", "wall clock set; uptime counts from this tick onwards");
+        }
+        // A portal edit to the timeout must reach the next request, not the next boot.
+        let configured = clamp_timeout(app.llm.timeout_s);
+        if timeout_s.load(Ordering::Relaxed) != configured {
+            timeout_s.store(configured, Ordering::Relaxed);
+            log.info("agent", format!("model timeout is now {configured} s"));
+        }
 
-    // Schedule first: a task that comes due on this tick runs on this tick, under the
-    // same lock, so nothing races for the one queue slot.
-    for source in app.sched_tick(now, minute) {
-        log.info("agent", format!("scheduler queued {source}"));
-    }
+        // Schedule first: a task that comes due on this tick runs on this tick.
+        for source in app.sched_tick(now, minute) {
+            log.info("agent", format!("scheduler queued {source}"));
+        }
 
-    if app.agent.pending.is_none() {
+        app.agent.pending.as_ref().map(|pending| {
+            (
+                pending.source.clone(),
+                app.llm.max_steps.max(1),
+                clamp_timeout(app.llm.timeout_s),
+            )
+        })
+    };
+
+    let Some((source, steps, timeout)) = queued else {
         return;
-    }
-    let source = app.agent.pending.as_ref().map(|p| p.source.clone()).unwrap_or_default();
-    let steps = app.llm.max_steps.max(1);
-    let timeout = clamp_timeout(app.llm.timeout_s);
-    // Logged before the call: the run holds the app lock, so the portal cannot answer
-    // while it is in flight and the bench should see why.
-    log.info("agent", format!("run starting (source `{source}`, <= {steps} step(s), {timeout} s per call)"));
+    };
+    log.info(
+        "agent",
+        format!("run starting (source `{source}`, <= {steps} step(s), {timeout} s per call)"),
+    );
     let started = Instant::now();
-    match app.run_agent_turn() {
+    match esp32_agent_core::app::drive_agent(shared, transport) {
         Some(Ok(text)) if text.is_empty() => {
             log.info("agent", format!("run finished with no text after {} ms", started.elapsed().as_millis()))
         }
@@ -518,8 +546,6 @@ fn tick(app: &mut App, now: u64, minute: u32, timeout_s: &AtomicU32, log: &LogBu
             "agent",
             format!("run failed after {} ms: {}", started.elapsed().as_millis(), llm::body_prefix(&e, 200)),
         ),
-        // `pending` was checked above, so this is unreachable rather than a case worth
-        // reporting.
         None => {}
     }
 }
