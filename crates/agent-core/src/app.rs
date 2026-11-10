@@ -2119,6 +2119,30 @@ fn selftest_completion(req: &Request) -> Value {
         .map(|m| m["content"].as_str().unwrap_or("").to_lowercase())
         .unwrap_or_default();
 
+    // A question about tools is answered from the specs the board actually sent, so a
+    // bench run can show the agent's real tool set without a model behind it.
+    let tool_names: Vec<String> = body["tools"]
+        .as_array()
+        .map(|tools| {
+            tools.iter().filter_map(|t| t["function"]["name"].as_str().map(|s| s.to_string())).collect()
+        })
+        .unwrap_or_default();
+    if (ask.contains("tool") || ask.contains("工具")) && !tool_names.is_empty() {
+        return json!({
+            "id": "selftest",
+            "object": "chat.completion",
+            "model": "selftest",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": format!("I was handed {} tools: {}", tool_names.len(), tool_names.join(", ")),
+                },
+                "finish_reason": "stop",
+            }],
+        });
+    }
+
     // Three scripts, chosen by what the user asked for, so one bench run can show
     // each tool family working: the board's own tools, the file workspace, and the
     // HTTP client (which talks to an external host). The file script walks write ->
@@ -2126,8 +2150,12 @@ fn selftest_completion(req: &Request) -> Value {
     const WRITE: (&str, &str) =
         ("fs_write", r#"{"path":"/bench/hello.txt","text":"written by the self-test turn"}"#);
     const READ: (&str, &str) = ("fs_read", r#"{"path":"/bench/hello.txt"}"#);
-    const GREP: (&str, &str) = ("fs_grep", r#"{"pattern":"self-test","path":"/bench"}"#);
-    let steps: &[(&str, &str)] = if ask.contains("file") {
+    const EDIT: (&str, &str) =
+        ("fs_edit", r#"{"path":"/bench/hello.txt","find":"self-test","replace":"edited"}"#);
+    const GREP: (&str, &str) = ("fs_grep", r#"{"pattern":"edited","path":"/bench"}"#);
+    let steps: &[(&str, &str)] = if ask.contains("edit") || ask.contains("改") {
+        &[WRITE, EDIT, READ]
+    } else if ask.contains("file") || ask.contains("文件") {
         &[WRITE, READ, GREP]
     } else if ask.contains("net") || ask.contains("http") {
         &[("net_get", r#"{"url":"http://example.com/"}"#)]
