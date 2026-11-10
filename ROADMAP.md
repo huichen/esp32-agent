@@ -33,7 +33,7 @@
 6. **I2S 音频**：INMP441 麦克风 + MAX98357A 功放 → `mic_level`、`tone`、`record`。
 7. **驱动扩充**：DHT11/22、RC522、VL53L0X、BH1750、BME680、SD 卡、步进电机。
 8. **清单模板库**：`examples/manifests/` 长成"设备配方"集合，网页里一键导入。
-9. **能力注册表**：把 `docs/capabilities.md` 的表格变成 CI 校验的单一来源。
+9. **能力注册表**：把 `docs/capabilities.md` 的表格变成 `scripts/` 里一条校验命令的单一来源（仓库不带 CI）。
 10. **多总线/多设备 UI**：现在同一 kind 的第二台设备会有 `_2` 后缀，网页里还看不出区别。
 
 ## 长期
