@@ -1,81 +1,102 @@
-# HTTP 与 MCP 接口
+# HTTP and MCP interfaces
 
-同一个端口同时提供网页控制台和 MCP 端点（默认 `8080`，`config.mcp.port` 可改）。
+One port serves both the web console and the MCP endpoint (default `8080`, changeable
+through `config.mcp.port`).
 
-## 1. MCP 端点
+## 1. MCP endpoint
 
-`POST /mcp`（`config.mcp.path` 可改）。Streamable HTTP，无 SSE。
+`POST /mcp` (changeable through `config.mcp.path`). Streamable HTTP, without SSE.
 
 ```bash
-# 列工具
+# list tools
 curl -sS -X POST http://<ip>:8080/mcp \
   -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' \
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
 
-# 调工具
+# call a tool
 curl -sS -X POST http://<ip>:8080/mcp -H 'Content-Type: application/json' \
   -d '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"board_status","arguments":{}}}'
 ```
 
-支持的 JSON-RPC 方法：`initialize`、`ping`、`tools/list`、`tools/call`、`resources/list`、
-`resources/read`、`resources/templates/list`、`prompts/list`（空）、`logging/setLevel`、`completion/complete`（空）。
-通知（无 `id`）返回 `202` 且无正文。批量数组按 JSON-RPC 处理。
+Supported JSON-RPC methods: `initialize`, `ping`, `tools/list`, `tools/call`,
+`resources/list`, `resources/read`, `resources/templates/list`, `prompts/list` (empty),
+`logging/setLevel`, `completion/complete` (empty). A notification (no `id`) returns `202`
+with no body. Batch arrays are handled as JSON-RPC batches.
 
-| 头 | 行为 |
+| Header | Behaviour |
 |---|---|
-| `Mcp-Session-Id`（响应） | `initialize` 或首个请求时分配；客户端可复用 |
-| `MCP-Protocol-Version` | `initialize` 的响应里带回服务端版本 |
-| `Authorization: Bearer <token>` | 配置了 `auth.mcp_token` 时必需，否则 401 |
-| `Connection: keep-alive` | 支持；单连接最多 32 个请求后关闭 |
-| `Transfer-Encoding: chunked` | 支持（Node 的 fetch 会用） |
-| `Expect: 100-continue` | 先回 100，再读正文 |
+| `Mcp-Session-Id` (response) | Allocated on `initialize` or the first request; the client may reuse it |
+| `MCP-Protocol-Version` | The server version comes back in the `initialize` response |
+| `Authorization: Bearer <token>` | Required when `auth.mcp_token` is set, otherwise 401 |
+| `Connection: keep-alive` | Supported; a single connection closes after 32 requests |
+| `Transfer-Encoding: chunked` | Supported (Node's fetch uses it) |
+| `Expect: 100-continue` | Answers 100 first, then reads the body |
 
-`GET /mcp` → `405`（说明用 POST）；`DELETE /mcp` → 结束该会话。
+`GET /mcp` → `405` (use POST); `DELETE /mcp` → end that session.
 
-CORS 默认开启（`mcp.cors`），浏览器里的 MCP 客户端可直接连。
+CORS is on by default (`mcp.cors`), so a browser MCP client can connect directly.
 
-## 2. 网页/配置 REST
+## 2. Web and configuration REST
 
-| 方法 | 路径 | 作用 |
+| Method | Path | Purpose |
 |---|---|---|
-| GET | `/` | 控制台（内嵌 HTML/CSS/JS，无外链） |
+| GET | `/` | Console (embedded HTML/CSS/JS, no external links) |
 | GET | `/healthz` | `{ok, uptime_s, devices}` |
-| GET | `/api/status` | 板卡、内存、WiFi、MCP、设备数、计数器 |
-| GET | `/api/config` | 配置（密码/token 显示为 `__set__`） |
-| POST | `/api/config` | 部分更新（同形状 JSON） |
-| GET | `/api/devices` | 设备表 + 未识别地址 + 总线 |
-| POST | `/api/devices/probe` | 重新探测 |
-| GET | `/api/tools` | 工具表（含隐藏原因） |
+| GET | `/api/status` | Board, memory, WiFi, MCP, device count, counters |
+| GET | `/api/config` | Configuration (secrets shown as `__set__`) |
+| POST | `/api/config` | Partial update (JSON of the same shape) |
+| GET | `/api/devices` | Device table + unidentified addresses + buses |
+| POST | `/api/devices/probe` | Probe again |
+| GET | `/api/tools` | Tool table, including why anything is hidden |
 | POST | `/api/tools` | `{mode: auto|generic|all, disabled: [...]}` |
-| GET | `/api/manifest` | 当前清单 + revision |
+| GET | `/api/manifest` | Current manifest + revision |
 | POST | `/api/manifest` | `{manifest, mode?, dry_run?}` |
-| GET | `/api/manifest/schema` | 与 `manifest_describe` 相同内容 |
-| GET | `/api/wifi/scan` | 扫网 |
-| POST | `/api/wifi/connect` | `{ssid, password}`，保存并重连 |
-| POST | `/api/wifi/forget` | 清除凭证 |
-| GET | `/api/logs?n=&since=` | 环形日志 |
-| GET | `/api/catalog` | 驱动目录 |
-| GET | `/api/sessions` | MCP 会话 |
-| GET | `/api/clients` | 可直接复制的客户端配置 |
-| POST | `/api/auth` | `{pin}`，校验控制台 PIN |
-| POST | `/api/reboot` | 重启 |
-| POST | `/api/factory-reset` | 清配置与清单并重启 |
+| GET | `/api/manifest/schema` | Same content as `manifest_describe` |
+| GET | `/api/wifi/scan` | Scan |
+| POST | `/api/wifi/connect` | `{ssid, password}`, save and reconnect |
+| POST | `/api/wifi/forget` | Clear the credentials |
+| GET | `/api/logs?n=&since=` | Ring log |
+| GET | `/api/catalog` | Driver catalog |
+| GET | `/api/sessions` | MCP sessions |
+| GET | `/api/clients` | Client configuration, ready to copy |
+| POST | `/api/auth` | `{pin}`, check the console PIN |
+| POST | `/api/reboot` | Reboot |
+| POST | `/api/factory-reset` | Clear configuration and manifest, then reboot |
 
-写操作在设置了 `auth.portal_pin` 时要求 `X-Portal-Pin`（或 `?pin=`）；读操作不要求。
+### Agent and orchestration
 
-## 3. 资源（`resources/*`）
+| Method | Path | Purpose |
+|---|---|---|
+| POST | `/api/agent/message` | `{text}` — queue a user message; answers `202` with the queued count |
+| GET | `/api/agent/history?after=<n>` | Transcript entries after `n`, plus `usage` |
+| POST | `/api/agent/reset` | Clear the conversation |
+| GET | `/api/agent/config` | Model connection, `tick_ms`, `last_run`/`total` usage |
+| POST | `/api/agent/config` | Update `base_url` / `model` / `api_key` / `tick_ms` |
+| GET | `/api/agent/events?after=<seq>` | The run journal as JSON (polling) |
+| GET | `/api/agent/stream?after=<seq>` | The same journal as **SSE**: replay, then follow. 503 with `Retry-After: 5` when two streams are already open |
+| GET | `/api/sched` | Scheduled tasks and sensor rules |
+| POST | `/api/sched` | Replace them (or set `agent.tick_ms` behaviour through `/api/agent/config`) |
 
-| URI | 内容 |
+`POST /selftest/chat/completions` is not part of the API: it is an OpenAI-compatible stub
+that answers as a scripted model, served before the `App` lock so a self-test cannot
+deadlock. It exists so the loop can be verified without an API key.
+
+Write operations require `X-Portal-Pin` (or `?pin=`) when `auth.portal_pin` is set; reads
+do not.
+
+## 3. Resources (`resources/*`)
+
+| URI | Content |
 |---|---|
-| `mcp://capabilities` | 当前能力、可见工具、被隐藏的工具及缺失能力 |
-| `mcp://devices` | 设备表、未识别地址、总线扫描结果 |
-| `mcp://devices/<id>` | 单个设备的详情 |
-| `mcp://manifest` | 当前清单 + revision |
-| `mcp://config` | 脱敏配置 |
-| `mcp://logs` | 最近日志 |
-| `mcp://catalog` | 驱动目录 |
+| `mcp://capabilities` | Current capabilities, visible tools, hidden tools and the capability each one lacks |
+| `mcp://devices` | Device table, unidentified addresses, bus scan results |
+| `mcp://devices/<id>` | One device in detail |
+| `mcp://manifest` | Current manifest + revision |
+| `mcp://config` | Configuration with secrets redacted |
+| `mcp://logs` | Recent log lines |
+| `mcp://catalog` | Driver catalog |
 
-## 4. 工具结果形状
+## 4. Tool result shape
 
 ```json
 { "jsonrpc":"2.0","id":2,
@@ -84,11 +105,13 @@ CORS 默认开启（`mcp.cors`），浏览器里的 MCP 客户端可直接连。
               "isError": false } }
 ```
 
-工具失败也返回 `result`，只是 `isError: true` 且正文里带错误消息与码——这样模型能看到原因并自己修参数，
-而不是看到一个协议级错误。协议级错误（未知方法、坏 JSON）才用 `error` 对象。
+A failing tool still returns `result`, with `isError: true` and the message and code in the
+body — so the model can see why and fix its arguments instead of hitting a protocol-level
+error. Only protocol errors (unknown method, malformed JSON) use the `error` object.
 
-## 5. 客户端接入
+## 5. Connecting a client
 
-- **Claude Desktop / Cursor 等支持 HTTP 的**：`{"mcpServers":{"esp32-agent":{"type":"http","url":"http://<ip>:8080/mcp"}}}`
-- **只支持 stdio 的**：用 `mcp-remote`、`mcp2serial` 一类桥。
-- **自己写脚本**：见上面的 curl；`/api/clients` 会返回拼好的命令。
+- **Claude Desktop / Cursor and anything else that speaks HTTP**:
+  `{"mcpServers":{"esp32-agent":{"type":"http","url":"http://<ip>:8080/mcp"}}}`
+- **stdio-only clients**: use a bridge such as `mcp-remote` or `mcp2serial`.
+- **Your own script**: see the curl above; `/api/clients` returns a ready-made command.

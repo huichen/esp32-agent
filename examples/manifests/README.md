@@ -1,19 +1,22 @@
-# 清单示例
+# Manifest examples
 
-每个文件都是可以直接提交给 `manifest_apply`（`mode: merge`）的**完整参数对象**，也可以复制到网页
-"清单"页里应用。
+Each file is a **complete argument object** that can be handed straight to
+`manifest_apply` (`mode: merge`), or pasted into the console's manifest tab and applied
+there.
 
-| 文件 | 需要什么硬件 | 说明 |
+| File | Hardware it needs | What it shows |
 |---|---|---|
-| `relay-pump.json` | GPIO12 上的继电器（低电平吸合） | 开关 + 定时脉冲，`confirm` 与限频都开着 |
-| `servo-scan.json` | GPIO7 上的舵机 | 角度设置 + 一次往返扫描；`safety` 比 `params` 更窄（5–175 度） |
-| `i2c-sensor-raw.json` | 0x40 上一个假设的光照传感器 | 直接用 `i2c_read` 读原始值，换算写进 description |
-| `led-indicator.json` | GPIO48 上的 WS2812 | 状态灯 + 闪烁提示，`enum` 参数限定预设 |
+| `relay-pump.json` | a relay on GPIO12 (active low) | on/off plus a timed pulse; `confirm` and rate limiting are both on |
+| `servo-scan.json` | a servo on GPIO7 | an angle setter plus one sweep; `safety` is narrower than `params` (5–175 degrees) |
+| `i2c-sensor-raw.json` | a hypothetical light sensor at 0x40 | reads the raw value with `i2c_read` and puts the conversion in the description |
+| `led-indicator.json` | the WS2812 on GPIO48 | a status light plus a blink, with an `enum` parameter over presets |
 
-## 写自己的示例
+## Writing your own
 
-1. 先 `inventory` / `i2c_scan` 确认真实地址与引脚。
-2. 数值范围写两遍：`params[].min/max` 给模型看，`safety.min/max` 在板上强制。
-3. 有物理动作的加 `max_calls_per_min`；不可逆的动作加 `confirm: true`。
-4. 单位写进 `description` 与 `unit`——模型只能看到这些。
-5. 纯 JSON，不能有注释；需要解释就用 `devices[].note` 或把说明写进 `description`。
+1. Start with `inventory` / `i2c_scan` to confirm the real address and pins.
+2. State a range twice: `params[].min/max` for the model, `safety.min/max` to enforce on
+   the board.
+3. Anything physical gets `max_calls_per_min`; anything irreversible gets `confirm: true`.
+4. Put units in both `description` and `unit` — they are all the model can see.
+5. Plain JSON, no comments; when you need to explain something use `devices[].note` or
+   fold it into `description`.

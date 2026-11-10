@@ -1,71 +1,82 @@
-# 排错
+# Troubleshooting
 
-先看 `GET /api/logs`（或网页"日志"页）。启动阶段的每一行都有 `target`（`boot`/`probe`/`wifi`/`http`/`tool`/`manifest`）。
+Start with `GET /api/logs` (or the console's log tab). Every boot-time line carries a
+`target` (`boot`/`probe`/`wifi`/`http`/`tool`/`manifest`).
 
-## 板子起不来
+## The board will not come up
 
-| 现象 | 检查 |
+| Symptom | Check |
 |---|---|
-| 串口没有任何输出 | 控制台不是 USB-Serial/JTAG？改 `CONFIG_ESP_CONSOLE_*`；波特率 115200 |
-| `rst:0x…` 后立刻重启 | 看 `panic` 行；多半是 PSRAM 配置与板子不符（`CONFIG_SPIRAM_MODE_OCT`） |
-| `i2c bus 0 (SDA 8, SCL 9) failed` | 引脚不存在或已被占用；改 `config.bus.i2c` 或在网页里换引脚 |
-| 日志里 `no stored config` | 正常：第一次上电，走热点配网 |
+| Nothing on the serial console | Is the console not USB-Serial/JTAG? Change `CONFIG_ESP_CONSOLE_*`; baud rate 115200 |
+| Reboots right after `rst:0x…` | Read the `panic` line; usually PSRAM settings that do not match the board (`CONFIG_SPIRAM_MODE_OCT`) |
+| `i2c bus 0 (SDA 8, SCL 9) failed` | The pin does not exist or is taken; change `config.bus.i2c` or pick other pins in the console |
+| `no stored config` in the log | Normal: first power-up, so it falls back to provisioning |
 
-## 配网
+## Provisioning
 
-| 现象 | 检查 |
+| Symptom | Check |
 |---|---|
-| 手机看不到 `esp32-agent-setup` | 板子有旧凭证 → 串口 `wifi: joining ...`；`POST /api/wifi/forget` 后再重启 |
-| 连上热点但打不开页面 | 必须是 `http://192.168.4.1:8080/`，注意端口；捕获式 DNS 只帮 HTTP 自动弹窗 |
-| 填完密码连不上 | 2.4 GHz + WPA2 才稳（ESP32 不支持 5 GHz）；看日志 `wifi: status=…`；检查密码是否被复制带入空格 |
-| 连上了但 IP 找不到 | 路由器 DHCP 列表按 hostname `esp32-agent` 找；或串口日志里的 `ip=` |
+| The phone cannot see `esp32-agent-setup` | The board still has old credentials → the serial log says `wifi: joining ...`; `POST /api/wifi/forget` then reboot |
+| Joined the access point but no page | It must be `http://192.168.4.1:8080/` — note the port; the captive DNS only makes HTTP pop up automatically |
+| Credentials entered but it will not connect | 2.4 GHz and WPA2 are what works (the ESP32 has no 5 GHz radio); watch `wifi: status=…` in the log; check for trailing spaces in a pasted password |
+| Connected but no IP found | Look for hostname `esp32-agent` in the router's DHCP list, or the `ip=` line in the serial log |
 
-## 设备看不见
+## A device is invisible
 
-1. `POST /api/devices/probe`，或模型侧调 `devices_probe` 再 `devices_list`。
-2. `i2c_scan` 看地址在不在：
-   - 一个都没有 → 接线/上拉/供电；SDA/SCL 是否接反；模块是否 5 V 供电而板子是 3.3 V 逻辑。
-   - 有地址但 `unidentified` → `i2c_identify {addr}` 看候选；必要时用 `i2c_read` 自己读 ID 寄存器。
-3. 地址对但驱动没认：地址冲突很常见（0x76/0x77、0x3C/0x3D、0x44/0x45）。看日志里驱动给出的失败原因。
-4. 1-Wire 设备没出现：1-Wire 只在 `bus.onewire_pins` 里列出的引脚上探测，且必须有 4.7 kΩ 上拉。
+1. `POST /api/devices/probe`, or from the model call `devices_probe` then `devices_list`.
+2. `i2c_scan` to see whether the address answers at all:
+   - Nothing at all → wiring, pull-ups or power; are SDA/SCL swapped; is a 5 V module
+     driving a 3.3 V logic board.
+   - An address appears but is `unidentified` → `i2c_identify {addr}` for candidates, or
+     read the ID register yourself with `i2c_read`.
+3. Right address, wrong driver: address collisions are common (0x76/0x77, 0x3C/0x3D,
+   0x44/0x45). The log carries the reason the driver gave.
+4. A 1-Wire device never appears: 1-Wire is probed only on the pins listed in
+   `bus.onewire_pins`, and it needs a 4.7 kΩ pull-up.
 
-## 工具没出现在 `tools/list`
+## A tool is missing from `tools/list`
 
-- `GET /api/tools`：每一项有 `visible` 与 `missing`。`missing` 非空就是硬件没检测到。
-- 用户禁用了？`mcp.disabled_tools`。
-- `tools_mode = "generic"` 时设备工具被折叠，改用 `device_invoke`，或切回 `auto`。
-- 清单工具：确认 `enabled` 不是 `false`，名字合法（`a-z0-9_-` 与 `.`）。
+- `GET /api/tools`: each entry has `visible` and `missing`. A non-empty `missing` means the
+  hardware was not detected.
+- Did the user disable it? `mcp.disabled_tools`.
+- With `tools_mode = "generic"` the device tools are collapsed into `device_invoke`; switch
+  back to `auto` if you want them individually.
+- Manifest tools: check that `enabled` is not `false` and the name is legal (`a-z0-9_-`
+  and `.`).
 
-## 清单应用失败
+## Applying a manifest fails
 
-返回的 `issues[].path` 是 JSON Pointer，直接定位：
-- `/tools/0/exec/pin` → 引脚越界
-- `/tools/2/name` → 名字非法或重复
-- `/devices/1/driver` → 驱动 id 不在 `docs/capabilities.md` 的表里
-- `sequence` 报总时长 → 减少 `ms` 或步数
+The returned `issues[].path` is a JSON Pointer, so it points straight at the problem:
+- `/tools/0/exec/pin` → pin out of range
+- `/tools/2/name` → illegal or duplicate name
+- `/devices/1/driver` → driver id not in the table in `docs/capabilities.md`
+- a `sequence` total-duration complaint → reduce `ms` or the number of steps
 
-## 越界调用被拒
+## An out-of-range call is refused
 
-这是设计：`safety.min/max` 与 `params.min/max` 都在板子上检查。
-消息里带范围，例如 `` `ms` = 90000 is outside 10..=5000 ms ``。改参数，不要改固件。
+That is by design: `safety.min/max` and `params.min/max` are both checked on the board, and
+the message carries the range, e.g. `` `ms` = 90000 is outside 10..=5000 ms ``. Change the
+argument, not the firmware.
 
-## 屏幕不亮 / 花屏
+## The panel stays dark or shows garbage
 
-- 128x32 与 128x64 认错会花屏：设 `pins["oled.height"]`，或清单里 `options.height`。
-- SH1106 仿制品：`options.controller = "sh1106"`（列偏移 2）。
-- 全是噪点：先 `oled_contrast 0xCF`，再确认供电与 4.7 kΩ 上拉。
+- Confusing 128x32 with 128x64 garbles it: set `pins["oled.height"]`, or `options.height` in
+  the manifest.
+- SH1106 clones: `options.controller = "sh1106"` (column offset 2).
+- Pure noise: `oled_contrast 0xCF` first, then check power and the 4.7 kΩ pull-ups.
 
-## 性能与稳定性
+## Performance and stability
 
-| 现象 | 原因/处理 |
+| Symptom | Cause / fix |
 |---|---|
-| 连接被拒（503） | 并发连接上限 6；关掉浏览器里的旧标签 |
-| 一次工具调用 > 500 ms | 日志会 warn；I2C 设备慢或 1-Wire 转换（DS18B20 固定 750 ms） |
-| 内存不足 | 降 `log.ring`、减少并发、把 `tools_mode` 切 `generic` |
-| 会话越积越多 | `session_ttl_s`（默认 900 s）与 `max_sessions`（默认 4）自动回收 |
+| Connections refused (503) | The concurrent connection limit is 6; close stale browser tabs |
+| A tool call takes > 500 ms | The log warns; the I2C device is slow, or it is a 1-Wire conversion (DS18B20 is fixed at 750 ms) |
+| Out of memory | Lower `log.ring`, reduce concurrency, switch `tools_mode` to `generic` |
+| Sessions pile up | `session_ttl_s` (900 s default) and `max_sessions` (4 default) reclaim them |
+| `could not spawn connection thread` | Internal RAM exhausted (PSRAM cannot back a stack); close streams or lower the connection limit |
 
-## 模拟器
+## The simulator
 
 - `cargo run -p esp32-agent-sim -- --port 18080 --state sim-state/kv.json`
-- `--empty`：一块空板子（验证"没硬件时工具列表为空"）。
-- 想回到初始状态：删 `sim-state/kv.json`。
+- `--empty`: a bare board (to verify that the tool list is empty with no hardware).
+- To start over: delete `sim-state/kv.json`.

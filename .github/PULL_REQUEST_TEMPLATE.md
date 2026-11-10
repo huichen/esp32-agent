@@ -1,41 +1,43 @@
-## 这个 PR 做了什么
+## What does this PR do
 
-<!-- 一句话；详细理由放下面 -->
+<!-- one sentence; put the detailed reasoning below -->
 
-## 类型
+## Type
 
-- [ ] 新驱动（`drivers/*.rs`）
-- [ ] 清单示例（`examples/manifests/*.json`）
-- [ ] 清单引擎/协议（`manifest.rs`、`protocol.rs`、`app.rs`）
-- [ ] 网页控制台（`web/`）
-- [ ] 固件（`firmware/`）
-- [ ] 文档/CI
+- [ ] New driver (`drivers/*.rs`)
+- [ ] Manifest example (`examples/manifests/*.json`)
+- [ ] Manifest engine / protocol (`manifest.rs`, `protocol.rs`, `app.rs`)
+- [ ] Web console (`web/`)
+- [ ] Firmware (`firmware/`)
+- [ ] Documentation
 
-## 验证
+## Verification
 
-<!-- 贴命令与关键输出，不要只打勾 -->
+<!-- paste the commands and the key output, do not just tick the boxes -->
 
-- [ ] `cargo test -p esp32-agent-core` 通过
-- [ ] `powershell -File scripts/smoke.ps1` 通过
-- [ ] `cargo clippy … -D warnings` 与 `cargo fmt --all --check` 通过
-- [ ] 改到 `firmware/` 时：`scripts/build-firmware.ps1` 通过（没工具链就在描述里说明）
+- [ ] `cargo test -p esp32-agent-core` passes
+- [ ] `powershell -File scripts/smoke.ps1` passes
+- [ ] `cargo clippy … -D warnings` and `cargo fmt --all --check` pass
+- [ ] When `firmware/` changed: `scripts/build-firmware.ps1` passes (if there is no
+      toolchain on your machine, say so in the description)
 
-## 硬件依据（改驱动/板型时必填）
+## Hardware evidence (required for driver or board-profile changes)
 
-- 数据手册页码 / 实测日志：
-- 测试过的板子与芯片版本：
+- Datasheet page / measurement log:
+- Board and chip revision tested:
 
-## 文档
+## Documentation
 
-- [ ] `docs/capabilities.md` 已更新（新驱动/新能力）
-- [ ] `docs/manifest.md` 已更新（清单字段变化）
-- [ ] `CHANGELOG.md` 已加一行
+- [ ] `docs/capabilities.md` updated (new driver or capability)
+- [ ] `docs/manifest.md` updated (manifest fields changed)
+- [ ] `CHANGELOG.md` has a line
 
-## 影响面
+## Blast radius
 
-<!-- 会不会改变已有工具的行为？会不会让旧清单加载失败？（字段必须 #[serde(default)]） -->
+<!-- Does this change the behaviour of an existing tool? Can an old manifest fail to
+load? (new fields must be #[serde(default)]) -->
 
-## 检查
+## Checks
 
-- [ ] 没有提交凭证、`sim-state/`、`*.bin`、`firmware/sdkconfig`
-- [ ] 没有把"未验证"写成"已支持"
+- [ ] No credentials, no `sim-state/`, no `*.bin`, no `firmware/sdkconfig`
+- [ ] Nothing unverified written up as supported

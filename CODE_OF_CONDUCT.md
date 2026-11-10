@@ -1,21 +1,29 @@
-# 行为准则
+# Code of conduct
 
-## 约定
+## Our conventions
 
-- **就事论事，对证据说话**：争论"这块屏要 0x3C 还是 0x3D"请附数据手册页码或实测日志。
-- **尊重不同硬件**：ESP32-C3 用户、克隆板用户、只有一块面包板的人，都是目标用户。
-- **不假定对方水平**：问"怎么烧录"不是蠢问题，文档没写清是我们的问题。
-- **拒绝人身攻击、骚扰、歧视性言论**，包括在 issue、PR、讨论区和私下沟通中。
+- **Argue about the work, and bring evidence**: a disagreement over whether a panel is
+  at 0x3C or 0x3D should come with a datasheet page or a measurement log.
+- **Respect other hardware**: ESP32-C3 users, clone-board users and people with a single
+  breadboard are all the target audience.
+- **Never assume the other person's level**: "how do I flash this" is not a stupid
+  question — if the documentation did not answer it, that is our fault.
+- **No personal attacks, harassment or discriminatory language**, in issues, pull
+  requests, discussions, or private messages.
 
-## 范围
+## Scope
 
-适用于仓库内的 issue、PR、讨论、以及代表本项目的外部场合。
+This applies to issues, pull requests and discussions in the repository, and to any
+external venue where you represent the project.
 
-## 处理
+## Enforcement
 
-维护者可以编辑/关闭不友善内容，必要时限制参与。遇到问题请私信维护者，不要公开对线。
-违规会先私下提醒，再视情况限制参与。
+Maintainers may edit or close unfriendly content and, if necessary, restrict
+participation. If something is wrong, message a maintainer privately rather than
+arguing in public. A violation gets a private warning first; further restriction
+depends on what follows.
 
-## 归属
+## Attribution
 
-本准则参考 Contributor Covenant 的精神，用中文重写并针对硬件协作场景补了前两条。
+Written in the spirit of the Contributor Covenant, and extended with the first two
+conventions for the specific case of collaborating on hardware.

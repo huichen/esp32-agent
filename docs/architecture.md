@@ -1,78 +1,104 @@
-# 架构
+# Architecture
 
-## 1. 为什么拆三层
+## 1. Why three layers
 
-早期设备端 MCP 项目（包括我们参照的 C++ 固件）把三件事写在同一段代码里：驱动、能力语义、MCP 胶水。
-结果是每加一个外设都要改代码、编译、重烧、重连。重烧的代价远大于那几十行代码。
+Early device-side MCP projects (including the C++ firmware we learned from) put three
+things in one place: the driver, the meaning of a capability, and the MCP glue. Every new
+peripheral then meant editing code, compiling, reflashing and reconnecting — and the
+reflash costs far more than the few dozen lines it saved.
 
 ```
 ┌──────────────────────────────────────────────────────────────┐
-│ MCP 层  protocol.rs / app.rs / http.rs / web/                │
-│   与设备无关：JSON-RPC、会话、鉴权、能力过滤、网页控制台      │
-│   只写一次，所有设备共享                                      │
+│ MCP layer   protocol.rs / app.rs / http.rs / web/            │
+│   Device-agnostic: JSON-RPC, sessions, auth, capability       │
+│   filtering, the web console. Written once, shared by all.    │
 └───────────────▲──────────────────────────────────────────────┘
-                │ 编译清单 → ToolDef（含参数 schema 与执行闭包）
+                │ compile a manifest → ToolDef (parameter schema + exec closure)
 ┌───────────────┴──────────────────────────────────────────────┐
-│ 清单层  manifest.rs（JSON 存在 NVS 的 `manifest` 键）          │
-│   声明：有哪些设备、暴露成哪些工具、原语怎么组合、安全边界     │
-│   新增外设常常只是写一段 JSON → 热生效，不重烧                 │
+│ Manifest layer   manifest.rs (JSON in the NVS `manifest` key) │
+│   Declares: which devices exist, which tools they expose, how │
+│   primitives compose, where the safety boundaries are.        │
+│   Adding a peripheral is often a JSON edit → live, no reflash │
 └───────────────▲──────────────────────────────────────────────┘
-                │ 按 driver id 实例化
+                │ instantiate by driver id
 ┌───────────────┴──────────────────────────────────────────────┐
-│ 驱动层  drivers/*.rs（编译进固件）                             │
-│   只有必须自己跑协议/校准/状态机的芯片才需要：SSD1306、BME280… │
+│ Driver layer   drivers/*.rs (compiled into the firmware)      │
+│   Only for chips that must run their own protocol,            │
+│   calibration or state machine: SSD1306, BME280, …            │
 └───────────────▲──────────────────────────────────────────────┘
-                │ 只通过 trait
+                │ traits only
 ┌───────────────┴──────────────────────────────────────────────┐
-│ Hardware trait  hardware.rs                                   │
-│   固件实现（ESP-IDF）/ 模拟器实现（虚拟寄存器）               │
+│ Hardware trait   hardware.rs                                  │
+│   Firmware impl (ESP-IDF) / simulator impl (virtual registers)│
 └──────────────────────────────────────────────────────────────┘
 ```
 
-驱动层不知道 MCP 存在；MCP 层不知道任何芯片；清单层是两边的粘合剂。
+The driver layer does not know MCP exists; the MCP layer knows no chip; the manifest layer
+is the glue between them.
 
-## 2. 一次请求的路径
+## 2. The path of one request
 
 ```
-手机/大模型 → TCP:8080
-  http.rs        解析 HTTP/1.1（keep-alive、chunked、100-continue）
-  app.rs         路由：/mcp 或 /api/*
-    /mcp POST → 鉴权(可选 Bearer) → 分配/复用 Mcp-Session-Id
-              → protocol.rs 解析 JSON-RPC（支持 batch）
-              → 分发：initialize / tools/list / tools/call / resources/*
-              → tools/call：查 registry → 过滤可见性 → ToolCtx → handler
-              → 结果包成 content[] + structuredContent
-    /api/*    → 网页用的 REST（状态、设备、工具、清单、日志、WiFi）
-  settle()       请求结束时统一收尾：落盘 config/manifest、必要时重建工具表
+phone / model → TCP:8080
+  http.rs        parse HTTP/1.1 (keep-alive, chunked, 100-continue)
+  app.rs         route: /mcp or /api/*
+    /mcp POST → auth (optional Bearer) → allocate or reuse Mcp-Session-Id
+              → protocol.rs parses JSON-RPC (batches included)
+              → dispatch: initialize / tools/list / tools/call / resources/*
+              → tools/call: look up the registry → filter visibility → ToolCtx → handler
+              → wrap the result as content[] + structuredContent
+    /api/*    → the REST surface the console uses (status, devices, tools, manifest, logs,
+                WiFi, agent)
+  settle()       one place to flush at the end of a request: persist config/manifest and
+                 rebuild the tool table when needed
 ```
 
-一个 `App` 在一把锁后面，因为硬件本来就只有一份（一条 I2C、一块屏）。串行化工具调用没有真实代价，
-却消掉了一整类并发 bug。HTTP 连接仍然是多个线程，只是进入 `App` 时排队。
+One `App` behind one lock, because the hardware really is singular (one I2C bus, one
+panel). Serialising tool calls costs nothing real and removes a whole class of
+concurrency bugs. HTTP connections are still served by several threads; they queue only
+when they enter `App`.
 
-## 3. 能力过滤：工具列表就是"板子上有什么"
+The one place that had to be relaxed is the agent loop: a model call takes seconds, so it
+runs **outside** the lock. `Agent::begin` computes the request under the lock,
+`Agent::apply` consumes the reply under the lock, and the network wait in between holds
+nothing.
 
-- 每个设备在 `info().caps` 里声明能力（`oled`、`bme280`、`relay`…）。
-- 每个工具在 `requires` 里声明依赖，清单工具可以是空数组。
-- `tools/list` 只输出 `requires ⊆ 板卡能力 + 设备能力` 的工具，再减去用户禁用的名字。
+## 3. Capability filtering: the tool list is "what this board has"
 
-所以没接的 OLED 不会让模型看到一个"oled_text"，模型也不会去调它然后失败。
-`tools_mode = "generic"` 时进一步把设备工具收口成 `device_invoke`，防止外设一多就把上下文吃满。
+- Each device declares capabilities in `info().caps` (`oled`, `bme280`, `relay`, …).
+- Each tool declares its requirements in `requires`; a manifest tool may require nothing.
+- `tools/list` emits only tools whose `requires ⊆ board caps + device caps`, minus the
+  names the user disabled.
 
-## 4. 热更新：什么会立即生效，什么不会
+So an absent OLED never shows the model an `oled_text` it would then call and fail on.
+`tools_mode = "generic"` collapses the device tools further into `device_invoke`, which
+keeps a many-peripheral board from eating the context window.
 
-| 改动 | 生效方式 | 需要重启吗 |
+## 4. Hot reload: what takes effect immediately
+
+| Change | How it applies | Restart needed |
 |---|---|---|
-| 清单（设备/工具/参数/安全） | `settle()` 里重建 registry，下一次请求即用 | ❌ |
-| 工具启用/禁用、工具风格 | 同上 | ❌ |
-| 总线引脚、板型 | 重建 + 重新探测 | ❌ |
-| WiFi 凭证 | `wifi_connect` 立即重连 | ❌ |
-| MCP 端口 | 主循环发现端口变了，只重启 HTTP 服务 | 不需要整机重启 |
-| 固件本身 | OTA / 串口 | 是 |
+| Manifest (devices/tools/params/safety) | `settle()` rebuilds the registry; the next request uses it | ❌ |
+| Tool enable/disable, tool style | same | ❌ |
+| Bus pins, board profile | rebuild and re-probe | ✅ `restart_required: true` |
+| WiFi credentials | `wifi_connect` reconnects at once | ❌ |
+| MCP port | the main loop notices and restarts only the HTTP server | no full reboot |
+| The firmware itself | OTA / serial | yes |
 
-## 5. 关键取舍
+A driver that has already opened its bus cannot change pins in place, so a pin or profile
+change reports `restart_required: true` rather than quietly keeping the old wiring.
 
-- **阻塞式 HTTP，不用 async**：ESP-IDF 的 std 网络够用；MCP 请求量小，单次工具调用反而是串行的。
-- **每个连接一个线程**：板子上限 6 个连接，host 上栈 512 KB、板子上 20 KB（见 `http.rs` 的 `cfg`）。
-- **清单在板子上校验**：schema 只是给模型看的说明书，真正拦截的是 `check_args` + `safety`。
-- **不做 SSE**：规范允许 `GET /mcp` 返回 405；省一个长连接和一堆内存。
-- **会话状态很轻**：一个 id、最后活跃时间、协议版本；过期就丢，不持久化。
+## 5. Key trade-offs
+
+- **Blocking HTTP, no async**: ESP-IDF's std networking is enough; MCP request volume is
+  low and a single tool call is serial anyway.
+- **One thread per connection**: at most six connections on the board; 512 KB of stack per
+  thread on the host, 10 KB on the board (see `cfg` in `http.rs`). The board figure is
+  dictated by internal RAM, which PSRAM cannot supply for stacks.
+- **Manifests are validated on the board**: the schema is a manual for the model; what
+  actually rejects a call is `check_args` plus `safety`.
+- **SSE only where it pays**: `GET /mcp` still answers 405, which the spec allows. The
+  agent's run journal is streamed from `/api/agent/stream`, capped at two concurrent
+  streams because each holds one of the six connection slots.
+- **Session state is tiny**: an id, a last-seen time and a protocol version. It is dropped
+  when it expires, never persisted.

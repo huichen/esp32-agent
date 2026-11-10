@@ -1,34 +1,42 @@
-# 安全策略
+# Security policy
 
-这是一台**能动手的**设备：MCP 客户端可以让它合上继电器、转舵机、写 I2C。请把它当作局域网内的执行器，
-而不是普通网页。
+This is a device that **can act**: an MCP client can make it close a relay, turn a
+servo, or write to I2C. Treat it as an actuator on your LAN, not as an ordinary web
+page.
 
-## 部署建议
+## Deployment recommendations
 
-1. **只在可信局域网**：默认无 TLS，别把 `8080` 直接暴露到公网；要远程访问请走 VPN 或反向代理（带 TLS）。
-2. **开 token 与 PIN**：
+1. **Trusted LAN only**: there is no TLS by default; do not expose `8080` to the
+   internet. For remote access use a VPN or a reverse proxy that terminates TLS.
+2. **Turn on the token and the PIN**:
    ```json
-   { "auth": { "mcp_token": "<32 字节随机>", "portal_pin": "123456" } }
+   { "auth": { "mcp_token": "<32 random bytes>", "portal_pin": "123456" } }
    ```
-   开了之后 MCP 要求 `Authorization: Bearer …`，控制台写操作要求 `X-Portal-Pin`。
-3. **限制危险动作**：给清单里的写操作加 `safety`，例如 `{"max_calls_per_min": 10}`、
-   `{"min": 0, "max": 90}`、`{"confirm": true}`。这些在板子上强制，不依赖模型自觉。
-4. **关掉不用的热点**：配网完成后设 `wifi.ap_fallback: false`，减少一个入口。
-5. **及时改密码**：`POST /api/wifi/forget` 清除凭证，重新配网。
+   With these set, MCP requires `Authorization: Bearer …` and console write operations
+   require `X-Portal-Pin`.
+3. **Constrain dangerous actions**: give manifest write operations a `safety` block,
+   e.g. `{"max_calls_per_min": 10}`, `{"min": 0, "max": 90}`, `{"confirm": true}`. These
+   are enforced on the board, not left to the model's good behaviour.
+4. **Turn off the access point you do not need**: after provisioning, set
+   `wifi.ap_fallback: false` to remove one entry point.
+5. **Rotate credentials**: `POST /api/wifi/forget` clears them; provision again.
 
-## 已知风险
+## Known risks
 
-| 风险 | 现状 | 缓解 |
+| Risk | Current state | Mitigation |
 |---|---|---|
-| 提示注入导致物理动作 | 无审批环节 | `safety.confirm`、限频、局域网隔离 |
-| 明文 HTTP | 无 TLS | 内网 + 反向代理；不要把端口映射到公网 |
-| 凭证在 NVS 明文 | ESP-IDF NVS 默认不加密 | 可开 NVS 加密（`CONFIG_NVS_ENCRYPTION`），需要先烧密钥 |
-| 任意 I2C 写 | `i2c_write` / 清单原语是设计的一部分 | 只给可信模型；必要时在清单里不暴露写原语 |
-| 固件无签名校验 | 未实现 OTA | 见 ROADMAP；当前只能串口烧录 |
+| Prompt injection leading to physical action | no approval step | `safety.confirm`, rate limits, LAN isolation |
+| Plaintext HTTP | no TLS | intranet plus a reverse proxy; never map the port to the internet |
+| Credentials in plaintext NVS | ESP-IDF NVS is not encrypted by default | NVS encryption (`CONFIG_NVS_ENCRYPTION`) is available but needs keys flashed first |
+| Arbitrary I2C writes | `i2c_write` and the manifest primitive are by design | point it at trusted models only; omit the write primitive when you do not need it |
+| No firmware signature check | OTA is not implemented | see ROADMAP; flashing is over serial today |
 
-## 报告漏洞
+## Reporting a vulnerability
 
-请**不要**公开开 issue。用 GitHub 的私密漏洞报告（Security → Report a vulnerability），或直接联系维护者。
-请附：影响的版本/commit、可复现步骤、影响面（能否触发物理动作）、以及你建议的修复方向。
+**Do not** open a public issue. Use GitHub's private vulnerability reporting
+(Security → Report a vulnerability), or contact the maintainers directly. Include the
+affected version/commit, reproduction steps, the blast radius (can it trigger a
+physical action), and the fix you would suggest.
 
-我们会在 7 天内确认，修复后在该版本 `CHANGELOG.md` 里致谢（除非你要求匿名）。
+We acknowledge within 7 days and credit you in that release's `CHANGELOG.md` unless you
+ask to stay anonymous.

@@ -1,50 +1,51 @@
 name: Bug report
-description: 行为与文档不符、崩溃、烧录失败
+description: Behaviour that contradicts the documentation, a crash, or a flashing failure
 labels: [bug]
 body:
   - type: markdown
     attributes:
       value: |
-        先在 `docs/troubleshooting.md` 里找一遍。日志请贴 `GET /api/logs` 的原文，不要只写"不行"。
+        Search `docs/troubleshooting.md` first. Paste the raw output of `GET /api/logs`,
+        not a description of it — "it does not work" cannot be acted on.
   - type: input
     id: version
     attributes:
-      label: 版本 / commit
-      description: 固件版本（`/api/status` 里的 firmware）或 git commit
+      label: Version / commit
+      description: The firmware version from `/api/status`, or the git commit
     validations:
       required: true
   - type: dropdown
     id: board
     attributes:
-      label: 板子
-      options: [ESP32-S3-DevKitC-1, ESP32 DevKit v1, ESP32-C3-DevKitM-1, ESP32-C6-DevKitC-1, 自制/面包板, 模拟器]
+      label: Board
+      options: [ESP32-S3-DevKitC-1, ESP32 DevKit v1, ESP32-C3-DevKitM-1, ESP32-C6-DevKitC-1, custom/breadboard, simulator]
     validations:
       required: true
   - type: textarea
     id: what
     attributes:
-      label: 现象
-      description: 期望什么 / 实际什么。涉及工具调用时贴请求与响应 JSON。
+      label: What happens
+      description: What you expected and what actually happened. For tool calls, include the request and response JSON.
     validations:
       required: true
   - type: textarea
     id: logs
     attributes:
-      label: 日志
-      description: `/api/logs?n=200` 或串口输出（从启动开始）
+      label: Logs
+      description: "`/api/logs?n=200`, or the serial output from boot"
       render: text
     validations:
       required: true
   - type: textarea
     id: manifest
     attributes:
-      label: 相关清单/配置
-      description: 出问题的那部分 `manifest` 或 `config`（密码用 `__set__` 替换）
+      label: Relevant manifest or configuration
+      description: The part of `manifest` or `config` involved (replace secrets with `__set__`)
       render: json
   - type: checkboxes
     id: checks
     attributes:
-      label: 自查
+      label: Before filing
       options:
-        - label: 已执行 `POST /api/devices/probe` 并附上 `i2c_scan` 结果
-        - label: 已确认不是引脚/供电问题（换过线或换过模块）
+        - label: "I ran `POST /api/devices/probe` and attached the `i2c_scan` result"
+        - label: I ruled out wiring and power (swapped the cable or the module)

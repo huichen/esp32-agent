@@ -1,57 +1,69 @@
-# 贡献指南
+# Contributing
 
-目标是让"支持一块新硬件"尽量只需要写配置，最坏才写 Rust。请先读 [AGENTS.md](AGENTS.md)（分支、提交、检查命令）。
+The goal is that supporting new hardware needs nothing but configuration, and only
+at worst some Rust. Read [AGENTS.md](AGENTS.md) first (branching, commits, the check
+commands).
 
-## 两条路，先选轻的那条
+## Two paths — take the lighter one
 
-### 路线 A：只写清单（不需要碰固件）
+### Path A: manifest only (no firmware changes)
 
-适用于：GPIO 开关、PWM、ADC、读某个 I2C 寄存器、组合动作。
+For: GPIO switches, PWM, ADC, reading one I2C register, composed actions.
 
-1. 在网页控制台或 `manifest_apply` 里写清单，例如读一个已知地址的 I2C 传感器：
+1. Write the manifest in the web console or through `manifest_apply`, e.g. reading an
+   I2C sensor at a known address:
 
    ```json
-   {"tools":[{"name":"soil.moisture","description":"读土壤湿度原始值",
+   {"tools":[{"name":"soil.moisture","description":"Read the raw soil moisture value",
      "params":[],"exec":{"type":"i2c_read","addr":72,"reg":0,"length":2},
      "safety":{"max_calls_per_min":30}}]}
    ```
 
-2. 跑通后把这段放进 `examples/manifests/<device>.json`，并在文件头注释里写：芯片型号、地址、接线、
-   数据手册页码、以及"原始值怎么换算成物理量"（模型需要这条信息）。
-3. 在 `docs/capabilities.md` 的表格里加一行，状态写 `manifest`。
+2. Once it works, put it in `examples/manifests/<device>.json` and record in a header
+   comment: the chip part number, the address, the wiring, the datasheet page, and how
+   the raw value converts to a physical quantity (a model needs that last part).
+3. Add a row to the table in `docs/capabilities.md` with status `manifest`.
 
-### 路线 B：写驱动（需要时序、校准或状态机）
+### Path B: a driver (needs timing, calibration or a state machine)
 
-适用于：SSD1306、BME280、DS18B20、HC-SR04 这类必须自己跑协议/补偿的。
+For: SSD1306, BME280, DS18B20, HC-SR04 — anything that has to run a protocol or the
+compensation itself.
 
-1. 在 `crates/agent-core/src/drivers/` 新建模块，实现 `Device` trait（`info` / `tools` / `call`）。
-2. `probe()` 要用**寄存器级证据**确认身份（chip id、id register、CRC），不要只看地址——地址会撞。
-3. 补偿/换算公式必须配单元测试；有数据手册示例值的直接用示例值（见 `bme280.rs`）。
-4. 在 `drivers/mod.rs` 的 `CATALOG` 加一行，并在 `detect()` 里加探测调用（注意顺序：先具体后通用）。
-5. 在 `instantiate()` 里加分支，让模型可以通过清单显式声明该设备（含地址/引脚）。
-6. 补 `docs/capabilities.md`，写清识别方式与已知坑。
+1. Add a module under `crates/agent-core/src/drivers/` implementing the `Device` trait
+   (`info` / `tools` / `call`).
+2. `probe()` must confirm identity from **register-level evidence** (chip id, id
+   register, CRC), not from the address alone — addresses collide.
+3. Compensation/conversion formulas need unit tests; when the datasheet gives worked
+   examples, assert against those values (see `bme280.rs`).
+4. Add a row to `CATALOG` in `drivers/mod.rs` and a probe call in `detect()` (order
+   matters: specific before generic).
+5. Add a branch in `instantiate()` so a manifest can declare the device explicitly
+   (address/pins included).
+6. Update `docs/capabilities.md` with how the device is identified and its known traps.
 
-## 驱动检查清单
+## Driver checklist
 
-- [ ] 只用 `Hardware` trait，不直接引用 ESP-IDF 类型
-- [ ] `probe` 失败返回 `None`/`Err` 而不是 panic
-- [ ] 所有 I2C 读取都有超时或错误传播
-- [ ] 单位写进工具描述与 `detail`（°C、hPa、%RH、mV、cm）
-- [ ] 有至少一个单元测试（解析、换算或 CRC）
-- [ ] 在 `virtual_board.rs` 里加一个假设备，让模拟器也能演示
+- [ ] Uses only the `Hardware` trait, never ESP-IDF types directly
+- [ ] `probe` failure returns `None`/`Err` rather than panicking
+- [ ] Every I2C read has a timeout or propagates the error
+- [ ] Units appear in the tool description and in `detail` (°C, hPa, %RH, mV, cm)
+- [ ] At least one unit test (parsing, conversion or CRC)
+- [ ] A fake device in `virtual_board.rs` so the simulator can demonstrate it too
 
-## 改清单引擎（`manifest.rs`）
+## Changing the manifest engine (`manifest.rs`)
 
-- 新增原语：加 `Exec` 变体、`run_exec` 分支、`validate_exec` 校验、`primitives_doc()` 文档、`docs/manifest.md`。
-- 新增字段：`#[serde(default)]` 必加，保证旧清单仍能加载。
-- 任何新的"能做物理动作"的能力都要有对应的 `safety` 说明；默认不提供无限制通路。
+- New primitive: add an `Exec` variant, a `run_exec` branch, a `validate_exec` check,
+  the `primitives_doc()` entry, and `docs/manifest.md`.
+- New field: `#[serde(default)]` is mandatory so old manifests still load.
+- Every new capability that can move something physical needs a matching `safety`
+  story; an unrestricted path is not the default.
 
-## 文档与示例
+## Documentation and examples
 
-- 示例必须能跑：`scripts/smoke.ps1` 里至少有一条引用它。
-- 不写"应该可以"：未验证的写进 `ROADMAP.md`。
+- Examples must run: at least one `scripts/smoke.ps1` check must reference it.
+- Never write "should work": unverified behaviour goes into `ROADMAP.md`.
 
-## 提交前
+## Before committing
 
 ```bash
 cargo test -p esp32-agent-core
@@ -60,6 +72,7 @@ cargo clippy -p esp32-agent-core -p esp32-agent-sim -- -D warnings
 cargo fmt --all --check
 ```
 
-## 行为准则
+## Code of conduct
 
-见 [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md)：就事论事、给证据、别让人身攻击硬件型号。
+See [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md): argue about the work, bring evidence, and
+do not attack people over which hardware they use.
