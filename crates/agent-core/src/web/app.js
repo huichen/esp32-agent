@@ -86,7 +86,7 @@ const state = {
   devices: [],
   tools: [],
   manifest: { revision: 0, manifest: { version: 1, devices: [], tools: [] } },
-  agent: { seq: 0, messages: [], config: null, tasks: [], rules: [] },
+  agent: { seq: 0, messages: [], config: null, tasks: [], rules: [], usage: null },
   tab: "overview",
 };
 
@@ -294,9 +294,36 @@ function renderAgent() {
         .join("\n");
     }
     body.textContent = text || "…";
+    // The model's reasoning, as its own folded block: the host agent shows thinking
+    // separately from the answer, and so does this.
+    if (m.reasoning) {
+      const think = document.createElement("details");
+      think.className = "msg-think";
+      const summary = document.createElement("summary");
+      summary.textContent = "thinking · " + m.reasoning.length + " chars";
+      const inner = document.createElement("div");
+      inner.textContent = m.reasoning;
+      think.append(summary, inner);
+      row.append(think);
+    }
+    if (m.is_error) row.classList.add("msg-error");
     row.append(head, body);
     box.append(row);
   });
+  const usage = state.agent.usage && state.agent.usage.last_run;
+  if (usage && usage.total_tokens) {
+    const foot = document.createElement("div");
+    foot.className = "hint";
+    foot.textContent =
+      "tokens: " +
+      usage.total_tokens +
+      " (prompt " +
+      usage.prompt_tokens +
+      ", completion " +
+      usage.completion_tokens +
+      ")";
+    box.append(foot);
+  }
   box.scrollTop = box.scrollHeight;
 }
 
@@ -304,6 +331,7 @@ async function refreshAgentHistory() {
   const { data } = await api("/api/agent/history?after=0");
   if (!data) return;
   state.agent.seq = data.seq || 0;
+  state.agent.usage = data.usage || null;
   state.agent.messages = data.messages || [];
   renderAgent();
 }

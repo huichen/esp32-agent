@@ -86,8 +86,28 @@ pub struct ToolCall {
 /// A model turn: text, tool calls, or both.
 #[derive(Clone, Debug, Default)]
 pub struct ModelReply {
+    /// The assistant's visible answer. Empty on a pure tool-call turn.
     pub content: String,
+    /// The model's reasoning, when the provider exposes it (DeepSeek sends
+    /// `reasoning_content`, some gateways send `reasoning`). It is kept as its own
+    /// block rather than folded into `content`, and echoed back on the next request
+    /// because a reasoner rejects the turn without it.
+    pub reasoning: String,
     pub tool_calls: Vec<ToolCall>,
+    pub usage: Usage,
+}
+
+/// Token accounting for one model call, the way the host agent reports it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Usage {
+    pub prompt_tokens: u32,
+    pub completion_tokens: u32,
+}
+
+impl Usage {
+    pub fn total(&self) -> u32 {
+        self.prompt_tokens.saturating_add(self.completion_tokens)
+    }
 }
 
 /// One request/response round trip. `messages` and `tools` are already serialised
@@ -145,6 +165,21 @@ fn parse_reply(body: &str) -> Result<ModelReply, String> {
         Some(other) => other.to_string(),
     };
 
+    // Reasoning is a first-class block in the host agent's transcript; here it is the
+    // provider field the wire actually carries. DeepSeek uses `reasoning_content`,
+    // several gateways use `reasoning`, and an empty string means "none given".
+    let reasoning = message
+        .get("reasoning_content")
+        .or_else(|| message.get("reasoning"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let usage = value.get("usage").map(|u| Usage {
+        prompt_tokens: u.get("prompt_tokens").and_then(Value::as_u64).unwrap_or(0) as u32,
+        completion_tokens: u.get("completion_tokens").and_then(Value::as_u64).unwrap_or(0) as u32,
+    });
+    let usage = usage.unwrap_or_default();
+
     let mut tool_calls = Vec::new();
     if let Some(calls) = message.get("tool_calls").and_then(Value::as_array) {
         for call in calls {
@@ -177,7 +212,7 @@ fn parse_reply(body: &str) -> Result<ModelReply, String> {
         }
     }
 
-    Ok(ModelReply { content, tool_calls })
+    Ok(ModelReply { content, reasoning, tool_calls, usage })
 }
 
 /// The argument-parse error of `tc`, if `chat` degraded its arguments.

@@ -710,6 +710,17 @@ impl App {
             "history": self.agent.history.len(),
             "pending": self.agent.pending.is_some(),
             "busy": self.agent.pending.is_some(),
+            "events": self.agent.events.len(),
+            "usage_run": {
+                "prompt_tokens": self.agent.usage_run.prompt_tokens,
+                "completion_tokens": self.agent.usage_run.completion_tokens,
+                "total_tokens": self.agent.usage_run.total(),
+            },
+            "usage_total": {
+                "prompt_tokens": self.agent.usage_total.prompt_tokens,
+                "completion_tokens": self.agent.usage_total.completion_tokens,
+                "total_tokens": self.agent.usage_total.total(),
+            },
         });
         v
     }
@@ -770,6 +781,20 @@ impl App {
     /// the run appends the real one.
     fn agent_history_json(&self, after: usize) -> Value {
         let mut v = self.agent.messages_json(after);
+        // Token accounting travels with the transcript, the way the host agent reports
+        // usage beside the messages.
+        v["usage"] = json!({
+            "last_run": {
+                "prompt_tokens": self.agent.usage_run.prompt_tokens,
+                "completion_tokens": self.agent.usage_run.completion_tokens,
+                "total_tokens": self.agent.usage_run.total(),
+            },
+            "total": {
+                "prompt_tokens": self.agent.usage_total.prompt_tokens,
+                "completion_tokens": self.agent.usage_total.completion_tokens,
+                "total_tokens": self.agent.usage_total.total(),
+            },
+        });
         if let Some(pending) = self.agent.pending.as_ref() {
             let m = json!({
                 "role": "user",
@@ -1348,6 +1373,12 @@ impl App {
             ("GET", "/api/agent/history") => {
                 let after = req.query_get("after").and_then(|v| v.parse().ok()).unwrap_or(0usize);
                 Response::json(&self.agent_history_json(after))
+            }
+            // The run journal, with the host agent's event names. A client polls it
+            // with `?after=<seq>` exactly like the transcript.
+            ("GET", "/api/agent/events") => {
+                let after = req.query_get("after").and_then(|v| v.parse().ok()).unwrap_or(0u64);
+                Response::json(&self.agent.events_json(after))
             }
             ("POST", "/api/agent/message") => {
                 if let Err(r) = self.require_pin(req) {
@@ -2132,11 +2163,13 @@ fn selftest_completion(req: &Request) -> Value {
             "id": "selftest",
             "object": "chat.completion",
             "model": "selftest",
+            "usage": { "prompt_tokens": 32, "completion_tokens": 41 },
             "choices": [{
                 "index": 0,
                 "message": {
                     "role": "assistant",
                     "content": format!("I was handed {} tools: {}", tool_names.len(), tool_names.join(", ")),
+                    "reasoning_content": "selftest: the question is about my tool set, so read it out of the request instead of calling anything",
                 },
                 "finish_reason": "stop",
             }],
@@ -2185,10 +2218,23 @@ fn selftest_completion(req: &Request) -> Value {
         (None, None) => json!({ "role": "assistant", "content": "selftest: nothing to do" }),
     };
     let answered = next_tool.is_none();
+    // A scripted turn still carries reasoning and usage: the point of this endpoint is
+    // to exercise the same pipe a real model feeds, so leaving those empty would hide
+    // the reasoning block and the token accounting from every bench run.
+    let mut message = message;
+    if message["role"].as_str() == Some("assistant") {
+        message["reasoning_content"] = json!(format!(
+            "selftest has no model behind it: this turn was scripted, {tool_rounds} tool round(s) so far"
+        ));
+    }
     json!({
         "id": "selftest",
         "object": "chat.completion",
         "model": "selftest",
+        "usage": {
+            "prompt_tokens": 40 + tool_rounds * 24,
+            "completion_tokens": if answered { 12 } else { 9 },
+        },
         "choices": [{
             "index": 0,
             "message": message,

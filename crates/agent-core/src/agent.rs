@@ -29,6 +29,14 @@ pub const MAX_REPLY_BYTES: usize = 8 * 1024;
 /// A queued user message larger than this is cut before it enters the history.
 pub const MAX_USER_BYTES: usize = 4096;
 
+/// Reasoning is shown in the portal but never sent back as answer text, so it gets a
+/// tighter cap than the reply itself.
+pub const MAX_REASONING_BYTES: usize = 4096;
+
+/// The run journal is a ring: enough to render one run in the portal, small enough to
+/// live in RAM next to the transcript on a board with a few hundred KB of internal heap.
+pub const MAX_EVENTS: usize = 96;
+
 /// Who produced a message. Serialised as the OpenAI role name.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Role {
@@ -63,11 +71,18 @@ impl Role {
 #[derive(Clone, Debug)]
 pub struct Message {
     pub role: Role,
+    /// The visible text: the assistant's answer, or the tool's output.
     pub text: String,
+    /// The model's reasoning for this message, when it gave any. Kept as its own
+    /// block (the host agent calls it `Reasoning`) so it can be shown, folded away or
+    /// echoed back to a reasoner without polluting the answer.
+    pub reasoning: String,
     /// Assistant messages only.
     pub tool_calls: Vec<ToolCall>,
     /// Tool messages only: which call this answers.
     pub tool_call_id: Option<String>,
+    /// Tool messages only: did the call fail? (the host agent's `is_error`)
+    pub is_error: bool,
     /// `""` | `"http"` | `"schedule:<id>"` | `"sensor:<id>"`; user messages only.
     pub source: String,
     pub at_ms: u64,
@@ -78,30 +93,53 @@ impl Message {
         Self {
             role: Role::User,
             text: llm::truncate_bytes(text, MAX_USER_BYTES),
+            reasoning: String::new(),
             tool_calls: Vec::new(),
             tool_call_id: None,
+            is_error: false,
             source: source.to_string(),
             at_ms,
         }
     }
 
     pub fn assistant(text: &str, tool_calls: Vec<ToolCall>, at_ms: u64) -> Self {
+        Self::assistant_with_reasoning(text, "", tool_calls, at_ms)
+    }
+
+    /// An assistant turn that also carries the model's reasoning, the way the host
+    /// agent stores a `Reasoning` block next to the `Text` one.
+    pub fn assistant_with_reasoning(
+        text: &str,
+        reasoning: &str,
+        tool_calls: Vec<ToolCall>,
+        at_ms: u64,
+    ) -> Self {
         Self {
             role: Role::Assistant,
             text: llm::truncate_bytes(text, MAX_REPLY_BYTES),
+            reasoning: llm::truncate_bytes(reasoning, MAX_REASONING_BYTES),
             tool_calls,
             tool_call_id: None,
+            is_error: false,
             source: String::new(),
             at_ms,
         }
     }
 
     pub fn tool(tool_call_id: &str, text: &str, at_ms: u64) -> Self {
+        Self::tool_result(tool_call_id, text, false, at_ms)
+    }
+
+    /// A tool result, with the host agent's `is_error` flag rather than inferring it
+    /// from the payload.
+    pub fn tool_result(tool_call_id: &str, text: &str, is_error: bool, at_ms: u64) -> Self {
         Self {
             role: Role::Tool,
             text: llm::truncate_bytes(text, MAX_TOOL_RESULT_BYTES),
+            reasoning: String::new(),
             tool_calls: Vec::new(),
             tool_call_id: Some(tool_call_id.to_string()),
+            is_error,
             source: String::new(),
             at_ms,
         }
@@ -124,6 +162,71 @@ pub struct Agent {
     pub pending: Option<Message>,
     pub last_error: String,
     pub runs: u32,
+    /// The run journal: the same vocabulary the host agent streams, as a ring.
+    pub events: std::collections::VecDeque<Event>,
+    event_seq: u64,
+    /// Token accounting, per run and cumulative.
+    pub usage_run: llm::Usage,
+    pub usage_total: llm::Usage,
+}
+
+/// One journal entry. The kinds are the host agent's event names on purpose
+/// (`message_start`, `thinking_start|delta|end`, `text_start|delta|end`, `tool_use`,
+/// `tool_result`, `usage`, `message_end`, `error`, `run_end`): a client that reads one
+/// console can read the other. The board does not stream token by token, so a delta
+/// carries the whole block; the names and the order are what stay identical.
+#[derive(Clone, Debug)]
+pub struct Event {
+    pub seq: u64,
+    pub kind: &'static str,
+    pub at_ms: u64,
+    pub text: String,
+    pub tool_call_id: Option<String>,
+    pub name: Option<String>,
+    pub is_error: bool,
+    pub prompt_tokens: u32,
+    pub completion_tokens: u32,
+}
+
+impl Event {
+    fn simple(seq: u64, kind: &'static str, at_ms: u64) -> Self {
+        Self {
+            seq,
+            kind,
+            at_ms,
+            text: String::new(),
+            tool_call_id: None,
+            name: None,
+            is_error: false,
+            prompt_tokens: 0,
+            completion_tokens: 0,
+        }
+    }
+
+    pub fn json(&self) -> Value {
+        let mut v = serde_json::Map::new();
+        v.insert("seq".into(), json!(self.seq));
+        v.insert("event".into(), json!(self.kind));
+        v.insert("at_ms".into(), json!(self.at_ms));
+        if !self.text.is_empty() {
+            v.insert("text".into(), json!(llm::truncate_bytes(&self.text, 512)));
+        }
+        if let Some(id) = &self.tool_call_id {
+            v.insert("tool_call_id".into(), json!(id));
+        }
+        if let Some(name) = &self.name {
+            v.insert("name".into(), json!(name));
+        }
+        if self.is_error {
+            v.insert("is_error".into(), json!(true));
+        }
+        if self.kind == "usage" {
+            v.insert("prompt_tokens".into(), json!(self.prompt_tokens));
+            v.insert("completion_tokens".into(), json!(self.completion_tokens));
+            v.insert("total_tokens".into(), json!(self.prompt_tokens.saturating_add(self.completion_tokens)));
+        }
+        Value::Object(v)
+    }
 }
 
 impl Agent {
@@ -175,6 +278,18 @@ impl Agent {
             "last_error": self.last_error,
             "pending": self.pending.is_some(),
             "pending_source": self.pending.as_ref().map(|p| p.source.clone()).unwrap_or_default(),
+            "usage": {
+                "last_run": {
+                    "prompt_tokens": self.usage_run.prompt_tokens,
+                    "completion_tokens": self.usage_run.completion_tokens,
+                    "total_tokens": self.usage_run.total(),
+                },
+                "total": {
+                    "prompt_tokens": self.usage_total.prompt_tokens,
+                    "completion_tokens": self.usage_total.completion_tokens,
+                    "total_tokens": self.usage_total.total(),
+                },
+            },
             "messages": messages,
         })
     }
@@ -204,6 +319,8 @@ impl Agent {
         self.runs = self.runs.saturating_add(1);
         self.history.push(user);
         self.trim();
+        self.usage_run = llm::Usage::default();
+        self.emit("message_start", now_ms(), |_| {});
 
         let tools = host.tool_specs();
         // A zeroed config still deserves one model call rather than a silent
@@ -216,43 +333,128 @@ impl Agent {
                 Ok(reply) => reply,
                 Err(e) => {
                     self.last_error = e.clone();
+                    self.emit("error", now_ms(), |ev| ev.text = e.clone());
+                    self.emit("run_end", now_ms(), |ev| ev.is_error = true);
                     return Err(e);
                 }
             };
 
+            // Journal in the host agent's order: reasoning first, then the visible
+            // text, then one `tool_use` per call it asked for.
+            self.usage_run.prompt_tokens =
+                self.usage_run.prompt_tokens.saturating_add(reply.usage.prompt_tokens);
+            self.usage_run.completion_tokens =
+                self.usage_run.completion_tokens.saturating_add(reply.usage.completion_tokens);
+            self.usage_total.prompt_tokens =
+                self.usage_total.prompt_tokens.saturating_add(reply.usage.prompt_tokens);
+            self.usage_total.completion_tokens =
+                self.usage_total.completion_tokens.saturating_add(reply.usage.completion_tokens);
+            self.emit("usage", now_ms(), |ev| {
+                ev.prompt_tokens = reply.usage.prompt_tokens;
+                ev.completion_tokens = reply.usage.completion_tokens;
+            });
+            if !reply.reasoning.is_empty() {
+                let reasoning = reply.reasoning.clone();
+                self.emit("thinking_start", now_ms(), |_| {});
+                self.emit("thinking_delta", now_ms(), |ev| ev.text = reasoning.clone());
+                self.emit("thinking_end", now_ms(), |_| {});
+            }
+            if !reply.content.is_empty() {
+                let text = reply.content.clone();
+                self.emit("text_start", now_ms(), |_| {});
+                self.emit("text_delta", now_ms(), |ev| ev.text = text.clone());
+                self.emit("text_end", now_ms(), |_| {});
+            }
+
             if reply.tool_calls.is_empty() {
                 let text = llm::truncate_bytes(&reply.content, MAX_REPLY_BYTES);
-                self.history.push(Message::assistant(&text, Vec::new(), now_ms()));
+                self.history.push(Message::assistant_with_reasoning(
+                    &text,
+                    &reply.reasoning,
+                    Vec::new(),
+                    now_ms(),
+                ));
                 self.trim();
                 self.last_error.clear();
+                self.emit("message_end", now_ms(), |_| {});
+                self.emit("run_end", now_ms(), |_| {});
                 return Ok(text);
             }
 
-            self.history.push(Message::assistant(&reply.content, reply.tool_calls.clone(), now_ms()));
+            for call in &reply.tool_calls {
+                let call_id = call.id.clone();
+                let name = call.name.clone();
+                self.emit("tool_use", now_ms(), |ev| {
+                    ev.tool_call_id = Some(call_id.clone());
+                    ev.name = Some(name.clone());
+                    ev.text = call.arguments.to_string();
+                });
+            }
+            self.history.push(Message::assistant_with_reasoning(
+                &reply.content,
+                &reply.reasoning,
+                reply.tool_calls.clone(),
+                now_ms(),
+            ));
             for call in &reply.tool_calls {
                 let at = now_ms();
+                let mut is_error = false;
                 let result = match llm::arguments_error(call) {
                     // The model's argument string was not JSON: report it as a
                     // tool error and do not guess at what it meant.
-                    Some(err) => json!({ "error": format!("arguments: {err}") }).to_string(),
+                    Some(err) => {
+                        is_error = true;
+                        json!({ "error": format!("arguments: {err}") }).to_string()
+                    }
                     None if call.name.trim().is_empty() => {
+                        is_error = true;
                         json!({ "error": "tool call without a name" }).to_string()
                     }
                     None => match host.call_tool(&call.name, &call.arguments) {
                         Ok(text) => text,
-                        Err(e) => json!({ "error": e }).to_string(),
+                        Err(e) => {
+                            is_error = true;
+                            json!({ "error": e }).to_string()
+                        }
                     },
                 };
-                // `Message::tool` owns the 2 KB cut; the marker tells the model
-                // the result it sees is incomplete.
-                self.history.push(Message::tool(&call.id, &result, at));
+                self.emit("tool_result", at, |ev| {
+                    ev.tool_call_id = Some(call.id.clone());
+                    ev.name = Some(call.name.clone());
+                    ev.text = result.clone();
+                    ev.is_error = is_error;
+                });
+                // `Message::tool_result` owns the 2 KB cut; the marker tells the
+                // model the result it sees is incomplete.
+                self.history.push(Message::tool_result(&call.id, &result, is_error, at));
             }
             self.trim();
         }
 
         let err = format!("agent: step limit {max_steps} reached before a final answer");
         self.last_error = err.clone();
+        self.emit("error", now_ms(), |ev| ev.text = err.clone());
+        self.emit("run_end", now_ms(), |ev| ev.is_error = true);
         Err(err)
+    }
+
+    /// Append one journal entry, keeping the ring bounded.
+    fn emit(&mut self, kind: &'static str, at_ms: u64, edit: impl FnOnce(&mut Event)) {
+        self.event_seq = self.event_seq.saturating_add(1);
+        let seq = self.event_seq;
+        let mut event = Event::simple(seq, kind, at_ms);
+        edit(&mut event);
+        if self.events.len() >= MAX_EVENTS {
+            self.events.pop_front();
+        }
+        self.events.push_back(event);
+    }
+
+    /// The journal, optionally only what came after `seq`. Shape matches the host
+    /// agent's stream so one client can read both.
+    pub fn events_json(&self, after: u64) -> Value {
+        let events: Vec<Value> = self.events.iter().filter(|e| e.seq > after).map(|e| e.json()).collect();
+        json!({ "seq": self.event_seq, "kind": "agent_events", "events": events })
     }
 
     /// Drop the oldest messages until the ring is within both bounds, keeping
@@ -323,7 +525,21 @@ fn openai_message(message: &Message) -> Value {
             // `content` is null for a pure tool-call turn, which is what every
             // OpenAI-compatible server expects to see.
             let content = if message.text.is_empty() { Value::Null } else { json!(message.text) };
-            json!({ "role": Role::Assistant.as_str(), "content": content, "tool_calls": calls })
+            let mut out =
+                json!({ "role": Role::Assistant.as_str(), "content": content, "tool_calls": calls });
+            // A reasoning model refuses its own turn back without the reasoning that
+            // produced the calls, so it goes out again as the provider field.
+            if !message.reasoning.is_empty() {
+                out["reasoning_content"] = json!(message.reasoning);
+            }
+            out
+        }
+        Role::Assistant if !message.reasoning.is_empty() => {
+            json!({
+                "role": Role::Assistant.as_str(),
+                "content": message.text,
+                "reasoning_content": message.reasoning,
+            })
         }
         Role::Tool => json!({
             "role": Role::Tool.as_str(),
@@ -345,6 +561,11 @@ fn message_json(seq: usize, message: &Message) -> Value {
     if !message.source.is_empty() {
         out["source"] = json!(message.source);
     }
+    // A separate block, like the host agent's `Reasoning`: the portal renders it
+    // dimmed and folded, and a client that ignores it still sees the answer.
+    if !message.reasoning.is_empty() {
+        out["reasoning"] = json!(message.reasoning);
+    }
     if !message.tool_calls.is_empty() {
         let calls: Vec<Value> =
             message.tool_calls.iter().map(|call| json!({ "id": call.id, "name": call.name })).collect();
@@ -352,6 +573,9 @@ fn message_json(seq: usize, message: &Message) -> Value {
     }
     if let Some(id) = &message.tool_call_id {
         out["tool_call_id"] = json!(id);
+    }
+    if message.is_error {
+        out["is_error"] = json!(true);
     }
     out
 }
@@ -437,6 +661,43 @@ mod tests {
         .to_string()
     }
 
+    /// A reply carrying the host agent's two extra pieces: a reasoning block and token
+    /// usage, both of which the wire puts beside the text.
+    fn reasoned_reply(reasoning: &str, text: &str, prompt: u32, completion: u32) -> String {
+        json!({
+            "usage": { "prompt_tokens": prompt, "completion_tokens": completion },
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": text,
+                    "reasoning_content": reasoning,
+                }
+            }]
+        })
+        .to_string()
+    }
+
+    /// The interesting case for a reasoner: it thinks, then asks for a tool. The next
+    /// request has to carry that reasoning back or the provider rejects the turn.
+    fn reasoned_tool_call_reply(id: &str, name: &str, arguments: &str, reasoning: &str) -> String {
+        json!({
+            "usage": { "prompt_tokens": 12, "completion_tokens": 5 },
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "reasoning_content": reasoning,
+                    "tool_calls": [{
+                        "id": id,
+                        "type": "function",
+                        "function": { "name": name, "arguments": arguments }
+                    }]
+                }
+            }]
+        })
+        .to_string()
+    }
+
     fn answer_reply(text: &str) -> String {
         json!({ "choices": [{ "message": { "role": "assistant", "content": text } }] }).to_string()
     }
@@ -452,6 +713,48 @@ mod tests {
 
     fn clock() -> u64 {
         1_000
+    }
+
+    /// The shape the host agent streams, in the same order: reasoning, text, tool use,
+    /// tool result, usage. The board cannot stream token by token, so a delta carries
+    /// the whole block - the vocabulary and the ordering are what stay identical.
+    #[test]
+    fn the_run_journal_uses_the_host_agents_event_names_in_order() {
+        let mut agent = Agent::new();
+        let mut host = StubHost::returning(r#"{"ok":true}"#);
+        let mut transport = StubTransport::new(vec![
+            reasoned_tool_call_reply("c1", "board_status", "{}", "look at the board first"),
+            reasoned_reply("the tool answered, now summarise", "the board is fine", 30, 7),
+        ]);
+        agent.push_user("is the board ok?", "http", 40);
+        agent.run_pending(&mut host, &mut transport, &cfg(), clock).expect("answer");
+
+        let kinds: Vec<&str> = agent.events.iter().map(|e| e.kind).collect();
+        let first = |k: &str| {
+            kinds.iter().position(|x| *x == k).unwrap_or_else(|| panic!("{k} missing in {kinds:?}"))
+        };
+        assert!(first("message_start") < first("thinking_start"), "{kinds:?}");
+        assert!(first("thinking_end") < first("tool_use"), "reasoning precedes the call it explains");
+        assert!(first("tool_use") < first("tool_result"), "{kinds:?}");
+        assert!(first("tool_result") < first("text_start"), "the answer comes after the tool ran");
+        assert!(first("text_end") < first("message_end"), "{kinds:?}");
+        assert!(first("message_end") < first("run_end"), "{kinds:?}");
+        assert!(kinds.iter().filter(|k| **k == "usage").count() >= 2, "one per model call: {kinds:?}");
+
+        // Reasoning is its own block on the assistant turn that produced the call...
+        let tool_turn = agent.history.iter().find(|m| !m.tool_calls.is_empty()).expect("the tool-call turn");
+        assert_eq!(tool_turn.reasoning, "look at the board first");
+        // ...and it goes back out on the next request as the provider field.
+        let body = transport.bodies.last().expect("a request body");
+        assert!(body.contains("reasoning_content"), "{body}");
+
+        let last = agent.history.last().expect("assistant message");
+        assert_eq!(last.text, "the board is fine");
+        assert_eq!(last.reasoning, "the tool answered, now summarise");
+        // Both model calls are accounted: 12+30 prompt, 5+7 completion.
+        assert_eq!(agent.usage_run.prompt_tokens, 42);
+        assert_eq!(agent.usage_run.completion_tokens, 12);
+        assert_eq!(agent.usage_total.total(), 54);
     }
 
     #[test]
