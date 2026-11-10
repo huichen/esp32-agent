@@ -95,18 +95,123 @@ pub fn specs() -> Value {
                     &[],
                 ),
             }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "skill_write",
+                "description": "Create or replace one skill at `/skills/<name>.md`: the description becomes the line other turns see in the prompt index, the text is the procedure. Existing skills are only overwritten with replace=true",
+                "parameters": object_schema(
+                    &[
+                        ("name", string("the skill name, a-z A-Z 0-9 _ -, max 32, e.g. `deploy`")),
+                        ("description", string("one line: when to load this skill (defaults to a `description:` line in the text)")),
+                        ("text", string("the procedure itself, up to 2 KB")),
+                        ("replace", json!({ "type": "boolean", "description": "must be true to overwrite an existing skill" })),
+                    ],
+                    &["name", "text"],
+                ),
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "skill_delete",
+                "description": "Delete one skill. Requires confirm=true: the file is gone, and the index in the prompt follows on the next turn",
+                "parameters": object_schema(
+                    &[
+                        ("name", string("the skill to delete")),
+                        ("confirm", json!({ "type": "boolean", "description": "must be true" })),
+                    ],
+                    &["name", "confirm"],
+                ),
+            }
         }
     ])
 }
 
-/// Route one of the three tools, or `None` when the name is not ours.
+/// Route one of the tools this module owns, or `None` when the name is not ours.
 pub fn call(ws: &mut dyn Workspace, name: &str, args: &Value) -> Option<Result<String, String>> {
     match name {
         "skill_list" => Some(list(ws)),
         "skill_read" => Some(read_skill(ws, args)),
+        "skill_write" => Some(write_skill(ws, args)),
+        "skill_delete" => Some(delete_skill(ws, args)),
         "agents_md" => Some(agents_md(ws, args)),
         _ => None,
     }
+}
+
+/// Create or replace a skill, keeping the file in the shape the index reads.
+///
+/// Overwriting needs `replace: true`. That is the same trade `fs_edit` makes with its
+/// exactly-one-match rule: an accidental overwrite of somebody's procedure is quiet, and
+/// the model that did it has already forgotten why it was there.
+fn write_skill(ws: &mut dyn Workspace, args: &Value) -> Result<String, String> {
+    let name = j::field(args, "name").and_then(|v| v.as_str()).unwrap_or_default().trim().to_string();
+    if !is_skill_name(&name) {
+        return Err(format!(
+            "`{name}` is not a skill name (a-z, A-Z, 0-9, `_`, `-`, max {NAME_MAX}); the skills are: {}",
+            names(ws).join(", ")
+        ));
+    }
+    let text = j::field(args, "text").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+    if text.trim().is_empty() {
+        return Err("`text` is required: the skill's procedure".to_string());
+    }
+    let path = format!("{SKILLS_DIR}/{name}.md");
+    let exists = ws.read(&path).ok();
+    if exists.is_some() && !j::opt_bool(args, "replace").unwrap_or(false) {
+        return Err(format!(
+            "`{name}` already exists ({} bytes); pass replace=true to overwrite it, or read it first with skill_read",
+            exists.map(|t| t.len()).unwrap_or(0)
+        ));
+    }
+
+    // The description may be given, or already be the first line of the text; either way
+    // the file is written with one, because the index is what makes a skill findable.
+    let description = match j::opt_str(args, "description").map(|d| d.trim().to_string()) {
+        Some(d) if !d.is_empty() => d,
+        _ => describe(&text),
+    };
+    let mut file = format!("# {name}\n");
+    if !description.is_empty() {
+        file.push_str(&format!("description: {}\n", description.replace('\n', " ")));
+    }
+    file.push('\n');
+    file.push_str(text.trim_end());
+    file.push('\n');
+
+    if file.len() > crate::tools::fs::MAX_FILE_BYTES {
+        return Err(format!(
+            "the skill would be {} bytes; the workspace limit is {} bytes per file — cut the procedure down, not the description",
+            file.len(),
+            crate::tools::fs::MAX_FILE_BYTES
+        ));
+    }
+    ws.write(&path, &file)?;
+    Ok(to_text(json!({
+        "ok": true,
+        "name": name,
+        "path": path,
+        "bytes": file.len(),
+        "description": description,
+        "replaced": exists.is_some(),
+        "note": "in the index from the next turn; skill_read returns it whole",
+    })))
+}
+
+fn delete_skill(ws: &mut dyn Workspace, args: &Value) -> Result<String, String> {
+    let name = j::field(args, "name").and_then(|v| v.as_str()).unwrap_or_default().trim().to_string();
+    if !is_skill_name(&name) {
+        return Err(format!("`{name}` is not a skill name; the skills are: {}", names(ws).join(", ")));
+    }
+    if !j::opt_bool(args, "confirm").unwrap_or(false) {
+        return Err(format!("set confirm=true to delete `{name}`"));
+    }
+    let path = format!("{SKILLS_DIR}/{name}.md");
+    ws.remove(&path)
+        .map_err(|e| format!("no skill `{name}` ({e}); the skills are: {}", names(ws).join(", ")))?;
+    Ok(to_text(json!({ "ok": true, "deleted": name, "path": path })))
 }
 
 fn list(ws: &mut dyn Workspace) -> Result<String, String> {
@@ -351,6 +456,80 @@ mod tests {
         assert!(injected.len() < long.len(), "the prompt must not carry the whole file");
         assert!(injected.contains("truncated") && injected.contains("fs_read"), "{injected}");
         assert!(injected.len() <= INSTRUCTIONS_BUDGET + 120, "{}", injected.len());
+    }
+
+    #[test]
+    fn a_skill_is_written_in_the_shape_the_index_reads() {
+        let mut ws = ws_with(&[]);
+        let out = call(
+            &mut ws,
+            "skill_write",
+            &json!({ "name": "deploy", "description": "roll the portal forward", "text": "1. snapshot\n2. flash" }),
+        )
+        .unwrap()
+        .expect("skill_write");
+        assert!(out.contains("\"replaced\":false"), "{out}");
+
+        // The file that landed on the workspace starts with the header the index parses.
+        let file = ws.read("/skills/deploy.md").unwrap();
+        assert!(file.starts_with("# deploy\ndescription: roll the portal forward\n"), "{file}");
+        assert!(file.ends_with("1. snapshot\n2. flash\n"), "{file}");
+        let index = index(&ws);
+        assert_eq!(index[0].description, "roll the portal forward");
+    }
+
+    #[test]
+    fn a_skill_is_only_overwritten_on_purpose() {
+        let mut ws = ws_with(&[]);
+        call(&mut ws, "skill_write", &json!({ "name": "pins", "text": "12 relay" })).unwrap().unwrap();
+        let err =
+            call(&mut ws, "skill_write", &json!({ "name": "pins", "text": "other" })).unwrap().unwrap_err();
+        assert!(err.contains("replace=true"), "{err}");
+        assert!(ws.read("/skills/pins.md").unwrap().contains("12 relay"), "the file changed anyway");
+
+        let ok =
+            call(&mut ws, "skill_write", &json!({ "name": "pins", "text": "14 relay", "replace": true }))
+                .unwrap()
+                .unwrap();
+        assert!(ok.contains("\"replaced\":true"), "{ok}");
+        assert!(ws.read("/skills/pins.md").unwrap().contains("14 relay"));
+    }
+
+    #[test]
+    fn a_skill_that_does_not_fit_is_refused_with_the_limit() {
+        let mut ws = ws_with(&[]);
+        let big = "x".repeat(crate::tools::fs::MAX_FILE_BYTES);
+        let err = call(&mut ws, "skill_write", &json!({ "name": "huge", "text": big })).unwrap().unwrap_err();
+        assert!(err.contains(&crate::tools::fs::MAX_FILE_BYTES.to_string()), "{err}");
+        assert!(index(&ws).is_empty(), "a refused write left a file behind");
+    }
+
+    #[test]
+    fn deleting_a_skill_needs_a_confirmation_and_says_what_is_left() {
+        let mut ws = ws_with(&[]);
+        call(&mut ws, "skill_write", &json!({ "name": "pins", "text": "12 relay" })).unwrap().unwrap();
+        let err = call(&mut ws, "skill_delete", &json!({ "name": "pins" })).unwrap().unwrap_err();
+        assert!(err.contains("confirm=true"), "{err}");
+        let ok = call(&mut ws, "skill_delete", &json!({ "name": "pins", "confirm": true })).unwrap().unwrap();
+        assert!(ok.contains("deleted"), "{ok}");
+        assert!(index(&ws).is_empty());
+        let err =
+            call(&mut ws, "skill_delete", &json!({ "name": "pins", "confirm": true })).unwrap().unwrap_err();
+        assert!(err.contains("no skill"), "{err}");
+    }
+
+    #[test]
+    fn the_description_falls_back_to_the_texts_own_line() {
+        let mut ws = ws_with(&[]);
+        call(
+            &mut ws,
+            "skill_write",
+            &json!({ "name": "notes", "text": "description: wiring notes for the bench\nGPIO12 is the relay" }),
+        )
+        .unwrap()
+        .unwrap();
+        let index = index(&ws);
+        assert_eq!(index[0].description, "wiring notes for the bench");
     }
 
     #[test]

@@ -59,6 +59,11 @@ version numbering follows semantic versioning.
   — plain `http://` over `std::net`, `https://` over esp-tls with the ESP-IDF
   certificate bundle (no skip-verification switch) — and the simulator uses rustls with
   the webpki roots, so the same endpoint can be tried on the desk before it is flashed
+- **Instructions and skills on the board**: `/AGENTS.md` is injected into the system
+  prompt (first 1 KB, the rest readable with `fs_read`), and each `/skills/<name>.md` is
+  indexed by name and one-line description until the model loads it with `skill_read`;
+  `skill_write` composes the header and refuses a silent overwrite, `skill_delete` needs
+  `confirm: true`. Contract: `docs/agent-skills.md`
 - Documentation: architecture, the manifest specification, the capability table, the HTTP
   API, adding a device, flashing, troubleshooting, the roadmap, AGENTS.md
 
@@ -80,6 +85,14 @@ version numbering follows semantic versioning.
 
 ### Fixed
 
+- `net_get` / `net_post` now work inside a turn. The model call borrowed the App's only
+  HTTP client, so a tool call during a turn found none — and the simulator never attached
+  one at all, which is why the same code worked on a board and not on the desk. The App
+  owns a tool transport (`attach_tool_transport`), the driver loop owns the model one
+- `manifest_describe` answers one section per call (`overview`, `schema`, `exec`,
+  `examples`, `drivers`, with examples and drivers paged by name) instead of returning
+  8 KB into a 2 KB tool result: the model used to receive a quarter of the reference and
+  invent the rest
 - Manifest tool names are checked against the wire charset (`^[a-zA-Z0-9_-]+$`) when the
   manifest is applied, not when the request is built: a dotted name such as `pump.pulse`
   was accepted by the board and then rejected by every OpenAI-compatible endpoint, and

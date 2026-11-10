@@ -2145,13 +2145,16 @@ impl ToolHost for App {
     }
 
     fn call_tool(&mut self, name: &str, arguments: &Value) -> std::result::Result<String, String> {
-        if matches!(name, "skill_list" | "skill_read" | "agents_md") {
+        if matches!(name, "skill_list" | "skill_read" | "skill_write" | "skill_delete" | "agents_md") {
             let result = crate::tools::knowledge::call(&mut self.workspace, name, arguments)
                 .unwrap_or_else(|| Err(format!("`{name}` is a knowledge tool but is not routed")));
             // Only a write changes the stored blob; a read must not cost an NVS write.
-            if name == "agents_md"
-                && arguments.get("action").and_then(|v| v.as_str()).unwrap_or("get") == "set"
-            {
+            let mutates = match name {
+                "skill_write" | "skill_delete" => true,
+                "agents_md" => arguments.get("action").and_then(|v| v.as_str()).unwrap_or("get") == "set",
+                _ => false,
+            };
+            if mutates && result.is_ok() {
                 self.persist_workspace();
             }
             return result;
@@ -4097,22 +4100,29 @@ mod tests {
             .iter()
             .filter_map(|t| t["function"]["name"].as_str().map(|s| s.to_string()))
             .collect();
-        for needle in ["skill_list", "skill_read", "agents_md"] {
+        for needle in ["skill_list", "skill_read", "skill_write", "skill_delete", "agents_md"] {
             assert!(names.contains(&needle.to_string()), "{needle} is missing: {names:?}");
         }
 
-        ToolHost::call_tool(
+        // The whole cycle through the tool host: write, list, read, delete.
+        let written = ToolHost::call_tool(
             &mut app,
-            "fs_write",
-            &json!({ "path": "/skills/pins.md", "text": "# pins\ndescription: GPIO map for the bench\n12 relay\n" }),
+            "skill_write",
+            &json!({ "name": "pins", "description": "GPIO map for the bench", "text": "12 relay\n" }),
         )
-        .unwrap();
+        .expect("skill_write");
+        assert!(written.contains("GPIO map for the bench"), "{written}");
+
         let listed = ToolHost::call_tool(&mut app, "skill_list", &json!({})).unwrap();
         assert!(listed.contains("pins") && listed.contains("GPIO map"), "{listed}");
         let body = ToolHost::call_tool(&mut app, "skill_read", &json!({ "name": "pins" })).unwrap();
         assert!(body.contains("12 relay"), "{body}");
         let err = ToolHost::call_tool(&mut app, "skill_read", &json!({ "name": "missing" })).unwrap_err();
         assert!(err.contains("pins"), "the error must list what exists: {err}");
+        let gone = ToolHost::call_tool(&mut app, "skill_delete", &json!({ "name": "pins", "confirm": true }))
+            .expect("skill_delete");
+        assert!(gone.contains("deleted"), "{gone}");
+        assert!(!ToolHost::call_tool(&mut app, "skill_list", &json!({})).unwrap().contains("pins"));
     }
 
     /// A manifest must not be able to name a tool the endpoint will refuse.
