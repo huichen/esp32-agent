@@ -698,7 +698,21 @@ impl App {
             .with_data(json!({ "missing_capabilities": missing })));
         }
         let out = {
-            let App { hw, devices, cfg, runtime, log, caps, profile, probe, tools, manifest, .. } = self;
+            let App {
+                hw,
+                devices,
+                cfg,
+                runtime,
+                log,
+                caps,
+                profile,
+                probe,
+                tools,
+                manifest,
+                tasks,
+                rules,
+                ..
+            } = self;
             let def = match tools.get(name) {
                 Some(d) => d,
                 None => return Err(McpError::not_found(format!("no tool `{name}`"))),
@@ -720,6 +734,8 @@ impl App {
                 probe,
                 manifest,
                 taken: &taken,
+                tasks,
+                rules,
             };
             (def.handler)(&mut ctx, args)
         };
@@ -757,6 +773,10 @@ impl App {
         }
         if self.runtime.config_dirty {
             self.persist_config();
+        }
+        if self.runtime.sched_dirty {
+            self.runtime.sched_dirty = false;
+            self.persist_sched();
         }
         if manifest_changed || self.runtime.reprobe_requested {
             self.runtime.reprobe_requested = false;
@@ -1802,7 +1822,12 @@ impl App {
                 let v = self.status_json();
                 Response::json(&v)
             }
-            ("GET", "/api/config") => Response::json(&self.cfg.public_json()),
+            ("GET", "/api/config") => {
+                if let Err(r) = self.require_read(req) {
+                    return r;
+                }
+                Response::json(&self.cfg.public_json())
+            }
             ("POST", "/api/config") | ("PUT", "/api/config") => {
                 if let Err(r) = self.require_pin(req) {
                     return r;
@@ -1868,6 +1893,9 @@ impl App {
                 self.update_tool_selection(req)
             }
             ("GET", "/api/agent/history") => {
+                if let Err(r) = self.require_read(req) {
+                    return r;
+                }
                 let after = req.query_get("after").and_then(|v| v.parse().ok()).unwrap_or(0usize);
                 Response::json(&self.agent_history_json(after))
             }
@@ -1919,6 +1947,9 @@ impl App {
             // the compressed index live here, and a client that cannot see them cannot
             // tell a bad prompt from a bad model.
             ("GET", "/api/agent/prompt") => {
+                if let Err(r) = self.require_read(req) {
+                    return r;
+                }
                 let text = self.agent.prompt_text(self);
                 Response::json(&json!({
                     "bytes": text.len(),
@@ -1998,7 +2029,18 @@ impl App {
                     .and_then(|v| v.get("pin").and_then(|p| p.as_str()).map(|s| s.to_string()))
                     .unwrap_or_default();
                 if self.cfg.auth.portal_pin.is_empty() || pin == self.cfg.auth.portal_pin {
-                    Response::json(&json!({ "ok": true, "required": !self.cfg.auth.portal_pin.is_empty() }))
+                    // A token, not just an acknowledgement: the page keeps it and sends
+                    // it as a bearer token, and so can a script. Twelve hours is long
+                    // enough for a bench session and short enough that a forgotten tab
+                    // on a shared network stops working the next day.
+                    let token = self.runtime.issue_token(seed(), now_ms(), 12 * 3600);
+                    self.log.info("auth", "portal token issued");
+                    Response::json(&json!({
+                        "ok": true,
+                        "required": !self.cfg.auth.portal_pin.is_empty(),
+                        "token": token,
+                        "expires_in": 12 * 3600,
+                    }))
                 } else {
                     self.runtime.counters.auth_failures += 1;
                     Response::json_status(401, &json!({ "ok": false, "error": "wrong PIN" }))
@@ -2060,17 +2102,57 @@ impl App {
         if self.cfg.auth.portal_pin.is_empty() {
             return Ok(());
         }
-        let provided = req
-            .header("x-portal-pin")
-            .map(|s| s.to_string())
-            .or_else(|| req.query_get("pin").map(|s| s.to_string()))
-            .unwrap_or_default();
-        if provided == self.cfg.auth.portal_pin {
+        if self.credential_ok(req) {
             Ok(())
         } else {
             self.runtime.counters.auth_failures += 1;
             Err(Response::json_status(401, &json!({ "error": "PIN required", "pin_required": true })))
         }
+    }
+
+    /// True when the request carries the portal PIN or a token minted from it.
+    ///
+    /// Three ways in, because the three callers differ: a browser keeps a token from
+    /// `POST /api/auth`, a script sends `X-Portal-Pin`, and an MCP client sends a bearer
+    /// token. All of them are compared here so no route can be reached by a path that
+    /// forgot one of them.
+    fn credential_ok(&mut self, req: &Request) -> bool {
+        let pin = self.cfg.auth.portal_pin.clone();
+        let direct = req
+            .header("x-portal-pin")
+            .map(|s| s.to_string())
+            .or_else(|| req.query_get("pin").map(|s| s.to_string()))
+            .unwrap_or_default();
+        if !direct.is_empty() && direct == pin {
+            return true;
+        }
+        let bearer = req
+            .header("authorization")
+            .and_then(|v| v.strip_prefix("Bearer ").or_else(|| v.strip_prefix("bearer ")))
+            .map(|v| v.trim().to_string())
+            .unwrap_or_default();
+        if bearer.is_empty() {
+            return false;
+        }
+        if bearer == pin {
+            return true;
+        }
+        let now = now_ms();
+        self.runtime.token_valid(&bearer, now)
+    }
+
+    /// Reads that expose secrets, the transcript or the prompt need the same credential
+    /// as a write when a PIN is configured: `config` masks values but still lists the
+    /// network, and the transcript is the most private thing on the board.
+    fn require_read(&mut self, req: &Request) -> std::result::Result<(), Response> {
+        if self.cfg.auth.portal_pin.is_empty() {
+            return Ok(());
+        }
+        if self.credential_ok(req) {
+            return Ok(());
+        }
+        self.runtime.counters.auth_failures += 1;
+        Err(Response::json_status(401, &json!({ "error": "PIN required", "pin_required": true })))
     }
 
     fn handle_mcp_post(&mut self, req: &Request) -> Response {
@@ -3120,16 +3202,48 @@ mod tests {
 
     /// The portal has to carry the agent panel: a panel whose buttons call an
     /// endpoint that does not exist is worse than no panel.
+    ///
+    /// The page is a conversation with everything else behind the menu, so the panel is
+    /// reached through `data-panel`, and the transcript lives in `.chat` as bubbles
+    /// rather than in a transcript table.
     #[test]
     fn the_portal_ships_the_agent_panel() {
         assert!(web::INDEX_HTML.contains("id=\"panel-agent\""));
-        assert!(web::INDEX_HTML.contains("data-tab=\"agent\""));
+        assert!(web::INDEX_HTML.contains("data-panel=\"agent\""));
+        assert!(web::INDEX_HTML.contains("id=\"chat\""), "the conversation is the page");
         for needle in ["/api/agent/message", "/api/agent/history", "/api/agent/config", "/api/sched"] {
             assert!(web::APP_JS.contains(needle), "app.js never calls {needle}");
         }
         // A schedule table that cannot toggle a task does not meet the brief.
         assert!(web::APP_JS.contains("sched_disable") && web::APP_JS.contains("sched_enable"));
-        assert!(web::STYLE_CSS.contains(".transcript"));
+        assert!(web::STYLE_CSS.contains(".bubble"), "bubbles are the transcript");
+        assert!(web::STYLE_CSS.contains("100dvh"), "mobile height, not a guessed one");
+    }
+
+    /// The board's own agent can put work on the board's schedule: a task, on an interval
+    /// or at a daily time, into the same queue a user message uses.
+    #[test]
+    fn the_agent_can_schedule_its_own_work() {
+        let mut app = test_app();
+        let added = app
+            .call_tool("schedule", &json!({"action":"add","prompt":"read the sensor","every_s":60}))
+            .expect("add");
+        assert_eq!(added["id"], "t1");
+        assert_eq!(app.tasks.len(), 1);
+        assert_eq!(app.tasks[0].every_s, 60);
+        assert!(app.runtime.sched_dirty || !app.tasks.is_empty());
+
+        // A task with no trigger never fires, so it is refused instead of stored.
+        let bad = app.call_tool("schedule", &json!({"action":"add","prompt":"nothing"}));
+        assert!(bad.is_err(), "a task with neither every_s nor at_hhmm is a trap");
+
+        let listed = app.call_tool("schedule", &json!({"action":"list"})).expect("list");
+        assert_eq!(listed["count"], 1);
+
+        app.call_tool("schedule", &json!({"action":"disable","id":"t1"})).expect("disable");
+        assert!(!app.tasks[0].enabled);
+        app.call_tool("schedule", &json!({"action":"remove","id":"t1"})).expect("remove");
+        assert!(app.tasks.is_empty());
     }
 
     #[test]
@@ -3493,12 +3607,43 @@ mod tests {
         assert_eq!(app.route(&post("/api/agent/reset", "{}")).status, 401);
         assert_eq!(app.route(&post("/api/agent/config", r#"{"model":"x"}"#)).status, 401);
         assert_eq!(app.route(&post("/api/sched", r#"{"kind":"task","op":"delete","id":"t1"}"#)).status, 401);
-        // Reads stay open, exactly as they do for the rest of the console.
-        assert_eq!(app.route(&get("/api/agent/history")).status, 200);
-        assert_eq!(app.route(&get("/api/agent/config")).status, 200);
+        // Secrets and the transcript need the same credential now: `config` names the
+        // network even with values masked, and the transcript is the most private thing
+        // on the board. Status, devices and the schedule stay readable.
+        assert_eq!(app.route(&get("/api/agent/history")).status, 401);
+        assert_eq!(app.route(&get("/api/config")).status, 401);
+        assert_eq!(app.route(&get("/api/agent/prompt")).status, 401);
         assert_eq!(app.route(&get("/api/sched")).status, 200);
         assert!(app.tasks.is_empty(), "an unauthorised write got through");
         assert!(app.agent.history.is_empty());
+    }
+
+    /// Login, then use the token: the page and a script both need a way in that is not
+    /// "repeat the PIN in every URL".
+    #[test]
+    fn a_token_from_the_pin_authorises_writes_and_reads() {
+        let mut app = test_app();
+        app.cfg.auth.portal_pin = "1234".into();
+
+        let wrong = body_json(&app.route(&post("/api/auth", r#"{"pin":"9999"}"#)));
+        assert_eq!(wrong["ok"], false);
+        assert_eq!(app.route(&post("/api/auth", r#"{"pin":"9999"}"#)).status, 401);
+
+        let login = body_json(&app.route(&post("/api/auth", r#"{"pin":"1234"}"#)));
+        let token = login["token"].as_str().expect("token").to_string();
+        assert_eq!(login["expires_in"], 12 * 3600);
+
+        let mut write = post("/api/agent/reset", "{}");
+        write.headers.insert("authorization".into(), format!("Bearer {token}"));
+        assert_eq!(app.route(&write).status, 200, "the token authorises a write");
+
+        let mut read = get("/api/config");
+        read.headers.insert("authorization".into(), format!("Bearer {token}"));
+        assert_eq!(app.route(&read).status, 200, "and a read that needs the credential");
+
+        let mut forged = get("/api/config");
+        forged.headers.insert("authorization".into(), "Bearer 0000000000000000".into());
+        assert_eq!(app.route(&forged).status, 401, "a token it never minted is worthless");
     }
 
     #[test]

@@ -312,9 +312,9 @@ pub const ROUTES: &[Route] = &[
         "/api/auth",
         "config",
         Auth::Open,
-        "Check a portal PIN without changing anything",
+        "Check a portal PIN and take a bearer token (12 h) in exchange; with a PIN set, every mutation and the reads that expose the transcript or the config need one",
         "{pin}",
-        "{ok}",
+        "{ok, token, expires_in}",
     ),
     r("POST", "/api/reboot", "system", Auth::Pin, "Reboot the board", "", "{ok}"),
     r(

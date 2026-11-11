@@ -186,6 +186,26 @@ entries in the catalogue are named so nobody duplicates work.
 - Tool results are capped at 2 KB and replies at 8 KB, so a runaway model cannot eat the
   board's RAM — the board has ~8 MB of PSRAM and a few dozen kB of internal SRAM.
 
+## Security: three callers, one credential
+
+The board is on a LAN with no cloud in the middle, so the credential is local and simple —
+but it is the same one everywhere, because three different clients have to use it:
+
+| Caller | How it authenticates |
+|---|---|
+| The portal (a person) | `POST /api/auth {"pin":"…"}` → a bearer token kept in `localStorage`; the page asks once and retries the request it was making |
+| A script | `X-Portal-Pin: <pin>`, or the same bearer token |
+| An MCP client | `Authorization: Bearer <mcp.token>`; if no MCP token is set but a portal PIN is, the PIN (or a token) is accepted |
+
+With `auth.portal_pin` set, mutations **and** the reads that expose the transcript, the
+prompt, the config and the logs all require it. Status, devices, tools, the schedule and
+the discovery document stay open, so a monitor can watch the board without a credential.
+
+Tokens live in RAM: a reboot revokes them, and changing the PIN invalidates the ones the
+page holds. The default is no PIN and no token — `GET /agent.json` says so in its
+`security` block rather than leaving it to be discovered, and the portal's Access panel
+sets it in one field.
+
 ## 30 seconds without a board
 
 ```bash
