@@ -7,11 +7,16 @@
 //! same port. A manifest edit only rebuilds the tool registry — the server, the
 //! radio and the buses keep running.
 
-mod agent;
+// The two platform halves of a layered design, named for what they are rather than for
+// the layer above them: the agent *loop* lives in `esp32-agent-core` (and is tested on the
+// host against a virtual board), while `runner` is the ESP-IDF thread that drives it and
+// `console` is the USB-Serial-JTAG reader. Two files called `agent.rs` was the earlier
+// shape, and it made the split look like a duplicate.
+mod console;
 mod dns;
 mod esp_hw;
 mod nvs_store;
-mod provision;
+mod runner;
 mod wifi;
 
 use esp32_agent_core::app::{make_handler, App, FwMeta, Shared};
@@ -247,7 +252,7 @@ fn run() -> anyhow::Result<()> {
     };
 
     // The console is the provisioning path that does not cost anybody their network.
-    provision::start(app.clone(), log.clone());
+    console::start(app.clone(), log.clone());
 
     // Radio first: the portal is useless without an address, and the setup AP is
     // how a phone reaches it.
@@ -311,11 +316,11 @@ fn run() -> anyhow::Result<()> {
     // The agent runs on its own thread: one tick a second for the schedule, and the
     // queued turn if there is one. The transport has to exist before the first tick,
     // because both the model call and the `net_*` tools draw on it.
-    let (agent_timeout, agent_transport) = agent::attach(&app, &log);
+    let (agent_timeout, agent_transport) = runner::attach(&app, &log);
     // A board that cannot start the agent thread is still a working board: the
     // portal, the MCP endpoint and the tools do not depend on it. Say so on the
     // serial console instead of taking the whole firmware down with it.
-    if let Err(e) = agent::start(app.clone(), log.clone(), agent_timeout, agent_transport) {
+    if let Err(e) = runner::start(app.clone(), log.clone(), agent_timeout, agent_transport) {
         log::error!("agent thread did not start: {e}");
         log.error("agent", format!("agent thread did not start: {e}"));
     }

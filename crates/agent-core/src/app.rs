@@ -280,6 +280,7 @@ impl App {
         self.probe = ProbeReport {
             buses: res.buses,
             unknown: res.unknown,
+            candidates: res.candidates,
             at_ms: now_ms(),
             duration_ms: started.elapsed().as_millis() as u64,
         };
@@ -313,6 +314,16 @@ impl App {
                     self.log.warn("manifest", format!("device `{}` failed: {}", spec.id, e.message));
                     declared_errors.push(json!({ "device": spec.id, "error": e.message }));
                 }
+            }
+        }
+
+        // Mark which candidates are already live, so a script that adopts them does not
+        // have to diff two lists itself — and so a second run is visibly a no-op.
+        if !self.probe.candidates.is_empty() {
+            let live: Vec<String> = self.devices.infos().iter().map(|d| d.id.clone()).collect();
+            for candidate in self.probe.candidates.iter_mut() {
+                let id = candidate.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                candidate["adopted"] = json!(live.contains(&id));
             }
         }
 
@@ -404,12 +415,34 @@ impl App {
 
     // ---------------------------------------------------------------- queries
 
+    /// The tools `mcp.profile = "minimal"` hides: conveniences, never capabilities.
+    ///
+    /// Each one has an HTTP route or a manifest equivalent, and a model that has only these
+    /// removed loses no ability — it loses a shortcut.
+    const MINIMAL_HIDDEN: &'static [&'static str] = &[
+        "board_config_get",
+        "delay",
+        "logs_tail",
+        "wifi_scan",
+        "wifi_status",
+        "reboot",
+        "factory_reset",
+        "manifest_validate",
+        "manifest_reset",
+    ];
+
     /// May this tool appear in `tools/list` right now?
     pub fn is_visible(&self, name: &str) -> bool {
         let Some(def) = self.tools.get(name) else {
             return false;
         };
         if self.cfg.mcp.disabled_tools.iter().any(|d| d == name) {
+            return false;
+        }
+        // `minimal` hides conveniences, never capabilities: an HTTP route or a manifest can
+        // do these, and a model rarely needs them. Discovery, manifest, GPIO and the file
+        // tools stay in every profile — without them an empty board cannot rebuild itself.
+        if self.cfg.mcp.profile == "minimal" && Self::MINIMAL_HIDDEN.contains(&name) {
             return false;
         }
         if self.cfg.mcp.tools_mode == "generic" && def.spec.device_tool {
@@ -445,7 +478,7 @@ impl App {
     /// is a device tool.
     fn extra_mcp_specs(&self) -> Vec<Value> {
         let mut out = Vec::new();
-        for group in [fs_tools::specs(), net_tools::specs()] {
+        for group in [fs_tools::specs(), net_tools::specs(), board_tools::script_specs()] {
             for tool in openai_tools(&group) {
                 let name = tool["function"]["name"].as_str().unwrap_or_default().to_string();
                 if self.cfg.mcp.disabled_tools.iter().any(|d| d == &name) {
@@ -526,6 +559,7 @@ impl App {
     pub fn status_json(&mut self) -> Value {
         let info = self.hw.board_info();
         let wifi = self.hw.wifi_status();
+        let internal = self.hw.heap_internal();
         let now = now_ms();
         json!({
             "device_name": self.cfg.device_name,
@@ -556,6 +590,10 @@ impl App {
             "memory": {
                 "free_heap_kb": info.free_heap_kb,
                 "min_free_heap_kb": info.min_free_heap_kb,
+                // Internal SRAM is what thread stacks, DMA and the TLS handshake come from;
+                // the total above includes PSRAM and can look healthy while this is empty.
+                "internal_kb": internal.map(|(free, _)| free / 1024),
+                "largest_internal_kb": internal.map(|(_, largest)| largest / 1024),
             },
             "uptime_s": self.runtime.uptime_s(now),
             "wifi": wifi,
@@ -684,7 +722,146 @@ impl App {
 
     // ---------------------------------------------------------------- tool calls
 
+    /// Run a board script (`script` tool).
+    ///
+    /// The script gets a host that calls back into this dispatcher, so `tool()` inside a
+    /// script has exactly the reach of the caller: no extra capability, no bypass of
+    /// `is_visible`, and `script` itself is refused to stop unbounded recursion.
+    fn run_script(&mut self, args: &Value) -> Result<Value> {
+        // No `source` means the caller wants the reference, not a run: a model writing its
+        // first script has no other way to learn the syntax, and one paragraph in the tool
+        // description is not a language.
+        let help_section = crate::json::opt_str(args, "section").unwrap_or_default();
+        let wants_help = crate::json::opt_bool(args, "help").unwrap_or(false) || !help_section.is_empty();
+        let source = crate::json::opt_str(args, "source").unwrap_or_default();
+        if crate::json::opt_bool(args, "lint").unwrap_or(false) && !source.trim().is_empty() {
+            let lint = crate::script::lint(&source);
+            return Ok(json!({
+                "ok": lint.ok(),
+                "errors": lint.errors,
+                "warnings": lint.warnings,
+                "note": "lint only — nothing was run; send `source` without `lint` to execute",
+            }));
+        }
+        if wants_help || source.trim().is_empty() {
+            let section = if help_section.is_empty() { "overview".to_string() } else { help_section };
+            let text = crate::script::help(&section).map_err(McpError::invalid_params)?;
+            return Ok(json!({
+                "section": section,
+                "text": text,
+                "bytes": text.len(),
+                "next": "overview | builtins | examples, then send `source`",
+            }));
+        }
+        struct Host<'a> {
+            app: &'a mut App,
+        }
+        impl crate::script::ScriptHost for Host<'_> {
+            fn call_tool(&mut self, name: &str, arguments: &Value) -> std::result::Result<Value, String> {
+                if name == "script" {
+                    return Err("a script may not call `script`".into());
+                }
+                // `App::call_tool` already returns the tool's JSON value.
+                self.app.call_tool(name, arguments).map_err(|e| e.message)
+            }
+        }
+        let mut host = Host { app: self };
+        let started = now_ms();
+        match crate::script::run(&source, &mut host) {
+            Ok(outcome) => {
+                self.log.info(
+                    "script",
+                    format!(
+                        "ran in {} ms: {} step(s), {} log line(s)",
+                        now_ms().saturating_sub(started),
+                        outcome.steps,
+                        outcome.output.len()
+                    ),
+                );
+                Ok(json!({
+                    "ok": true,
+                    "result": outcome.result,
+                    "output": outcome.output,
+                    "steps": outcome.steps,
+                }))
+            }
+            Err(e) => Err(McpError::invalid_params(format!("script failed: {e}"))),
+        }
+    }
+
+    /// If this `net_*` call points at the board itself, the method, path and body to serve.
+    ///
+    /// Recognised hosts are loopback, the station address and the setup-AP address — that
+    /// is, anything a model would write when it means "this board". The port has to match
+    /// `mcp.port`, so a real second service on the LAN is untouched.
+    fn self_target(&mut self, args: &Value) -> Option<(String, String, String)> {
+        let url = args.get("url").and_then(|v| v.as_str())?.trim();
+        let rest = url.strip_prefix("http://").or_else(|| url.strip_prefix("https://"))?;
+        let (authority, path) = match rest.find('/') {
+            Some(i) => (&rest[..i], &rest[i..]),
+            None => (rest, "/"),
+        };
+        let (host, port) = match authority.rsplit_once(':') {
+            Some((h, p)) => (h, p.parse::<u16>().ok()?),
+            None => (authority, if url.starts_with("https://") { 443 } else { 80 }),
+        };
+        if port != self.cfg.mcp.port {
+            return None;
+        }
+        let wifi = self.hw.wifi_status();
+        let mine = ["127.0.0.1", "localhost", "::1"];
+        let ours = mine.contains(&host) || host == wifi.ip || host == wifi.ap_ip;
+        if !ours {
+            return None;
+        }
+        let method = if args.get("body").is_some() { "POST" } else { "GET" };
+        let body = args.get("body").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        Some((method.to_string(), path.to_string(), body))
+    }
+
+    /// Answer a request that was aimed at this board, without a socket.
+    fn serve_self(&mut self, method: &str, path: &str, body: String) -> std::result::Result<String, String> {
+        let (pure_path, query) = match path.split_once('?') {
+            Some((p, q)) => (p.to_string(), q),
+            None => (path.to_string(), ""),
+        };
+        let query: std::collections::BTreeMap<String, String> = query
+            .split('&')
+            .filter_map(|kv| kv.split_once('='))
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        let req = Request {
+            method: method.to_string(),
+            path: pure_path,
+            query,
+            headers: Default::default(),
+            body: body.into_bytes(),
+            peer: "self".to_string(),
+        };
+        let resp = self.route(&req);
+        let text = String::from_utf8_lossy(&resp.body).to_string();
+        if !(200..300).contains(&resp.status) {
+            return Err(format!("HTTP {}: {}", resp.status, crate::llm::body_prefix(&text, 200)));
+        }
+        Ok(json!({
+            "url": path,
+            "method": method,
+            "status": resp.status,
+            "in_process": true,
+            "bytes": text.len(),
+            "truncated": text.len() > crate::tools::net::MAX_BODY_BYTES,
+            "body": crate::llm::truncate_bytes(&text, crate::tools::net::MAX_BODY_BYTES),
+        })
+        .to_string())
+    }
+
     pub fn call_tool(&mut self, name: &str, args: &Value) -> Result<Value> {
+        // The script tool is the one tool that needs the dispatcher itself: `tool()` inside
+        // a script calls any other tool, so it cannot live in the registry where handlers
+        // only see a `ToolCtx`.
+        if name == "script" {
+            return self.run_script(args);
+        }
         if !self.is_visible(name) {
             let missing =
                 self.tools.get(name).map(|d| self.caps.missing(&d.spec.requires)).unwrap_or_default();
@@ -698,7 +875,21 @@ impl App {
             .with_data(json!({ "missing_capabilities": missing })));
         }
         let out = {
-            let App { hw, devices, cfg, runtime, log, caps, profile, probe, tools, manifest, .. } = self;
+            let App {
+                hw,
+                devices,
+                cfg,
+                runtime,
+                log,
+                caps,
+                profile,
+                probe,
+                tools,
+                manifest,
+                tasks,
+                rules,
+                ..
+            } = self;
             let def = match tools.get(name) {
                 Some(d) => d,
                 None => return Err(McpError::not_found(format!("no tool `{name}`"))),
@@ -720,6 +911,8 @@ impl App {
                 probe,
                 manifest,
                 taken: &taken,
+                tasks,
+                rules,
             };
             (def.handler)(&mut ctx, args)
         };
@@ -757,6 +950,10 @@ impl App {
         }
         if self.runtime.config_dirty {
             self.persist_config();
+        }
+        if self.runtime.sched_dirty {
+            self.runtime.sched_dirty = false;
+            self.persist_sched();
         }
         if manifest_changed || self.runtime.reprobe_requested {
             self.runtime.reprobe_requested = false;
@@ -1802,7 +1999,12 @@ impl App {
                 let v = self.status_json();
                 Response::json(&v)
             }
-            ("GET", "/api/config") => Response::json(&self.cfg.public_json()),
+            ("GET", "/api/config") => {
+                if let Err(r) = self.require_read(req) {
+                    return r;
+                }
+                Response::json(&self.cfg.public_json())
+            }
             ("POST", "/api/config") | ("PUT", "/api/config") => {
                 if let Err(r) = self.require_pin(req) {
                     return r;
@@ -1844,6 +2046,8 @@ impl App {
                 "devices": self.devices.infos(),
                 "unidentified": self.probe.unknown,
                 "buses": self.probe.buses,
+                "candidates": self.probe.candidates,
+                "discovery": self.cfg.discovery,
                 "caps": self.caps.to_json(),
                 "summary": drivers::summary(&self.devices),
             })),
@@ -1868,6 +2072,9 @@ impl App {
                 self.update_tool_selection(req)
             }
             ("GET", "/api/agent/history") => {
+                if let Err(r) = self.require_read(req) {
+                    return r;
+                }
                 let after = req.query_get("after").and_then(|v| v.parse().ok()).unwrap_or(0usize);
                 Response::json(&self.agent_history_json(after))
             }
@@ -1890,11 +2097,46 @@ impl App {
                 if let Err(r) = self.require_pin(req) {
                     return r;
                 }
-                self.agent.reset();
+                let (removed, kept) = self.agent.forget(0);
                 self.log.info("agent", "transcript cleared from the portal");
-                Response::json(&json!({ "reset": true }))
+                Response::json(&json!({ "reset": true, "removed": removed, "kept": kept }))
+            }
+            // Forgetting with a boundary: keep the last N exchanges, or none. External
+            // agents use this to start a new task without losing what is in flight.
+            ("POST", "/api/agent/forget") => {
+                if let Err(r) = self.require_pin(req) {
+                    return r;
+                }
+                let body: Value = serde_json::from_str(&req.body_str()).unwrap_or(Value::Null);
+                let keep = body.get("keep").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                let (removed, kept) = self.agent.forget(keep);
+                self.log.info(
+                    "agent",
+                    format!("forgot {removed} message(s), kept the last {kept} toward {keep} exchange(s)"),
+                );
+                Response::json(&json!({
+                    "ok": true,
+                    "removed": removed,
+                    "kept": kept,
+                    "archive_cleared": true,
+                }))
             }
             ("GET", "/api/agent/config") => Response::json(&self.agent_config_json()),
+            // What the model is actually told, system part only. Memory, instructions and
+            // the compressed index live here, and a client that cannot see them cannot
+            // tell a bad prompt from a bad model.
+            ("GET", "/api/agent/prompt") => {
+                if let Err(r) = self.require_read(req) {
+                    return r;
+                }
+                let text = self.agent.prompt_text(self);
+                Response::json(&json!({
+                    "bytes": text.len(),
+                    "system": text,
+                    "archive_lines": self.agent.archive.len(),
+                    "history": self.agent.history.len(),
+                }))
+            }
             ("POST", "/api/agent/config") => {
                 if let Err(r) = self.require_pin(req) {
                     return r;
@@ -1966,7 +2208,18 @@ impl App {
                     .and_then(|v| v.get("pin").and_then(|p| p.as_str()).map(|s| s.to_string()))
                     .unwrap_or_default();
                 if self.cfg.auth.portal_pin.is_empty() || pin == self.cfg.auth.portal_pin {
-                    Response::json(&json!({ "ok": true, "required": !self.cfg.auth.portal_pin.is_empty() }))
+                    // A token, not just an acknowledgement: the page keeps it and sends
+                    // it as a bearer token, and so can a script. Twelve hours is long
+                    // enough for a bench session and short enough that a forgotten tab
+                    // on a shared network stops working the next day.
+                    let token = self.runtime.issue_token(seed(), now_ms(), 12 * 3600);
+                    self.log.info("auth", "portal token issued");
+                    Response::json(&json!({
+                        "ok": true,
+                        "required": !self.cfg.auth.portal_pin.is_empty(),
+                        "token": token,
+                        "expires_in": 12 * 3600,
+                    }))
                 } else {
                     self.runtime.counters.auth_failures += 1;
                     Response::json_status(401, &json!({ "ok": false, "error": "wrong PIN" }))
@@ -2028,17 +2281,57 @@ impl App {
         if self.cfg.auth.portal_pin.is_empty() {
             return Ok(());
         }
-        let provided = req
-            .header("x-portal-pin")
-            .map(|s| s.to_string())
-            .or_else(|| req.query_get("pin").map(|s| s.to_string()))
-            .unwrap_or_default();
-        if provided == self.cfg.auth.portal_pin {
+        if self.credential_ok(req) {
             Ok(())
         } else {
             self.runtime.counters.auth_failures += 1;
             Err(Response::json_status(401, &json!({ "error": "PIN required", "pin_required": true })))
         }
+    }
+
+    /// True when the request carries the portal PIN or a token minted from it.
+    ///
+    /// Three ways in, because the three callers differ: a browser keeps a token from
+    /// `POST /api/auth`, a script sends `X-Portal-Pin`, and an MCP client sends a bearer
+    /// token. All of them are compared here so no route can be reached by a path that
+    /// forgot one of them.
+    fn credential_ok(&mut self, req: &Request) -> bool {
+        let pin = self.cfg.auth.portal_pin.clone();
+        let direct = req
+            .header("x-portal-pin")
+            .map(|s| s.to_string())
+            .or_else(|| req.query_get("pin").map(|s| s.to_string()))
+            .unwrap_or_default();
+        if !direct.is_empty() && direct == pin {
+            return true;
+        }
+        let bearer = req
+            .header("authorization")
+            .and_then(|v| v.strip_prefix("Bearer ").or_else(|| v.strip_prefix("bearer ")))
+            .map(|v| v.trim().to_string())
+            .unwrap_or_default();
+        if bearer.is_empty() {
+            return false;
+        }
+        if bearer == pin {
+            return true;
+        }
+        let now = now_ms();
+        self.runtime.token_valid(&bearer, now)
+    }
+
+    /// Reads that expose secrets, the transcript or the prompt need the same credential
+    /// as a write when a PIN is configured: `config` masks values but still lists the
+    /// network, and the transcript is the most private thing on the board.
+    fn require_read(&mut self, req: &Request) -> std::result::Result<(), Response> {
+        if self.cfg.auth.portal_pin.is_empty() {
+            return Ok(());
+        }
+        if self.credential_ok(req) {
+            return Ok(());
+        }
+        self.runtime.counters.auth_failures += 1;
+        Err(Response::json_status(401, &json!({ "error": "PIN required", "pin_required": true })))
     }
 
     fn handle_mcp_post(&mut self, req: &Request) -> Response {
@@ -2275,7 +2568,7 @@ impl ToolHost for App {
         // File and HTTP tools gate on nothing the hardware must provide, so they are not
         // MCP tools; they are appended after the board's own list, and they come before
         // the manifest block because they never change at runtime.
-        for group in [fs_tools::specs(), net_tools::specs()] {
+        for group in [fs_tools::specs(), net_tools::specs(), board_tools::script_specs()] {
             tools.extend(openai_tools(&group));
         }
         tools.extend(volatile);
@@ -2299,6 +2592,11 @@ impl ToolHost for App {
             .collect()
     }
 
+    /// The memory index: `/memory.md`, one pointer per memory.
+    fn memory_index(&self) -> Option<String> {
+        crate::tools::knowledge::memory(&self.workspace)
+    }
+
     fn call_tool(&mut self, name: &str, arguments: &Value) -> std::result::Result<String, String> {
         if name.starts_with("fs_") {
             let result = fs_tools::call(&mut self.workspace, name, arguments)
@@ -2311,6 +2609,14 @@ impl ToolHost for App {
             return Ok(text);
         }
         if name.starts_with("net_") {
+            // A request to the board's own server cannot go out over a socket while this
+            // call is holding the thread that would answer it: the accept loop is inside
+            // this very tool. Answer it in process instead — the model gets the same JSON
+            // a socket would have carried, in microseconds, and the board cannot deadlock
+            // against itself.
+            if let Some((method, path, body)) = self.self_target(arguments) {
+                return self.serve_self(&method, &path, body);
+            }
             // The turn's own client is elsewhere, so this one is free to be used from
             // inside a tool call — which is what lets the agent reach the network
             // mid-run instead of only between turns.
@@ -2448,7 +2754,7 @@ fn llm_apply_json(cfg: &mut LlmConfig, v: &Value) {
         }
     }
     if let Some(n) = v.get("max_steps").and_then(|x| x.as_u64()) {
-        cfg.max_steps = n.clamp(1, 12) as u8;
+        cfg.max_steps = n.min(200) as u8;
     }
     if let Some(t) = v.get("temperature").and_then(|x| x.as_f64()) {
         cfg.temperature = t.clamp(0.0, 2.0) as f32;
@@ -3083,16 +3389,223 @@ mod tests {
 
     /// The portal has to carry the agent panel: a panel whose buttons call an
     /// endpoint that does not exist is worse than no panel.
+    ///
+    /// The page is a conversation with everything else behind the menu, so the panel is
+    /// reached through `data-panel`, and the transcript lives in `.chat` as bubbles
+    /// rather than in a transcript table.
     #[test]
     fn the_portal_ships_the_agent_panel() {
         assert!(web::INDEX_HTML.contains("id=\"panel-agent\""));
-        assert!(web::INDEX_HTML.contains("data-tab=\"agent\""));
+        assert!(web::INDEX_HTML.contains("data-panel=\"agent\""));
+        assert!(web::INDEX_HTML.contains("id=\"chat\""), "the conversation is the page");
         for needle in ["/api/agent/message", "/api/agent/history", "/api/agent/config", "/api/sched"] {
             assert!(web::APP_JS.contains(needle), "app.js never calls {needle}");
         }
         // A schedule table that cannot toggle a task does not meet the brief.
         assert!(web::APP_JS.contains("sched_disable") && web::APP_JS.contains("sched_enable"));
-        assert!(web::STYLE_CSS.contains(".transcript"));
+        assert!(web::STYLE_CSS.contains(".bubble"), "bubbles are the transcript");
+        assert!(web::STYLE_CSS.contains("100dvh"), "mobile height, not a guessed one");
+    }
+
+    /// The board's own agent can put work on the board's schedule: a task, on an interval
+    /// or at a daily time, into the same queue a user message uses.
+    #[test]
+    fn the_agent_can_schedule_its_own_work() {
+        let mut app = test_app();
+        let added = app
+            .call_tool("schedule", &json!({"action":"add","prompt":"read the sensor","every_s":60}))
+            .expect("add");
+        assert_eq!(added["id"], "t1");
+        assert_eq!(app.tasks.len(), 1);
+        assert_eq!(app.tasks[0].every_s, 60);
+        assert!(app.runtime.sched_dirty || !app.tasks.is_empty());
+
+        // A task with no trigger never fires, so it is refused instead of stored.
+        let bad = app.call_tool("schedule", &json!({"action":"add","prompt":"nothing"}));
+        assert!(bad.is_err(), "a task with neither every_s nor at_hhmm is a trap");
+
+        let listed = app.call_tool("schedule", &json!({"action":"list"})).expect("list");
+        assert_eq!(listed["count"], 1);
+
+        app.call_tool("schedule", &json!({"action":"disable","id":"t1"})).expect("disable");
+        assert!(!app.tasks[0].enabled);
+        app.call_tool("schedule", &json!({"action":"remove","id":"t1"})).expect("remove");
+        assert!(app.tasks.is_empty());
+    }
+
+    /// Manual discovery: the drivers probe, nothing is adopted, and the board's own agent
+    /// is the one that decides what the board has.
+    #[test]
+    fn manual_discovery_hands_the_decision_to_the_agent() {
+        let mut app = test_app();
+        let auto = app.devices.len();
+        assert!(auto > 0, "the virtual board reports a few devices");
+
+        app.cfg.discovery = "manual".into();
+        app.rebuild();
+        assert_eq!(app.devices.len(), 0, "manual discovery adopts nothing on its own");
+        assert!(app.probe.candidates.len() >= auto, "the drivers still saw them");
+        let candidate = app.probe.candidates[0].clone();
+        assert!(candidate["adopt"]["devices"].is_array(), "a candidate must say how to adopt it");
+
+        // The exact body a candidate hands back is a valid manifest.
+        let manifest = json!({
+            "version": 1,
+            "devices": candidate["adopt"]["devices"].clone(),
+            "tools": [],
+        });
+        app.call_tool("manifest_apply", &json!({"manifest": manifest})).expect("adopting a candidate works");
+        assert!(app.devices.len() >= 1, "the adopted device is live");
+    }
+
+    /// The reference is what makes the language usable: without it the model guesses the
+    /// syntax from one paragraph and then asks for tools that do not exist.
+    #[test]
+    fn the_script_tool_ships_a_reference_in_sections_that_fit_a_tool_result() {
+        let mut app = test_app();
+        let overview = app.call_tool("script", &json!({"help": true})).expect("help");
+        assert_eq!(overview["section"], "overview");
+        let text = overview["text"].as_str().expect("text");
+        for needle in ["while", "let", "tool(", "LIMITS"] {
+            assert!(text.contains(needle), "overview is missing {needle}");
+        }
+        for section in ["overview", "builtins", "examples"] {
+            let doc = app.call_tool("script", &json!({"section": section})).expect("section");
+            let bytes = doc["text"].as_str().unwrap().len();
+            assert!(bytes < 2048, "{section} is {bytes} bytes; a tool result is capped at 2 KB");
+        }
+        assert!(app.call_tool("script", &json!({"section": "nope"})).is_err());
+        // An empty call is a help request too, not a confusing "source required".
+        assert_eq!(app.call_tool("script", &json!({})).expect("empty is help")["section"], "overview");
+    }
+
+    /// A script is how the model writes the loop the tool vocabulary cannot express — and
+    /// `tool()` inside it goes through the same dispatcher, so it cannot reach further than
+    /// the caller.
+    /// `minimal` is the answer to "why are there still 27 tools on an empty board": it
+    /// hides the nine that are conveniences, and keeps everything an empty board needs to
+    /// rebuild itself.
+    #[test]
+    fn the_minimal_profile_hides_shortcuts_and_keeps_the_ability_to_rebuild() {
+        let mut app = test_app();
+        let full = app.tool_specs().as_array().unwrap().len();
+        for hidden in App::MINIMAL_HIDDEN {
+            assert!(app.is_visible(hidden), "{hidden} should be visible in full");
+        }
+
+        app.cfg.mcp.profile = "minimal".into();
+        let minimal = app.tool_specs().as_array().unwrap().len();
+        assert_eq!(minimal + App::MINIMAL_HIDDEN.len(), full, "nothing else moved");
+        for hidden in App::MINIMAL_HIDDEN {
+            assert!(!app.is_visible(hidden), "{hidden} should be hidden in minimal");
+        }
+        // The bootstrap survives: discovery, manifest, GPIO and the file tools.
+        for kept in [
+            "board_status",
+            "devices_list",
+            "devices_probe",
+            "i2c_scan",
+            "manifest_apply",
+            "manifest_describe",
+            "gpio_write",
+        ] {
+            assert!(app.is_visible(kept), "{kept} must survive the minimal profile");
+        }
+        // `fs_*`, `net_*` and `script` live outside the registry, so they are checked in the
+        // model's own tool list rather than through `is_visible`.
+        let names: Vec<String> = app
+            .tool_specs()
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["function"]["name"].as_str().unwrap_or("").to_string())
+            .collect();
+        for kept in ["fs_read", "fs_write", "net_get", "script"] {
+            assert!(names.iter().any(|n| n == kept), "{kept} must survive the minimal profile");
+        }
+
+        // And it is a config field, not a build: one patch brings them back.
+        let touched = app.cfg.apply_patch(&json!({"mcp": {"profile": "full"}})).expect("patch");
+        assert!(touched.contains(&"mcp.profile".to_string()));
+        assert_eq!(app.tool_specs().as_array().unwrap().len(), full);
+        assert!(app.cfg.apply_patch(&json!({"mcp": {"profile": "tiny"}})).is_err());
+    }
+
+    /// Linting is how a model checks a script before it runs: `tool()` calls have side
+    /// effects, so "execute and see" is the worst way to find a typo.
+    #[test]
+    fn the_linter_answers_before_anything_runs() {
+        let mut app = test_app();
+
+        let good = app
+            .call_tool("script", &json!({"lint": true, "source": "let i = 0\nwhile i < 3 { i = i + 1 }\ni"}))
+            .expect("lint");
+        assert_eq!(good["ok"], true);
+        assert!(good["errors"].as_array().unwrap().is_empty());
+
+        let bad = app.call_tool("script", &json!({"lint": true, "source": "let = 3"})).expect("lint");
+        assert_eq!(bad["ok"], false);
+        let first = bad["errors"][0].as_str().expect("an error message");
+        assert!(first.contains("line 1"), "an error without a position is a guess: {first}");
+        assert!(first.contains("column"), "{first}");
+
+        // A call to a function that does not exist is a warning, not an error: it runs and
+        // fails at that line, and the model should see the typo before that happens.
+        let typo = app
+            .call_tool("script", &json!({"lint": true, "source": "speaker_ton({freq_hz: 440})"}))
+            .expect("lint");
+        assert_eq!(typo["ok"], true);
+        assert!(typo["warnings"][0].as_str().unwrap().contains("speaker_ton"));
+        assert!(typo["warnings"][0].as_str().unwrap().contains("builtins"));
+
+        // And linting never runs the program: a tool call would have been logged.
+        let before = app.runtime.tool_calls.len();
+        app.call_tool("script", &json!({"lint": true, "source": "tool(\"reboot\", {})"})).expect("lint");
+        assert_eq!(app.runtime.tool_calls.len(), before, "lint must not execute anything");
+        assert!(!app.runtime.restart_requested);
+    }
+
+    #[test]
+    fn a_script_can_drive_the_boards_tools() {
+        let mut app = test_app();
+        let out = app
+            .call_tool(
+                "script",
+                &json!({"source": "let d = tool(\"devices_list\", {})\nlet n = d.count\nlet i = 0\nwhile i < n { i = i + 1 }\nlog(\"devices: \" + str(n))\ni"}),
+            )
+            .expect("script runs");
+        assert_eq!(out["ok"], true);
+        assert!(out["steps"].as_u64().unwrap_or(0) > 0);
+        assert!(out["output"][0].as_str().unwrap().starts_with("devices: "));
+        assert_eq!(out["result"], json!(app.devices.len() as i64));
+
+        // A script that tries to recurse is refused rather than nesting until the stack dies.
+        let err = app.call_tool("script", &json!({"source": "tool(\"script\", {})"}));
+        assert!(err.is_err());
+    }
+
+    /// A `net_get` aimed at the board itself has to be answered, not deadlocked.
+    ///
+    /// The tool runs on the thread that would answer the connection, so a real socket would
+    /// wait for itself: measured on the bench as a 45 s timeout. It is served in process now,
+    /// and the check is the same JSON a socket would have carried.
+    #[test]
+    fn asking_the_board_for_its_own_healthz_answers_in_process() {
+        let mut app = test_app();
+        let started = std::time::Instant::now();
+        // The path MCP and the on-board agent both take for `net_*` is `ToolHost`.
+        let out = ToolHost::call_tool(&mut app, "net_get", &json!({"url": "http://127.0.0.1:8080/healthz"}))
+            .expect("a self request is answered");
+        let body: Value = serde_json::from_str(&out).expect("json");
+        let took = started.elapsed();
+        assert!(took < std::time::Duration::from_secs(1), "took {took:?}");
+        assert_eq!(body["status"], 200);
+        assert_eq!(body["in_process"], true);
+        assert!(body["body"].as_str().unwrap().contains("ok"));
+
+        // A different port is somebody else's service: it goes to the transport.
+        let other = ToolHost::call_tool(&mut app, "net_get", &json!({"url": "http://127.0.0.1:9/healthz"}));
+        assert!(other.is_err(), "port 9 is not us");
     }
 
     #[test]
@@ -3443,7 +3956,9 @@ mod tests {
         assert!(String::from_utf8_lossy(&bad.body).contains("http://"));
         assert_eq!(app.llm.base_url, "https://api.example.com/v1/chat/completions");
         assert_eq!(app.route(&post("/api/agent/config", r#"{"max_steps":99}"#)).status, 200);
-        assert_eq!(app.llm.max_steps, 12, "max_steps is clamped, not trusted");
+        assert_eq!(app.llm.max_steps, 99, "a step cap can be set, up to the sane ceiling");
+        assert_eq!(app.route(&post("/api/agent/config", r#"{"max_steps":0}"#)).status, 200);
+        assert_eq!(app.llm.max_steps, 0, "zero turns the cap off again");
     }
 
     #[test]
@@ -3454,12 +3969,43 @@ mod tests {
         assert_eq!(app.route(&post("/api/agent/reset", "{}")).status, 401);
         assert_eq!(app.route(&post("/api/agent/config", r#"{"model":"x"}"#)).status, 401);
         assert_eq!(app.route(&post("/api/sched", r#"{"kind":"task","op":"delete","id":"t1"}"#)).status, 401);
-        // Reads stay open, exactly as they do for the rest of the console.
-        assert_eq!(app.route(&get("/api/agent/history")).status, 200);
-        assert_eq!(app.route(&get("/api/agent/config")).status, 200);
+        // Secrets and the transcript need the same credential now: `config` names the
+        // network even with values masked, and the transcript is the most private thing
+        // on the board. Status, devices and the schedule stay readable.
+        assert_eq!(app.route(&get("/api/agent/history")).status, 401);
+        assert_eq!(app.route(&get("/api/config")).status, 401);
+        assert_eq!(app.route(&get("/api/agent/prompt")).status, 401);
         assert_eq!(app.route(&get("/api/sched")).status, 200);
         assert!(app.tasks.is_empty(), "an unauthorised write got through");
         assert!(app.agent.history.is_empty());
+    }
+
+    /// Login, then use the token: the page and a script both need a way in that is not
+    /// "repeat the PIN in every URL".
+    #[test]
+    fn a_token_from_the_pin_authorises_writes_and_reads() {
+        let mut app = test_app();
+        app.cfg.auth.portal_pin = "1234".into();
+
+        let wrong = body_json(&app.route(&post("/api/auth", r#"{"pin":"9999"}"#)));
+        assert_eq!(wrong["ok"], false);
+        assert_eq!(app.route(&post("/api/auth", r#"{"pin":"9999"}"#)).status, 401);
+
+        let login = body_json(&app.route(&post("/api/auth", r#"{"pin":"1234"}"#)));
+        let token = login["token"].as_str().expect("token").to_string();
+        assert_eq!(login["expires_in"], 12 * 3600);
+
+        let mut write = post("/api/agent/reset", "{}");
+        write.headers.insert("authorization".into(), format!("Bearer {token}"));
+        assert_eq!(app.route(&write).status, 200, "the token authorises a write");
+
+        let mut read = get("/api/config");
+        read.headers.insert("authorization".into(), format!("Bearer {token}"));
+        assert_eq!(app.route(&read).status, 200, "and a read that needs the credential");
+
+        let mut forged = get("/api/config");
+        forged.headers.insert("authorization".into(), "Bearer 0000000000000000".into());
+        assert_eq!(app.route(&forged).status, 401, "a token it never minted is worthless");
     }
 
     #[test]
@@ -3562,6 +4108,17 @@ mod tests {
         impl ChatTransport for Fetching {
             fn post_json(
                 &mut self,
+                url: &str,
+                _headers: &[(&str, &str)],
+                _body: &str,
+            ) -> std::result::Result<String, String> {
+                self.urls.lock().unwrap().push(url.to_string());
+                Ok(self.body.clone())
+            }
+
+            fn request(
+                &mut self,
+                _method: &str,
                 url: &str,
                 _headers: &[(&str, &str)],
                 _body: &str,
@@ -4316,18 +4873,18 @@ mod tests {
         }
         assert!(!board.contains(&"aaa_manifest"), "a manifest tool is not in the board block: {board:?}");
 
-        // ... then the tools outside the registry — file and network — in module order ...
+        // ... then the tools outside the registry — file, network, script — in module order ...
         assert_eq!(
-            &names[split..split + 10],
+            &names[split..split + 11],
             &[
                 "fs_ls", "fs_read", "fs_write", "fs_edit", "fs_rm", "fs_cp", "fs_mv", "fs_grep", "net_get",
-                "net_post"
+                "net_post", "script"
             ],
-            "the file and network tools are not the trailing block: {names:?}"
+            "the file, network and script tools are not the trailing block: {names:?}"
         );
 
         // ... and the manifest block last, because it is the one the model rewrites.
-        assert_eq!(&names[split + 10..], &["aaa_manifest"], "{names:?}");
+        assert_eq!(&names[split + 11..], &["aaa_manifest"], "{names:?}");
     }
 
     /// The same board has to produce the same bytes, or the provider's prompt cache
@@ -5295,6 +5852,45 @@ mod tests {
 
     /// A model endpoint that is down must not burn the whole budget: three failed
     /// iterations in a row end the goal as blocked, and a failure still costs budget.
+    #[test]
+    fn forgetting_through_http_keeps_the_tail_and_reports_it() {
+        let mut app = test_app();
+        for i in 0..3 {
+            app.agent.history.push(crate::agent::Message::user(&format!("q{i}"), "http", 10 * i));
+            app.agent.history.push(crate::agent::Message::assistant("a", Vec::new(), 10 * i + 1));
+        }
+        let resp = app.route(&post("/api/agent/forget", r#"{"keep":1}"#));
+        assert_eq!(resp.status, 200);
+        let body: Value = serde_json::from_slice(&resp.body).expect("json");
+        assert_eq!(body["removed"], 4);
+        assert_eq!(body["kept"], 2);
+        assert_eq!(app.agent.history.len(), 2);
+        assert_eq!(app.agent.history[0].text, "q2");
+
+        // No `keep` means none: the whole conversation goes.
+        let resp = app.route(&post("/api/agent/forget", "{}"));
+        assert_eq!(resp.status, 200);
+        assert!(app.agent.history.is_empty());
+    }
+
+    #[test]
+    fn the_prompt_endpoint_shows_memory_and_the_compressed_view() {
+        let mut app = test_app();
+        use crate::tools::fs::Workspace as _;
+        app.workspace
+            .write("/memory.md", "- [pins](/memory/pins.md) — GPIO18 is the strip\n")
+            .expect("write");
+        app.agent.archive.push("called: board_status({})".into());
+        let resp = app.route(&get("/api/agent/prompt"));
+        assert_eq!(resp.status, 200);
+        let body: Value = serde_json::from_slice(&resp.body).expect("json");
+        let system = body["system"].as_str().expect("system");
+        assert!(system.contains("## Memory (/memory.md)"), "{system}");
+        assert!(system.contains("memory/pins.md"), "{system}");
+        assert!(system.contains("Earlier in this conversation"), "{system}");
+        assert_eq!(body["archive_lines"], 1);
+    }
+
     #[test]
     fn three_failed_iterations_in_a_row_block_the_goal() {
         let (mut app, _seen) = goal_app("", true);

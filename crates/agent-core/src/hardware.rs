@@ -181,6 +181,15 @@ pub trait Hardware: Send {
     fn inventory_extra(&mut self) -> Value {
         json!({})
     }
+
+    /// Internal RAM: `(free, largest contiguous block)` in bytes.
+    ///
+    /// Thread stacks and DMA come from here, and PSRAM cannot supply either, so this is
+    /// the number that decides whether an https handshake or a new connection thread fits.
+    /// The portal reports it next to the total heap for exactly that reason.
+    fn heap_internal(&mut self) -> Option<(u32, u32)> {
+        None
+    }
 }
 
 /// Convenience: a `Hardware` that answers nothing, for tests of code paths that

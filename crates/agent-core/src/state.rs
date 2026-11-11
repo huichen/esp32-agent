@@ -17,6 +17,8 @@ const SANE_EPOCH_MS: u64 = 1_600_000_000_000;
 pub struct ProbeReport {
     pub buses: Vec<Value>,
     pub unknown: Vec<Value>,
+    /// Devices a driver recognised but did not adopt (`devices.discovery = manual`).
+    pub candidates: Vec<Value>,
     pub at_ms: u64,
     pub duration_ms: u64,
 }
@@ -65,6 +67,12 @@ pub struct Runtime {
     pub manifest_rev: u64,
     /// Set when the manifest changed and the registry must be rebuilt.
     pub manifest_dirty: bool,
+    /// Set when the schedule changed; `settle` writes it to NVS.
+    pub sched_dirty: bool,
+    /// Portal tokens minted by `POST /api/auth`: `(token, expires_at_ms)`. They live in
+    /// RAM, so a reboot revokes every one of them — which is the right default for a
+    /// device whose PIN can be changed from the same page.
+    pub auth_tokens: Vec<(String, u64)>,
 }
 
 impl Runtime {
@@ -204,6 +212,27 @@ pub fn make_session_id(seed: u64, counter: u64, now_ms: u64) -> String {
     x = x.wrapping_mul(0xFF51_AFD7_ED55_8CCD);
     x ^= x >> 33;
     format!("{:016x}", x)
+}
+
+impl Runtime {
+    /// Mint a portal token that lives for `ttl_s`. Returns the token.
+    ///
+    /// Not a session cookie: the portal keeps it in `localStorage` and sends it as a
+    /// bearer token, so the same string works for `curl` and for the page without a
+    /// cookie jar. Old tokens are purged here rather than on a timer — the only moment
+    /// the list can grow is a login.
+    pub fn issue_token(&mut self, seed: u64, now_ms: u64, ttl_s: u64) -> String {
+        self.auth_tokens.retain(|(_, expiry)| *expiry > now_ms);
+        let token = make_session_id(seed, self.auth_tokens.len() as u64 + 7, now_ms);
+        self.auth_tokens.push((token.clone(), now_ms + ttl_s * 1000));
+        token
+    }
+
+    /// True when the token was minted here and has not expired.
+    pub fn token_valid(&mut self, token: &str, now_ms: u64) -> bool {
+        self.auth_tokens.retain(|(_, expiry)| *expiry > now_ms);
+        self.auth_tokens.iter().any(|(t, _)| t == token)
+    }
 }
 
 #[cfg(test)]

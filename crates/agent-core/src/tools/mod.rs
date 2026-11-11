@@ -12,7 +12,7 @@ use crate::capability::{cap, CapSet};
 use crate::error::McpError;
 use crate::hardware::PinMode;
 use crate::json as j;
-use crate::tool::{boolean, enumeration, integer, object_schema, ToolCtx, ToolDef};
+use crate::tool::{boolean, enumeration, integer, object_schema, string, ToolCtx, ToolDef};
 use crate::util::hex;
 use serde_json::{json, Value};
 
@@ -110,6 +110,8 @@ pub fn board_tools() -> Vec<ToolDef> {
                 "buses": ctx.probe.buses,
                 "devices": devices,
                 "unidentified": ctx.probe.unknown,
+                "candidates": ctx.probe.candidates,
+                "discovery": ctx.cfg.discovery,
                 "declared_pins": ctx.cfg.pins,
                 "board_extra": ctx.hw.inventory_extra(),
             }))
@@ -133,7 +135,16 @@ pub fn board_tools() -> Vec<ToolDef> {
                         })
                     })
                     .collect();
-                Ok(json!({ "count": devices.len(), "devices": devices, "caps": ctx.caps.to_json() }))
+                Ok(json!({
+                    "count": devices.len(),
+                    "devices": devices,
+                    "caps": ctx.caps.to_json(),
+                    // With `devices.discovery = manual` this is the list that matters: the
+                    // drivers recognised these and adopted none. `adopt` is the exact
+                    // `manifest_apply` body that would take one over.
+                    "candidates": ctx.probe.candidates,
+                    "discovery": ctx.cfg.discovery,
+                }))
             }),
         ToolDef::new("i2c_scan", "Scan an I2C bus and list the addresses that acknowledge")
             .title("I2C scan")
@@ -342,6 +353,83 @@ pub fn system_tools() -> Vec<ToolDef> {
             }
             Ok(json!({ "ok": true, "touched": touched, "restart_required": needs_restart }))
         }),
+        ToolDef::new(
+            "schedule",
+            "Manage the board's own schedule. action=list shows every task; add creates one that re-runs a prompt on an interval (`every_s`) or at a daily time (`at_hhmm`); remove/disable/enable take an `id`. A task fires into the same queue a user message uses, so the board works on its own",
+        )
+        .title("Schedule")
+        .category("system")
+        .core()
+        .mutating()
+        .schema(object_schema(
+            &[
+                ("action", enumeration(&["list", "add", "remove", "enable", "disable"], "what to do")),
+                ("id", string("task id, for remove/enable/disable")),
+                ("prompt", string("what to ask the agent when it fires")),
+                ("every_s", integer(0, 86_400, "repeat every N seconds; 0 = use at_hhmm")),
+                ("at_hhmm", string("daily time as \"07:30\" (UTC)")),
+                ("enabled", boolean("default true")),
+            ],
+            &["action"],
+        ))
+        .bind(|ctx, args| {
+            let action = j::opt_str(args, "action").unwrap_or_default();
+            match action.as_str() {
+                "list" => Ok(json!({
+                    "tasks": ctx.tasks.iter().map(|t| json!({
+                        "id": t.id,
+                        "prompt": t.prompt,
+                        "every_s": t.every_s,
+                        "at_hhmm": t.at_hhmm,
+                        "enabled": t.enabled,
+                    })).collect::<Vec<_>>(),
+                    "count": ctx.tasks.len(),
+                })),
+                "add" => {
+                    let prompt = j::opt_str(args, "prompt").unwrap_or_default();
+                    if prompt.trim().is_empty() {
+                        return Err(McpError::invalid_params("`prompt` is required to add a task"));
+                    }
+                    let every_s = j::opt_i64(args, "every_s").unwrap_or(0).clamp(0, 86_400) as u32;
+                    let at_hhmm = j::opt_str(args, "at_hhmm").unwrap_or_default();
+                    if every_s == 0 && at_hhmm.is_empty() {
+                        return Err(McpError::invalid_params(
+                            "give `every_s` or `at_hhmm`; a task with neither never fires",
+                        ));
+                    }
+                    // The id is derived, not asked for: a model inventing one twice would
+                    // silently replace its own task.
+                    let id = format!("t{}", ctx.tasks.len() + 1);
+                    ctx.tasks.push(crate::sched::ScheduledTask {
+                        id: id.clone(),
+                        prompt,
+                        every_s,
+                        at_hhmm,
+                        enabled: j::opt_bool(args, "enabled").unwrap_or(true),
+                        last_run_ms: 0,
+                    });
+                    ctx.runtime.sched_dirty = true;
+                    ctx.log.info("agent", format!("schedule: task `{id}` added from a tool call"));
+                    Ok(json!({ "ok": true, "id": id, "count": ctx.tasks.len() }))
+                }
+                "remove" | "enable" | "disable" => {
+                    let id = j::opt_str(args, "id").unwrap_or_default();
+                    let Some(task) = ctx.tasks.iter_mut().find(|t| t.id == id) else {
+                        return Err(McpError::not_found(format!("no task `{id}`")));
+                    };
+                    if action == "remove" {
+                        ctx.tasks.retain(|t| t.id != id);
+                    } else {
+                        task.enabled = action == "enable";
+                    }
+                    ctx.runtime.sched_dirty = true;
+                    Ok(json!({ "ok": true, "id": id, "count": ctx.tasks.len() }))
+                }
+                other => Err(McpError::invalid_params(format!(
+                    "unknown action `{other}`; use list, add, remove, enable or disable"
+                ))),
+            }
+        }),
         ToolDef::new("devices_probe", "Re-scan the buses and rebuild the tool list")
             .title("Re-probe devices")
             .category("system")
@@ -380,6 +468,43 @@ pub fn system_tools() -> Vec<ToolDef> {
                 Ok(json!({ "ok": true }))
             }),
     ]
+}
+
+/// The OpenAI `tools` array for the script tool.
+///
+/// One entry, because the language carries the generality: a script is how the model
+/// writes the loop it needs instead of asking for a new fixed tool every time.
+pub fn script_specs() -> Value {
+    json!([{
+        "type": "function",
+        "function": {
+            "name": "script",
+            "description": "Run a small script on the board — the way to write a loop or a condition the fixed tools cannot express. Syntax: `let x = 1`, `x = 2`, `l[0] = 9`, `if c { } else { }`, `while c { }` with `break`, values are numbers, strings, bools, nil, lists `[1,2]` and maps `{a: 1}`; operators `+ - * / %`, `== != < <= > >=`, `and or not`; builtins `len str num type log` and `tool(name, args)` which calls any other board tool; `#` starts a comment; the last expression is the result. Send {\"lint\": true} with `source` to check it without running, {\"help\": true} (or {\"section\": \"overview\"|\"builtins\"|\"examples\"}) for the full reference. Bounded at 50000 steps; `tool(\"script\")` is refused.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "source": {
+                        "type": "string",
+                        "description": "the program"
+                    },
+                    "lint": {
+                        "type": "boolean",
+                        "description": "check the syntax and unknown function names without running anything"
+                    },
+                    "help": {
+                        "type": "boolean",
+                        "description": "return the syntax reference instead of running anything"
+                    },
+                    "section": {
+                        "type": "string",
+                        "enum": ["overview", "builtins", "examples"],
+                        "description": "which part of the reference to return"
+                    }
+                },
+                "additionalProperties": false
+            }
+        }
+    }])
 }
 
 /// Every tool that needs no device at all.

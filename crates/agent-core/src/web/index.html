@@ -1,290 +1,173 @@
-<!DOCTYPE html>
-<html lang="zh-CN">
+<!doctype html>
+<html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="theme-color" content="#0b0f14">
-<title>esp32-agent 控制台</title>
+<meta name="color-scheme" content="dark light">
+<title>esp32-agent</title>
 <link rel="stylesheet" href="/assets/style.css">
 </head>
 <body>
-<header class="top">
-  <div class="brand">
-    <span class="dot" id="health-dot"></span>
-    <strong id="device-name">esp32-agent</strong>
-    <span class="chip" id="board-chip">…</span>
-    <span class="chip mono" id="ip-chip">–</span>
-  </div>
-  <div class="top-right">
-    <a class="btn ghost" id="lang-btn" href="#">EN</a>
-    <button class="btn ghost" id="reboot-btn" data-i18n="reboot">重启</button>
+
+<!-- Two lines at most: name + one status line, and the menu. -->
+<header class="bar">
+  <div class="bar-main">
+    <button id="menu-btn" class="icon" aria-label="Menu" title="Menu">&#9776;</button>
+    <div class="titles">
+      <h1 id="title">esp32-agent</h1>
+      <p id="sub">connecting&hellip;</p>
+    </div>
+    <span id="link" class="dot" title="connection"></span>
   </div>
 </header>
 
-<div id="setup-banner" class="banner hidden">
-  <div>
-    <strong data-i18n="setup_title">设备还没有加入网络</strong>
-    <p data-i18n="setup_hint">用手机连接设备自己发出的 WiFi（默认 esp32-agent-setup），然后在这个页面填写家里的 WiFi，保存后设备会自动联网。</p>
-  </div>
-</div>
-
-<nav class="tabs" id="tabs">
-  <button class="tab active" data-tab="overview" data-i18n="tab_overview">总览</button>
-  <button class="tab" data-tab="wifi" data-i18n="tab_wifi">WiFi</button>
-  <button class="tab" data-tab="devices" data-i18n="tab_devices">设备</button>
-  <button class="tab" data-tab="tools" data-i18n="tab_tools">工具</button>
-  <button class="tab" data-tab="manifest" data-i18n="tab_manifest">清单</button>
-  <button class="tab" data-tab="agent" data-i18n="tab_agent">智能体</button>
-  <button class="tab" data-tab="clients" data-i18n="tab_clients">接入</button>
-  <button class="tab" data-tab="logs" data-i18n="tab_logs">日志</button>
-</nav>
-
-<main>
-  <section class="panel active" id="panel-overview">
-    <div class="grid">
-      <div class="card"><h3 data-i18n="card_board">板子</h3><div id="ov-board" class="kv"></div></div>
-      <div class="card"><h3 data-i18n="card_mcp">MCP 服务</h3><div id="ov-mcp" class="kv"></div></div>
-      <div class="card"><h3 data-i18n="card_devices">周边设备</h3><div id="ov-devices" class="kv"></div></div>
-      <div class="card"><h3 data-i18n="card_caps">能力</h3><div id="ov-caps" class="tags"></div></div>
-    </div>
-    <div class="card">
-      <h3 data-i18n="card_flow">给大模型的工作流</h3>
-      <ol class="steps">
-        <li data-i18n="flow_1">发现：<code>inventory</code> / <code>i2c_scan</code> / <code>i2c_identify</code> 找到真实接线。</li>
-        <li data-i18n="flow_2">建模：<code>manifest_describe</code> 拿到清单 schema、原语和示例。</li>
-        <li data-i18n="flow_3">写入：<code>manifest_apply</code> 校验并生效，无需重启、无需重烧。</li>
-        <li data-i18n="flow_4">验证：<code>tools/list</code> 里出现新工具，直接调用。</li>
-        <li data-i18n="flow_5">迭代：结果不对就改清单再应用，工具列表实时更新。</li>
-      </ol>
-    </div>
-  </section>
-
-  <section class="panel" id="panel-wifi">
-    <div class="card">
-      <h3 data-i18n="wifi_current">当前连接</h3>
-      <div id="wifi-state" class="kv"></div>
-      <div class="row">
-        <button class="btn" id="wifi-scan" data-i18n="wifi_scan">扫描网络</button>
-        <button class="btn ghost" id="wifi-forget" data-i18n="wifi_forget">忘记网络</button>
-      </div>
-      <div id="wifi-list" class="list"></div>
-    </div>
-    <div class="card">
-      <h3 data-i18n="wifi_join">连接新的 WiFi</h3>
-      <div class="row">
-        <input id="wifi-ssid" placeholder="SSID" autocomplete="off">
-      </div>
-      <div class="row">
-        <input id="wifi-password" type="password" placeholder="密码 / password" autocomplete="off">
-        <button class="btn primary" id="wifi-connect" data-i18n="wifi_connect">保存并连接</button>
-      </div>
-      <p class="hint" data-i18n="wifi_note">凭证只写入板子的 NVS，不会进固件；换网络不用重新烧录。</p>
-    </div>
-  </section>
-
-  <section class="panel" id="panel-devices">
-    <div class="card">
-      <div class="row spread">
-        <h3 data-i18n="devices_found">识别到的设备</h3>
-        <button class="btn" id="devices-probe" data-i18n="devices_probe">重新探测</button>
-      </div>
-      <div id="device-table"></div>
-    </div>
-    <div class="card">
-      <h3 data-i18n="devices_unknown">未识别的 I2C 地址</h3>
-      <div id="unknown-table" class="kv"></div>
-    </div>
-    <div class="card">
-      <h3 data-i18n="devices_catalog">支持的驱动</h3>
-      <div id="catalog-table"></div>
-    </div>
-  </section>
-
-  <section class="panel" id="panel-tools">
-    <div class="card">
-      <div class="row spread">
-        <h3 data-i18n="tools_listed">暴露给模型的工具</h3>
-        <label class="row small">
-          <span data-i18n="tools_mode">风格</span>
-          <select id="tools-mode">
-            <option value="auto">auto · 每个动作一个工具</option>
-            <option value="generic">generic · device_invoke 收口</option>
-            <option value="all">all · 调试用</option>
-          </select>
-        </label>
-      </div>
-      <p class="hint" id="tools-summary"></p>
-      <div id="tool-table"></div>
-    </div>
-  </section>
-
-  <section class="panel" id="panel-manifest">
-    <div class="card">
-      <div class="row spread">
-        <h3 data-i18n="manifest_title">设备清单（manifest）</h3>
-        <div class="row">
-          <select id="manifest-mode">
-            <option value="merge">merge</option>
-            <option value="replace">replace</option>
-          </select>
-          <button class="btn" id="manifest-validate" data-i18n="manifest_validate">校验</button>
-          <button class="btn primary" id="manifest-apply" data-i18n="manifest_apply">应用</button>
-        </div>
-      </div>
-      <p class="hint" data-i18n="manifest_note">清单存在 NVS 里，应用后立即生效：工具列表会重建，不需要重启也不需要重新烧录。</p>
-      <textarea id="manifest-text" spellcheck="false" rows="22"></textarea>
-      <div id="manifest-issues" class="issues"></div>
-    </div>
-  </section>
-
-  <section class="panel" id="panel-agent">
-    <div class="card">
-      <div class="row spread">
-        <h3 data-i18n="agent_link">模型连接</h3>
-        <button class="btn primary" id="agent-config-save" data-i18n="save">保存</button>
-      </div>
-      <div class="row">
-        <input id="agent-base-url" placeholder="/v1/chat/completions 的完整地址（http）" autocomplete="off" spellcheck="false">
-      </div>
-      <div class="row" style="margin-top:8px">
-        <input id="agent-model" placeholder="model" autocomplete="off" spellcheck="false">
-        <input id="agent-api-key" type="password" placeholder="API key" autocomplete="off">
-        <label class="row small">
-          <span data-i18n="agent_max_steps">最大步数</span>
-          <input id="agent-max-steps" type="number" min="1" max="12" step="1" value="4" style="width:72px;flex:0 0 72px">
-        </label>
-        <label class="row small">
-          <span data-i18n="agent_tick">调度 tick</span>
-          <input id="agent-tick" type="number" min="200" max="5000" step="100" value="1000" style="width:88px;flex:0 0 88px">
-          <span class="unit">ms</span>
-        </label>
-      </div>
-      <p class="hint" data-i18n="agent_note">模型地址可以写 http:// 或 https://；https 在板子上用 esp-tls 校验证书包。key 只写进 NVS，读回来时只显示是否已设置。</p>
-      <p class="hint" data-i18n="agent_tick_note">调度 tick 就是队列最快多久被取走一次（200–5000 ms，默认 1000）：板子每个 tick 重新读它，所以改完下一个 tick 就生效，不用重启。</p>
-      <div id="agent-config-state" class="kv"></div>
-    </div>
-
-    <div class="card">
-      <div class="row spread">
-        <h3 data-i18n="agent_chat">对话</h3>
-        <div class="row">
-          <span class="hint" id="agent-runs"></span>
-          <button class="btn ghost" id="agent-reset" data-i18n="agent_reset">清空</button>
-        </div>
-      </div>
-      <div id="agent-transcript" class="transcript"></div>
-      <textarea id="agent-text" rows="3" spellcheck="false" placeholder="问板子点什么…（Ctrl+Enter 发送）"></textarea>
-      <div class="row spread" style="margin-top:8px">
-        <span class="hint" id="agent-hint"></span>
-        <button class="btn primary" id="agent-send" data-i18n="agent_send">发送</button>
-      </div>
-    </div>
-
-    <div class="card">
-      <div class="row spread">
-        <h3 data-i18n="goal_title">自主目标</h3>
-        <span class="badge off" id="goal-badge">–</span>
-      </div>
-      <div class="row">
-        <input id="goal-objective" data-i18n-ph="goal_objective_ph" autocomplete="off" spellcheck="false">
-        <label class="row small">
-          <span data-i18n="goal_max_iterations">最多迭代</span>
-          <input id="goal-max-iterations" type="number" min="1" max="100" step="1" value="10" style="width:72px;flex:0 0 72px">
-        </label>
-        <button class="btn primary" id="goal-start" data-i18n="goal_start">开始</button>
-        <button class="btn ghost" id="goal-stop" data-i18n="goal_stop">停止</button>
-      </div>
-      <div id="goal-state" class="kv"></div>
-      <div id="goal-notes"></div>
-      <p class="hint" data-i18n="goal_note">写下一个目标，板子会自己一轮一轮地做：每轮只走一小步，把结果写成一条笔记，下一轮带着这些笔记继续。回复里出现 GOAL MET 就结束，出现 GOAL BLOCKED、连续失败 3 轮或者迭代次数用完也会停。同一时间只能有一个目标，笔记存在 NVS 里，所以都很短。</p>
-    </div>
-
-    <div class="card">
-      <div class="row spread">
-        <h3 data-i18n="stream_title">实时事件</h3>
-        <div class="row">
-          <span class="badge off" id="agent-stream-badge">–</span>
-          <span class="hint" id="agent-stream-note"></span>
-          <button class="btn ghost" id="agent-stream-pause" data-i18n="stream_pause">暂停</button>
-          <button class="btn ghost" id="agent-stream-clear" data-i18n="stream_clear">清空</button>
-        </div>
-      </div>
-      <div id="agent-stream" class="stream" data-empty="1">
-        <p class="hint" data-i18n="stream_empty">还没有事件。停在这一页时，运行的每一步都会实时出现在这里。</p>
-      </div>
-      <p class="hint" data-i18n="stream_note">由 /api/agent/stream 推送（SSE）：板子空闲 30 秒或单条连接满 120 秒会主动断开，浏览器自己重连并从最后一条事件续上，页面不重发任何东西。</p>
-    </div>
-
-    <div class="card">
-      <div class="row spread">
-        <h3 data-i18n="sched_tasks">定时任务</h3>
-        <button class="btn ghost" id="sched-refresh" data-i18n="refresh">刷新</button>
-      </div>
-      <div id="sched-task-table"></div>
-      <div class="row" style="margin-top:10px">
-        <input id="task-id" placeholder="id" style="flex:0 0 90px">
-        <input id="task-prompt" placeholder="提示词 / prompt">
-        <input id="task-every" type="number" min="0" step="1" placeholder="每 N 秒" style="flex:0 0 110px">
-        <input id="task-at" placeholder="07:30" style="flex:0 0 90px">
-        <button class="btn" id="sched-task-add" data-i18n="sched_add">添加</button>
-      </div>
-      <p class="hint" data-i18n="sched_note">“每 N 秒”和“HH:MM”二选一：填秒数按周期触发，填 HH:MM 每天触发一次；到点的提示词会排进同一条智能体队列。</p>
-    </div>
-
-    <div class="card">
-      <h3 data-i18n="sched_rules">传感器规则</h3>
-      <div id="sched-rule-table"></div>
-      <div class="row" style="margin-top:10px">
-        <input id="rule-id" placeholder="id" style="flex:0 0 90px">
-        <input id="rule-tool" placeholder="工具，如 bme280_read" style="flex:0 0 160px">
-        <input id="rule-path" placeholder="结果里的字段，如 temperature_c" style="flex:0 0 170px">
-        <select id="rule-op" style="flex:0 0 78px">
-          <option value="gt">&gt;</option>
-          <option value="lt">&lt;</option>
-          <option value="eq">=</option>
-          <option value="ne">≠</option>
-          <option value="true">true</option>
-        </select>
-        <input id="rule-value" placeholder="阈值" style="flex:0 0 90px">
-        <input id="rule-prompt" placeholder="触发时发给模型的提示词">
-        <input id="rule-every" type="number" min="0" step="1" placeholder="最短间隔秒" style="flex:0 0 110px">
-        <button class="btn" id="sched-rule-add" data-i18n="sched_add">添加</button>
-      </div>
-      <p class="hint" data-i18n="sched_rule_note">规则每轮先调用工具读一次值，命中才排提示词；min_interval_s 防止一条规则持续刷屏。</p>
-    </div>
-  </section>
-
-  <section class="panel" id="panel-clients">
-    <div class="card">
-      <h3 data-i18n="clients_url">MCP 端点</h3>
-      <div class="kv" id="mcp-url"></div>
-      <pre class="code" id="curl-list"></pre>
-      <pre class="code" id="mcp-json"></pre>
-      <p class="hint" data-i18n="clients_note">浏览器或 Claude Desktop 需要支持 Streamable HTTP；只支持 stdio 的客户端要走 mcp-remote 之类的桥。</p>
-    </div>
-  </section>
-
-  <section class="panel" id="panel-logs">
-    <div class="card">
-      <div class="row spread">
-        <h3 data-i18n="logs_title">运行日志</h3>
-        <button class="btn ghost" id="logs-refresh" data-i18n="refresh">刷新</button>
-      </div>
-      <pre class="code logs" id="log-box"></pre>
-    </div>
-  </section>
+<main id="chat" class="chat" aria-live="polite">
+  <div class="row agent"><div class="bubble"><p>This is the board's own agent. Ask it about the hardware, tell it to change something, or give it a job &mdash; it calls its tools by itself.</p></div></div>
 </main>
 
-<div id="pin-gate" class="modal hidden">
-  <div class="modal-card">
-    <h3 data-i18n="pin_title">需要 PIN</h3>
-    <p data-i18n="pin_hint">这个板子设置了控制台 PIN，输入后才能修改配置。</p>
-    <input id="pin-input" type="password" inputmode="numeric" autocomplete="off">
-    <button class="btn primary" id="pin-submit">OK</button>
-  </div>
-</div>
+<form id="composer" class="composer" autocomplete="off">
+  <textarea id="input" rows="1" placeholder="Ask the board&hellip;" enterkeyhint="send"></textarea>
+  <button id="send" class="send" type="submit" aria-label="Send">&#8593;</button>
+</form>
 
-<div id="toast" class="toast hidden"></div>
+<div id="toast" class="toast"></div>
+
+<section id="sheet" class="sheet" hidden>
+  <div class="sheet-head">
+    <h2>Board</h2>
+    <button id="sheet-close" class="icon" aria-label="Close">&#10005;</button>
+  </div>
+  <!-- Ordered by how often a person needs it, and only six: devices, tools, the
+       agent itself, the schedule, what it said, what it is set to. -->
+  <nav class="tabs" role="tablist">
+    <button role="tab" data-panel="devices" aria-selected="true">Devices</button>
+    <button role="tab" data-panel="tools">Tools</button>
+    <button role="tab" data-panel="agent">Agent</button>
+    <button role="tab" data-panel="schedule">Schedule</button>
+    <button role="tab" data-panel="logs">Logs</button>
+    <button role="tab" data-panel="settings">Settings</button>
+  </nav>
+  <div class="sheet-body">
+
+    <div id="panel-devices" class="panel">
+      <div class="card">
+        <h3>Detected</h3>
+        <div id="devices-list" class="list"></div>
+        <div class="buttons">
+          <button id="devices-probe" class="btn primary">Probe devices</button>
+          <button id="devices-refresh" class="btn ghost">Refresh</button>
+        </div>
+        <p id="devices-mode" class="hint"></p>
+      </div>
+      <div class="card">
+        <h3>Candidates</h3>
+        <div id="candidates-list" class="list"></div>
+        <p class="hint">With <code>discovery: manual</code> these are found but not adopted. Each one carries the <code>manifest_apply</code> body that adopts it.</p>
+      </div>
+      <div class="card"><h3>Unidentified</h3><div id="unidentified-list" class="list"></div></div>
+    </div>
+
+    <div id="panel-tools" class="panel" hidden>
+      <div class="card">
+        <h3>Tools</h3>
+        <div id="tools-list" class="list"></div>
+        <p class="hint">Tap a tool for its declaration: category, capabilities it needs, and the argument schema the model sees.</p>
+      </div>
+    </div>
+
+    <div id="panel-agent" class="panel" hidden>
+      <div class="card">
+        <h3>Model</h3>
+        <label for="agent-base">Base URL</label>
+        <input id="agent-base" type="text" placeholder="chat completions endpoint">
+        <label for="agent-model">Model</label>
+        <input id="agent-model" type="text" placeholder="deepseek-flash">
+        <label for="agent-key">API key (write-only)</label>
+        <input id="agent-key" type="password" placeholder="__set__ = keep the stored one">
+        <label for="agent-steps">Max steps (0 = no limit)</label>
+        <input id="agent-steps" type="number" min="0" max="200" step="1">
+        <label for="agent-temperature">Temperature</label>
+        <input id="agent-temperature" type="number" min="0" max="2" step="0.1">
+        <div class="buttons"><button id="agent-save" class="btn primary">Save</button></div>
+      </div>
+      <div class="card">
+        <h3>Conversation</h3>
+        <div class="kv" id="conversation-kv"></div>
+        <div class="buttons">
+          <button id="forget-tail" class="btn ghost">Keep last exchange</button>
+          <button id="forget-all" class="btn ghost">Forget everything</button>
+        </div>
+        <p class="hint">Memories are files (<code>/memory.md</code>) and survive this. The transcript itself lives in RAM, so a reboot starts a new one.</p>
+      </div>
+    </div>
+
+    <div id="panel-schedule" class="panel" hidden>
+      <div class="card"><h3>Tasks</h3><div id="sched-list" class="list"></div>
+        <p class="hint">Daily times are UTC. The board gets UTC from SNTP; <code>Settings</code> says whether it has synced.</p>
+      </div>
+      <div class="card">
+        <h3>Add</h3>
+        <label for="sched-prompt">Prompt</label>
+        <textarea id="sched-prompt" class="field" placeholder="what to ask when it fires"></textarea>
+        <label for="sched-every">Every N seconds (0 = daily time)</label>
+        <input id="sched-every" type="number" min="0" step="1">
+        <label for="sched-at">Daily time, UTC (07:30)</label>
+        <input id="sched-at" type="text" placeholder="07:30">
+        <div class="buttons"><button id="sched-add" class="btn primary">Add task</button></div>
+      </div>
+    </div>
+
+    <div id="panel-logs" class="panel" hidden>
+      <div class="card"><h3>Log</h3><pre id="logs" class="log"></pre>
+        <div class="buttons"><button id="logs-refresh" class="btn ghost">Refresh</button></div>
+      </div>
+    </div>
+
+    <div id="panel-settings" class="panel" hidden>
+      <div class="card"><h3>Board</h3><div id="status-kv" class="kv"></div></div>
+      <div class="card">
+        <h3>WiFi</h3>
+        <div id="wifi-kv" class="kv"></div>
+        <label for="wifi-ssid">Network</label>
+        <input id="wifi-ssid" type="text" autocomplete="off">
+        <label for="wifi-password">Password</label>
+        <input id="wifi-password" type="password" autocomplete="new-password">
+        <div class="buttons">
+          <button id="wifi-connect" class="btn primary">Save and join</button>
+          <button id="wifi-scan" class="btn ghost">Scan</button>
+        </div>
+        <p id="wifi-result" class="hint"></p>
+      </div>
+      <div class="card">
+        <h3>Access</h3>
+        <label for="auth-pin">Portal PIN (empty = open on the LAN)</label>
+        <input id="auth-pin" type="password" placeholder="__set__ = keep the stored one">
+        <label for="auth-tick">Agent tick (ms)</label>
+        <input id="auth-tick" type="number" min="200" max="5000" step="100">
+        <div class="buttons"><button id="settings-save" class="btn primary">Save</button></div>
+      </div>
+      <div class="card">
+        <h3>Recovery</h3>
+        <div class="buttons"><button id="reboot" class="btn ghost">Reboot</button></div>
+      </div>
+    </div>
+
+  </div>
+</section>
+
+<section id="login" class="sheet" hidden>
+  <div class="sheet-head"><h2>PIN required</h2></div>
+  <div class="sheet-body">
+    <div class="card">
+      <label for="login-pin">Portal PIN</label>
+      <input id="login-pin" type="password" inputmode="numeric" autocomplete="current-password">
+      <div class="buttons"><button id="login-go" class="btn primary">Unlock</button></div>
+      <p id="login-error" class="hint"></p>
+    </div>
+  </div>
+</section>
+
 <script src="/assets/app.js"></script>
 </body>
 </html>

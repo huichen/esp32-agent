@@ -203,6 +203,15 @@ pub const ROUTES: &[Route] = &[
     ),
     r("POST", "/api/agent/reset", "agent", Auth::Pin, "Clear the conversation", "", "{ok}"),
     r(
+        "POST",
+        "/api/agent/forget",
+        "agent",
+        Auth::Pin,
+        "Keep the last `keep` question-and-answer exchanges and drop the rest, or drop everything with 0; the compressed index goes with it",
+        "{keep?: integer}",
+        "{ok, removed, kept}",
+    ),
+    r(
         "GET",
         "/api/agent/config",
         "agent",
@@ -237,6 +246,15 @@ pub const ROUTES: &[Route] = &[
         "The same journal as server-sent events: replay, then follow",
         "?after=<seq>",
         "text/event-stream; 503 and Retry-After: 5 when two are open",
+    ),
+    r(
+        "GET",
+        "/api/agent/prompt",
+        "agent",
+        Auth::Open,
+        "The system prompt as the model receives it: memory index and the compressed view of earlier turns included",
+        "",
+        "{system, bytes, archive_lines, history}",
     ),
     // --- scheduling and goals ------------------------------------------------------
     r("GET", "/api/sched", "sched", Auth::Open, "Scheduled tasks and sensor rules", "", "{tasks, rules}"),
@@ -294,9 +312,9 @@ pub const ROUTES: &[Route] = &[
         "/api/auth",
         "config",
         Auth::Open,
-        "Check a portal PIN without changing anything",
+        "Check a portal PIN and take a bearer token (12 h) in exchange; with a PIN set, every mutation and the reads that expose the transcript or the config need one",
         "{pin}",
-        "{ok}",
+        "{ok, token, expires_in}",
     ),
     r("POST", "/api/reboot", "system", Auth::Pin, "Reboot the board", "", "{ok}"),
     r(
@@ -308,6 +326,9 @@ pub const ROUTES: &[Route] = &[
         "",
         "{ok}",
     ),
+    r("POST", "/mcp", "mcp", Auth::Open,
+      "The MCP transport itself: initialize, tools/list, tools/call, resources/*. The path is `mcp.path`, so read it from the dynamic section before you connect",
+      "a JSON-RPC 2.0 message", "a JSON-RPC response, or text/event-stream when mcp.sse is on"),
     // --- the console ---------------------------------------------------------------
     r(
         "GET",
@@ -428,9 +449,11 @@ pub fn document(dynamic: Value) -> Value {
                 "event_streams": 2,
                 "manifest_tools": 48,
                 "sequence_steps": 8,
+                "model_steps": "unlimited by default; POST /api/agent/config max_steps sets a cap (0 = off, 200 max)",
             },
         },
         "endpoints": routed,
+        "settings": crate::settings::json(),
         "counts": {"endpoints": ROUTES.len()},
         "dynamic": dynamic,
     })

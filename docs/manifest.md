@@ -4,6 +4,35 @@ A manifest is a JSON document in the NVS `manifest` key. It decides which hardwa
 board exposes, as which tools. Call `manifest_apply` to make it take effect: `tools/list`
 changes immediately, without a reboot or a reflash.
 
+## 0. Manifest or driver?
+
+They are not alternatives to each other; they answer different questions.
+
+| | Manifest | Driver |
+|---|---|---|
+| Question | "this board has X wired to pin 12 — what may a caller do with it?" | "how does a chip of type X actually work?" |
+| Form | JSON in NVS, edited at runtime | Rust module in `drivers/`, compiled in |
+| Changes how | which tools exist and what they compose | what the board can detect and how it talks to the chip |
+| Needs a reflash | no — `manifest_apply` is live | yes |
+| Typical case | a relay, a servo, a raw I2C register read, a sequence of GPIO steps | SSD1306, INA226, DS18B20, I2S audio, anything with a state machine, calibration or timing |
+
+A manifest **tool** is built from primitives (`gpio_write`, `i2c_read`, `delay`, `sequence`,
+`adc`, `rgb`, `pwm`, `servo`, `distance`, …). It can move a pin and read a register; it
+cannot decode a CRC, wait for a conversion-done bit, or keep a bus in a state between
+calls.
+
+A driver **decodes** a chip and contributes its own tools (`bme280_read`, `oled_text`,
+`mic_level`). It is detected once at boot (and again on `devices_probe`), and its tools
+appear only when the probe finds the device — a board without the chip never advertises
+the capability.
+
+A device can have both: a driver instantiates it (so the board knows it is there and what
+its pins are), and manifest tools add operations the driver does not ship.
+
+So a new peripheral starts as a manifest fragment — no reflash, testable in one call — and
+becomes a driver only when it needs something a JSON primitive cannot express. See
+[adding-a-device](adding-a-device.md) for both paths.
+
 ## 1. Top level
 
 ```json

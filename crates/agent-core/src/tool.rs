@@ -37,6 +37,10 @@ pub struct ToolCtx<'a> {
     /// tool may not use one: `manifest_apply` would otherwise be able to replace
     /// itself, and the board would lose the tool it repairs its manifest with.
     pub taken: &'a [String],
+    /// The schedule itself. A tool that changes it sets `runtime.sched_dirty`, and the
+    /// app writes NVS after the call returns — the same path `POST /api/sched` uses.
+    pub tasks: &'a mut Vec<crate::sched::ScheduledTask>,
+    pub rules: &'a mut Vec<crate::sched::SensorRule>,
 }
 
 pub type ToolHandler = Box<dyn for<'a> Fn(&mut ToolCtx<'a>, &Value) -> Result<Value> + Send + Sync>;

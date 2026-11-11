@@ -41,13 +41,36 @@ pub trait ChatTransport {
     /// `url` is `http://` or `https://`; the scheme is the implementation's business
     /// (plain socket or TLS), and the implementation enforces its own timeout.
     fn post_json(&mut self, url: &str, headers: &[(&str, &str)], body: &str) -> Result<String, String>;
+
+    /// Send one request with an explicit method and return the response body.
+    ///
+    /// The default keeps a transport that only knows POST working — it is still the right
+    /// thing for the model call — but a real board transport overrides it, because a
+    /// `net_get` that arrives as a POST is not a GET: any server that distinguishes the two
+    /// answers 405, and the model learns the wrong thing about the request it made.
+    fn request(
+        &mut self,
+        method: &str,
+        url: &str,
+        headers: &[(&str, &str)],
+        body: &str,
+    ) -> Result<String, String> {
+        if method.eq_ignore_ascii_case("POST") {
+            self.post_json(url, headers, body)
+        } else {
+            Err(format!("this transport cannot send {method} requests"))
+        }
+    }
 }
 
 /// Where the model lives and how the loop should treat it.
 ///
-/// `Default` is hand-written rather than derived: a zeroed `max_steps` or a zero
-/// timeout would make the first run fail in a confusing way, so the documented
-/// defaults (4 steps, 0.2, 45 s) are what `LlmConfig::default()` yields.
+/// `Default` is hand-written rather than derived: a zero timeout would make the first run
+/// fail in a confusing way, so the documented defaults (0.2, 45 s) are what
+/// `LlmConfig::default()` yields. `max_steps` is unlimited by default — the loop already
+/// stops on its own (a final answer, a transport error, or the history budget), and a
+/// fixed cap only truncates work that would have finished. Set it when a run has to be
+/// bounded, e.g. on a metered endpoint.
 #[derive(Clone, Debug)]
 pub struct LlmConfig {
     /// e.g. `http://192.0.2.10:8899/v1/chat/completions`
@@ -56,9 +79,9 @@ pub struct LlmConfig {
     pub model: String,
     /// Empty = no `Authorization` header.
     pub api_key: String,
-    /// Tool iterations, default 4.
+    /// Model calls per run; **0 means no limit**.
     pub max_steps: u8,
-    /// Default 0.2.
+    /// Default 1.0: this board asks for tool calls, not prose.
     pub temperature: f32,
     /// Default 45. Used by the transport, not by `chat`.
     pub timeout_s: u32,
@@ -70,8 +93,8 @@ impl Default for LlmConfig {
             base_url: String::new(),
             model: String::new(),
             api_key: String::new(),
-            max_steps: 4,
-            temperature: 0.2,
+            max_steps: 0,
+            temperature: 1.0,
             timeout_s: 45,
         }
     }
@@ -392,8 +415,9 @@ mod tests {
     #[test]
     fn config_defaults_match_the_brief() {
         let cfg = LlmConfig::default();
-        assert_eq!(cfg.max_steps, 4);
-        assert!((cfg.temperature - 0.2).abs() < f32::EPSILON);
+        // No step cap by default: a fixed one truncated work that would have finished.
+        assert_eq!(cfg.max_steps, 0);
+        assert!((cfg.temperature - 1.0).abs() < f32::EPSILON);
         assert_eq!(cfg.timeout_s, 45);
         assert!(cfg.api_key.is_empty());
     }
@@ -413,7 +437,7 @@ mod tests {
         assert_eq!(body["model"], "stub");
         assert_eq!(body["tool_choice"], "auto");
         let temperature = body["temperature"].as_f64().expect("a number");
-        assert!((temperature - 0.2).abs() < 1e-6, "temperature is {temperature}");
+        assert!((temperature - 1.0).abs() < 1e-6, "temperature is {temperature}");
         assert_eq!(body["messages"], messages());
         assert_eq!(body["tools"], tools());
     }

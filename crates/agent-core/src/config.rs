@@ -16,6 +16,14 @@ pub const CONFIG_VERSION: u32 = 1;
 fn default_true() -> bool {
     true
 }
+
+fn default_discovery() -> String {
+    "auto".to_string()
+}
+
+fn default_profile() -> String {
+    "full".to_string()
+}
 pub const NVS_KEY_CONFIG: &str = "config";
 pub const DEFAULT_PORT: u16 = 8080;
 pub const DEFAULT_PATH: &str = "/mcp";
@@ -55,6 +63,12 @@ pub struct Config {
     /// how a different devkit gets a small surface it grows on purpose.
     #[serde(default = "default_true")]
     pub auto_peripherals: bool,
+    /// `auto` (default) adopts every device a driver recognises. `manual` probes and
+    /// reports them as candidates but adopts nothing, so the board can boot with an empty
+    /// device list and grow it by `manifest_apply` — the agent discovers the hardware and
+    /// decides what the board has.
+    #[serde(default = "default_discovery")]
+    pub discovery: String,
     pub wifi: WifiCfg,
     pub mcp: McpCfg,
     pub bus: BusCfg,
@@ -102,6 +116,14 @@ pub struct McpCfg {
     pub tools_mode: String,
     /// Tool names the user switched off in the portal.
     pub disabled_tools: Vec<String>,
+    /// `full` (default) or `minimal`.
+    ///
+    /// `minimal` hides the tools that are conveniences rather than capabilities: the ones
+    /// an HTTP client or a manifest can do as well, and the ones a model rarely needs.
+    /// Nothing is deleted — one field switches them back — and the tools that make an empty
+    /// board rebuildable (discovery, manifest, GPIO, files) always stay.
+    #[serde(default = "default_profile")]
+    pub profile: String,
     /// Maximum concurrent MCP sessions kept in memory.
     pub max_sessions: u32,
     /// A session id is forgotten after this many seconds of inactivity.
@@ -185,6 +207,7 @@ impl Default for Config {
             device_name: "esp32-agent".into(),
             board: "auto".into(),
             auto_peripherals: true,
+            discovery: default_discovery(),
             wifi: WifiCfg::default(),
             mcp: McpCfg::default(),
             bus: BusCfg::default(),
@@ -224,6 +247,7 @@ impl Default for McpCfg {
             path: DEFAULT_PATH.into(),
             tools_mode: "auto".into(),
             disabled_tools: Vec::new(),
+            profile: default_profile(),
             max_sessions: 4,
             session_ttl_s: 900,
             sse: false,
@@ -306,6 +330,22 @@ impl Config {
         if let Some(b) = patch.get("auto_peripherals").and_then(|v| v.as_bool()) {
             self.auto_peripherals = b;
             touched.push("auto_peripherals".into());
+        }
+        if let Some(d) = patch.get("discovery").and_then(|v| v.as_str()) {
+            if d != "auto" && d != "manual" {
+                return Err(crate::error::McpError::invalid_params("discovery must be `auto` or `manual`"));
+            }
+            self.discovery = d.to_string();
+            touched.push("discovery".into());
+        }
+        if let Some(p) = patch.get("mcp").and_then(|v| v.get("profile")).and_then(|v| v.as_str()) {
+            if p != "full" && p != "minimal" {
+                return Err(crate::error::McpError::invalid_params(
+                    "mcp.profile must be `full` or `minimal`",
+                ));
+            }
+            self.mcp.profile = p.to_string();
+            touched.push("mcp.profile".into());
         }
         if let Some(w) = patch.get("wifi").and_then(|v| v.as_object()) {
             if let Some(s) = w.get("ssid").and_then(|v| v.as_str()) {

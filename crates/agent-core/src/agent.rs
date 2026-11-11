@@ -22,6 +22,14 @@ use serde_json::{json, Value};
 pub const MAX_HISTORY_MESSAGES: usize = 48;
 /// Oldest messages are dropped above this much text.
 pub const MAX_HISTORY_BYTES: usize = 24 * 1024;
+/// How many question-and-answer exchanges survive compression verbatim.
+///
+/// Four is enough to keep the thread of a task (what was asked, what the last tools did)
+/// while leaving most of the budget for the retrieval work in progress.
+pub const COMPACT_KEEP_TURNS: usize = 4;
+/// The deterministic index of dropped exchanges is capped too: an index that grows without
+/// limit would take the budget back through the system prompt.
+pub const ARCHIVE_MAX_LINES: usize = 40;
 /// A tool result larger than this is cut with [`llm::TRUNCATED_MARK`].
 pub const MAX_TOOL_RESULT_BYTES: usize = 2048;
 /// Assistant text larger than this is cut with [`llm::TRUNCATED_MARK`].
@@ -168,6 +176,15 @@ pub trait ToolHost {
     fn skills(&self) -> Vec<SkillRef> {
         Vec::new()
     }
+
+    /// The memory index: `/memory.md`, already bounded by the host.
+    ///
+    /// Memories live on the file workspace like everything else the agent can edit — the
+    /// index is what makes them reachable without a tool of their own. `None` means the
+    /// board has not written any yet, and the prompt then says how to start.
+    fn memory_index(&self) -> Option<String> {
+        None
+    }
 }
 
 /// A skill as the prompt needs it: what it is called, the line that says when to open
@@ -191,6 +208,10 @@ pub enum AgentStep {
 #[derive(Default)]
 pub struct Agent {
     pub history: Vec<Message>,
+    /// A deterministic index of what compression dropped: one line per exchange, taken
+    /// from the messages themselves. It is **not** a model-written summary — nothing here
+    /// costs a model call, and it survives as long as the transcript does.
+    pub archive: Vec<String>,
     /// Depth-1 queue: a trigger while a run is in flight coalesces into this.
     pub pending: Option<Message>,
     pub last_error: String,
@@ -346,6 +367,7 @@ impl Agent {
 
     pub fn reset(&mut self) {
         self.history.clear();
+        self.archive.clear();
         self.pending = None;
         self.last_error.clear();
         self.runs = 0;
@@ -368,7 +390,7 @@ impl Agent {
         self.trim();
         self.usage_run = llm::Usage::default();
         self.turn_steps = 0;
-        self.turn_limit = max_steps.max(1);
+        self.turn_limit = max_steps;
         self.turn_tools = host.tool_specs();
         self.emit("message_start", now_ms(), |_| {});
         Some(self.ask(host))
@@ -498,7 +520,10 @@ impl Agent {
         }
         self.trim();
 
-        if self.turn_steps >= self.turn_limit {
+        // 0 means no cap: the loop ends on a final answer, a transport error, or when the
+        // history budget forces a trim. A fixed cap only truncates work that would have
+        // finished, so it is something to switch on rather than to live with.
+        if self.turn_limit > 0 && self.turn_steps >= self.turn_limit {
             let err = format!("agent: step limit {} reached before a final answer", self.turn_limit);
             self.last_error = err.clone();
             self.emit("error", now_ms(), |ev| ev.text = err.clone());
@@ -568,16 +593,90 @@ impl Agent {
 
     /// Drop the oldest messages until the ring is within both bounds, keeping
     /// the history a valid OpenAI transcript (a tool result never leads it).
+    ///
+    /// The dropped part is not lost silently: :func:`compress` turns it into a
+    /// deterministic index first, so the model still knows what it already tried.
     fn trim(&mut self) {
+        self.compress(COMPACT_KEEP_TURNS);
         while self.history.len() > MAX_HISTORY_MESSAGES {
             self.history.remove(0);
         }
         while self.history_bytes() > MAX_HISTORY_BYTES && self.history.len() > 1 {
-            self.history.remove(0);
+            let dropped = self.history.remove(0);
+            self.archive_message(&dropped);
         }
         while matches!(self.history.first().map(|m| m.role), Some(Role::Tool)) {
-            self.history.remove(0);
+            let dropped = self.history.remove(0);
+            self.archive_message(&dropped);
         }
+        while self.archive.len() > ARCHIVE_MAX_LINES {
+            self.archive.remove(0);
+        }
+    }
+
+    /// Keep the last `keep_turns` question-and-answer groups and move everything older
+    /// into the archive as one line per message.
+    ///
+    /// This is **compression without a summary**: the text is derived from the transcript,
+    /// so it costs no model call, cannot invent a fact, and is reproducible. The index is
+    /// what a model needs to avoid repeating itself — which tool ran with which arguments
+    /// and what came back — not prose about how the conversation felt.
+    pub fn compress(&mut self, keep_turns: usize) {
+        if self.history_bytes() <= MAX_HISTORY_BYTES && self.history.len() <= MAX_HISTORY_MESSAGES {
+            return;
+        }
+        let cut = turn_start(&self.history, keep_turns.min(self.history.len()));
+        if cut == 0 {
+            return;
+        }
+        let dropped: Vec<Message> = self.history.drain(..cut).collect();
+        for message in &dropped {
+            self.archive_message(message);
+        }
+    }
+
+    /// One line for the archive, bounded so the index itself cannot grow without limit.
+    fn archive_message(&mut self, message: &Message) {
+        let line = match message.role {
+            Role::User => format!("user: {}", head(&message.text, 90)),
+            Role::Assistant => {
+                if message.tool_calls.is_empty() {
+                    format!("answer: {}", head(&message.text, 90))
+                } else {
+                    let calls: Vec<String> = message
+                        .tool_calls
+                        .iter()
+                        .map(|c| format!("{}({})", c.name, head(&llm::arguments_request_json(c), 48)))
+                        .collect();
+                    format!("called: {}", head(&calls.join(", "), 100))
+                }
+            }
+            Role::Tool => {
+                // The result line joins the call above it by time: printing the id would
+                // spend the budget on a string the model cannot use.
+                let _ = message.tool_call_id.as_deref();
+                format!("result: {}", head(&message.text, 90))
+            }
+            Role::System => format!("note: {}", head(&message.text, 90)),
+        };
+        if line.trim().len() > 6 {
+            self.archive.push(line);
+        }
+    }
+
+    /// Forget the past: keep the last `keep_turns` exchanges, drop everything else, and
+    /// drop the archive with it — an index of what is no longer there is worse than none.
+    ///
+    /// `keep = 0` clears the conversation completely, which is what a client wants before
+    /// switching task; `keep = 2` is what a long session wants when it starts repeating
+    /// itself. Returns `(removed, kept)` message counts.
+    pub fn forget(&mut self, keep_turns: usize) -> (usize, usize) {
+        let cut = turn_start(&self.history, keep_turns.min(self.history.len()));
+        let removed = self.history.drain(..cut).count();
+        self.archive.clear();
+        self.pending = None;
+        self.last_error.clear();
+        (removed, self.history.len())
     }
 
     fn history_bytes(&self) -> usize {
@@ -609,6 +708,12 @@ impl Agent {
     /// It is kept per run rather than in NVS because it must follow the files: editing
     /// `/AGENTS.md` or adding a skill takes effect on the next turn, with no restart and
     /// no transcript rewrite.
+    /// The prompt the model receives, for `/api/agent/prompt`: the same text the next
+    /// request will carry, memory index and compressed history included.
+    pub fn prompt_text(&self, host: &dyn ToolHost) -> String {
+        self.system_message(host)
+    }
+
     fn system_message(&self, host: &dyn ToolHost) -> String {
         let mut text = String::from(system_prompt());
         if let Some(instructions) = host.project_instructions() {
@@ -628,6 +733,35 @@ impl Agent {
                 text.push_str(&format!("- {}: {} ({})\n", skill.name, skill.description, skill.path));
             }
         }
+        // What earlier sessions wrote down. The index is all that goes in the prompt; a
+        // memory is opened with `fs_read` like any other file, so nothing is loaded twice
+        // and nothing is spent on a topic this turn does not need.
+        text.push_str(
+            "\n\n## Memory (/memory.md)\n\
+             This is what you wrote down in earlier sessions, as an index. Open a topic with \
+             fs_read before relying on it; a fresh board has none.\n\
+             To remember something: write the fact to `/memory/<topic>.md` (2 KB is the file \
+             limit) and add **one line** to `/memory.md` — `- [topic](path) — hook`. The line is a \
+             pointer, never the memory itself, and the index is kept under 24 lines; replace an \
+             outdated entry instead of appending.\n",
+        );
+        match host.memory_index() {
+            Some(index) => text.push_str(&index),
+            None => text.push_str("(nothing yet — write the first memory when something is worth keeping)\n"),
+        }
+        // What compression kept of the thread: a deterministic index, not a summary.
+        if !self.archive.is_empty() {
+            text.push_str(
+                "\n## Earlier in this conversation (compressed)\n\
+                 These exchanges were dropped from the transcript to stay inside the context \
+                 budget. The lines are taken from the messages themselves — nothing was \
+                 summarised — so treat them as an index: a repeat of a tool call listed here \
+                 is wasted work.\n",
+            );
+            for line in &self.archive {
+                text.push_str(&format!("- {line}\n"));
+            }
+        }
         text
     }
 }
@@ -641,6 +775,37 @@ pub fn system_prompt() -> &'static str {
      3. Prefer board_status, then the narrower tool. Never repeat a call whose result you already have.\n\
      4. If a tool fails, say what failed and what you tried; do not invent readings.\n\
      5. You cannot browse the internet except through the net_get/net_post tools, and you cannot reboot the board."
+}
+
+/// Where the last `keep` question-and-answer exchanges begin.
+///
+/// A turn starts at a user message; everything from there on is kept. With `keep` larger
+/// than the transcript, nothing is cut.
+fn turn_start(history: &[Message], keep: usize) -> usize {
+    if keep == 0 {
+        return history.len();
+    }
+    let mut seen = 0;
+    for i in (0..history.len()).rev() {
+        if history[i].role == Role::User {
+            seen += 1;
+            if seen == keep {
+                return i;
+            }
+        }
+    }
+    0
+}
+
+/// The first `max` characters, newlines flattened: an archive line must stay one line.
+fn head(text: &str, max: usize) -> String {
+    let flat = text.replace(['\n', '\r'], " ");
+    let trimmed = flat.trim();
+    if trimmed.chars().count() <= max {
+        return trimmed.to_string();
+    }
+    let cut: String = trimmed.chars().take(max).collect();
+    format!("{cut}…")
 }
 
 fn openai_message(message: &Message) -> Value {
@@ -1157,6 +1322,111 @@ mod tests {
         assert_eq!(second["messages"][2]["tool_calls"][0]["function"]["arguments"], "{}");
     }
 
+    /// Zero means no cap: the loop runs until the model stops asking for tools.
+    ///
+    /// The default is zero, and a fixed cap truncated work that would have finished — a
+    /// five-step task died at step four with "step limit reached". A run that really has to
+    /// be bounded sets the number, which is why the previous test still exists.
+    #[test]
+    fn a_zero_step_limit_lets_the_model_finish_its_work() {
+        let mut agent = Agent::new();
+        let mut host = StubHost::returning("{}");
+        let mut transport = StubTransport::new(vec![
+            tool_call_reply("c1", "board_status", "{}"),
+            tool_call_reply("c2", "board_status", "{}"),
+            tool_call_reply("c3", "board_status", "{}"),
+            tool_call_reply("c4", "board_status", "{}"),
+            answer_reply("done after six calls"),
+        ]);
+        let config = LlmConfig { max_steps: 0, ..cfg() };
+        assert_eq!(LlmConfig::default().max_steps, 0, "unlimited is the default");
+
+        agent.push_user("keep going", "http", 1);
+        let text = agent.run_pending(&mut host, &mut transport, &config, clock).expect("finishes");
+        assert_eq!(text, "done after six calls");
+        assert_eq!(transport.bodies.len(), 5, "four tool rounds plus the answer");
+        assert_eq!(host.calls.len(), 4);
+        assert!(agent.last_error.is_empty(), "{}", agent.last_error);
+    }
+
+    /// A model that only calls tools must not survive a zero limit, but compression must:
+    /// the transcript shrinks and the index tells the model what it already did.
+    #[test]
+    fn compression_keeps_the_last_exchanges_and_indexes_the_rest() {
+        let mut agent = Agent::new();
+        // Enough answered exchanges to exceed the byte budget on their own: each tool
+        // result is capped at 2 KB, so this needs more than a dozen of them.
+        for i in 0..14 {
+            agent.history.push(Message::user(&format!("question {i}"), "http", 10 * i));
+            let call = ToolCall { id: "c".into(), name: "board_status".into(), arguments: json!({}) };
+            agent.history.push(Message::assistant("calling", vec![call], 10 * i + 1));
+            agent.history.push(Message::tool("c", &"x".repeat(MAX_TOOL_RESULT_BYTES), 10 * i + 2));
+        }
+        let before = agent.history.len();
+        agent.compress(1);
+        assert_eq!(agent.history.len(), 3, "one exchange survives: question, call, result");
+        assert_eq!(agent.history[0].text, "question 13");
+        assert!(before > agent.history.len());
+        assert!(!agent.archive.is_empty(), "dropped work must leave an index");
+        assert!(
+            agent.archive.iter().any(|line| line.starts_with("called: board_status"))
+                && agent.archive.iter().any(|line| line.starts_with("result:")),
+            "{:?}",
+            agent.archive
+        );
+
+        // The index is what the prompt carries — no summary, just the lines.
+        let mut host = StubHost::returning("{}");
+        let prompt = agent.system_message(&mut host);
+        assert!(prompt.contains("Earlier in this conversation"), "{prompt}");
+        assert!(prompt.contains("board_status"), "{prompt}");
+    }
+
+    #[test]
+    fn forgetting_keeps_the_last_exchanges_or_none_of_them() {
+        let mut agent = Agent::new();
+        for i in 0..3 {
+            agent.history.push(Message::user(&format!("q{i}"), "http", 10 * i));
+            agent.history.push(Message::assistant(&format!("a{i}"), Vec::new(), 10 * i + 1));
+        }
+        agent.archive.push("user: old".into());
+
+        let (removed, kept) = agent.forget(1);
+        assert_eq!(removed, 4, "two exchanges, two messages each");
+        assert_eq!(kept, 2);
+        assert_eq!(agent.history[0].text, "q2");
+        assert!(agent.archive.is_empty(), "an index of what is gone is worse than none");
+
+        let (removed, kept) = agent.forget(0);
+        assert_eq!(removed, 2);
+        assert_eq!(kept, 0);
+        assert!(agent.history.is_empty());
+    }
+
+    #[test]
+    fn the_memory_index_reaches_the_system_prompt() {
+        struct Remembering;
+        impl ToolHost for Remembering {
+            fn tool_specs(&self) -> Value {
+                json!([])
+            }
+            fn call_tool(&mut self, _n: &str, _a: &Value) -> Result<String, String> {
+                Ok("{}".into())
+            }
+            fn memory_index(&self) -> Option<String> {
+                Some("- [pins](/memory/pins.md) — GPIO18 is the strip\n".into())
+            }
+        }
+        let agent = Agent::new();
+        let prompt = agent.system_message(&mut Remembering);
+        assert!(prompt.contains("## Memory (/memory.md)"), "{prompt}");
+        assert!(prompt.contains("memory/pins.md"), "{prompt}");
+
+        let prompt = agent.system_message(&mut StubHost::returning("{}"));
+        assert!(prompt.contains("nothing yet"), "a fresh board says so: {prompt}");
+    }
+
+    /// A model that only calls tools must stop at the step limit.
     #[test]
     fn a_model_that_only_calls_tools_ends_at_the_step_limit() {
         let mut agent = Agent::new();
