@@ -11,6 +11,7 @@
 
 pub mod actuator;
 pub mod ads1115;
+pub mod audio;
 pub mod bme280;
 pub mod expander;
 pub mod ina219;
@@ -483,6 +484,36 @@ pub fn detect(
         }
     }
 
+    // I2S audio: nothing can be probed, so the pins come from the profile or
+    // `config.pins` (`mic.bclk`/`mic.ws`/`mic.din`, `amp.bclk`/`amp.ws`/`amp.dout`), and
+    // the channels either come up or the tools do not exist. The caps ride on the devices,
+    // so a board that cannot bring I2S up never claims `mic`/`speaker`.
+    let mic_pins = i2s_pins(cfg, profile.mic, "mic");
+    let amp_pins = i2s_pins(cfg, profile.amp, "amp");
+    if mic_pins.is_some() || amp_pins.is_some() {
+        match hw.i2s_setup(mic_pins, amp_pins) {
+            Ok(()) => {
+                if mic_pins.is_some() {
+                    let n = next_suffix("mic");
+                    devices.push(Box::new(audio::Mic {
+                        id: if n > 1 { format!("mic{n}") } else { "mic".into() },
+                    }));
+                }
+                if amp_pins.is_some() {
+                    let n = next_suffix("speaker");
+                    devices.push(Box::new(audio::Speaker {
+                        id: if n > 1 { format!("speaker{n}") } else { "speaker".into() },
+                    }));
+                }
+                log.info("probe", "I2S up: microphone and/or amplifier available");
+            }
+            Err(e) => log.warn(
+                "probe",
+                format!("I2S pins are configured but the channels did not come up: {}", e.message),
+            ),
+        }
+    }
+
     DetectResult { devices, unknown, buses: buses_json }
 }
 
@@ -592,6 +623,26 @@ pub fn board_caps(hw: &mut dyn Hardware, cfg: &Config, profile: &BoardProfile) -
     // no tool behind it — and I2S has no addressing or id register, so nothing about it
     // can be probed either. They come back here when the drivers land.
     caps
+}
+
+/// The I2S pins for one direction: `config.pins` wins over the board profile, and both
+/// `bclk` and `ws` must be present and non-negative for the side to count as wired.
+fn i2s_pins(
+    cfg: &Config,
+    hint: Option<crate::boards::I2sPins>,
+    prefix: &str,
+) -> Option<crate::boards::I2sPins> {
+    let get = |suffix: &str| cfg.pins.get(&format!("{prefix}.{suffix}")).copied();
+    let bclk = get("bclk").or_else(|| hint.map(|h| h.bclk));
+    let ws = get("ws").or_else(|| hint.map(|h| h.ws));
+    let din = get("din").or_else(|| hint.map(|h| h.din));
+    let dout = get("dout").or_else(|| hint.map(|h| h.dout));
+    match (bclk, ws) {
+        (Some(bclk), Some(ws)) if bclk >= 0 && ws >= 0 => {
+            Some(crate::boards::I2sPins { bclk, ws, din: din.unwrap_or(-1), dout: dout.unwrap_or(-1) })
+        }
+        _ => None,
+    }
 }
 
 /// Device counts per kind, for the portal's summary line.

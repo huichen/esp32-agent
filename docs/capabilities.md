@@ -29,11 +29,15 @@ At boot (and on every `devices_probe` / `/api/devices/probe`):
    how a different devkit starts with a minimal surface (44 tools instead of 48 on an
    S3-DevKitC-1) and grows on purpose. A pin set in `config.pins` (`led`, `button.boot`)
    still wins either way, because an explicit pin is a decision.
-5. An address no driver claims goes into `unidentified`; `i2c_identify` then reads the
-   common id registers to suggest candidates. Note what this cannot see: I2S microphones
-   and amplifiers (`inmp441`, `max98357a`) are catalogue entries without a driver — a
-   manifest naming one is refused with `unknown driver`, so "the board has a speaker" is
-   currently a capability the profile reports, not a device the board can use.
+5. I2S audio (microphone, amplifier): **never detectable** — I2S is point-to-point with no
+   addressing and no id register, so nothing can answer a probe. The pins come from the
+   board profile or `config.pins` (`mic.bclk`/`mic.ws`/`mic.din`,
+   `amp.bclk`/`amp.ws`/`amp.dout`); when they are set and `Hardware::i2s_setup` brings
+   the channels up, the `mic`/`speaker` devices and their tools exist. The capability
+   rides on the device, so a board whose I2S does not come up never claims `mic` or
+   `speaker`.
+6. An address no driver claims goes into `unidentified`; `i2c_identify` then reads the
+   common id registers to suggest candidates.
 
 ## 2. Implemented drivers
 

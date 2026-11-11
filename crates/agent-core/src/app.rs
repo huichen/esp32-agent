@@ -4497,6 +4497,38 @@ mod tests {
         assert_eq!(out["color"], json!("#010203"), "{out}");
     }
 
+    /// I2S cannot be probed, so the tools exist exactly when the pins are wired: the
+    /// devkit profile has no microphone, the xiaozhi wiring has both.
+    #[test]
+    fn the_microphone_and_amplifier_exist_only_when_the_i2s_pins_are_wired() {
+        let mut app = test_app();
+        assert!(!app.is_visible("mic_level"), "the devkit profile has no I2S");
+
+        app.cfg.board = "esp32s3-xiaozhi-bread".into();
+        app.rebuild();
+        for tool in ["mic_level", "mic_record", "speaker_tone", "speaker_play"] {
+            assert!(app.is_visible(tool), "{tool} missing: {:?}", app.visible_tool_names());
+        }
+
+        // The capabilities ride on the devices, so a board that cannot bring I2S up never
+        // claims them (that was the bench bug this replaces).
+        let inv = app.call_tool("inventory", &json!({})).unwrap();
+        let caps: Vec<String> =
+            inv["capabilities"].as_array().unwrap().iter().map(|c| c.as_str().unwrap().to_string()).collect();
+        assert!(caps.contains(&"mic".to_string()) && caps.contains(&"speaker".to_string()), "{caps:?}");
+
+        let level = app.call_tool("mic_level", &json!({ "ms": 50 })).unwrap();
+        assert!(level["dbfs"].is_number(), "the level meter read nothing: {level}");
+
+        let rec = app.call_tool("mic_record", &json!({ "samples": 64 })).unwrap();
+        assert_eq!(rec["samples"], json!(64), "{rec}");
+        assert!(rec["pcm_b64"].as_str().unwrap().len() <= 2048, "a tool result is capped at 2 KB");
+
+        let tone = app.call_tool("speaker_tone", &json!({ "freq_hz": 440, "ms": 50 })).unwrap();
+        assert_eq!(tone["ok"], json!(true), "{tone}");
+        assert!(tone["samples"].as_u64().unwrap() >= 400, "{tone}");
+    }
+
     #[test]
     fn a_manifest_cannot_shadow_a_board_tool() {
         let mut app = test_app();

@@ -117,6 +117,32 @@ pub trait Hardware: Send {
         Err(McpError::unsupported("ADC is not available on this board"))
     }
 
+    /// Set up the I2S peripherals from the board's wiring.
+    ///
+    /// I2S has no addressing and no id register, so nothing here can be *detected*: the
+    /// pins come from the board profile or `config.pins`, and this either brings the
+    /// channels up or says why not. `None` on a side means that direction is not wired.
+    fn i2s_setup(
+        &mut self,
+        _mic: Option<crate::boards::I2sPins>,
+        _amp: Option<crate::boards::I2sPins>,
+    ) -> Result<()> {
+        Err(McpError::unsupported("no I2S audio on this board"))
+    }
+
+    /// Read up to `out.len()` 16-bit mono samples from the microphone.
+    ///
+    /// Returns how many arrived before `timeout_ms`; fewer than asked for is normal (the
+    /// caller's window was longer than the device's buffer).
+    fn i2s_mic_read(&mut self, _out: &mut [i16], _timeout_ms: u32) -> Result<usize> {
+        Err(McpError::unsupported("no I2S microphone on this board"))
+    }
+
+    /// Write 16-bit mono samples to the amplifier, blocking until they are accepted.
+    fn i2s_out_write(&mut self, _samples: &[i16]) -> Result<()> {
+        Err(McpError::unsupported("no I2S speaker on this board"))
+    }
+
     /// Drive a single WS2812/SK6812 pixel (or the whole strip to one colour).
     fn ring_set(&mut self, _pin: i32, _rgb: (u8, u8, u8), _count: u16) -> Result<()> {
         Err(McpError::unsupported("addressable RGB LEDs are not available on this board"))

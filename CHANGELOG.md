@@ -107,6 +107,18 @@ version numbering follows semantic versioning.
 - **`fs_cp` / `fs_mv`**: copy or move a file, or every file under a directory (`mv` needs
   `confirm: true`); the workspace had one-way writes only
 
+### Added
+
+- **I2S audio: microphone and amplifier tools.** `mic_level` (RMS/peak in dBFS over a
+  window), `mic_record` (base64 PCM, at most 512 samples so the result fits one tool
+  reply), `speaker_tone` (generated sine) and `speaker_play` (base64 PCM). Nothing here
+  is *detected* — I2S has no addressing and no id register — so the pins come from the
+  board profile or `config.pins`, the channels are brought up once, and the tools exist
+  only if that succeeded. The capability rides on the device, so a board whose I2S fails
+  never claims `mic`/`speaker`. **The firmware's I2S backend is not written yet**: on a
+  board, `i2s_setup` answers "no I2S audio on this board" and the four tools do not
+  appear; the host seam, the drivers and the virtual board are done and tested
+
 ### Fixed
 
 - **`mic` / `speaker` were advertised as capabilities with nothing behind them.** A board
