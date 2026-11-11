@@ -41,6 +41,26 @@ pub trait ChatTransport {
     /// `url` is `http://` or `https://`; the scheme is the implementation's business
     /// (plain socket or TLS), and the implementation enforces its own timeout.
     fn post_json(&mut self, url: &str, headers: &[(&str, &str)], body: &str) -> Result<String, String>;
+
+    /// Send one request with an explicit method and return the response body.
+    ///
+    /// The default keeps a transport that only knows POST working — it is still the right
+    /// thing for the model call — but a real board transport overrides it, because a
+    /// `net_get` that arrives as a POST is not a GET: any server that distinguishes the two
+    /// answers 405, and the model learns the wrong thing about the request it made.
+    fn request(
+        &mut self,
+        method: &str,
+        url: &str,
+        headers: &[(&str, &str)],
+        body: &str,
+    ) -> Result<String, String> {
+        if method.eq_ignore_ascii_case("POST") {
+            self.post_json(url, headers, body)
+        } else {
+            Err(format!("this transport cannot send {method} requests"))
+        }
+    }
 }
 
 /// Where the model lives and how the loop should treat it.

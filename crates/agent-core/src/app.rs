@@ -732,7 +732,7 @@ impl App {
         // first script has no other way to learn the syntax, and one paragraph in the tool
         // description is not a language.
         let help_section = crate::json::opt_str(args, "section").unwrap_or_default();
-        let wants_help = crate::json::opt_bool(args, "help").unwrap_or(false) || help_section != "";
+        let wants_help = crate::json::opt_bool(args, "help").unwrap_or(false) || !help_section.is_empty();
         let source = crate::json::opt_str(args, "source").unwrap_or_default();
         if crate::json::opt_bool(args, "lint").unwrap_or(false) && !source.trim().is_empty() {
             let lint = crate::script::lint(&source);
@@ -787,6 +787,72 @@ impl App {
             }
             Err(e) => Err(McpError::invalid_params(format!("script failed: {e}"))),
         }
+    }
+
+    /// If this `net_*` call points at the board itself, the method, path and body to serve.
+    ///
+    /// Recognised hosts are loopback, the station address and the setup-AP address — that
+    /// is, anything a model would write when it means "this board". The port has to match
+    /// `mcp.port`, so a real second service on the LAN is untouched.
+    fn self_target(&mut self, args: &Value) -> Option<(String, String, String)> {
+        let url = args.get("url").and_then(|v| v.as_str())?.trim();
+        let rest = url.strip_prefix("http://").or_else(|| url.strip_prefix("https://"))?;
+        let (authority, path) = match rest.find('/') {
+            Some(i) => (&rest[..i], &rest[i..]),
+            None => (rest, "/"),
+        };
+        let (host, port) = match authority.rsplit_once(':') {
+            Some((h, p)) => (h, p.parse::<u16>().ok()?),
+            None => (authority, if url.starts_with("https://") { 443 } else { 80 }),
+        };
+        if port != self.cfg.mcp.port {
+            return None;
+        }
+        let wifi = self.hw.wifi_status();
+        let mine = ["127.0.0.1", "localhost", "::1"];
+        let ours = mine.contains(&host) || host == wifi.ip || host == wifi.ap_ip;
+        if !ours {
+            return None;
+        }
+        let method = if args.get("body").is_some() { "POST" } else { "GET" };
+        let body = args.get("body").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        Some((method.to_string(), path.to_string(), body))
+    }
+
+    /// Answer a request that was aimed at this board, without a socket.
+    fn serve_self(&mut self, method: &str, path: &str, body: String) -> std::result::Result<String, String> {
+        let (pure_path, query) = match path.split_once('?') {
+            Some((p, q)) => (p.to_string(), q),
+            None => (path.to_string(), ""),
+        };
+        let query: std::collections::BTreeMap<String, String> = query
+            .split('&')
+            .filter_map(|kv| kv.split_once('='))
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        let req = Request {
+            method: method.to_string(),
+            path: pure_path,
+            query,
+            headers: Default::default(),
+            body: body.into_bytes(),
+            peer: "self".to_string(),
+        };
+        let resp = self.route(&req);
+        let text = String::from_utf8_lossy(&resp.body).to_string();
+        if !(200..300).contains(&resp.status) {
+            return Err(format!("HTTP {}: {}", resp.status, crate::llm::body_prefix(&text, 200)));
+        }
+        Ok(json!({
+            "url": path,
+            "method": method,
+            "status": resp.status,
+            "in_process": true,
+            "bytes": text.len(),
+            "truncated": text.len() > crate::tools::net::MAX_BODY_BYTES,
+            "body": crate::llm::truncate_bytes(&text, crate::tools::net::MAX_BODY_BYTES),
+        })
+        .to_string())
     }
 
     pub fn call_tool(&mut self, name: &str, args: &Value) -> Result<Value> {
@@ -2543,6 +2609,14 @@ impl ToolHost for App {
             return Ok(text);
         }
         if name.starts_with("net_") {
+            // A request to the board's own server cannot go out over a socket while this
+            // call is holding the thread that would answer it: the accept loop is inside
+            // this very tool. Answer it in process instead — the model gets the same JSON
+            // a socket would have carried, in microseconds, and the board cannot deadlock
+            // against itself.
+            if let Some((method, path, body)) = self.self_target(arguments) {
+                return self.serve_self(&method, &path, body);
+            }
             // The turn's own client is elsewhere, so this one is free to be used from
             // inside a tool call — which is what lets the agent reach the network
             // mid-run instead of only between turns.
@@ -3510,6 +3584,30 @@ mod tests {
         assert!(err.is_err());
     }
 
+    /// A `net_get` aimed at the board itself has to be answered, not deadlocked.
+    ///
+    /// The tool runs on the thread that would answer the connection, so a real socket would
+    /// wait for itself: measured on the bench as a 45 s timeout. It is served in process now,
+    /// and the check is the same JSON a socket would have carried.
+    #[test]
+    fn asking_the_board_for_its_own_healthz_answers_in_process() {
+        let mut app = test_app();
+        let started = std::time::Instant::now();
+        // The path MCP and the on-board agent both take for `net_*` is `ToolHost`.
+        let out = ToolHost::call_tool(&mut app, "net_get", &json!({"url": "http://127.0.0.1:8080/healthz"}))
+            .expect("a self request is answered");
+        let body: Value = serde_json::from_str(&out).expect("json");
+        let took = started.elapsed();
+        assert!(took < std::time::Duration::from_secs(1), "took {took:?}");
+        assert_eq!(body["status"], 200);
+        assert_eq!(body["in_process"], true);
+        assert!(body["body"].as_str().unwrap().contains("ok"));
+
+        // A different port is somebody else's service: it goes to the transport.
+        let other = ToolHost::call_tool(&mut app, "net_get", &json!({"url": "http://127.0.0.1:9/healthz"}));
+        assert!(other.is_err(), "port 9 is not us");
+    }
+
     #[test]
     fn a_message_is_queued_and_reads_back_from_the_transcript() {
         let mut app = test_app();
@@ -4010,6 +4108,17 @@ mod tests {
         impl ChatTransport for Fetching {
             fn post_json(
                 &mut self,
+                url: &str,
+                _headers: &[(&str, &str)],
+                _body: &str,
+            ) -> std::result::Result<String, String> {
+                self.urls.lock().unwrap().push(url.to_string());
+                Ok(self.body.clone())
+            }
+
+            fn request(
+                &mut self,
+                _method: &str,
                 url: &str,
                 _headers: &[(&str, &str)],
                 _body: &str,

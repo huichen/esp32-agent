@@ -1,0 +1,18 @@
+fix(net): net_get is a real GET, and the board can reach itself
+
+Two bench findings, both in the same tool.
+
+`net_get` issued a POST with an empty body, because `ChatTransport` had one verb. Any server
+that distinguishes methods answered 405 — httpbin, example.com, the provider's own root —
+and the model read that as "the endpoint refused me" rather than "I sent the wrong verb".
+The trait now has `request(method, …)`, the board and the simulator transports implement it,
+and `net_get` sends a GET with no body and no content headers. Verified on the board:
+`https://httpbin.org/get` answers 200 with `"method": "GET"` in the echoed payload.
+
+`net_get` aimed at the board's own address deadlocked for 45 s: since requests are served on
+the accept thread, a tool call that opens a socket to `/healthz` is waiting for the thread
+that is running it. Such a call is now answered in process, through the same router, with
+the same JSON a socket would have produced — and only when host and port are the board's own
+(loopback, the station address, or the setup AP, on `mcp.port`), so a real second service on
+the LAN is untouched. Verified on the board: `/healthz` answers 200 with `in_process: true`
+in 0.27 s.

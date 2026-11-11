@@ -440,7 +440,7 @@ fn lex(src: &str) -> Result<Vec<Sp>, String> {
             continue;
         }
         let (start_line, start_col) = (line, col);
-        let mut push = |tok: Tok, out: &mut Vec<Sp>| {
+        let push = |tok: Tok, out: &mut Vec<Sp>| {
             out.push(Sp { tok, line: start_line, col: start_col });
         };
         if c.is_ascii_digit() {

@@ -117,9 +117,22 @@ fn clamp_timeout(seconds: u32) -> u32 {
 
 impl ChatTransport for EspHttpTransport {
     fn post_json(&mut self, url: &str, headers: &[(&str, &str)], body: &str) -> Result<String, String> {
+        self.request("POST", url, headers, body)
+    }
+
+    fn request(
+        &mut self,
+        method: &str,
+        url: &str,
+        headers: &[(&str, &str)],
+        body: &str,
+    ) -> Result<String, String> {
         let target = Target::parse(url)?;
         let timeout = self.timeout();
-        let request = request_bytes(&target, headers, body);
+        // A GET carries no body and no content headers; sending them is what made every
+        // method-sensitive endpoint answer 405.
+        let body = if method.eq_ignore_ascii_case("GET") { "" } else { body };
+        let request = request_bytes(method, &target, headers, body);
 
         let mut conn = if target.tls {
             Conn::connect_tls(&target, timeout)?
@@ -320,9 +333,9 @@ impl Target {
 
 /// The request head plus body as one buffer, so a multi-byte UTF-8 body is never
 /// re-encoded on the way to the socket.
-fn request_bytes(target: &Target, headers: &[(&str, &str)], body: &str) -> Vec<u8> {
+fn request_bytes(method: &str, target: &Target, headers: &[(&str, &str)], body: &str) -> Vec<u8> {
     let mut head = String::with_capacity(256 + body.len());
-    head.push_str(&format!("POST {} HTTP/1.1\r\n", target.path));
+    head.push_str(&format!("{method} {} HTTP/1.1\r\n", target.path));
     head.push_str(&format!("Host: {}\r\n", target.authority()));
     // One request per connection: the reply is delimited by the close as well as by
     // its own framing, which is what lets the reader stay this small.
