@@ -233,6 +233,7 @@ async function send(text) {
     S.busy = true;
     $("#link").className = "dot busy";
     pendingRow = null;
+    connectStream();
   } catch (e) {
     toast(e.message);
   }
@@ -297,6 +298,8 @@ function handleEvent(name, data) {
       }
       pendingRow = null;
       $("#link").className = "dot live";
+      // The run is over: give the board its 8 kB back.
+      setTimeout(stopStream, 500);
       break;
   }
 }
@@ -308,7 +311,7 @@ const EVENT_KINDS = [
 ];
 
 function connectStream() {
-  if (S.stream) S.stream.close();
+  if (S.stream) return;
   const es = new EventSource("/api/agent/stream?after=" + S.lastSeq);
   S.stream = es;
   for (const kind of EVENT_KINDS) {
@@ -325,8 +328,19 @@ function connectStream() {
     es.close();
     S.stream = null;
     $("#link").className = "dot off";
-    setTimeout(connectStream, 1500);
+    if (S.busy) setTimeout(connectStream, 1500);
   };
+}
+
+/** Close the stream when nothing is running.
+ *
+ * A stream costs ~8 kB of internal RAM on the board for as long as it is open, and the
+ * model call needs that RAM for its TLS handshake: a page that keeps a stream open while it
+ * sits idle makes every run start with too little. So the stream follows the run. */
+function stopStream() {
+  if (!S.stream) return;
+  S.stream.close();
+  S.stream = null;
 }
 
 // ---------------------------------------------------------------- panels
@@ -645,8 +659,11 @@ function init() {
 
   loadHistory();
   loadStatus();
-  connectStream();
-  setInterval(() => { if (!$("#sheet").hidden) return; loadStatus(); }, 5000);
+  // Not connected at load: the stream is opened when a run starts and closed when it ends.
+  setInterval(() => {
+    if (!$("#sheet").hidden) return;
+    loadStatus();
+  }, 5000);
 }
 
 document.addEventListener("DOMContentLoaded", init);

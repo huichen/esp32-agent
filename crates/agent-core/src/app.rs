@@ -706,8 +706,22 @@ impl App {
     /// script has exactly the reach of the caller: no extra capability, no bypass of
     /// `is_visible`, and `script` itself is refused to stop unbounded recursion.
     fn run_script(&mut self, args: &Value) -> Result<Value> {
-        let source = crate::json::opt_str(args, "source")
-            .ok_or_else(|| McpError::invalid_params("`source` is required"))?;
+        // No `source` means the caller wants the reference, not a run: a model writing its
+        // first script has no other way to learn the syntax, and one paragraph in the tool
+        // description is not a language.
+        let help_section = crate::json::opt_str(args, "section").unwrap_or_default();
+        let wants_help = crate::json::opt_bool(args, "help").unwrap_or(false) || help_section != "";
+        let source = crate::json::opt_str(args, "source").unwrap_or_default();
+        if wants_help || source.trim().is_empty() {
+            let section = if help_section.is_empty() { "overview".to_string() } else { help_section };
+            let text = crate::script::help(&section).map_err(McpError::invalid_params)?;
+            return Ok(json!({
+                "section": section,
+                "text": text,
+                "bytes": text.len(),
+                "next": "overview | builtins | examples, then send `source`",
+            }));
+        }
         struct Host<'a> {
             app: &'a mut App,
         }
@@ -3337,6 +3351,27 @@ mod tests {
         });
         app.call_tool("manifest_apply", &json!({"manifest": manifest})).expect("adopting a candidate works");
         assert!(app.devices.len() >= 1, "the adopted device is live");
+    }
+
+    /// The reference is what makes the language usable: without it the model guesses the
+    /// syntax from one paragraph and then asks for tools that do not exist.
+    #[test]
+    fn the_script_tool_ships_a_reference_in_sections_that_fit_a_tool_result() {
+        let mut app = test_app();
+        let overview = app.call_tool("script", &json!({"help": true})).expect("help");
+        assert_eq!(overview["section"], "overview");
+        let text = overview["text"].as_str().expect("text");
+        for needle in ["while", "let", "tool(", "LIMITS"] {
+            assert!(text.contains(needle), "overview is missing {needle}");
+        }
+        for section in ["overview", "builtins", "examples"] {
+            let doc = app.call_tool("script", &json!({"section": section})).expect("section");
+            let bytes = doc["text"].as_str().unwrap().len();
+            assert!(bytes < 2048, "{section} is {bytes} bytes; a tool result is capped at 2 KB");
+        }
+        assert!(app.call_tool("script", &json!({"section": "nope"})).is_err());
+        // An empty call is a help request too, not a confusing "source required".
+        assert_eq!(app.call_tool("script", &json!({})).expect("empty is help")["section"], "overview");
     }
 
     /// A script is how the model writes the loop the tool vocabulary cannot express — and
