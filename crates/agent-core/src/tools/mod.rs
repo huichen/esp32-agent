@@ -12,7 +12,7 @@ use crate::capability::{cap, CapSet};
 use crate::error::McpError;
 use crate::hardware::PinMode;
 use crate::json as j;
-use crate::tool::{boolean, enumeration, integer, object_schema, ToolCtx, ToolDef};
+use crate::tool::{boolean, enumeration, integer, object_schema, string, ToolCtx, ToolDef};
 use crate::util::hex;
 use serde_json::{json, Value};
 
@@ -341,6 +341,83 @@ pub fn system_tools() -> Vec<ToolDef> {
                 ctx.runtime.reprobe_requested = true;
             }
             Ok(json!({ "ok": true, "touched": touched, "restart_required": needs_restart }))
+        }),
+        ToolDef::new(
+            "schedule",
+            "Manage the board's own schedule. action=list shows every task; add creates one that re-runs a prompt on an interval (`every_s`) or at a daily time (`at_hhmm`); remove/disable/enable take an `id`. A task fires into the same queue a user message uses, so the board works on its own",
+        )
+        .title("Schedule")
+        .category("system")
+        .core()
+        .mutating()
+        .schema(object_schema(
+            &[
+                ("action", enumeration(&["list", "add", "remove", "enable", "disable"], "what to do")),
+                ("id", string("task id, for remove/enable/disable")),
+                ("prompt", string("what to ask the agent when it fires")),
+                ("every_s", integer(0, 86_400, "repeat every N seconds; 0 = use at_hhmm")),
+                ("at_hhmm", string("daily time as \"07:30\" (UTC)")),
+                ("enabled", boolean("default true")),
+            ],
+            &["action"],
+        ))
+        .bind(|ctx, args| {
+            let action = j::opt_str(args, "action").unwrap_or_default();
+            match action.as_str() {
+                "list" => Ok(json!({
+                    "tasks": ctx.tasks.iter().map(|t| json!({
+                        "id": t.id,
+                        "prompt": t.prompt,
+                        "every_s": t.every_s,
+                        "at_hhmm": t.at_hhmm,
+                        "enabled": t.enabled,
+                    })).collect::<Vec<_>>(),
+                    "count": ctx.tasks.len(),
+                })),
+                "add" => {
+                    let prompt = j::opt_str(args, "prompt").unwrap_or_default();
+                    if prompt.trim().is_empty() {
+                        return Err(McpError::invalid_params("`prompt` is required to add a task"));
+                    }
+                    let every_s = j::opt_i64(args, "every_s").unwrap_or(0).clamp(0, 86_400) as u32;
+                    let at_hhmm = j::opt_str(args, "at_hhmm").unwrap_or_default();
+                    if every_s == 0 && at_hhmm.is_empty() {
+                        return Err(McpError::invalid_params(
+                            "give `every_s` or `at_hhmm`; a task with neither never fires",
+                        ));
+                    }
+                    // The id is derived, not asked for: a model inventing one twice would
+                    // silently replace its own task.
+                    let id = format!("t{}", ctx.tasks.len() + 1);
+                    ctx.tasks.push(crate::sched::ScheduledTask {
+                        id: id.clone(),
+                        prompt,
+                        every_s,
+                        at_hhmm,
+                        enabled: j::opt_bool(args, "enabled").unwrap_or(true),
+                        last_run_ms: 0,
+                    });
+                    ctx.runtime.sched_dirty = true;
+                    ctx.log.info("agent", format!("schedule: task `{id}` added from a tool call"));
+                    Ok(json!({ "ok": true, "id": id, "count": ctx.tasks.len() }))
+                }
+                "remove" | "enable" | "disable" => {
+                    let id = j::opt_str(args, "id").unwrap_or_default();
+                    let Some(task) = ctx.tasks.iter_mut().find(|t| t.id == id) else {
+                        return Err(McpError::not_found(format!("no task `{id}`")));
+                    };
+                    if action == "remove" {
+                        ctx.tasks.retain(|t| t.id != id);
+                    } else {
+                        task.enabled = action == "enable";
+                    }
+                    ctx.runtime.sched_dirty = true;
+                    Ok(json!({ "ok": true, "id": id, "count": ctx.tasks.len() }))
+                }
+                other => Err(McpError::invalid_params(format!(
+                    "unknown action `{other}`; use list, add, remove, enable or disable"
+                ))),
+            }
         }),
         ToolDef::new("devices_probe", "Re-scan the buses and rebuild the tool list")
             .title("Re-probe devices")

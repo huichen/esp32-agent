@@ -1,289 +1,191 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="theme-color" content="#0b0f14">
-<title>esp32-agent console</title>
+<meta name="color-scheme" content="dark light">
+<title>esp32-agent</title>
 <link rel="stylesheet" href="/assets/style.css">
 </head>
 <body>
-<header class="top">
-  <div class="brand">
-    <span class="dot" id="health-dot"></span>
-    <strong id="device-name">esp32-agent</strong>
-    <span class="chip" id="board-chip">…</span>
-    <span class="chip mono" id="ip-chip">–</span>
-  </div>
-  <div class="top-right">
-    <button class="btn ghost" id="reboot-btn">Reboot</button>
+
+<!-- Header: two lines at most. Title, one status line, one connection dot. -->
+<header class="bar">
+  <div class="bar-main">
+    <button id="menu-btn" class="icon" aria-label="Menu" title="Menu">&#9776;</button>
+    <div class="titles">
+      <h1 id="title">esp32-agent</h1>
+      <p id="sub">connecting&hellip;</p>
+    </div>
+    <span id="link" class="dot" title="connection"></span>
   </div>
 </header>
 
-<div id="setup-banner" class="banner hidden">
-  <div>
-    <strong>This board is not on a network yet</strong>
-    <p>Join the WiFi network the board is broadcasting (esp32-agent-setup by default), then enter your home network here. The board joins it and keeps the setting in NVS.</p>
-  </div>
-</div>
-
-<nav class="tabs" id="tabs">
-  <button class="tab active" data-tab="overview">Overview</button>
-  <button class="tab" data-tab="wifi">WiFi</button>
-  <button class="tab" data-tab="devices">Devices</button>
-  <button class="tab" data-tab="tools">Tools</button>
-  <button class="tab" data-tab="manifest">Manifest</button>
-  <button class="tab" data-tab="agent">Agent</button>
-  <button class="tab" data-tab="clients">Clients</button>
-  <button class="tab" data-tab="logs">Logs</button>
-</nav>
-
-<main>
-  <section class="panel active" id="panel-overview">
-    <div class="grid">
-      <div class="card"><h3>Board</h3><div id="ov-board" class="kv"></div></div>
-      <div class="card"><h3>MCP service</h3><div id="ov-mcp" class="kv"></div></div>
-      <div class="card"><h3>Peripherals</h3><div id="ov-devices" class="kv"></div></div>
-      <div class="card"><h3>Capabilities</h3><div id="ov-caps" class="tags"></div></div>
-    </div>
-    <div class="card">
-      <h3>How a model configures this board</h3>
-      <ol class="steps">
-        <li>Discover: <code>inventory</code> / <code>i2c_scan</code> / <code>i2c_identify</code>.</li>
-        <li>Model: <code>manifest_describe</code> gives the schema, primitives and examples.</li>
-        <li>Write: <code>manifest_apply</code> validates and applies — no reboot, no reflash.</li>
-        <li>Verify: the new tools appear in <code>tools/list</code> and work immediately.</li>
-        <li>Iterate: edit and apply again as often as needed.</li>
-      </ol>
-    </div>
-  </section>
-
-  <section class="panel" id="panel-wifi">
-    <div class="card">
-      <h3>Current link</h3>
-      <div id="wifi-state" class="kv"></div>
-      <div class="row">
-        <button class="btn" id="wifi-scan">Scan</button>
-        <button class="btn ghost" id="wifi-forget">Forget</button>
-      </div>
-      <div id="wifi-list" class="list"></div>
-    </div>
-    <div class="card">
-      <h3>Join a network</h3>
-      <div class="row">
-        <input id="wifi-ssid" placeholder="SSID" autocomplete="off">
-      </div>
-      <div class="row">
-        <input id="wifi-password" type="password" placeholder="password" autocomplete="off">
-        <button class="btn primary" id="wifi-connect">Save and connect</button>
-      </div>
-      <p class="hint">Credentials are stored in NVS only; they are never compiled into the firmware.</p>
-    </div>
-  </section>
-
-  <section class="panel" id="panel-devices">
-    <div class="card">
-      <div class="row spread">
-        <h3>Detected devices</h3>
-        <button class="btn" id="devices-probe">Re-probe</button>
-      </div>
-      <div id="device-table"></div>
-    </div>
-    <div class="card">
-      <h3>Unidentified I2C addresses</h3>
-      <div id="unknown-table" class="kv"></div>
-    </div>
-    <div class="card">
-      <h3>Supported drivers</h3>
-      <div id="catalog-table"></div>
-    </div>
-  </section>
-
-  <section class="panel" id="panel-tools">
-    <div class="card">
-      <div class="row spread">
-        <h3>Tools exposed to the model</h3>
-        <label class="row small">
-          <span>Style</span>
-          <select id="tools-mode">
-            <option value="auto">auto · one tool per action</option>
-            <option value="generic">generic · collapsed into device_invoke</option>
-            <option value="all">all · for debugging</option>
-          </select>
-        </label>
-      </div>
-      <p class="hint" id="tools-summary"></p>
-      <div id="tool-table"></div>
-    </div>
-  </section>
-
-  <section class="panel" id="panel-manifest">
-    <div class="card">
-      <div class="row spread">
-        <h3>Device manifest</h3>
-        <div class="row">
-          <select id="manifest-mode">
-            <option value="merge">merge</option>
-            <option value="replace">replace</option>
-          </select>
-          <button class="btn" id="manifest-validate">Validate</button>
-          <button class="btn primary" id="manifest-apply">Apply</button>
-        </div>
-      </div>
-      <p class="hint">Stored in NVS and applied live: the tool list is rebuilt in place — no reboot, no reflash.</p>
-      <textarea id="manifest-text" spellcheck="false" rows="22"></textarea>
-      <div id="manifest-issues" class="issues"></div>
-    </div>
-  </section>
-
-  <section class="panel" id="panel-agent">
-    <div class="card">
-      <div class="row spread">
-        <h3>Model link</h3>
-        <button class="btn primary" id="agent-config-save">Save</button>
-      </div>
-      <div class="row">
-        <input id="agent-base-url" placeholder="full URL of the /v1/chat/completions endpoint (http)" autocomplete="off" spellcheck="false">
-      </div>
-      <div class="row" style="margin-top:8px">
-        <input id="agent-model" placeholder="model" autocomplete="off" spellcheck="false">
-        <input id="agent-api-key" type="password" placeholder="API key" autocomplete="off">
-        <label class="row small">
-          <span>Max steps</span>
-          <input id="agent-max-steps" type="number" min="1" max="12" step="1" value="4" style="width:72px;flex:0 0 72px">
-        </label>
-        <label class="row small">
-          <span>Scheduler tick</span>
-          <input id="agent-tick" type="number" min="200" max="5000" step="100" value="1000" style="width:88px;flex:0 0 88px">
-          <span class="unit">ms</span>
-        </label>
-      </div>
-      <p class="hint">The endpoint may be http:// or https://; TLS is verified against the ESP-IDF certificate bundle on the board. The key is stored in NVS and never read back.</p>
-      <p class="hint">The tick bounds how soon a queued turn is picked up (200–5000 ms, default 1000). The firmware reads it every tick, so an edit lands on the next tick, not on reboot.</p>
-      <div id="agent-config-state" class="kv"></div>
-    </div>
-
-    <div class="card">
-      <div class="row spread">
-        <h3>Conversation</h3>
-        <div class="row">
-          <span class="hint" id="agent-runs"></span>
-          <button class="btn ghost" id="agent-reset">Clear</button>
-        </div>
-      </div>
-      <div id="agent-transcript" class="transcript"></div>
-      <textarea id="agent-text" rows="3" spellcheck="false" placeholder="Ask the board something… (Ctrl+Enter sends)"></textarea>
-      <div class="row spread" style="margin-top:8px">
-        <span class="hint" id="agent-hint"></span>
-        <button class="btn primary" id="agent-send">Send</button>
-      </div>
-    </div>
-
-    <div class="card">
-      <div class="row spread">
-        <h3>Goal</h3>
-        <span class="badge off" id="goal-badge">–</span>
-      </div>
-      <div class="row">
-        <input id="goal-objective" placeholder="e.g. keep the bench below 25 °C" autocomplete="off" spellcheck="false">
-        <label class="row small">
-          <span>Max iterations</span>
-          <input id="goal-max-iterations" type="number" min="1" max="100" step="1" value="10" style="width:72px;flex:0 0 72px">
-        </label>
-        <button class="btn primary" id="goal-start">Start</button>
-        <button class="btn ghost" id="goal-stop">Stop</button>
-      </div>
-      <div id="goal-state" class="kv"></div>
-      <div id="goal-notes"></div>
-      <p class="hint">State one objective and the board works through it alone: one small step per iteration, each result written down as a note that the next iteration is prompted with. A reply saying GOAL MET ends it; GOAL BLOCKED, three failures in a row or the iteration budget ends it too. One goal at a time, and the notes live in NVS, so they are short.</p>
-    </div>
-
-    <div class="card">
-      <div class="row spread">
-        <h3>Live events</h3>
-        <div class="row">
-          <span class="badge off" id="agent-stream-badge">–</span>
-          <span class="hint" id="agent-stream-note"></span>
-          <button class="btn ghost" id="agent-stream-pause">Pause</button>
-          <button class="btn ghost" id="agent-stream-clear">Clear</button>
-        </div>
-      </div>
-      <div id="agent-stream" class="stream" data-empty="1">
-        <p class="hint">No events yet. While this tab is open, every step of a run shows up here as it happens.</p>
-      </div>
-      <p class="hint">Pushed by /api/agent/stream (SSE). The board closes the stream after 30 s of silence or 120 s in total; the browser reconnects on its own and resumes from the last event, so the page never resends anything.</p>
-    </div>
-
-    <div class="card">
-      <div class="row spread">
-        <h3>Scheduled tasks</h3>
-        <button class="btn ghost" id="sched-refresh">Refresh</button>
-      </div>
-      <div id="sched-task-table"></div>
-      <div class="row" style="margin-top:10px">
-        <input id="task-id" placeholder="id" style="flex:0 0 90px">
-        <input id="task-prompt" placeholder="prompt">
-        <input id="task-every" type="number" min="0" step="1" placeholder="every N s" style="flex:0 0 110px">
-        <input id="task-at" placeholder="07:30" style="flex:0 0 90px">
-        <button class="btn" id="sched-task-add">Add</button>
-      </div>
-      <p class="hint">Use either every-N-seconds or HH:MM: the first repeats, the second fires once a day. A due prompt joins the same agent queue.</p>
-    </div>
-
-    <div class="card">
-      <h3>Sensor rules</h3>
-      <div id="sched-rule-table"></div>
-      <div class="row" style="margin-top:10px">
-        <input id="rule-id" placeholder="id" style="flex:0 0 90px">
-        <input id="rule-tool" placeholder="tool, e.g. bme280_read" style="flex:0 0 160px">
-        <input id="rule-path" placeholder="field in the result, e.g. temperature_c" style="flex:0 0 170px">
-        <select id="rule-op" style="flex:0 0 78px">
-          <option value="gt">&gt;</option>
-          <option value="lt">&lt;</option>
-          <option value="eq">=</option>
-          <option value="ne">≠</option>
-          <option value="true">true</option>
-        </select>
-        <input id="rule-value" placeholder="threshold" style="flex:0 0 90px">
-        <input id="rule-prompt" placeholder="prompt sent to the model when the rule fires">
-        <input id="rule-every" type="number" min="0" step="1" placeholder="min interval (s)" style="flex:0 0 110px">
-        <button class="btn" id="sched-rule-add">Add</button>
-      </div>
-      <p class="hint">Each tick reads the tool once and only queues a prompt when the rule matches; min_interval_s keeps one rule from flooding the queue.</p>
-    </div>
-  </section>
-
-  <section class="panel" id="panel-clients">
-    <div class="card">
-      <h3>MCP endpoint</h3>
-      <div class="kv" id="mcp-url"></div>
-      <pre class="code" id="curl-list"></pre>
-      <pre class="code" id="mcp-json"></pre>
-      <p class="hint">Clients must speak the Streamable HTTP transport; stdio-only clients need a bridge such as mcp-remote.</p>
-    </div>
-  </section>
-
-  <section class="panel" id="panel-logs">
-    <div class="card">
-      <div class="row spread">
-        <h3>Log</h3>
-        <button class="btn ghost" id="logs-refresh">Refresh</button>
-      </div>
-      <pre class="code logs" id="log-box"></pre>
-    </div>
-  </section>
+<main id="chat" class="chat" aria-live="polite">
+  <div class="row agent"><div class="bubble"><p>This is the board's own agent. Ask it about the hardware, tell it to change something, or give it a job &mdash; it calls its tools by itself.</p></div></div>
 </main>
 
-<div id="pin-gate" class="modal hidden">
-  <div class="modal-card">
-    <h3>PIN required</h3>
-    <p>This board protects its console with a PIN.</p>
-    <input id="pin-input" type="password" inputmode="numeric" autocomplete="off">
-    <button class="btn primary" id="pin-submit">OK</button>
-  </div>
-</div>
+<form id="composer" class="composer" autocomplete="off">
+  <textarea id="input" rows="1" placeholder="Ask the board&hellip;" enterkeyhint="send"></textarea>
+  <button id="send" class="send" type="submit" aria-label="Send">&#8593;</button>
+</form>
 
-<div id="toast" class="toast hidden"></div>
+<div id="toast" class="toast"></div>
+
+<!-- Everything that is not the conversation lives behind the menu. -->
+<section id="sheet" class="sheet" hidden>
+  <div class="sheet-head">
+    <h2>Board</h2>
+    <button id="sheet-close" class="icon" aria-label="Close">&#10005;</button>
+  </div>
+  <nav class="tabs" role="tablist">
+    <button role="tab" data-panel="status" aria-selected="true">Status</button>
+    <button role="tab" data-panel="devices">Devices</button>
+    <button role="tab" data-panel="tools">Tools</button>
+    <button role="tab" data-panel="manifest">Manifest</button>
+    <button role="tab" data-panel="agent">Agent</button>
+    <button role="tab" data-panel="schedule">Schedule</button>
+    <button role="tab" data-panel="logs">Logs</button>
+    <button role="tab" data-panel="settings">Settings</button>
+  </nav>
+  <div class="sheet-body">
+
+    <div id="panel-status" class="panel">
+      <div class="card"><h3>Board</h3><div id="status-kv" class="kv"></div></div>
+      <div class="card"><h3>Connection</h3><div id="wifi-kv" class="kv"></div></div>
+      <div class="card"><h3>Model</h3><div id="model-kv" class="kv"></div></div>
+      <div class="buttons"><button id="devices-probe" class="btn">Probe devices</button></div>
+    </div>
+
+    <div id="panel-devices" class="panel" hidden>
+      <div class="card"><h3>Detected</h3><div id="devices-list" class="list"></div></div>
+      <div class="card"><h3>Unidentified</h3><div id="unidentified-list" class="list"></div>
+        <p class="hint">An address that answers with no driver: use <code>i2c_read</code> or describe it in the manifest.</p>
+      </div>
+    </div>
+
+    <div id="panel-tools" class="panel" hidden>
+      <div class="card"><h3>Tools</h3><div id="tools-list" class="list"></div></div>
+    </div>
+
+    <div id="panel-manifest" class="panel" hidden>
+      <div class="card">
+        <h3>Manifest</h3>
+        <textarea id="manifest-text" class="field" spellcheck="false"></textarea>
+        <div class="buttons">
+          <button id="manifest-validate" class="btn ghost">Validate</button>
+          <button id="manifest-apply" class="btn primary">Apply</button>
+          <button id="manifest-reload" class="btn ghost">Reload</button>
+        </div>
+        <p id="manifest-result" class="hint"></p>
+      </div>
+    </div>
+
+    <div id="panel-agent" class="panel" hidden>
+      <div class="card">
+        <h3>Model</h3>
+        <label for="agent-base">Base URL</label>
+        <input id="agent-base" type="text" placeholder="chat completions endpoint">
+        <label for="agent-model">Model</label>
+        <input id="agent-model" type="text" placeholder="deepseek-flash">
+        <label for="agent-key">API key (write-only)</label>
+        <input id="agent-key" type="password" placeholder="__set__ = keep the stored one">
+        <label for="agent-steps">Max steps (0 = no limit)</label>
+        <input id="agent-steps" type="number" min="0" max="200" step="1">
+        <label for="agent-temperature">Temperature</label>
+        <input id="agent-temperature" type="number" min="0" max="2" step="0.1">
+        <div class="buttons"><button id="agent-save" class="btn primary">Save</button></div>
+      </div>
+      <div class="card">
+        <h3>Goal</h3>
+        <label for="goal-objective">Objective</label>
+        <textarea id="goal-objective" class="field" placeholder="what the board should work towards"></textarea>
+        <label for="goal-max-iterations">Max iterations</label>
+        <input id="goal-max-iterations" type="number" min="1" max="50">
+        <div class="buttons">
+          <button id="goal-start" class="btn primary">Start</button>
+          <button id="goal-stop" class="btn ghost">Stop</button>
+        </div>
+        <pre id="goal-notes" class="log"></pre>
+        <p class="hint">A goal ends on GOAL MET or GOAL BLOCKED, or when the iterations run out.</p>
+      </div>
+      <div class="card">
+        <h3>Conversation</h3>
+        <div class="buttons">
+          <button id="forget-tail" class="btn ghost">Keep last exchange</button>
+          <button id="forget-all" class="btn ghost">Forget everything</button>
+        </div>
+        <p class="hint">Memories are files (<code>/memory.md</code>) and survive this.</p>
+      </div>
+    </div>
+
+    <div id="panel-schedule" class="panel" hidden>
+      <div class="card"><h3>Tasks</h3><div id="sched-list" class="list"></div></div>
+      <div class="card">
+        <h3>Add</h3>
+        <label for="sched-prompt">Prompt</label>
+        <textarea id="sched-prompt" class="field" placeholder="what to ask when it fires"></textarea>
+        <label for="sched-every">Every N seconds (0 = daily time)</label>
+        <input id="sched-every" type="number" min="0" step="1">
+        <label for="sched-at">Daily time, UTC (07:30)</label>
+        <input id="sched-at" type="text" placeholder="07:30">
+        <div class="buttons"><button id="sched-add" class="btn primary">Add task</button></div>
+      </div>
+    </div>
+
+    <div id="panel-logs" class="panel" hidden>
+      <div class="card"><h3>Log</h3><pre id="logs" class="log"></pre>
+        <div class="buttons"><button id="logs-refresh" class="btn ghost">Refresh</button></div>
+      </div>
+    </div>
+
+    <div id="panel-settings" class="panel" hidden>
+      <div class="card">
+        <h3>WiFi</h3>
+        <label for="wifi-ssid">Network</label>
+        <input id="wifi-ssid" type="text" autocomplete="off">
+        <label for="wifi-password">Password</label>
+        <input id="wifi-password" type="password" autocomplete="new-password">
+        <div class="buttons">
+          <button id="wifi-connect" class="btn primary">Save and join</button>
+          <button id="wifi-scan" class="btn ghost">Scan</button>
+        </div>
+        <p id="wifi-result" class="hint"></p>
+      </div>
+      <div class="card">
+        <h3>Access</h3>
+        <label for="auth-pin">Portal PIN (empty = open on the LAN)</label>
+        <input id="auth-pin" type="password" placeholder="__set__ = keep the stored one">
+        <label for="auth-tick">Agent tick (ms)</label>
+        <input id="auth-tick" type="number" min="200" max="5000" step="100">
+        <div class="buttons"><button id="settings-save" class="btn primary">Save</button></div>
+        <p class="hint">With a PIN set, this page asks for it once and keeps a token; scripts send it as <code>Authorization: Bearer</code>.</p>
+      </div>
+      <div class="card">
+        <h3>Board</h3>
+        <div class="buttons">
+          <button id="reboot" class="btn ghost">Reboot</button>
+        </div>
+      </div>
+    </div>
+
+  </div>
+</section>
+
+<!-- Login: also a sheet, so it works the same on a phone and on a laptop. -->
+<section id="login" class="sheet" hidden>
+  <div class="sheet-head"><h2>PIN required</h2></div>
+  <div class="sheet-body">
+    <div class="card">
+      <label for="login-pin">Portal PIN</label>
+      <input id="login-pin" type="password" inputmode="numeric" autocomplete="current-password">
+      <div class="buttons"><button id="login-go" class="btn primary">Unlock</button></div>
+      <p id="login-error" class="hint"></p>
+    </div>
+  </div>
+</section>
+
 <script src="/assets/app.js"></script>
 </body>
 </html>
