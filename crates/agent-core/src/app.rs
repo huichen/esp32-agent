@@ -2448,7 +2448,7 @@ fn llm_apply_json(cfg: &mut LlmConfig, v: &Value) {
         }
     }
     if let Some(n) = v.get("max_steps").and_then(|x| x.as_u64()) {
-        cfg.max_steps = n.clamp(1, 12) as u8;
+        cfg.max_steps = n.min(200) as u8;
     }
     if let Some(t) = v.get("temperature").and_then(|x| x.as_f64()) {
         cfg.temperature = t.clamp(0.0, 2.0) as f32;
@@ -3443,7 +3443,9 @@ mod tests {
         assert!(String::from_utf8_lossy(&bad.body).contains("http://"));
         assert_eq!(app.llm.base_url, "https://api.example.com/v1/chat/completions");
         assert_eq!(app.route(&post("/api/agent/config", r#"{"max_steps":99}"#)).status, 200);
-        assert_eq!(app.llm.max_steps, 12, "max_steps is clamped, not trusted");
+        assert_eq!(app.llm.max_steps, 99, "a step cap can be set, up to the sane ceiling");
+        assert_eq!(app.route(&post("/api/agent/config", r#"{"max_steps":0}"#)).status, 200);
+        assert_eq!(app.llm.max_steps, 0, "zero turns the cap off again");
     }
 
     #[test]

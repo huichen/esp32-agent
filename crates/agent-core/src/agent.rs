@@ -368,7 +368,7 @@ impl Agent {
         self.trim();
         self.usage_run = llm::Usage::default();
         self.turn_steps = 0;
-        self.turn_limit = max_steps.max(1);
+        self.turn_limit = max_steps;
         self.turn_tools = host.tool_specs();
         self.emit("message_start", now_ms(), |_| {});
         Some(self.ask(host))
@@ -498,7 +498,10 @@ impl Agent {
         }
         self.trim();
 
-        if self.turn_steps >= self.turn_limit {
+        // 0 means no cap: the loop ends on a final answer, a transport error, or when the
+        // history budget forces a trim. A fixed cap only truncates work that would have
+        // finished, so it is something to switch on rather than to live with.
+        if self.turn_limit > 0 && self.turn_steps >= self.turn_limit {
             let err = format!("agent: step limit {} reached before a final answer", self.turn_limit);
             self.last_error = err.clone();
             self.emit("error", now_ms(), |ev| ev.text = err.clone());
@@ -1155,6 +1158,33 @@ mod tests {
         // The model sees `{}` on the way back out, not our private error key.
         let second: Value = serde_json::from_str(&transport.bodies[1]).expect("json");
         assert_eq!(second["messages"][2]["tool_calls"][0]["function"]["arguments"], "{}");
+    }
+
+    /// Zero means no cap: the loop runs until the model stops asking for tools.
+    ///
+    /// The default is zero, and a fixed cap truncated work that would have finished — a
+    /// five-step task died at step four with "step limit reached". A run that really has to
+    /// be bounded sets the number, which is why the previous test still exists.
+    #[test]
+    fn a_zero_step_limit_lets_the_model_finish_its_work() {
+        let mut agent = Agent::new();
+        let mut host = StubHost::returning("{}");
+        let mut transport = StubTransport::new(vec![
+            tool_call_reply("c1", "board_status", "{}"),
+            tool_call_reply("c2", "board_status", "{}"),
+            tool_call_reply("c3", "board_status", "{}"),
+            tool_call_reply("c4", "board_status", "{}"),
+            answer_reply("done after six calls"),
+        ]);
+        let config = LlmConfig { max_steps: 0, ..cfg() };
+        assert_eq!(LlmConfig::default().max_steps, 0, "unlimited is the default");
+
+        agent.push_user("keep going", "http", 1);
+        let text = agent.run_pending(&mut host, &mut transport, &config, clock).expect("finishes");
+        assert_eq!(text, "done after six calls");
+        assert_eq!(transport.bodies.len(), 5, "four tool rounds plus the answer");
+        assert_eq!(host.calls.len(), 4);
+        assert!(agent.last_error.is_empty(), "{}", agent.last_error);
     }
 
     #[test]
