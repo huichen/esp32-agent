@@ -114,12 +114,26 @@ version numbering follows semantic versioning.
   reply), `speaker_tone` (generated sine) and `speaker_play` (base64 PCM). Nothing here
   is *detected* — I2S has no addressing and no id register — so the pins come from the
   board profile or `config.pins`, the channels are brought up once, and the tools exist
-  only if that succeeded. The capability rides on the device, so a board whose I2S fails
-  never claims `mic`/`speaker`. **The firmware's I2S backend is not written yet**: on a
-  board, `i2s_setup` answers "no I2S audio on this board" and the four tools do not
-  appear; the host seam, the drivers and the virtual board are done and tested
+  only if that succeeded. Formats are the ones measured on this board: microphone
+  16 kHz / 32-bit slots / left channel, amplifier 24 kHz / 16-bit / Philips. The
+  firmware backend is in `esp_hw.rs` and reads by `bytes_read` rather than by the return
+  code, because `i2s_channel_read` times out while still handing back samples
+- **WS2812 output actually works**: `ring_set` was a TODO answering "addressable RGB is
+  not implemented", so a board listed an LED whose tool always failed. It now drives the
+  chain through `rmt_new_bytes_encoder` (10 MHz, 3/9 and 9/3 tick symbols, GRB payload)
+- **`examples/manifests/lamp-strip.json`**: the xiaozhi demo strip on GPIO18, so a board
+  with two WS2812 outputs can carry both
 
 ### Fixed
+
+- **Two devices of one kind no longer share a tool name.** The board's second WS2812
+  output (a strip on GPIO18) registered its `led_set` over the devkit LED's, so the
+  second device silently made the first unreachable while `devices_list` claimed both
+  were callable — two BME280s had the same problem waiting. The first keeps the plain
+  name and the rest become `_2`, `_3`, in both `tools/list` and `devices_list`
+- **A manifest device keeps the id the manifest gave it.** `instantiate` returned the
+  driver's default id (`led`), so `device_invoke` could only reach the first device of a
+  kind; a `NamedDevice` wrapper now carries `spec.id`
 
 - **`mic` / `speaker` were advertised as capabilities with nothing behind them.** A board
   profile can record the I2S pins (the xiaozhi wiring does), and `board_caps` turned that

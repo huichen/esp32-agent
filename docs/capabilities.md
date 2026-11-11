@@ -35,7 +35,12 @@ At boot (and on every `devices_probe` / `/api/devices/probe`):
    `amp.bclk`/`amp.ws`/`amp.dout`); when they are set and `Hardware::i2s_setup` brings
    the channels up, the `mic`/`speaker` devices and their tools exist. The capability
    rides on the device, so a board whose I2S does not come up never claims `mic` or
-   `speaker`.
+   `speaker`. Formats are fixed per side and come from the bench measurements:
+   microphone **16 kHz, 32-bit slots, left channel only** (an INMP441 sends 24 bits
+   left-justified, right slot always zero); amplifier **24 kHz, 16-bit, Philips, mono**.
+   On the read side the driver judges by `bytes_read`, not by the return code: this
+   board's `i2s_channel_read` answers `ESP_ERR_TIMEOUT` while already holding samples, and
+   counting only `ESP_OK` makes a working microphone read as silence.
 6. An address no driver claims goes into `unidentified`; `i2c_identify` then reads the
    common id registers to suggest candidates.
 
