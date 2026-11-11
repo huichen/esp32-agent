@@ -1,0 +1,14 @@
+{
+  "version": 1,
+  "devices": [
+    {
+      "id": "lamp",
+      "kind": "led",
+      "driver": "led",
+      "pins": { "out": 18 },
+      "options": { "kind": "ws2812", "count": "8" },
+      "note": "xiaozhi demo strip on GPIO18; set options.count to the number of pixels. With the devkit's own LED on 48 both tools exist: led_set (48) and led_set_2 (18)"
+    }
+  ],
+  "tools": []
+}

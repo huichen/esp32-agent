@@ -304,7 +304,10 @@ impl App {
             match drivers::instantiate(spec, &mut *self.hw) {
                 Ok(dev) => {
                     self.log.info("manifest", format!("instantiated `{}` from the manifest", spec.id));
-                    self.devices.push(dev);
+                    // The manifest's id is the one `device_invoke` and `devices_list`
+                    // use; the driver's own default (`led`, `relay`) would make two
+                    // devices of one kind indistinguishable.
+                    self.devices.push(Box::new(crate::device::NamedDevice::new(dev, &spec.id)));
                 }
                 Err(e) => {
                     self.log.warn("manifest", format!("device `{}` failed: {}", spec.id, e.message));
@@ -4527,6 +4530,49 @@ mod tests {
         let tone = app.call_tool("speaker_tone", &json!({ "freq_hz": 440, "ms": 50 })).unwrap();
         assert_eq!(tone["ok"], json!(true), "{tone}");
         assert!(tone["samples"].as_u64().unwrap() >= 400, "{tone}");
+    }
+
+    /// Two WS2812 outputs (the devkit's own on 48 and the xiaozhi strip on 18) both want
+    /// `led_set`; without distinct names the second silently replaced the first in the
+    /// registry, and `devices_list` still claimed both were reachable.
+    #[test]
+    fn two_devices_of_one_kind_get_distinct_tool_names() {
+        let mut app = test_app();
+        assert!(app.is_visible("led_set"), "the devkit's LED starts as `led_set`");
+
+        let v = app
+            .call_tool(
+                "manifest_apply",
+                &json!({ "manifest": { "devices": [
+                    { "id": "lamp", "kind": "led", "driver": "led", "pins": { "out": 18 },
+                      "options": { "kind": "ws2812", "count": "8" } }
+                ] } }),
+            )
+            .unwrap();
+        assert_eq!(v["applied"], true, "{v}");
+        assert!(app.is_visible("led_set_2"), "the strip has no tool: {:?}", app.visible_tool_names());
+
+        // The two views agree: `devices_list` names the same suffixed tool.
+        let inv = app.call_tool("devices_list", &json!({})).unwrap();
+        let ids: Vec<String> = inv["devices"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|d| d["id"].as_str().unwrap_or("?").to_string())
+            .collect();
+        let lamp = inv["devices"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|d| d["id"] == "lamp")
+            .unwrap_or_else(|| panic!("no lamp device: {ids:?}"));
+        let tools: Vec<String> =
+            lamp["tools"].as_array().unwrap().iter().map(|t| t.as_str().unwrap().to_string()).collect();
+        assert!(tools.contains(&"led_set_2".to_string()), "{tools:?}");
+
+        // ... and the second one is answered by the strip, not refused as unknown.
+        let out = app.call_tool("led_set_2", &json!({ "color": "#102030" })).unwrap();
+        assert_eq!(out["ok"], json!(true), "{out}");
     }
 
     #[test]
