@@ -107,6 +107,34 @@ http: listening on http://0.0.0.0:8080/
 Credentials live only in NVS. **The firmware contains no password**, so moving networks
 costs nothing.
 
+### Without leaving the network: the console
+
+Joining the board's access point from a machine that is also talking to a model over the
+network cuts that machine off — and if the model runs on this agent, the run dies with it.
+The console is a way in that touches nothing else. With the board on its USB port:
+
+```text
+provision <ssid> <password>
+```
+
+one line, terminated by `\n`. The board answers on the console, writes NVS and restarts:
+
+```
+I (…) esp32_agent::provision: credentials for `my-network` received on the console
+I (…) esp32_agent: wifi state: ap+sta, station ip Some("192.168.3.7")
+```
+
+Two details decide whether it works on a given bench:
+
+- **Which port.** A DevKitC-1 has two USB sockets. The UART one is UART0 (GPIO43/44); the
+  other is the chip's own **USB-Serial-JTAG**. The firmware reads the USB-Serial-JTAG port
+  when it can and falls back to UART0, because writing to the wrong one just times out on
+  the host. If the log says `console: reading USB-Serial-JTAG`, the port next to `PWR` is
+  the one to talk to.
+- **Do not reset on open.** Tools that assert DTR/RTS while opening the port pulse the
+  chip's reset or park it in download mode, so the line lands on a booting device. Drop
+  both lines first (`pyserial`: `sp.dtr = False; sp.rts = False` before `open()`).
+
 ## 5. Reaching it afterwards
 
 - Look for `esp32-agent`'s DHCP lease on the router; the serial log prints the IP too.
