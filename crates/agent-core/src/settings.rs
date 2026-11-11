@@ -62,6 +62,12 @@ const BOARD: &[Field] = &[
     f("mcp.port", "integer", "8080", "needs a restart"),
     f("mcp.path", "string", "/mcp", "endpoint path"),
     f("mcp.tools_mode", "string", "auto", "auto | generic | all"),
+    f(
+        "mcp.profile",
+        "string",
+        "full",
+        "full | minimal — minimal hides nine convenience tools, never the ones an empty board needs",
+    ),
     f("mcp.disabled_tools", "string[]", "[]", "hide these tool names"),
     f("mcp.max_sessions", "integer", "4", "concurrent MCP sessions"),
     f("mcp.session_ttl_s", "integer", "900", "idle session lifetime"),

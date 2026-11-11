@@ -415,12 +415,34 @@ impl App {
 
     // ---------------------------------------------------------------- queries
 
+    /// The tools `mcp.profile = "minimal"` hides: conveniences, never capabilities.
+    ///
+    /// Each one has an HTTP route or a manifest equivalent, and a model that has only these
+    /// removed loses no ability — it loses a shortcut.
+    const MINIMAL_HIDDEN: &'static [&'static str] = &[
+        "board_config_get",
+        "delay",
+        "logs_tail",
+        "wifi_scan",
+        "wifi_status",
+        "reboot",
+        "factory_reset",
+        "manifest_validate",
+        "manifest_reset",
+    ];
+
     /// May this tool appear in `tools/list` right now?
     pub fn is_visible(&self, name: &str) -> bool {
         let Some(def) = self.tools.get(name) else {
             return false;
         };
         if self.cfg.mcp.disabled_tools.iter().any(|d| d == name) {
+            return false;
+        }
+        // `minimal` hides conveniences, never capabilities: an HTTP route or a manifest can
+        // do these, and a model rarely needs them. Discovery, manifest, GPIO and the file
+        // tools stay in every profile — without them an empty board cannot rebuild itself.
+        if self.cfg.mcp.profile == "minimal" && Self::MINIMAL_HIDDEN.contains(&name) {
             return false;
         }
         if self.cfg.mcp.tools_mode == "generic" && def.spec.device_tool {
@@ -712,6 +734,15 @@ impl App {
         let help_section = crate::json::opt_str(args, "section").unwrap_or_default();
         let wants_help = crate::json::opt_bool(args, "help").unwrap_or(false) || help_section != "";
         let source = crate::json::opt_str(args, "source").unwrap_or_default();
+        if crate::json::opt_bool(args, "lint").unwrap_or(false) && !source.trim().is_empty() {
+            let lint = crate::script::lint(&source);
+            return Ok(json!({
+                "ok": lint.ok(),
+                "errors": lint.errors,
+                "warnings": lint.warnings,
+                "note": "lint only — nothing was run; send `source` without `lint` to execute",
+            }));
+        }
         if wants_help || source.trim().is_empty() {
             let section = if help_section.is_empty() { "overview".to_string() } else { help_section };
             let text = crate::script::help(&section).map_err(McpError::invalid_params)?;
@@ -3377,6 +3408,89 @@ mod tests {
     /// A script is how the model writes the loop the tool vocabulary cannot express — and
     /// `tool()` inside it goes through the same dispatcher, so it cannot reach further than
     /// the caller.
+    /// `minimal` is the answer to "why are there still 27 tools on an empty board": it
+    /// hides the nine that are conveniences, and keeps everything an empty board needs to
+    /// rebuild itself.
+    #[test]
+    fn the_minimal_profile_hides_shortcuts_and_keeps_the_ability_to_rebuild() {
+        let mut app = test_app();
+        let full = app.tool_specs().as_array().unwrap().len();
+        for hidden in App::MINIMAL_HIDDEN {
+            assert!(app.is_visible(hidden), "{hidden} should be visible in full");
+        }
+
+        app.cfg.mcp.profile = "minimal".into();
+        let minimal = app.tool_specs().as_array().unwrap().len();
+        assert_eq!(minimal + App::MINIMAL_HIDDEN.len(), full, "nothing else moved");
+        for hidden in App::MINIMAL_HIDDEN {
+            assert!(!app.is_visible(hidden), "{hidden} should be hidden in minimal");
+        }
+        // The bootstrap survives: discovery, manifest, GPIO and the file tools.
+        for kept in [
+            "board_status",
+            "devices_list",
+            "devices_probe",
+            "i2c_scan",
+            "manifest_apply",
+            "manifest_describe",
+            "gpio_write",
+        ] {
+            assert!(app.is_visible(kept), "{kept} must survive the minimal profile");
+        }
+        // `fs_*`, `net_*` and `script` live outside the registry, so they are checked in the
+        // model's own tool list rather than through `is_visible`.
+        let names: Vec<String> = app
+            .tool_specs()
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["function"]["name"].as_str().unwrap_or("").to_string())
+            .collect();
+        for kept in ["fs_read", "fs_write", "net_get", "script"] {
+            assert!(names.iter().any(|n| n == kept), "{kept} must survive the minimal profile");
+        }
+
+        // And it is a config field, not a build: one patch brings them back.
+        let touched = app.cfg.apply_patch(&json!({"mcp": {"profile": "full"}})).expect("patch");
+        assert!(touched.contains(&"mcp.profile".to_string()));
+        assert_eq!(app.tool_specs().as_array().unwrap().len(), full);
+        assert!(app.cfg.apply_patch(&json!({"mcp": {"profile": "tiny"}})).is_err());
+    }
+
+    /// Linting is how a model checks a script before it runs: `tool()` calls have side
+    /// effects, so "execute and see" is the worst way to find a typo.
+    #[test]
+    fn the_linter_answers_before_anything_runs() {
+        let mut app = test_app();
+
+        let good = app
+            .call_tool("script", &json!({"lint": true, "source": "let i = 0\nwhile i < 3 { i = i + 1 }\ni"}))
+            .expect("lint");
+        assert_eq!(good["ok"], true);
+        assert!(good["errors"].as_array().unwrap().is_empty());
+
+        let bad = app.call_tool("script", &json!({"lint": true, "source": "let = 3"})).expect("lint");
+        assert_eq!(bad["ok"], false);
+        let first = bad["errors"][0].as_str().expect("an error message");
+        assert!(first.contains("line 1"), "an error without a position is a guess: {first}");
+        assert!(first.contains("column"), "{first}");
+
+        // A call to a function that does not exist is a warning, not an error: it runs and
+        // fails at that line, and the model should see the typo before that happens.
+        let typo = app
+            .call_tool("script", &json!({"lint": true, "source": "speaker_ton({freq_hz: 440})"}))
+            .expect("lint");
+        assert_eq!(typo["ok"], true);
+        assert!(typo["warnings"][0].as_str().unwrap().contains("speaker_ton"));
+        assert!(typo["warnings"][0].as_str().unwrap().contains("builtins"));
+
+        // And linting never runs the program: a tool call would have been logged.
+        let before = app.runtime.tool_calls.len();
+        app.call_tool("script", &json!({"lint": true, "source": "tool(\"reboot\", {})"})).expect("lint");
+        assert_eq!(app.runtime.tool_calls.len(), before, "lint must not execute anything");
+        assert!(!app.runtime.restart_requested);
+    }
+
     #[test]
     fn a_script_can_drive_the_boards_tools() {
         let mut app = test_app();
