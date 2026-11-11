@@ -136,6 +136,110 @@ Report and stop early on a failure:
     if s.heap_kb != nil { log("heap " + str(s.heap_kb)) }
 "#;
 
+/// What a check came back with.
+#[derive(Debug, Default)]
+pub struct Lint {
+    /// Things that stop the program from running, with a line and column.
+    pub errors: Vec<String>,
+    /// Things that will run but are probably wrong.
+    pub warnings: Vec<String>,
+}
+
+impl Lint {
+    pub fn ok(&self) -> bool {
+        self.errors.is_empty()
+    }
+}
+
+/// Check a program without running it.
+///
+/// A model should be able to find out that its script is wrong before the board executes
+/// half of it — `tool()` calls have side effects, so "run it and see" is the worst way to
+/// learn. This covers the two failure classes that actually happen: syntax (the lexer and
+/// parser answer with a line and column) and a call to a function that does not exist
+/// (`speaker_ton` instead of `speaker_tone`, `print` instead of `log`).
+pub fn lint(source: &str) -> Lint {
+    let mut out = Lint::default();
+    if source.len() > MAX_SOURCE {
+        out.errors.push(format!("the script is larger than {MAX_SOURCE} bytes"));
+        return out;
+    }
+    let toks = match lex(source) {
+        Ok(t) => t,
+        Err(e) => {
+            out.errors.push(e);
+            return out;
+        }
+    };
+    let mut parser = Parser { toks, pos: 0 };
+    let program = match parser.program() {
+        Ok(p) => p,
+        Err(e) => {
+            out.errors.push(e);
+            return out;
+        }
+    };
+    let mut calls = Vec::new();
+    collect_calls(&program, &mut calls);
+    for name in calls {
+        if !BUILTINS_NAMES.contains(&name.as_str()) {
+            out.warnings
+                .push(format!("unknown function `{name}`; the builtins are {}", BUILTINS_NAMES.join(", ")));
+        }
+        if name == "script" {
+            out.warnings.push("`tool(\"script\", …)` is refused when the script runs".into());
+        }
+    }
+    out
+}
+
+/// The functions a script may call, other than `tool`.
+pub const BUILTINS_NAMES: &[&str] = &["len", "str", "num", "type", "log", "tool"];
+
+fn collect_calls(stmts: &[Stmt], out: &mut Vec<String>) {
+    for stmt in stmts {
+        match stmt {
+            Stmt::Let(_, e) | Stmt::Assign(_, e) | Stmt::Expr(e) => collect_expr(e, out),
+            Stmt::SetIndex(_, a, b) => {
+                collect_expr(a, out);
+                collect_expr(b, out);
+            }
+            Stmt::If(c, then, otherwise) => {
+                collect_expr(c, out);
+                collect_calls(then, out);
+                collect_calls(otherwise, out);
+            }
+            Stmt::While(c, body) => {
+                collect_expr(c, out);
+                collect_calls(body, out);
+            }
+            Stmt::Break => {}
+        }
+    }
+}
+
+fn collect_expr(expr: &Expr, out: &mut Vec<String>) {
+    match expr {
+        Expr::Lit(_) | Expr::Var(_) => {}
+        Expr::List(items) => items.iter().for_each(|e| collect_expr(e, out)),
+        Expr::Map(pairs) => pairs.iter().for_each(|(_, e)| collect_expr(e, out)),
+        Expr::Unary(_, e) => collect_expr(e, out),
+        Expr::Binary(_, a, b) => {
+            collect_expr(a, out);
+            collect_expr(b, out);
+        }
+        Expr::Index(a, b) => {
+            collect_expr(a, out);
+            collect_expr(b, out);
+        }
+        Expr::Member(a, _) => collect_expr(a, out),
+        Expr::Call(name, args) => {
+            out.push(name.clone());
+            args.iter().for_each(|e| collect_expr(e, out));
+        }
+    }
+}
+
 /// The result of a run.
 #[derive(Debug)]
 pub struct Outcome {
@@ -294,39 +398,69 @@ enum Tok {
     Eof,
 }
 
-fn lex(src: &str) -> Result<Vec<Tok>, String> {
+/// A token and where it came from. Every error a model sees has to name a place, or the
+/// fix is a guess: `line 3, column 7: expected a name after `let`` is actionable,
+/// "unexpected token" is not.
+#[derive(Clone, Debug, PartialEq)]
+struct Sp {
+    tok: Tok,
+    line: u32,
+    col: u32,
+}
+
+fn lex(src: &str) -> Result<Vec<Sp>, String> {
     let chars: Vec<char> = src.chars().collect();
     let mut i = 0;
-    let mut out = Vec::new();
+    let mut line = 1u32;
+    let mut col = 1u32;
+    let mut out: Vec<Sp> = Vec::new();
+    // Advance one character, keeping line/column in step with it.
+    macro_rules! bump {
+        () => {{
+            if chars[i] == '\n' {
+                line += 1;
+                col = 1;
+            } else {
+                col += 1;
+            }
+            i += 1;
+        }};
+    }
     while i < chars.len() {
         let c = chars[i];
         if c.is_whitespace() {
-            i += 1;
+            bump!();
             continue;
         }
         // comments: `#` to end of line, and `//`
         if c == '#' || (c == '/' && chars.get(i + 1) == Some(&'/')) {
             while i < chars.len() && chars[i] != '\n' {
-                i += 1;
+                bump!();
             }
             continue;
         }
+        let (start_line, start_col) = (line, col);
+        let mut push = |tok: Tok, out: &mut Vec<Sp>| {
+            out.push(Sp { tok, line: start_line, col: start_col });
+        };
         if c.is_ascii_digit() {
             let start = i;
             while i < chars.len() && (chars[i].is_ascii_digit() || chars[i] == '.') {
-                i += 1;
+                bump!();
             }
             let text: String = chars[start..i].iter().collect();
-            let n = text.parse::<f64>().map_err(|_| format!("bad number `{text}`"))?;
-            out.push(Tok::Num(n));
+            let n = text
+                .parse::<f64>()
+                .map_err(|_| format!("line {start_line}, column {start_col}: `{text}` is not a number"))?;
+            push(Tok::Num(n), &mut out);
             continue;
         }
         if c == '"' {
-            i += 1;
+            bump!();
             let mut s = String::new();
             while i < chars.len() && chars[i] != '"' {
                 if chars[i] == '\\' && i + 1 < chars.len() {
-                    i += 1;
+                    bump!();
                     s.push(match chars[i] {
                         'n' => '\n',
                         't' => '\t',
@@ -335,22 +469,22 @@ fn lex(src: &str) -> Result<Vec<Tok>, String> {
                 } else {
                     s.push(chars[i]);
                 }
-                i += 1;
+                bump!();
             }
             if i >= chars.len() {
-                return Err("unterminated string".into());
+                return Err(format!("line {start_line}, column {start_col}: the string is never closed"));
             }
-            i += 1;
-            out.push(Tok::Str(s));
+            bump!();
+            push(Tok::Str(s), &mut out);
             continue;
         }
         if c.is_alphabetic() || c == '_' {
             let start = i;
             while i < chars.len() && (chars[i].is_alphanumeric() || chars[i] == '_') {
-                i += 1;
+                bump!();
             }
             let word: String = chars[start..i].iter().collect();
-            out.push(match word.as_str() {
+            let tok = match word.as_str() {
                 "let" => Tok::Let,
                 "if" => Tok::If,
                 "else" => Tok::Else,
@@ -363,7 +497,8 @@ fn lex(src: &str) -> Result<Vec<Tok>, String> {
                 "or" => Tok::Or,
                 "not" => Tok::Not,
                 _ => Tok::Ident(word),
-            });
+            };
+            push(tok, &mut out);
             continue;
         }
         let two: String = chars[i..(i + 2).min(chars.len())].iter().collect();
@@ -391,13 +526,19 @@ fn lex(src: &str) -> Result<Vec<Tok>, String> {
                 '/' => (Tok::Slash, 1),
                 '%' => (Tok::Percent, 1),
                 '.' => (Tok::Dot, 1),
-                other => return Err(format!("unexpected character `{other}`")),
+                other => {
+                    return Err(format!(
+                        "line {start_line}, column {start_col}: `{other}` is not part of the language"
+                    ))
+                }
             },
         };
-        out.push(tok);
-        i += len;
+        push(tok, &mut out);
+        for _ in 0..len {
+            bump!();
+        }
     }
-    out.push(Tok::Eof);
+    out.push(Sp { tok: Tok::Eof, line, col });
     Ok(out)
 }
 
@@ -428,13 +569,22 @@ enum Stmt {
 }
 
 struct Parser {
-    toks: Vec<Tok>,
+    toks: Vec<Sp>,
     pos: usize,
 }
 
 impl Parser {
+    /// The token at the cursor, without its position.
     fn peek(&self) -> &Tok {
-        self.toks.get(self.pos).unwrap_or(&Tok::Eof)
+        self.toks.get(self.pos).map(|s| &s.tok).unwrap_or(&Tok::Eof)
+    }
+
+    /// Where the cursor is, for an error a model can act on.
+    fn here(&self) -> String {
+        match self.toks.get(self.pos) {
+            Some(sp) => format!("line {}, column {}", sp.line, sp.col),
+            None => "end of script".to_string(),
+        }
     }
 
     fn next(&mut self) -> Tok {
@@ -456,7 +606,7 @@ impl Parser {
         if self.eat(t) {
             Ok(())
         } else {
-            Err(format!("expected {:?}, found {:?}", t, self.peek()))
+            Err(format!("{}: expected {:?}, found {:?}", self.here(), t, self.peek()))
         }
     }
 
@@ -473,7 +623,7 @@ impl Parser {
         let mut out = Vec::new();
         while self.peek() != &Tok::RBrace {
             if self.peek() == &Tok::Eof {
-                return Err("unterminated block".into());
+                return Err(format!("{}: the block is never closed", self.here()));
             }
             out.push(self.stmt()?);
         }
@@ -487,7 +637,9 @@ impl Parser {
                 self.next();
                 let name = match self.next() {
                     Tok::Ident(n) => n,
-                    other => return Err(format!("expected a name after `let`, found {other:?}")),
+                    other => {
+                        return Err(format!("{}: expected a name after `let`, found {other:?}", self.here()))
+                    }
                 };
                 self.expect(&Tok::Assign)?;
                 let value = self.expr()?;
@@ -528,7 +680,7 @@ impl Parser {
             _ => {
                 // Assignment or an expression statement.
                 if let Tok::Ident(name) = self.peek().clone() {
-                    if self.toks.get(self.pos + 1) == Some(&Tok::Assign) {
+                    if self.toks.get(self.pos + 1).map(|s| &s.tok) == Some(&Tok::Assign) {
                         self.pos += 2;
                         let value = self.expr()?;
                         self.eat(&Tok::Semi);
@@ -537,7 +689,7 @@ impl Parser {
                 }
                 // `a[i] = v`
                 if let Tok::Ident(name) = self.peek().clone() {
-                    if self.toks.get(self.pos + 1) == Some(&Tok::LBracket) {
+                    if self.toks.get(self.pos + 1).map(|s| &s.tok) == Some(&Tok::LBracket) {
                         let save = self.pos;
                         self.pos += 2;
                         let index = self.expr()?;
@@ -665,7 +817,12 @@ impl Parser {
             } else if self.eat(&Tok::Dot) {
                 match self.next() {
                     Tok::Ident(name) => node = Expr::Member(Box::new(node), name),
-                    other => return Err(format!("expected a field name after `.`, found {other:?}")),
+                    other => {
+                        return Err(format!(
+                            "{}: expected a field name after `.`, found {other:?}",
+                            self.here()
+                        ))
+                    }
                 }
             } else {
                 break;
@@ -724,7 +881,7 @@ impl Parser {
                     loop {
                         let key = match self.next() {
                             Tok::Ident(k) | Tok::Str(k) => k,
-                            other => return Err(format!("expected a key, found {other:?}")),
+                            other => return Err(format!("{}: expected a key, found {other:?}", self.here())),
                         };
                         // `:` reads like JSON, `=` like a constructor; a model writes both.
                         if !self.eat(&Tok::Colon) {
@@ -741,7 +898,7 @@ impl Parser {
                 }
                 Ok(Expr::Map(pairs))
             }
-            other => Err(format!("unexpected token {other:?}")),
+            other => Err(format!("{}: unexpected token {other:?}", self.here())),
         }
     }
 }

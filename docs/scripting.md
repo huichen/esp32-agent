@@ -8,7 +8,6 @@ agent can write a **script** to find the hardware and declare it.
 By default (`devices.discovery = auto`) a driver that recognises a device adopts it, and it
 appears in `tools/list` straight away. Set it to `manual` and the drivers still probe — they
 just stop deciding:
-
 ```bash
 curl -sS -X POST http://<board>:8080/mcp -H 'Content-Type: application/json' -d '{
   "jsonrpc":"2.0","id":1,"method":"tools/call",
@@ -44,6 +43,27 @@ Small on purpose: the board has ~40 kB of free internal RAM, and the language ex
 model can express **loops and conditions over tool calls** that a fixed tool vocabulary
 cannot. It is Turing-complete (assignment plus `while`), has no pointers and no user
 functions, and cannot reach anything the caller cannot.
+
+### How a model learns it
+
+`script` describes itself, because a tool description is one paragraph and a language is
+not:
+
+| Call | Answer |
+|---|---|
+| `{"help": true}` (or `{}`) | the overview: values, statements, operators, access, limits |
+| `{"section": "builtins"}` | the six functions and what `tool()` may reach |
+| `{"section": "examples"}` | two runnable programs |
+| `{"lint": true, "source": "…"}` | check it without running: syntax errors with line and column, and warnings for unknown function names |
+
+The lint exists because `tool()` calls have side effects: "run it and see" is the worst way
+to find a typo, and a syntax error at line 12 after three tool calls is worse still. Each
+section is under 2 KB, the cap on a tool result.
+
+```text
+{"ok": false, "errors": ["line 1, column 5: expected a name after `let`, found Assign"]}
+{"ok": true,  "warnings": ["unknown function `speaker_ton`; the builtins are len, str, …"]}
+```
 
 ```text
 let scan = tool("i2c_scan", {})          # any board tool, same permissions

@@ -20,6 +20,10 @@ fn default_true() -> bool {
 fn default_discovery() -> String {
     "auto".to_string()
 }
+
+fn default_profile() -> String {
+    "full".to_string()
+}
 pub const NVS_KEY_CONFIG: &str = "config";
 pub const DEFAULT_PORT: u16 = 8080;
 pub const DEFAULT_PATH: &str = "/mcp";
@@ -112,6 +116,14 @@ pub struct McpCfg {
     pub tools_mode: String,
     /// Tool names the user switched off in the portal.
     pub disabled_tools: Vec<String>,
+    /// `full` (default) or `minimal`.
+    ///
+    /// `minimal` hides the tools that are conveniences rather than capabilities: the ones
+    /// an HTTP client or a manifest can do as well, and the ones a model rarely needs.
+    /// Nothing is deleted — one field switches them back — and the tools that make an empty
+    /// board rebuildable (discovery, manifest, GPIO, files) always stay.
+    #[serde(default = "default_profile")]
+    pub profile: String,
     /// Maximum concurrent MCP sessions kept in memory.
     pub max_sessions: u32,
     /// A session id is forgotten after this many seconds of inactivity.
@@ -235,6 +247,7 @@ impl Default for McpCfg {
             path: DEFAULT_PATH.into(),
             tools_mode: "auto".into(),
             disabled_tools: Vec::new(),
+            profile: default_profile(),
             max_sessions: 4,
             session_ttl_s: 900,
             sse: false,
@@ -324,6 +337,15 @@ impl Config {
             }
             self.discovery = d.to_string();
             touched.push("discovery".into());
+        }
+        if let Some(p) = patch.get("mcp").and_then(|v| v.get("profile")).and_then(|v| v.as_str()) {
+            if p != "full" && p != "minimal" {
+                return Err(crate::error::McpError::invalid_params(
+                    "mcp.profile must be `full` or `minimal`",
+                ));
+            }
+            self.mcp.profile = p.to_string();
+            touched.push("mcp.profile".into());
         }
         if let Some(w) = patch.get("wifi").and_then(|v| v.as_object()) {
             if let Some(s) = w.get("ssid").and_then(|v| v.as_str()) {
