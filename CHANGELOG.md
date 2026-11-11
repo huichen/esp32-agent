@@ -78,6 +78,11 @@ version numbering follows semantic versioning.
 
 ### Changed
 
+- **The portal is English only**: the `EN` / `中` switch is gone, and every label,
+  placeholder, table header and client-side message is English, so there is one text to
+  read and one to keep working. A test fails the build on any CJK character in
+  `index.html`, `app.js` or `style.css`, and on a leftover `data-i18n` / `I18N` hook
+
 - **The model's tool list is ordered least-volatile-first**: board tools, then `fs_*` and
   `net_*`, then manifest tools — alphabetical inside each block. Providers cache a request
   by prefix, so a mid-turn `manifest_apply` used to shift every tool after the inserted

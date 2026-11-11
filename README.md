@@ -22,7 +22,7 @@ So MCP is an interface here, not the product: an outside agent can drive the boa
 tools over MCP, and the board can drive itself without one — including the case where
 the thing it is driving is the MCP surface it just configured.
 
-The firmware also serves a bilingual web console. It is usable before it has any WiFi
+The firmware also serves a web console (English only). It is usable before it has any WiFi
 credentials: the board raises its own access point, a phone joins it, fills in the home
 network at the fixed address `192.168.4.1`, and the board joins it — **no password is
 ever compiled into the firmware**.
