@@ -407,7 +407,10 @@ pub fn detect(
     // Declared GPIO peripherals.
     let pin_of = |key: &str| cfg.pins.get(key).copied();
 
-    // Buttons: configured pins win, otherwise the board profile's own buttons.
+    // Buttons and the LED are the devkit's own, so they follow `board.auto_peripherals`:
+    // a minimal board starts without them and has them back by declaring the device in
+    // the manifest. An explicitly configured pin (`pins["button.boot"]`, `pins["led"]`)
+    // still counts as a decision and wins either way.
     let mut buttons: Vec<(String, i32)> = Vec::new();
     for (k, v) in &cfg.pins {
         if let Some(rest) = k.strip_prefix("button.") {
@@ -418,7 +421,7 @@ pub fn detect(
             }
         }
     }
-    if buttons.is_empty() {
+    if buttons.is_empty() && cfg.auto_peripherals {
         for b in profile.buttons {
             buttons.push((b.name.to_string(), b.pin));
         }
@@ -431,8 +434,10 @@ pub fn detect(
         }
     }
 
-    // LED: an explicit pin wins over the profile.
-    let led_pin = pin_of("led").or_else(|| profile.led.map(|l| l.pin));
+    // LED: an explicit pin wins over the profile, and the profile only speaks when the
+    // board is allowed to bring its own peripherals up.
+    let led_pin =
+        pin_of("led").or_else(|| if cfg.auto_peripherals { profile.led.map(|l| l.pin) } else { None });
     if let Some(pin) = led_pin {
         let kind = if pin_of("led.pwm").unwrap_or(0) != 0 {
             "pwm"
@@ -541,6 +546,16 @@ pub fn instantiate(spec: &crate::manifest::DeviceSpec, hw: &mut dyn Hardware) ->
             },
             opt("count").and_then(|c| c.parse().ok()).unwrap_or(1),
         )),
+        // `pins` is a name→pin map, which is exactly what a button set is.
+        "buttons" => {
+            let mut buttons: Vec<(String, i32)> =
+                spec.pins.iter().map(|(name, pin)| (name.clone(), *pin)).collect();
+            buttons.sort_by(|a, b| a.0.cmp(&b.0));
+            if buttons.is_empty() {
+                return Err(McpError::invalid_params("driver `buttons` needs pins, e.g. {\"boot\": 0}"));
+            }
+            Box::new(actuator::Buttons::new(buttons))
+        }
         other => {
             return Err(McpError::invalid_params(format!(
                 "no compiled driver `{other}`; use primitives (gpio/pwm/adc/i2c) in the manifest instead"

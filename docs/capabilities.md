@@ -21,9 +21,19 @@ At boot (and on every `devices_probe` / `/api/devices/probe`):
 3. 1-Wire: probe only the pins in `config.bus.onewire_pins` (sending a reset pulse on an
    arbitrary pin is not a harmless operation), and require a presence pulse plus a ROM CRC.
 4. Declarative peripherals (relay/servo/HC-SR04/LED/buttons): from the board profile or
-   `config.pins`, because they cannot be probed passively.
+   `config.pins`, because they cannot be probed passively. The devkit's own LED and BOOT
+   button follow `config.auto_peripherals`: with `false` the board comes up without them
+   and they exist once a manifest declares the device —
+   `{"id":"rgb","kind":"led","driver":"led","pins":{"out":48},"options":{"kind":"ws2812"}}`
+   and `{"id":"boot","kind":"buttons","driver":"buttons","pins":{"boot":0}}`. That is
+   how a different devkit starts with a minimal surface (44 tools instead of 48 on an
+   S3-DevKitC-1) and grows on purpose. A pin set in `config.pins` (`led`, `button.boot`)
+   still wins either way, because an explicit pin is a decision.
 5. An address no driver claims goes into `unidentified`; `i2c_identify` then reads the
-   common id registers to suggest candidates.
+   common id registers to suggest candidates. Note what this cannot see: I2S microphones
+   and amplifiers (`inmp441`, `max98357a`) are catalogue entries without a driver — a
+   manifest naming one is refused with `unknown driver`, so "the board has a speaker" is
+   currently a capability the profile reports, not a device the board can use.
 
 ## 2. Implemented drivers
 

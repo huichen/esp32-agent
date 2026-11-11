@@ -11,6 +11,11 @@ use serde_json::{json, Value};
 use std::collections::BTreeMap;
 
 pub const CONFIG_VERSION: u32 = 1;
+
+/// Default for the flags that are on unless a board says otherwise.
+fn default_true() -> bool {
+    true
+}
 pub const NVS_KEY_CONFIG: &str = "config";
 pub const DEFAULT_PORT: u16 = 8080;
 pub const DEFAULT_PATH: &str = "/mcp";
@@ -42,6 +47,14 @@ pub struct Config {
     pub device_name: String,
     /// Board profile id, or `"auto"` to pick one from the SoC/flash it finds.
     pub board: String,
+    /// Instantiate the board profile's own peripherals (the devkit's RGB LED and its
+    /// BOOT button) at boot.
+    ///
+    /// `false` is the minimal start: the board comes up with the bus, GPIO and manifest
+    /// tools only, and those peripherals exist once a manifest declares them — which is
+    /// how a different devkit gets a small surface it grows on purpose.
+    #[serde(default = "default_true")]
+    pub auto_peripherals: bool,
     pub wifi: WifiCfg,
     pub mcp: McpCfg,
     pub bus: BusCfg,
@@ -171,6 +184,7 @@ impl Default for Config {
             version: CONFIG_VERSION,
             device_name: "esp32-agent".into(),
             board: "auto".into(),
+            auto_peripherals: true,
             wifi: WifiCfg::default(),
             mcp: McpCfg::default(),
             bus: BusCfg::default(),
@@ -288,6 +302,10 @@ impl Config {
                 self.board = s.trim().to_string();
                 touched.push("board".into());
             }
+        }
+        if let Some(b) = patch.get("auto_peripherals").and_then(|v| v.as_bool()) {
+            self.auto_peripherals = b;
+            touched.push("auto_peripherals".into());
         }
         if let Some(w) = patch.get("wifi").and_then(|v| v.as_object()) {
             if let Some(s) = w.get("ssid").and_then(|v| v.as_str()) {

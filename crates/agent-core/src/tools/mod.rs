@@ -335,6 +335,11 @@ pub fn system_tools() -> Vec<ToolDef> {
             if needs_restart {
                 ctx.runtime.restart_requested = true;
             }
+            // Turning the board's own peripherals on or off changes the device list, which
+            // only a fresh probe can do.
+            if touched.iter().any(|t| t == "auto_peripherals" || t == "board") {
+                ctx.runtime.reprobe_requested = true;
+            }
             Ok(json!({ "ok": true, "touched": touched, "restart_required": needs_restart }))
         }),
         ToolDef::new("devices_probe", "Re-scan the buses and rebuild the tool list")

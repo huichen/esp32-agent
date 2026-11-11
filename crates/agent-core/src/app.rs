@@ -4423,6 +4423,40 @@ mod tests {
         assert!(app.skills().is_empty(), "the index still lists a deleted skill: {:?}", app.skills());
     }
 
+    /// The devkit's own peripherals are opt-out: a board that wants the smallest possible
+    /// surface comes up with the bus, GPIO and manifest tools, and has its LED and button
+    /// back by declaring them — which is also how a different devkit starts small.
+    #[test]
+    fn a_minimal_board_starts_without_the_devkits_own_peripherals() {
+        let mut app = test_app();
+        assert!(app.is_visible("led_set"), "the profile's LED is there by default");
+
+        // Through the config path a person or the agent would use.
+        app.call_tool("config_set", &json!({ "patch": { "auto_peripherals": false } })).unwrap();
+        for gone in ["led_set", "led_blink", "buttons_read", "button_wait"] {
+            assert!(!app.is_visible(gone), "{gone} survived a minimal start");
+        }
+        assert!(app.is_visible("gpio_write"), "the primitives must stay");
+        assert!(app.is_visible("manifest_apply"), "self-configuration must stay");
+
+        // Declaring them in the manifest brings the tools back — the whole point.
+        let v = app
+            .call_tool(
+                "manifest_apply",
+                &json!({ "manifest": { "devices": [
+                    { "id": "rgb", "kind": "led", "driver": "led", "pins": { "out": 48 },
+                      "options": { "kind": "ws2812" } },
+                    { "id": "boot", "kind": "buttons", "driver": "buttons", "pins": { "boot": 0 } }
+                ] } }),
+            )
+            .unwrap();
+        assert_eq!(v["applied"], true, "{v}");
+        assert!(app.is_visible("led_set"), "the declared LED did not appear");
+        assert!(app.is_visible("buttons_read"), "the declared button did not appear");
+        let out = app.call_tool("led_set", &json!({ "color": "#010203" })).unwrap();
+        assert_eq!(out["color"], json!("#010203"), "{out}");
+    }
+
     #[test]
     fn a_manifest_cannot_shadow_a_board_tool() {
         let mut app = test_app();

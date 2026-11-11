@@ -7,6 +7,15 @@ version numbering follows semantic versioning.
 
 ### Added
 
+- **`board.auto_peripherals`**: the devkit's own RGB LED and BOOT button are no longer
+  forced into the device list. With `false` the board comes up with the bus, GPIO and
+  manifest tools (44 instead of 48 on an S3-DevKitC-1) and gets them back by declaring
+  `led` / `buttons` in a manifest — the minimal start a different board can grow from.
+  Set from the portal, `config_set`, or `POST /api/config`; it takes effect on the next
+  probe, no reboot
+- **`buttons` as a manifest driver**: `pins` is a name→GPIO map, e.g. `{"boot": 0}`, so a
+  button set can be declared like any other device
+
 - **Goal loop**: state one objective (`POST /api/goal`) and the board iterates on its own
   — each iteration is one small step, its result becomes a note that the next iteration
   reads, and a reply saying `GOAL MET` / `GOAL BLOCKED` ends the run; the goal lives in
