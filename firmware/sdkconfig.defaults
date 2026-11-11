@@ -16,7 +16,11 @@ CONFIG_SPIRAM_SPEED_80M=y
 # free and the HTTP server could not spawn a single connection thread (`could not spawn
 # connection thread`, and the portal would not open) while 8 MB of PSRAM sat idle.
 CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y
-CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=2048
+# Allocations below this threshold always come from internal SRAM. The HTTP server, the
+# agent and a TLS handshake all want that same SRAM, and a 30 kB model request squeezed it
+# to 8 kB — at which point the handshake failed with a bare ESP_FAIL. Most of those
+# allocations are JSON trees and request buffers, which have no business in internal RAM.
+CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=512
 
 # Room for the HTTP request line and the JSON frames that go over it.
 CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
@@ -46,6 +50,11 @@ CONFIG_LWIP_TCP_MSL=5000
 # set every https handshake fails (certificates from 2024 read as "not yet valid" to a
 # board in 1970). A minute is a fair compromise on a LAN that may have no NTP route.
 CONFIG_LWIP_SNTP_UPDATE_DELAY=60000
+# mbedTLS wants a 16 KB input buffer and a 4 KB output buffer per session. Internal RAM is
+# where the radio, the HTTP server and the agent live, and at handshake time only ~17 kB was
+# free with a 9 kB largest block: every https:// request failed with a bare ESP_FAIL.
+# Those buffers are not DMA memory, so PSRAM is the right home for them.
+CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC=y
 
 # Partition table from partitions.csv - factory app plus a two-slot OTA rotation with
 # the otadata record that selects between them.

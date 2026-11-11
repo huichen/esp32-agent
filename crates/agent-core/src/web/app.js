@@ -1,1257 +1,669 @@
-// esp32-agent portal. No build step, no framework: the board serves this file.
+/* The board's console.
+ *
+ * The page is a conversation. Everything else — devices, tools, manifest, schedule,
+ * logs, settings — is a sheet behind the menu button, because a phone is the target and
+ * a chat plus a bottom composer is the only layout that survives a keyboard.
+ *
+ * Auth: with a portal PIN set, every call carries the token from POST /api/auth. A 401
+ * anywhere opens the login sheet and the failed request is retried after unlocking.
+ */
 "use strict";
 
-const I18N = {
-  zh: {
-    reboot: "重启", tab_overview: "总览", tab_wifi: "WiFi", tab_devices: "设备",
-    tab_tools: "工具", tab_manifest: "清单", tab_agent: "智能体", tab_clients: "接入", tab_logs: "日志",
-    setup_title: "设备还没有加入网络",
-    setup_hint: "用手机连接设备自己发出的 WiFi（默认 esp32-agent-setup），然后在这个页面填写家里的 WiFi，保存后设备会自动联网。",
-    card_board: "板子", card_mcp: "MCP 服务", card_devices: "周边设备", card_caps: "能力",
-    card_flow: "给大模型的工作流",
-    flow_1: "发现：inventory / i2c_scan / i2c_identify 找到真实接线。",
-    flow_2: "建模：manifest_describe 拿到清单 schema、原语和示例。",
-    flow_3: "写入：manifest_apply 校验并生效，无需重启、无需重烧。",
-    flow_4: "验证：tools/list 里出现新工具，直接调用。",
-    flow_5: "迭代：结果不对就改清单再应用，工具列表实时更新。",
-    wifi_current: "当前连接", wifi_scan: "扫描网络", wifi_forget: "忘记网络",
-    wifi_join: "连接新的 WiFi", wifi_connect: "保存并连接",
-    wifi_note: "凭证只写入板子的 NVS，不会进固件；换网络不用重新烧录。",
-    devices_found: "识别到的设备", devices_probe: "重新探测",
-    devices_unknown: "未识别的 I2C 地址", devices_catalog: "支持的驱动",
-    tools_listed: "暴露给模型的工具", tools_mode: "风格",
-    manifest_title: "设备清单（manifest）", manifest_validate: "校验",
-    manifest_apply: "应用",
-    manifest_note: "清单存在 NVS 里，应用后立即生效：工具列表会重建，不需要重启也不需要重新烧录。",
-    clients_url: "MCP 端点",
-    clients_note: "浏览器或 Claude Desktop 需要支持 Streamable HTTP；只支持 stdio 的客户端要走 mcp-remote 之类的桥。",
-    logs_title: "运行日志", refresh: "刷新",
-    pin_title: "需要 PIN", pin_hint: "这个板子设置了控制台 PIN，输入后才能修改配置。",
-    save: "保存",
-    agent_link: "模型连接", agent_chat: "对话", agent_reset: "清空", agent_send: "发送",
-    agent_max_steps: "最大步数",
-    agent_tick: "调度 tick",
-    agent_tick_note: "调度 tick 决定队列最快多久被取走一次（200–5000 ms，默认 1000）：板子每个 tick 重新读它，改完下一个 tick 就生效，不用重启。",
-    stream_title: "实时事件",
-    stream_empty: "还没有事件。停在这一页时，运行的每一步都会实时出现在这里。",
-    stream_note: "由 /api/agent/stream 推送（SSE）：板子空闲 30 秒或单条连接满 120 秒会主动断开，浏览器自己重连并从最后一条事件续上，页面不重发任何东西。",
-    stream_pause: "暂停", stream_resume: "继续", stream_clear: "清空",
-    stream_live: "实时", stream_connecting: "连接中", stream_offline: "未连接", stream_paused: "已暂停",
-    stream_skipped: "跳过 {n} 条",
-    agent_note: "模型地址可以写 http:// 或 https://；https 在板子上用 esp-tls 校验证书包。key 只写进 NVS，读回来时只显示是否已设置。",
-    agent_key_set: "已设置，留空表示不改", agent_key_none: "没有 key（不发送 Authorization）",
-    agent_queued: "已排队", agent_running: "运行中", agent_idle: "空闲", agent_empty: "还没有对话。发一条消息，模型会用板子自己的工具作答。",
-    goal_title: "自主目标", goal_start: "开始", goal_stop: "停止",
-    goal_objective: "目标", goal_objective_ph: "比如：把工作台温度稳定在 25 °C 以下",
-    goal_max_iterations: "最多迭代", goal_iter: "第 {i} / {m} 轮",
-    goal_failures: "连续失败", goal_last: "上一轮", goal_reason: "停止原因",
-    goal_notes: "笔记（最新在最后）", goal_no_notes: "还没有笔记：第一轮跑完才会写进来。",
-    goal_idle: "还没有目标。写一句想让它做成的事，再点“开始”。",
-    goal_need_objective: "先写一个目标", goal_started: "已开始",
-    goal_status_idle: "空闲", goal_status_running: "运行中", goal_status_met: "已达成",
-    goal_status_blocked: "受阻", goal_status_exhausted: "轮次用尽", goal_status_stopped: "已停止",
-    goal_note: "写下一个目标，板子会自己一轮一轮地做：每轮只走一小步，把结果写成一条笔记，下一轮带着这些笔记继续。回复里出现 GOAL MET 就结束，出现 GOAL BLOCKED、连续失败 3 轮或者迭代次数用完也会停。同一时间只能有一个目标，笔记存在 NVS 里，所以都很短。",
-    sched_tasks: "定时任务", sched_rules: "传感器规则", sched_add: "添加",
-    sched_enable: "启用", sched_disable: "停用", del: "删除", none: "（空）",
-    sched_note: "“每 N 秒”和“HH:MM”二选一：填秒数按周期触发，填 HH:MM 每天触发一次；到点的提示词会排进同一条智能体队列。",
-    sched_rule_note: "规则每轮先调用工具读一次值，命中才排提示词；min_interval_s 防止一条规则持续刷屏。",
-    saved: "已保存", applied: "已应用", failed: "失败",
-  },
-  en: {
-    reboot: "Reboot", tab_overview: "Overview", tab_wifi: "WiFi", tab_devices: "Devices",
-    tab_tools: "Tools", tab_manifest: "Manifest", tab_agent: "Agent", tab_clients: "Clients", tab_logs: "Logs",
-    setup_title: "This board is not on a network yet",
-    setup_hint: "Join the WiFi network the board is broadcasting (esp32-agent-setup by default), then enter your home network here. The board joins it and keeps the setting in NVS.",
-    card_board: "Board", card_mcp: "MCP service", card_devices: "Peripherals", card_caps: "Capabilities",
-    card_flow: "How a model configures this board",
-    flow_1: "Discover: inventory / i2c_scan / i2c_identify.",
-    flow_2: "Model: manifest_describe gives the schema, primitives and examples.",
-    flow_3: "Write: manifest_apply validates and applies — no reboot, no reflash.",
-    flow_4: "Verify: the new tools appear in tools/list and work immediately.",
-    flow_5: "Iterate: edit and apply again as often as needed.",
-    wifi_current: "Current link", wifi_scan: "Scan", wifi_forget: "Forget",
-    wifi_join: "Join a network", wifi_connect: "Save and connect",
-    wifi_note: "Credentials are stored in NVS only; they are never compiled into the firmware.",
-    devices_found: "Detected devices", devices_probe: "Re-probe",
-    devices_unknown: "Unidentified I2C addresses", devices_catalog: "Supported drivers",
-    tools_listed: "Tools exposed to the model", tools_mode: "Style",
-    manifest_title: "Device manifest", manifest_validate: "Validate",
-    manifest_apply: "Apply",
-    manifest_note: "Stored in NVS and applied live: the tool list is rebuilt in place — no reboot, no reflash.",
-    clients_url: "MCP endpoint",
-    clients_note: "Clients must speak the Streamable HTTP transport; stdio-only clients need a bridge such as mcp-remote.",
-    logs_title: "Log", refresh: "Refresh",
-    pin_title: "PIN required", pin_hint: "This board protects its console with a PIN.",
-    save: "Save",
-    agent_link: "Model link", agent_chat: "Conversation", agent_reset: "Clear", agent_send: "Send",
-    agent_max_steps: "Max steps",
-    agent_tick: "Scheduler tick",
-    agent_tick_note: "The tick bounds how soon a queued turn is picked up (200–5000 ms, default 1000). The firmware reads it every tick, so an edit lands on the next tick, not on reboot.",
-    stream_title: "Live events",
-    stream_empty: "No events yet. While this tab is open, every step of a run shows up here as it happens.",
-    stream_note: "Pushed by /api/agent/stream (SSE). The board closes the stream after 30 s of silence or 120 s in total; the browser reconnects on its own and resumes from the last event, so the page never resends anything.",
-    stream_pause: "Pause", stream_resume: "Resume", stream_clear: "Clear",
-    stream_live: "live", stream_connecting: "connecting", stream_offline: "offline", stream_paused: "paused",
-    stream_skipped: "{n} skipped",
-    agent_note: "The endpoint may be http:// or https://; TLS is verified against the ESP-IDF certificate bundle on the board. The key is stored in NVS and never read back.",
-    agent_key_set: "set, leave empty to keep it", agent_key_none: "no key (no Authorization header)",
-    agent_queued: "Queued", agent_running: "running", agent_idle: "idle", agent_empty: "No conversation yet. Send a message and the model works with the board's own tools.",
-    goal_title: "Goal", goal_start: "Start", goal_stop: "Stop",
-    goal_objective: "Objective", goal_objective_ph: "e.g. keep the bench below 25 °C",
-    goal_max_iterations: "Max iterations", goal_iter: "iteration {i} of {m}",
-    goal_failures: "consecutive failures", goal_last: "Last round", goal_reason: "Stop reason",
-    goal_notes: "Notes (newest last)", goal_no_notes: "No notes yet — the first iteration writes one.",
-    goal_idle: "No goal yet. Describe what it should achieve, then press Start.",
-    goal_need_objective: "Write an objective first", goal_started: "Started",
-    goal_status_idle: "idle", goal_status_running: "running", goal_status_met: "met",
-    goal_status_blocked: "blocked", goal_status_exhausted: "exhausted", goal_status_stopped: "stopped",
-    goal_note: "State one objective and the board works through it alone: one small step per iteration, each result written down as a note that the next iteration is prompted with. A reply saying GOAL MET ends it; GOAL BLOCKED, three failures in a row or the iteration budget ends it too. One goal at a time, and the notes live in NVS, so they are short.",
-    sched_tasks: "Scheduled tasks", sched_rules: "Sensor rules", sched_add: "Add",
-    sched_enable: "Enable", sched_disable: "Disable", del: "Delete", none: "(none)",
-    sched_note: "Use either every-N-seconds or HH:MM: the first repeats, the second fires once a day. A due prompt joins the same agent queue.",
-    sched_rule_note: "Each tick reads the tool once and only queues a prompt when the rule matches; min_interval_s keeps one rule from flooding the queue.",
-    saved: "Saved", applied: "Applied", failed: "Failed",
-  },
+const $ = (sel, root = document) => root.querySelector(sel);
+const $$ = (sel, root = document) => Array.from(root.querySelectorAll(sel));
+
+const S = {
+  token: localStorage.getItem("esp32-agent.token") || "",
+  lastSeq: 0,
+  stream: null,
+  busy: false,
+  panel: "status",
+  afterUnlock: null,
 };
 
-const state = {
-  lang: localStorage.getItem("lang") || "zh",
-  pin: localStorage.getItem("pin") || "",
-  status: null,
-  config: null,
-  devices: [],
-  tools: [],
-  manifest: { revision: 0, manifest: { version: 1, devices: [], tools: [] } },
-  agent: { seq: 0, messages: [], config: null, tasks: [], rules: [], usage: null },
-  goal: null,
-  tab: "overview",
-};
+// ---------------------------------------------------------------- transport
 
-const $ = (id) => document.getElementById(id);
-
-function t(key) {
-  return (I18N[state.lang] && I18N[state.lang][key]) || I18N.zh[key] || key;
-}
-
-function applyLang() {
-  document.documentElement.lang = state.lang === "zh" ? "zh-CN" : "en";
-  document.querySelectorAll("[data-i18n]").forEach((el) => {
-    el.textContent = t(el.getAttribute("data-i18n"));
-  });
-  // Placeholders are translated too, or a language switch would leave the form in
-  // the language it was rendered in.
-  document.querySelectorAll("[data-i18n-ph]").forEach((el) => {
-    el.placeholder = t(el.getAttribute("data-i18n-ph"));
-  });
-  $("lang-btn").textContent = state.lang === "zh" ? "EN" : "中";
-  syncStreamUi();
-  // The goal card is built by renderGoal, not by the [data-i18n] pass, so its
-  // status word and labels have to be redrawn on a language switch.
-  if (state.goal) renderGoal();
-}
-
-function toast(msg, bad) {
-  const el = $("toast");
-  el.textContent = msg;
-  el.style.borderColor = bad ? "var(--bad)" : "#12617d";
-  el.classList.remove("hidden");
-  clearTimeout(toast._t);
-  toast._t = setTimeout(() => el.classList.add("hidden"), 2600);
-}
-
-async function api(path, opts) {
-  opts = opts || {};
-  const headers = Object.assign({ "Content-Type": "application/json" }, opts.headers || {});
-  if (state.pin) headers["X-Portal-Pin"] = state.pin;
-  const res = await fetch(path, {
-    method: opts.method || "GET",
-    headers,
-    body: opts.body ? JSON.stringify(opts.body) : undefined,
-  });
+async function api(path, opts = {}) {
+  const headers = { ...(opts.headers || {}) };
+  if (S.token) headers.Authorization = "Bearer " + S.token;
+  let body = opts.body;
+  if (body !== undefined && typeof body !== "string") {
+    headers["Content-Type"] = "application/json";
+    body = JSON.stringify(body);
+  }
+  const res = await fetch(path, { method: opts.method || "GET", headers, body });
+  if (res.status === 401) {
+    const retried = await unlock();
+    if (retried) return api(path, opts);
+    throw new Error("PIN required");
+  }
   const text = await res.text();
   let data = null;
-  try { data = text ? JSON.parse(text) : null; } catch (e) { data = { raw: text }; }
-  if (res.status === 401 && data && data.pin_required) {
-    askPin();
-    throw new Error("pin required");
-  }
-  return { status: res.status, data };
+  try { data = text ? JSON.parse(text) : null; } catch { data = { raw: text }; }
+  if (!res.ok) throw new Error((data && data.error) || res.status + " " + res.statusText);
+  return data;
 }
 
-function askPin() {
-  $("pin-gate").classList.remove("hidden");
-  $("pin-input").value = "";
-  $("pin-input").focus();
-}
-
-function kv(el, rows) {
-  el.innerHTML = "";
-  rows.forEach(([k, v]) => {
-    if (v === undefined || v === null || v === "") return;
-    const row = document.createElement("div");
-    row.className = "row";
-    const a = document.createElement("span");
-    a.textContent = k;
-    const b = document.createElement("span");
-    b.className = "mono";
-    b.textContent = String(v);
-    row.append(a, b);
-    el.append(row);
+function unlock() {
+  return new Promise((resolve) => {
+    S.afterUnlock = resolve;
+    $("#login").hidden = false;
+    setTimeout(() => $("#login-pin").focus(), 60);
   });
 }
 
-function badge(text, cls) {
-  const s = document.createElement("span");
-  s.className = "badge " + (cls || "");
-  s.textContent = text;
-  return s;
-}
-
-async function refreshStatus() {
-  const { data } = await api("/api/status");
-  if (!data) return;
-  state.status = data;
-  $("device-name").textContent = data.device_name;
-  $("board-chip").textContent = data.board.profile + " · " + data.board.soc;
-  $("ip-chip").textContent = (data.wifi && (data.wifi.ip || data.wifi.ap_ip)) || "no ip";
-  $("health-dot").className = "dot " + (data.wifi && data.wifi.state.includes("connected") ? "ok" : "bad");
-  $("setup-banner").classList.toggle("hidden", !(data.setup && data.setup.needed));
-
-  kv($("ov-board"), [
-    ["Profile", data.board.profile_name],
-    ["SoC / flash", data.board.soc + " · " + data.board.flash_mb + " MB"],
-    ["PSRAM", data.board.psram_kb + " kB"],
-    ["Temperature", data.board.temperature_c != null ? data.board.temperature_c + " °C" : "–"],
-    ["Free heap", data.memory.free_heap_kb + " kB"],
-    ["Uptime", data.uptime_s + " s"],
-    ["Firmware", data.firmware.version + " (" + data.firmware.build + ")"],
-  ]);
-  kv($("ov-mcp"), [
-    ["Endpoint", data.mcp.url],
-    ["Port / path", data.mcp.port + " " + data.mcp.path],
-    ["Tool style", data.mcp.tools_mode],
-    ["Tools visible", data.mcp.tools_visible],
-    ["Manifest rev", data.mcp.manifest_revision + " · " + data.mcp.manifest_tools + " tools"],
-    ["Sessions", data.mcp.sessions],
-    ["Auth", data.mcp.auth_required ? "bearer token" : "open on LAN"],
-  ]);
-  kv($("ov-devices"), [
-    ["Detected", data.devices.count],
-    ["Unidentified", data.devices.unknown_addresses],
-    ["Probe time", data.devices.last_probe_ms + " ms"],
-    ["WiFi", (data.wifi && data.wifi.state) || "–"],
-    ["RSSI", data.wifi && data.wifi.rssi_dbm ? data.wifi.rssi_dbm + " dBm" : "–"],
-  ]);
-  const caps = $("ov-caps");
-  caps.innerHTML = "";
-  (data.devices.caps || []).forEach((c) => {
-    const s = document.createElement("span");
-    s.className = "tag";
-    s.textContent = c;
-    caps.append(s);
-  });
-  $("tools-mode").value = data.mcp.tools_mode;
-  kv($("mcp-url"), [
-    ["URL", data.mcp.url],
-    ["Portal", (data.setup && data.setup.portal_url) || location.href],
-  ]);
-}
-
-async function refreshDevices() {
-  const { data } = await api("/api/devices");
-  if (!data) return;
-  state.devices = data.devices || [];
-  const table = $("device-table");
-  table.innerHTML = "";
-  if (!state.devices.length) {
-    table.innerHTML = '<p class="hint">没有识别到设备。接好线后点“重新探测”。</p>';
-  } else {
-    const html = ['<table><thead><tr><th>id</th><th>设备</th><th>总线</th><th>能力</th><th>工具</th><th>状态</th></tr></thead><tbody>'];
-    state.devices.forEach((d) => {
-      html.push(
-        `<tr><td class="mono">${esc(d.id)}</td><td>${esc(d.name)}</td>` +
-        `<td class="mono">${esc(d.bus)}${d.address != null ? " 0x" + d.address.toString(16).toUpperCase() : ""}` +
-        `${d.pins && d.pins.length ? " · pins " + d.pins.join(",") : ""}</td>` +
-        `<td>${(d.caps || []).map((c) => `<span class="tag">${esc(c)}</span>`).join(" ")}</td>` +
-        `<td class="mono">${(d.tools || []).join(", ")}</td>` +
-        `<td>${d.status === "ok" ? '<span class="badge ok">ok</span>' : '<span class="badge warn">' + esc(d.status) + "</span>"}` +
-        `${d.note ? "<br><small>" + esc(d.note) + "</small>" : ""}</td></tr>`
-      );
+async function doLogin() {
+  const pin = $("#login-pin").value.trim();
+  const error = $("#login-error");
+  error.textContent = "";
+  try {
+    const res = await fetch("/api/auth", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ pin }),
     });
-    html.push("</tbody></table>");
-    table.innerHTML = html.join("");
-  }
-  kv($("unknown-table"), (data.unidentified || []).map((u) => [u.address, u.note]));
-
-  const cat = await api("/api/catalog");
-  const rows = (cat.data || []).map(
-    (c) =>
-      `<tr><td class="mono">${esc(c.kind)}</td><td>${esc(c.name)}</td><td>${esc(c.detection)}</td>` +
-      `<td>${c.status === "implemented" ? '<span class="badge ok">done</span>' : '<span class="badge warn">' + esc(c.status) + "</span>"}</td></tr>`
-  );
-  $("catalog-table").innerHTML =
-    '<table><thead><tr><th>id</th><th>设备</th><th>识别方式</th><th>状态</th></tr></thead><tbody>' + rows.join("") + "</tbody></table>";
-}
-
-async function refreshTools() {
-  const { data } = await api("/api/tools");
-  if (!data) return;
-  state.tools = data.tools || [];
-  $("tools-summary").textContent = `${data.visible} / ${data.total} · ${data.style_hint}`;
-  const html = ['<table><thead><tr><th>工具</th><th>类别</th><th>需要</th><th>说明</th><th>可见</th></tr></thead><tbody>'];
-  state.tools.forEach((tl) => {
-    html.push(
-      `<tr class="${tl.visible ? "" : "hidden-tool"}"><td class="mono">${esc(tl.name)}` +
-      `${tl.mutating ? ' <span class="badge warn">mutating</span>' : ""}` +
-      `${tl.core ? ' <span class="badge core">core</span>' : ""}</td>` +
-      `<td>${esc(tl.category)}</td>` +
-      `<td class="mono">${(tl.requires || []).join(", ") || "–"}` +
-      `${tl.missing && tl.missing.length ? '<br><small style="color:var(--bad)">missing: ' + esc(tl.missing.join(",")) + "</small>" : ""}</td>` +
-      `<td>${esc((tl.description || "").slice(0, 140))}</td>` +
-      `<td>${tl.visible ? '<span class="badge ok">yes</span>' : '<span class="badge bad">no</span>'}</td></tr>`
-    );
-  });
-  html.push("</tbody></table>");
-  $("tool-table").innerHTML = html.join("");
-}
-
-// ---------------------------------------------------------------- agent
-
-function renderAgent() {
-  const box = $("agent-transcript");
-  box.innerHTML = "";
-  const msgs = state.agent.messages || [];
-  if (!msgs.length) {
-    box.innerHTML = '<p class="hint">' + esc(t("agent_empty")) + "</p>";
-    return;
-  }
-  msgs.forEach((m) => {
-    const row = document.createElement("div");
-    row.className = "msg " + (m.role || "system");
-    const head = document.createElement("div");
-    head.className = "msg-head";
-    head.textContent = (m.role || "?") + ":" + (m.source ? "  · " + m.source : "");
-    const body = document.createElement("div");
-    body.className = "msg-body";
-    let text = m.text || "";
-    if (!text && m.tool_calls && m.tool_calls.length) {
-      text = m.tool_calls
-        .map((c) => "→ " + (c.name || "?") + "(" + JSON.stringify(c.arguments || {}) + ")")
-        .join("\n");
-    }
-    body.textContent = text || "…";
-    // The model's reasoning, as its own folded block: the host agent shows thinking
-    // separately from the answer, and so does this.
-    if (m.reasoning) {
-      const think = document.createElement("details");
-      think.className = "msg-think";
-      const summary = document.createElement("summary");
-      summary.textContent = "thinking · " + m.reasoning.length + " chars";
-      const inner = document.createElement("div");
-      inner.textContent = m.reasoning;
-      think.append(summary, inner);
-      row.append(think);
-    }
-    if (m.is_error) row.classList.add("msg-error");
-    row.append(head, body);
-    box.append(row);
-  });
-  const usage = state.agent.usage && state.agent.usage.last_run;
-  if (usage && usage.total_tokens) {
-    const foot = document.createElement("div");
-    foot.className = "hint";
-    foot.textContent =
-      "tokens: " +
-      usage.total_tokens +
-      " (prompt " +
-      usage.prompt_tokens +
-      ", completion " +
-      usage.completion_tokens +
-      ")";
-    box.append(foot);
-  }
-  box.scrollTop = box.scrollHeight;
-}
-
-async function refreshAgentHistory() {
-  const { data } = await api("/api/agent/history?after=0");
-  if (!data) return;
-  state.agent.seq = data.seq || 0;
-  state.agent.usage = data.usage || null;
-  state.agent.messages = data.messages || [];
-  renderAgent();
-}
-
-async function refreshAgentConfig() {
-  const { data } = await api("/api/agent/config");
-  if (!data) return;
-  state.agent.config = data;
-  $("agent-base-url").value = data.base_url || "";
-  $("agent-model").value = data.model || "";
-  $("agent-max-steps").value = data.max_steps || 4;
-  $("agent-tick").value = data.tick_ms || 1000;
-  const key = $("agent-api-key");
-  key.value = "";
-  key.placeholder = data.api_key_set ? t("agent_key_set") : t("agent_key_none");
-  const run = data.run || {};
-  $("agent-runs").textContent =
-    (run.busy || run.pending ? t("agent_running") : t("agent_idle")) +
-    " · runs " + (run.runs || 0) + " · " + (run.history || 0) + " msgs";
-  $("agent-hint").textContent = run.last_error ? "last_error: " + run.last_error : "";
-  kv($("agent-config-state"), [
-    ["base_url", data.base_url || "–"],
-    ["model", data.model || "–"],
-    ["api_key", data.api_key_set ? "__set__" : "–"],
-    ["max_steps", data.max_steps],
-    ["tick_ms", (data.tick_ms || 1000) + " ms"],
-    ["temperature", data.temperature],
-    ["timeout_s", (data.timeout_s || 0) + " s"],
-    ["history", run.history || 0],
-    ["pending", run.pending ? "queued" : "–"],
-  ]);
-}
-
-function clampTick(ms) {
-  if (!Number.isFinite(ms) || ms <= 0) return 1000;
-  return Math.min(5000, Math.max(200, Math.round(ms)));
-}
-
-async function sendAgentMessage() {
-  const el = $("agent-text");
-  const text = el.value.trim();
-  if (!text) return;
-  const { status, data } = await api("/api/agent/message", { method: "POST", body: { text } });
-  if (status !== 202) {
-    toast((data && data.error) || t("failed"), true);
-    return;
-  }
-  el.value = "";
-  toast(t("agent_queued"));
-  setTimeout(() => {
-    refreshAgentHistory().catch(() => {});
-    refreshAgentConfig().catch(() => {});
-  }, 700);
-}
-
-async function resetAgent() {
-  if (!confirm("Clear the transcript?")) return;
-  const { status } = await api("/api/agent/reset", { method: "POST" });
-  if (status !== 200) return toast(t("failed"), true);
-  state.agent.messages = [];
-  state.agent.seq = 0;
-  renderAgent();
-  toast(t("saved"));
-}
-
-async function saveAgentConfig() {
-  const body = {
-    base_url: $("agent-base-url").value.trim(),
-    model: $("agent-model").value.trim(),
-    max_steps: Number($("agent-max-steps").value) || 4,
-    // Clamped here as well as on the board, so the field never shows a value the
-    // board would silently replace.
-    tick_ms: clampTick(Number($("agent-tick").value)),
-  };
-  $("agent-tick").value = body.tick_ms;
-  const key = $("agent-api-key").value;
-  if (key) body.api_key = key; // empty field = keep the stored key
-  const { status, data } = await api("/api/agent/config", { method: "POST", body });
-  toast(status === 200 ? t("saved") : (data && data.error) || t("failed"), status !== 200);
-  if (status === 200) refreshAgentConfig().catch(() => {});
-}
-
-// ---------------------------------------------------------------- goal loop
-// One objective the board works through on its own. The card never drives the loop
-// itself: the agent thread does, and this only starts/stops it and shows
-// GET /api/goal, which is the board's own record of where the loop is.
-
-const GOAL_BADGE = { running: "core", met: "ok", blocked: "bad", exhausted: "warn", stopped: "warn" };
-
-function goalStatusLabel(status) {
-  const key = "goal_status_" + status;
-  const label = t(key);
-  return label === key ? status : label;
-}
-
-function renderGoalNotes(notes) {
-  const box = $("goal-notes");
-  box.innerHTML = "";
-  const label = document.createElement("p");
-  label.className = "hint";
-  label.textContent = t("goal_notes");
-  box.append(label);
-  const list = document.createElement("div");
-  list.className = "list";
-  if (!notes.length) {
-    list.innerHTML = '<p class="hint">' + esc(t("goal_no_notes")) + "</p>";
-    box.append(list);
-    return;
-  }
-  notes.forEach((note, i) => {
-    const item = document.createElement("div");
-    item.className = "list-item";
-    // A note is text, not a target: the hover border is for the WiFi list.
-    item.style.cursor = "default";
-    const n = document.createElement("span");
-    n.className = "mono";
-    n.textContent = String(i + 1);
-    const text = document.createElement("span");
-    text.style.flex = "1";
-    text.textContent = note;
-    item.append(n, text);
-    list.append(item);
-  });
-  box.append(list);
-}
-
-function renderGoal() {
-  const data = state.goal || {};
-  const status = String(data.status || "idle");
-  const active = status === "running";
-  const iteration = Number(data.iteration) || 0;
-  const maxIterations = Number(data.max_iterations) || 0;
-
-  const badge = $("goal-badge");
-  badge.className = "badge " + (GOAL_BADGE[status] || "off");
-  badge.textContent = goalStatusLabel(status);
-
-  // The board answers 409 to a second goal and leaves a finished one untouched by a
-  // stop, so the buttons only offer what the board will actually do.
-  $("goal-start").disabled = active;
-  $("goal-stop").disabled = !active;
-
-  const box = $("goal-state");
-  if (!data.objective) {
-    box.innerHTML = '<p class="hint">' + esc(t("goal_idle")) + "</p>";
-  } else {
-    // One line carries both facts: which round the loop is on, and where it stands.
-    // kv drops empty values, so every row here needs a value to be drawn at all.
-    kv(box, [
-      [t("goal_objective"), data.objective],
-      [t("goal_iter").replace("{i}", iteration).replace("{m}", maxIterations), goalStatusLabel(status)],
-      [t("goal_failures"), data.failures ? data.failures : ""],
-      [t("goal_last"), data.last_result],
-      [t("goal_reason"), data.stop_reason],
-    ]);
-  }
-  renderGoalNotes(data.notes || []);
-}
-
-async function refreshGoal() {
-  const { data } = await api("/api/goal");
-  if (!data) return;
-  // This runs on every 4 s poll. Redraw only when the board's document actually
-  // changed, so a text selection inside the notes survives the next tick.
-  if (JSON.stringify(data) === JSON.stringify(state.goal)) return;
-  state.goal = data;
-  renderGoal();
-}
-
-function clampGoalIterations(n) {
-  if (!Number.isFinite(n) || n <= 0) return 10;
-  return Math.min(100, Math.max(1, Math.round(n)));
-}
-
-async function startGoal() {
-  const objective = $("goal-objective").value.trim();
-  if (!objective) return toast(t("goal_need_objective"), true);
-  // Clamped here as well as on the board, so the field never shows a value the
-  // board would silently replace.
-  const maxIterations = clampGoalIterations(Number($("goal-max-iterations").value));
-  $("goal-max-iterations").value = maxIterations;
-  const { status, data } = await api("/api/goal", {
-    method: "POST",
-    body: { objective, max_iterations: maxIterations },
-  });
-  if (status !== 200) {
-    toast((data && data.error) || t("failed"), true);
-    // A 409 carries the goal that is already running: show it instead of a stale one.
-    if (data && data.goal) {
-      state.goal = data.goal;
-      renderGoal();
-    }
-    return;
-  }
-  $("goal-objective").value = "";
-  state.goal = data;
-  renderGoal();
-  toast(t("goal_started"));
-}
-
-async function stopGoal() {
-  // No confirm: the board keeps the objective and the notes, and the badge says what
-  // happened, so a stop costs a re-statement, not the record.
-  const { status, data } = await api("/api/goal/stop", { method: "POST", body: {} });
-  if (status !== 200) {
-    toast((data && data.error) || t("failed"), true);
-    return;
-  }
-  state.goal = data;
-  renderGoal();
-  toast(t("goal_status_stopped"));
-}
-
-function schedButton(label, onClick) {
-  const b = document.createElement("button");
-  b.className = "btn ghost";
-  b.textContent = label;
-  b.onclick = onClick;
-  return b;
-}
-
-function actionCell(buttons) {
-  const td = document.createElement("td");
-  td.className = "row";
-  buttons.forEach((b) => td.append(b));
-  return td;
-}
-
-function schedTable(head) {
-  const table = document.createElement("table");
-  const thead = document.createElement("thead");
-  const tr = document.createElement("tr");
-  head.forEach((h) => {
-    const th = document.createElement("th");
-    th.textContent = h;
-    tr.append(th);
-  });
-  thead.append(tr);
-  table.append(thead, document.createElement("tbody"));
-  return table;
-}
-
-function schedRow(table, cells, actions) {
-  const tr = document.createElement("tr");
-  cells.forEach((c, i) => {
-    const td = document.createElement("td");
-    if (i === 0) td.className = "mono";
-    td.textContent = String(c == null ? "" : c);
-    tr.append(td);
-  });
-  tr.append(actionCell(actions));
-  table.querySelector("tbody").append(tr);
-}
-
-function renderTasks() {
-  const box = $("sched-task-table");
-  box.innerHTML = "";
-  const tasks = state.agent.tasks || [];
-  if (!tasks.length) {
-    box.innerHTML = '<p class="hint">' + esc(t("none")) + "</p>";
-    return;
-  }
-  const table = schedTable(["id", "trigger", "prompt", "state", ""]);
-  tasks.forEach((task) => {
-    schedRow(
-      table,
-      [
-        task.id,
-        task.every_s ? "every " + task.every_s + " s" : task.at_hhmm || "–",
-        task.prompt,
-        task.enabled ? "on" : "off",
-      ],
-      [
-        schedButton(task.enabled ? t("sched_disable") : t("sched_enable"), () =>
-          schedPost({ op: task.enabled ? "disable" : "enable", kind: "task", id: task.id })
-        ),
-        schedButton(t("del"), () => schedPost({ op: "delete", kind: "task", id: task.id })),
-      ]
-    );
-  });
-  box.append(table);
-}
-
-function renderRules() {
-  const box = $("sched-rule-table");
-  box.innerHTML = "";
-  const rules = state.agent.rules || [];
-  if (!rules.length) {
-    box.innerHTML = '<p class="hint">' + esc(t("none")) + "</p>";
-    return;
-  }
-  const table = schedTable(["id", "tool", "path", "op", "value", "min s", "state", ""]);
-  rules.forEach((rule) => {
-    schedRow(
-      table,
-      [
-        rule.id,
-        rule.tool,
-        rule.path || "–",
-        rule.op,
-        JSON.stringify(rule.value),
-        rule.min_interval_s,
-        rule.enabled ? "on" : "off",
-      ],
-      [
-        schedButton(rule.enabled ? t("sched_disable") : t("sched_enable"), () =>
-          schedPost({ op: rule.enabled ? "disable" : "enable", kind: "rule", id: rule.id })
-        ),
-        schedButton(t("del"), () => schedPost({ op: "delete", kind: "rule", id: rule.id })),
-      ]
-    );
-  });
-  box.append(table);
-}
-
-async function refreshSched() {
-  const { data } = await api("/api/sched");
-  if (!data) return;
-  state.agent.tasks = data.tasks || [];
-  state.agent.rules = data.rules || [];
-  renderTasks();
-  renderRules();
-}
-
-async function schedPost(body) {
-  const { status, data } = await api("/api/sched", { method: "POST", body });
-  if (status !== 200) {
-    toast((data && data.error) || t("failed"), true);
-    return;
-  }
-  state.agent.tasks = data.tasks || [];
-  state.agent.rules = data.rules || [];
-  renderTasks();
-  renderRules();
-  toast(t("saved"));
-}
-
-function ruleValue(raw) {
-  const s = String(raw).trim();
-  if (s === "true") return true;
-  if (s === "false") return false;
-  if (s && !isNaN(Number(s))) return Number(s);
-  return s;
-}
-
-function addTask() {
-  const id = $("task-id").value.trim() || "t" + (state.agent.tasks.length + 1);
-  const prompt = $("task-prompt").value.trim();
-  if (!prompt) return toast("prompt 必填", true);
-  schedPost({
-    op: "upsert",
-    kind: "task",
-    task: {
-      id,
-      prompt,
-      every_s: Number($("task-every").value) || 0,
-      at_hhmm: $("task-at").value.trim(),
-      enabled: true,
-    },
-  }).then(() => {
-    $("task-prompt").value = "";
-    $("task-every").value = "";
-    $("task-at").value = "";
-    $("task-id").value = "";
-  });
-}
-
-function addRule() {
-  const tool = $("rule-tool").value.trim();
-  if (!tool) return toast("tool 必填", true);
-  const id = $("rule-id").value.trim() || "r" + (state.agent.rules.length + 1);
-  schedPost({
-    op: "upsert",
-    kind: "rule",
-    rule: {
-      id,
-      tool,
-      path: $("rule-path").value.trim(),
-      op: $("rule-op").value,
-      value: ruleValue($("rule-value").value),
-      prompt: $("rule-prompt").value.trim() || "看一下板子现在的状态",
-      min_interval_s: Number($("rule-every").value) || 60,
-      enabled: true,
-    },
-  }).then(() => {
-    ["rule-id", "rule-tool", "rule-path", "rule-value", "rule-prompt", "rule-every"].forEach(
-      (k) => ($(k).value = "")
-    );
-  });
-}
-
-// ---------------------------------------------------------------- live journal
-// /api/agent/stream is server-sent events: one frame per journal entry, with `id`
-// and `event` set so a plain EventSource can do the work. The board ends the
-// stream on purpose (30 s silent, or 120 s in total) and EventSource reconnects by
-// itself, sending Last-Event-ID; the `after=` in the URL is only the starting
-// point, so this page never resends or replays an event on its own.
-
-const STREAM_KINDS = [
-  "message_start", "thinking_start", "thinking_delta", "thinking_end",
-  "text_start", "text_delta", "text_end",
-  "tool_use", "tool_progress", "tool_result",
-  "usage", "message_end", "error", "run_end",
-];
-const STREAM_MAX_LINES = 200;
-const STREAM_MAX_CHARS = 240;
-
-const stream = {
-  es: null,
-  state: "off", // off | connecting | live | offline
-  lastSeq: 0,
-  count: 0,
-  skipped: 0,
-  paused: false,
-  lastAt: 0,
-  timer: null,
-  backoff: 3000,
-};
-
-function stampNow() {
-  const d = new Date();
-  const p = (n, w) => String(n).padStart(w || 2, "0");
-  return p(d.getHours()) + ":" + p(d.getMinutes()) + ":" + p(d.getSeconds()) + "." + p(d.getMilliseconds(), 3);
-}
-
-/// The gap to the previous event, from the board's own monotonic clock: a run that
-/// takes 40 s and one that takes 4 s look the same otherwise.
-function streamDelta(ev) {
-  const at = Number(ev.at_ms);
-  if (!Number.isFinite(at)) return "";
-  const out = stream.lastAt && at >= stream.lastAt ? "+" + ((at - stream.lastAt) / 1000).toFixed(2) + "s" : "";
-  stream.lastAt = at;
-  return out;
-}
-
-function streamClass(kind) {
-  if (kind === "tool_progress") return "progress";
-  if (kind === "tool_use" || kind === "tool_result") return "tool";
-  if (kind.indexOf("thinking_") === 0) return "thinking";
-  if (kind.indexOf("text_") === 0) return "text";
-  if (kind === "usage") return "usage";
-  if (kind === "error") return "error";
-  if (kind === "run_end") return "run";
-  return "mark";
-}
-
-/// One line of the log. Every field the board sends has a place, and an event kind
-/// this page does not know still shows up raw instead of vanishing.
-function streamBody(ev) {
-  const kind = String(ev.event || "");
-  let text = "";
-  if (kind === "tool_use") {
-    text = (ev.name || "?") + "(" + (ev.text || "{}") + ")";
-  } else if (kind === "tool_progress") {
-    text = (ev.name || "?") + " · " + (ev.phase || "?") +
-      (ev.elapsed_ms != null ? " · " + ev.elapsed_ms + " ms" : "");
-  } else if (kind === "tool_result") {
-    text = (ev.name ? ev.name + " → " : "") + (ev.text || (ev.is_error ? "error" : "ok"));
-  } else if (kind === "usage") {
-    text = "prompt " + (ev.prompt_tokens || 0) + " · completion " + (ev.completion_tokens || 0) +
-      " · total " + (ev.total_tokens || 0);
-  } else {
-    text = ev.text || "";
-  }
-  const full = String(text);
-  if (full.length > STREAM_MAX_CHARS) return full.slice(0, STREAM_MAX_CHARS) + "…";
-  return full;
-}
-
-function streamAppend(ev) {
-  const box = $("agent-stream");
-  if (!box || !ev) return;
-  const kind = String(ev.event || "?");
-  if (stream.paused) {
-    stream.skipped += 1;
-    syncStreamUi();
-    return;
-  }
-  if (box.dataset.empty === "1") {
-    box.innerHTML = "";
-    delete box.dataset.empty;
-  }
-  // Only follow the tail when the reader is already there; scrolling up to read
-  // must not be yanked back by the next event.
-  const atBottom = box.scrollTop + box.clientHeight >= box.scrollHeight - 24;
-  const line = document.createElement("div");
-  line.className = "ev ev-" + streamClass(kind);
-  const ts = document.createElement("span");
-  ts.className = "ts";
-  ts.textContent = stampNow();
-  const dt = document.createElement("span");
-  dt.className = "dt";
-  dt.textContent = streamDelta(ev);
-  const name = document.createElement("span");
-  name.className = "kind";
-  name.textContent = kind;
-  const msg = document.createElement("span");
-  msg.className = "msg";
-  msg.textContent = streamBody(ev);
-  line.append(ts, dt, name, msg);
-  line.title = JSON.stringify(ev);
-  box.append(line);
-  while (box.childElementCount > STREAM_MAX_LINES) box.removeChild(box.firstElementChild);
-  if (atBottom) box.scrollTop = box.scrollHeight;
-  stream.count += 1;
-  syncStreamUi();
-}
-
-function onStreamEvent(frame) {
-  // `error` is both a journal kind and the browser's own connection-error event: a
-  // frame with no data string is the latter, and belongs to onerror, not to the log.
-  if (!frame || typeof frame.data !== "string" || !frame.data) return;
-  let ev = null;
-  try { ev = JSON.parse(frame.data); } catch (e) { return; }
-  // A frame on the wire is proof the stream is up: don't leave the badge on
-  // "connecting" just because `open` has not been dispatched yet.
-  if (ev && stream.state !== "live") setStreamState("live");
-  if (ev && typeof ev.seq === "number" && ev.seq >= stream.lastSeq) stream.lastSeq = ev.seq;
-  streamAppend(ev);
-  const kind = ev && ev.event;
-  if (kind === "error") toast(String(ev.text || "run failed").slice(0, 140), true);
-  if (kind === "message_end" || kind === "run_end" || kind === "error") {
-    // The journal says where the run is; the transcript is still the readable
-    // shape of it, so refresh it once per message instead of polling.
-    refreshAgentHistory().catch(() => {});
-    if (kind === "run_end" || kind === "error") refreshAgentConfig().catch(() => {});
-  }
-}
-
-function setStreamState(next) {
-  stream.state = next;
-  syncStreamUi();
-}
-
-function streamOpen() {
-  if (stream.es) return;
-  clearTimeout(stream.timer);
-  stream.timer = null;
-  const es = new EventSource("/api/agent/stream?after=" + (stream.lastSeq || 0));
-  stream.es = es;
-  setStreamState("connecting");
-  es.onopen = () => {
-    if (stream.es !== es) return; // a replaced stream cannot speak for this one
-    stream.backoff = 3000;
-    setStreamState("live");
-  };
-  es.onerror = () => {
-    // 2 is CLOSED in every implementation of the spec; compared as a number so a
-    // missing static (or a shim) cannot turn a refusal into an endless retry.
-    if (stream.es !== es) {
-      try { es.close(); } catch (err) { /* already gone */ }
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      error.textContent = data.error || "wrong PIN";
       return;
     }
-    if (es.readyState === 2) {
-      // Not a transient drop: the board refused the stream (it allows two) or the
-      // endpoint is gone. EventSource gives up for good on that, so retry slowly —
-      // but close this object first, so nothing keeps reconnecting behind our back.
-      try { es.close(); } catch (err) { /* already gone */ }
-      stream.es = null;
-      setStreamState("offline");
-      scheduleStreamReopen();
-    } else {
-      setStreamState("connecting"); // EventSource is already retrying
-    }
-  };
-  STREAM_KINDS.forEach((kind) =>
-    es.addEventListener(kind, (frame) => {
-      // Frames from a superseded stream are dropped: only the current one may
-      // advance the log, or a stale socket could replay the run a second time.
-      if (stream.es !== es) return;
-      onStreamEvent(frame);
+    S.token = data.token || "";
+    if (S.token) localStorage.setItem("esp32-agent.token", S.token);
+    $("#login").hidden = true;
+    $("#login-pin").value = "";
+    const wait = S.afterUnlock;
+    S.afterUnlock = null;
+    if (wait) wait(true);
+    else location.reload();
+  } catch (e) {
+    error.textContent = String(e.message || e);
+  }
+}
+
+function toast(text) {
+  const el = $("#toast");
+  el.textContent = text;
+  el.classList.add("show");
+  clearTimeout(toast.timer);
+  toast.timer = setTimeout(() => el.classList.remove("show"), 2200);
+}
+
+// ---------------------------------------------------------------- markdown
+
+const escapeHtml = (s) =>
+  s.replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+
+/** A small Markdown subset: the four things a model actually emits on a 2 KB budget. */
+function markdown(text) {
+  const blocks = [];
+  let src = escapeHtml(text || "").replace(/```([\s\S]*?)```/g, (_, code) => {
+    blocks.push(code.replace(/^\w*\n/, ""));
+    return "\u0000BLOCK" + (blocks.length - 1) + "\u0000";
+  });
+
+  src = src
+    .replace(/^### (.*)$/gm, "<h3>$1</h3>")
+    .replace(/^## (.*)$/gm, "<h2>$1</h2>")
+    .replace(/^# (.*)$/gm, "<h1>$1</h1>")
+    .replace(/^&gt; (.*)$/gm, "<blockquote>$1</blockquote>")
+    .replace(/^[-*] (.*)$/gm, "<li>$1</li>")
+    .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
+    .replace(/(^|[^*])\*([^*\n]+)\*/g, "$1<em>$2</em>")
+    .replace(/`([^`]+)`/g, "<code>$1</code>")
+    .replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
+
+  // Wrap runs of list items, then paragraphs.
+  src = src.replace(/(?:<li>.*<\/li>\n?)+/g, (m) => "<ul>" + m.replace(/\n/g, "") + "</ul>");
+  const html = src
+    .split(/\n{2,}/)
+    .map((chunk) => {
+      const t = chunk.trim();
+      if (!t) return "";
+      if (/^<(h\d|ul|blockquote|pre|p|\u0000BLOCK)/.test(t)) return t;
+      return "<p>" + t.replace(/\n/g, "<br>") + "</p>";
     })
-  );
+    .join("");
+  return html.replace(/\u0000BLOCK(\d+)\u0000/g, (_, i) => "<pre><code>" + blocks[Number(i)] + "</code></pre>");
 }
 
-function scheduleStreamReopen() {
-  if (state.tab !== "agent" || document.hidden) return;
-  clearTimeout(stream.timer);
-  stream.timer = setTimeout(() => {
-    stream.timer = null;
-    streamOpen();
-    stream.backoff = Math.min(stream.backoff * 2, 30000);
-  }, stream.backoff);
+// ---------------------------------------------------------------- chat view
+
+function addRow(who) {
+  const row = document.createElement("div");
+  row.className = "row " + who;
+  const bubble = document.createElement("div");
+  bubble.className = "bubble";
+  row.appendChild(bubble);
+  $("#chat").appendChild(row);
+  scrollToEnd();
+  return { row, bubble };
 }
 
-/// Close the connection, not the panel: the board serves six connections and two
-/// streams is its whole budget, so leaving the tab gives one back.
-function streamClose() {
-  clearTimeout(stream.timer);
-  stream.timer = null;
-  if (stream.es) {
-    stream.es.close();
-    stream.es = null;
+function addTools(row) {
+  let tools = row.querySelector(".tools");
+  if (!tools) {
+    tools = document.createElement("div");
+    tools.className = "tools";
+    row.appendChild(tools);
   }
-  setStreamState("off");
+  return tools;
 }
 
-function toggleStreamPause() {
-  stream.paused = !stream.paused;
-  // The skipped count describes the pause that just ended, not the log as a whole.
-  if (!stream.paused) stream.skipped = 0;
-  syncStreamUi();
-}
-
-function streamClear() {
-  const box = $("agent-stream");
-  stream.count = 0;
-  stream.skipped = 0;
-  stream.lastAt = 0;
-  if (box) {
-    box.innerHTML = '<p class="hint">' + esc(t("stream_empty")) + "</p>";
-    box.dataset.empty = "1";
+function chip(tools, label, detail) {
+  // A tool call reads as one compact line; the arguments and the result live behind the
+  // disclosure triangle. A chat that shows every result inline is a log, not a chat.
+  const wrap = document.createElement("details");
+  wrap.className = "tool";
+  const summary = document.createElement("summary");
+  summary.textContent = label;
+  wrap.appendChild(summary);
+  for (const [name, text] of detail || []) {
+    const pre = document.createElement("pre");
+    pre.textContent = name + ": " + text;
+    wrap.appendChild(pre);
   }
-  syncStreamUi();
+  tools.appendChild(wrap);
+  return wrap;
 }
 
-function syncStreamUi() {
-  const badge = $("agent-stream-badge");
-  if (!badge) return;
-  // Pause outranks the transport state: it is what the user did, and it is what
-  // governs the log. Where the socket is while paused goes in the note instead of
-  // hiding either fact.
-  let cls = "off";
-  let label = t("stream_offline");
-  if (stream.paused) {
-    cls = "paused";
-    label = t("stream_paused");
-  } else if (stream.state === "live") {
-    cls = "live";
-    label = t("stream_live");
-  } else if (stream.state === "connecting") {
-    cls = "retry";
-    label = t("stream_connecting");
-  } else if (stream.state === "offline") {
-    cls = "bad";
-    label = t("stream_offline");
-  }
-  badge.className = "badge " + cls;
-  badge.textContent = label;
-  const note = $("agent-stream-note");
-  if (note) {
-    let text = "seq " + stream.lastSeq + " · " + stream.count + " ev";
-    if (stream.paused) {
-      if (stream.state === "connecting") text += " · " + t("stream_connecting");
-      else if (stream.state !== "live") text += " · " + t("stream_offline");
-      if (stream.skipped) text += " · " + t("stream_skipped").replace("{n}", stream.skipped);
+/** Mark a tool row green or red once its result arrives. */
+function finishChip(wrap, ok) {
+  if (!wrap) return;
+  wrap.classList.add(ok ? "ok" : "err");
+}
+
+function scrollToEnd() {
+  const chat = $("#chat");
+  chat.scrollTop = chat.scrollHeight;
+}
+
+function renderMessage(msg) {
+  if (msg.role === "tool") return;
+  const who = msg.role === "user" ? "user" : "agent";
+  const text = msg.text || "";
+  if (!text && !(msg.tool_calls && msg.tool_calls.length)) return;
+  const { row, bubble } = addRow(who);
+  bubble.innerHTML = markdown(text);
+  if (msg.tool_calls && msg.tool_calls.length) {
+    const tools = addTools(row);
+    for (const call of msg.tool_calls) {
+      const fn = call.function || call;
+      chip(tools, fn.name + "(…)", [["arguments", typeof fn.arguments === "string" ? fn.arguments : JSON.stringify(fn.arguments || {})]]);
     }
-    note.textContent = text;
   }
-  const pause = $("agent-stream-pause");
-  if (pause) pause.textContent = stream.paused ? t("stream_resume") : t("stream_pause");
+  if (who === "agent") {
+    const meta = document.createElement("div");
+    meta.className = "meta";
+    meta.textContent = new Date(msg.at_ms || Date.now()).toLocaleTimeString();
+    row.appendChild(meta);
+  }
 }
 
-async function refreshAgent() {
-  await refreshAgentConfig().catch(() => {});
-  await refreshAgentHistory().catch(() => {});
-  await refreshSched().catch(() => {});
-  await refreshGoal().catch(() => {});
-}
-
-async function refreshManifest() {
-  const { data } = await api("/api/manifest");
-  if (!data) return;
-  state.manifest = data;
-  $("manifest-text").value = JSON.stringify(data.manifest, null, 2);
-}
-
-async function refreshClients() {
-  const { data } = await api("/api/clients");
-  if (!data) return;
-  kv($("mcp-url"), [["URL", data.url]]);
-  $("curl-list").textContent = data.curl_list;
-  $("mcp-json").textContent = JSON.stringify(data.mcp_servers_json, null, 2);
-}
-
-async function refreshLogs() {
-  const { data } = await api("/api/logs?n=200");
-  if (!data) return;
-  const lines = (data.lines || []).map(
-    (l) => `${String(l.t_ms).padStart(8)} ${l.level.padEnd(5)} ${l.target.padEnd(10)} ${l.msg}`
-  );
-  $("log-box").textContent = lines.join("\n") || "(empty)";
-  $("log-box").scrollTop = $("log-box").scrollHeight;
-}
-
-async function scanWifi() {
-  const btn = $("wifi-scan");
-  btn.disabled = true;
+async function loadHistory() {
   try {
-    const { data } = await api("/api/wifi/scan");
-    const list = $("wifi-list");
-    list.innerHTML = "";
-    ((data && data.networks) || []).forEach((n) => {
-      const item = document.createElement("div");
-      item.className = "list-item";
-      const left = document.createElement("span");
-      left.textContent = `${n.ssid || "(hidden)"} · ${n.auth}`;
-      const right = document.createElement("span");
-      right.className = "mono";
-      right.textContent = `${n.rssi} dBm · ch${n.channel}`;
-      item.append(left, right);
-      item.onclick = () => { $("wifi-ssid").value = n.ssid; $("wifi-password").focus(); };
-      list.append(item);
-    });
-    if (!list.children.length) list.innerHTML = '<p class="hint">没有扫到网络。</p>';
-  } finally {
-    btn.disabled = false;
-  }
-}
-
-function esc(s) {
-  return String(s == null ? "" : s).replace(/[&<>"']/g, (c) =>
-    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c])
-  );
-}
-
-function showTab(name) {
-  state.tab = name;
-  document.querySelectorAll(".tab").forEach((b) => b.classList.toggle("active", b.dataset.tab === name));
-  document.querySelectorAll(".panel").forEach((p) => p.classList.toggle("active", p.id === "panel-" + name));
-  localStorage.setItem("tab", name);
-  if (name === "devices") refreshDevices();
-  if (name === "tools") refreshTools();
-  if (name === "manifest") refreshManifest();
-  if (name === "agent") {
-    refreshAgent();
-    streamOpen();
-  } else {
-    streamClose();
-  }
-  if (name === "clients") refreshClients();
-  if (name === "logs") refreshLogs();
-}
-
-function renderIssues(issues) {
-  const box = $("manifest-issues");
-  box.innerHTML = "";
-  (issues || []).forEach((i) => {
-    const div = document.createElement("div");
-    div.className = "issue";
-    div.innerHTML = `<span class="path">${esc(i.path)}</span> — ${esc(i.message)}` +
-      (i.hint ? `<br><small>${esc(i.hint)}</small>` : "");
-    box.append(div);
-  });
-}
-
-function bind() {
-  $("tabs").addEventListener("click", (e) => {
-    const b = e.target.closest(".tab");
-    if (b) showTab(b.dataset.tab);
-  });
-  $("lang-btn").addEventListener("click", (e) => {
-    e.preventDefault();
-    state.lang = state.lang === "zh" ? "en" : "zh";
-    localStorage.setItem("lang", state.lang);
-    applyLang();
-    if (state.status) refreshStatus();
-  });
-  $("pin-submit").addEventListener("click", async () => {
-    state.pin = $("pin-input").value.trim();
-    localStorage.setItem("pin", state.pin);
-    $("pin-gate").classList.add("hidden");
-    toast("PIN ok");
-    refreshStatus();
-  });
-  $("reboot-btn").addEventListener("click", async () => {
-    if (!confirm("Reboot the board?")) return;
-    await api("/api/reboot", { method: "POST" });
-    toast("rebooting");
-  });
-  $("wifi-scan").addEventListener("click", scanWifi);
-  $("wifi-connect").addEventListener("click", async () => {
-    const ssid = $("wifi-ssid").value.trim();
-    if (!ssid) return toast("SSID 必填", true);
-    const { status, data } = await api("/api/wifi/connect", {
-      method: "POST",
-      body: { ssid, password: $("wifi-password").value },
-    });
-    toast(status === 200 ? (data.note || t("saved")) : (data && data.error) || t("failed"), status !== 200);
-    setTimeout(refreshStatus, 1500);
-  });
-  $("wifi-forget").addEventListener("click", async () => {
-    if (!confirm("Clear the stored WiFi credentials?")) return;
-    await api("/api/wifi/forget", { method: "POST" });
-    toast(t("saved"));
-    refreshStatus();
-  });
-  $("devices-probe").addEventListener("click", async () => {
-    const { data } = await api("/api/devices/probe", { method: "POST" });
-    refreshDevices();
-    toast(`re-probed in ${data && data.took_ms} ms`);
-  });
-  $("tools-mode").addEventListener("change", async (e) => {
-    await api("/api/tools", { method: "POST", body: { mode: e.target.value } });
-    refreshTools();
-    refreshStatus();
-  });
-  $("manifest-validate").addEventListener("click", async () => {
-    let doc;
-    try { doc = JSON.parse($("manifest-text").value); } catch (err) {
-      return renderIssues([{ path: "(json)", message: "JSON 解析失败: " + err.message, hint: "" }]);
+    const data = await api("/api/agent/history");
+    const chat = $("#chat");
+    chat.innerHTML = "";
+    const msgs = (data && data.messages) || [];
+    if (!msgs.length) {
+      const { bubble } = addRow("agent");
+      bubble.innerHTML =
+        "<p>This is the board's own agent. Ask it about the hardware, tell it to change something, or give it a job &mdash; it calls its tools by itself.</p>";
+      return;
     }
-    const { data } = await api("/api/manifest", { method: "POST", body: { manifest: doc, dry_run: true } });
-    renderIssues((data && (data.issues || [])) || []);
-    toast(data && data.applied === false ? "checked" : t("applied"));
-  });
-  $("manifest-apply").addEventListener("click", async () => {
-    let doc;
-    try { doc = JSON.parse($("manifest-text").value); } catch (err) {
-      return renderIssues([{ path: "(json)", message: "JSON 解析失败: " + err.message, hint: "" }]);
-    }
-    const mode = $("manifest-mode").value;
-    const { status, data } = await api("/api/manifest", {
-      method: "POST",
-      body: { manifest: doc, mode },
-    });
-    renderIssues((data && data.issues) || []);
-    if (status === 200 && data && data.applied) {
-      toast(t("applied") + " · rev " + data.revision);
-      await refreshStatus();
-      await refreshDevices();
-      await refreshTools();
-      await refreshManifest();
-    } else {
-      toast((data && data.error) || "issues found", true);
-    }
-  });
-  $("logs-refresh").addEventListener("click", refreshLogs);
-  $("agent-send").addEventListener("click", sendAgentMessage);
-  $("agent-text").addEventListener("keydown", (e) => {
-    if ((e.ctrlKey || e.metaKey) && e.key === "Enter") sendAgentMessage();
-  });
-  $("agent-reset").addEventListener("click", resetAgent);
-  $("agent-stream-pause").addEventListener("click", toggleStreamPause);
-  $("agent-stream-clear").addEventListener("click", streamClear);
-  $("agent-config-save").addEventListener("click", saveAgentConfig);
-  $("goal-start").addEventListener("click", startGoal);
-  $("goal-stop").addEventListener("click", stopGoal);
-  $("goal-objective").addEventListener("keydown", (e) => {
-    // Starting a goal is the one thing this field can do, so Enter does it.
-    if (e.key === "Enter") startGoal();
-  });
-  $("sched-refresh").addEventListener("click", refreshSched);
-  $("sched-task-add").addEventListener("click", addTask);
-  $("sched-rule-add").addEventListener("click", addRule);
-}
-
-(async function main() {
-  applyLang();
-  bind();
-  showTab(localStorage.getItem("tab") || "overview");
-  try {
-    await refreshStatus();
-    await refreshTools();
-    if (state.status && state.status.setup.needed) {
-      $("setup-banner").classList.remove("hidden");
-      await scanWifi();
+    for (const m of msgs) {
+      renderMessage(m);
+      S.lastSeq = Math.max(S.lastSeq, m.seq || 0);
     }
   } catch (e) {
-    console.error(e);
+    if (String(e.message).includes("PIN")) return;
+    toast("history: " + e.message);
   }
+}
+
+async function send(text) {
+  const trimmed = text.trim();
+  if (!trimmed) return;
+  const { bubble } = addRow("user");
+  bubble.innerHTML = markdown(trimmed);
+  $("#input").value = "";
+  autosize();
+  try {
+    await api("/api/agent/message", { method: "POST", body: { text: trimmed } });
+    S.busy = true;
+    $("#link").className = "dot busy";
+    pendingRow = null;
+    connectStream();
+  } catch (e) {
+    toast(e.message);
+  }
+}
+
+// ---------------------------------------------------------------- streaming
+
+let pendingRow = null;
+
+function ensurePending() {
+  if (pendingRow) return pendingRow;
+  const { row, bubble } = addRow("agent");
+  bubble.innerHTML = '<span class="typing"><i></i><i></i><i></i></span>';
+  pendingRow = row;
+  return row;
+}
+
+function handleEvent(name, data) {
+  S.lastSeq = Math.max(S.lastSeq, data.seq || 0);
+  switch (name) {
+    case "message_start":
+      S.busy = true;
+      $("#link").className = "dot busy";
+      break;
+    case "text_delta": {
+      const row = ensurePending();
+      const bubble = row.querySelector(".bubble");
+      if (bubble.querySelector(".typing")) bubble.innerHTML = "";
+      bubble.dataset.raw = (bubble.dataset.raw || "") + (data.text || "");
+      bubble.innerHTML = markdown(bubble.dataset.raw);
+      scrollToEnd();
+      break;
+    }
+    case "tool_use": {
+      const row = pendingRow || ensurePending();
+      const args = data.text || "{}";
+      const wrap = chip(addTools(row), (data.name || "tool") + "()", [["arguments", args]]);
+      wrap.dataset.id = data.tool_call_id || "";
+      break;
+    }
+    case "tool_result": {
+      const row = pendingRow;
+      if (!row) break;
+      const rows = Array.from(row.querySelectorAll("details.tool"));
+      const last = rows.filter((d) => !d.classList.contains("ok") && !d.classList.contains("err")).pop() || rows.pop();
+      if (last) {
+        const pre = document.createElement("pre");
+        pre.textContent = "result: " + (data.text || "");
+        last.appendChild(pre);
+        finishChip(last, !data.is_error);
+      }
+      break;
+    }
+    case "error":
+      toast(data.text || "run failed");
+      break;
+    case "run_end":
+      S.busy = false;
+      if (pendingRow) {
+        const bubble = pendingRow.querySelector(".bubble");
+        if (bubble.querySelector(".typing")) bubble.innerHTML = "<p><em>no answer</em></p>";
+      }
+      pendingRow = null;
+      $("#link").className = "dot live";
+      // The run is over: give the board its 8 kB back.
+      setTimeout(stopStream, 500);
+      break;
+  }
+}
+
+const EVENT_KINDS = [
+  "message_start", "thinking_start", "thinking_delta", "thinking_end",
+  "text_start", "text_delta", "text_end", "tool_use", "tool_progress",
+  "tool_result", "usage", "message_end", "error", "run_end",
+];
+
+function connectStream() {
+  if (S.stream) return;
+  const es = new EventSource("/api/agent/stream?after=" + S.lastSeq);
+  S.stream = es;
+  for (const kind of EVENT_KINDS) {
+    es.addEventListener(kind, (ev) => {
+      let data = {};
+      try { data = JSON.parse(ev.data); } catch { return; }
+      handleEvent(kind, data);
+    });
+  }
+  es.onopen = () => { $("#link").className = S.busy ? "dot busy" : "dot live"; };
+  // The board closes the stream after 30 s of silence or 120 s total; EventSource would
+  // resume with Last-Event-ID, which this server does not read, so reconnect by hand.
+  es.onerror = () => {
+    es.close();
+    S.stream = null;
+    $("#link").className = "dot off";
+    if (S.busy) setTimeout(connectStream, 1500);
+  };
+}
+
+/** Close the stream when nothing is running.
+ *
+ * A stream costs ~8 kB of internal RAM on the board for as long as it is open, and the
+ * model call needs that RAM for its TLS handshake: a page that keeps a stream open while it
+ * sits idle makes every run start with too little. So the stream follows the run. */
+function stopStream() {
+  if (!S.stream) return;
+  S.stream.close();
+  S.stream = null;
+}
+
+// ---------------------------------------------------------------- panels
+
+function kv(el, pairs) {
+  el.innerHTML = pairs
+    .map(([k, v]) => "<span>" + escapeHtml(k) + "</span><span>" + escapeHtml(String(v)) + "</span>")
+    .join("");
+}
+
+async function loadStatus() {
+  try {
+    const d = await api("/api/status");
+    kv($("#status-kv"), [
+      ["Name", d.device_name],
+      ["Profile", d.board.profile],
+      ["Chip", d.board.soc + " / " + d.board.cores + " cores"],
+      ["Uptime", Math.floor(d.uptime_s / 60) + " min"],
+      ["Heap", d.memory.free_heap_kb + " kB"],
+      ["Devices", d.devices.count],
+      ["Tools", d.mcp.tools_visible],
+      ["Clock", d.time && d.time.synced ? "synced" : "not synced"],
+      ["Internal", (d.memory.internal_kb ?? "?") + " kB (largest " + (d.memory.largest_internal_kb ?? "?") + ")"],
+    ]);
+    kv($("#wifi-kv"), [
+      ["State", d.wifi.state],
+      ["SSID", d.wifi.ssid || "-"],
+      ["IP", d.wifi.ip || "-"],
+      ["AP", d.wifi.ap_ip],
+    ]);
+    // The model settings live in the Agent panel now; the header line is enough here.
+    const model = await api("/api/agent/config");
+    $("#sub").textContent =
+      (d.wifi.ip || d.wifi.ap_ip) + " · " + d.devices.count + " devices · " + d.mcp.tools_visible + " tools · " +
+      (model.model || "no model");
+    $("#title").textContent = d.device_name || "esp32-agent";
+  } catch (e) {
+    if (!String(e.message).includes("PIN")) $("#sub").textContent = "offline";
+  }
+}
+
+async function loadDevices() {
+  try {
+    const d = await api("/api/devices");
+    const detail = (dev) =>
+      '<details class="item-detail"><summary><b>' + escapeHtml(dev.id) + "</b> <span>" +
+      escapeHtml(dev.name) + (dev.address ? " @ " + dev.address : "") + "</span></summary><pre>" +
+      escapeHtml(JSON.stringify(dev, null, 2)) + "</pre></details>";
+    $("#devices-list").innerHTML =
+      d.devices.map(detail).join("") || '<div class="item faint">none — nothing adopted</div>';
+    $("#candidates-list").innerHTML =
+      (d.candidates || [])
+        .map(
+          (c) =>
+            '<details class="item-detail"><summary><b>' + escapeHtml(c.id) + "</b> <span>" +
+            escapeHtml(c.kind) + (c.address ? " @ " + c.address : "") +
+            (c.adopted ? " · adopted" : "") + "</span></summary><pre>" +
+            escapeHtml(JSON.stringify(c, null, 2)) + "</pre></details>"
+        )
+        .join("") || '<div class="item faint">no candidates</div>';
+    $("#unidentified-list").innerHTML =
+      (d.unidentified || [])
+        .map((u) => '<div class="item"><b>' + escapeHtml(u.address) + "</b><span>" + escapeHtml(u.note || "") + "</span></div>")
+        .join("") || '<div class="item faint">none</div>';
+    $("#devices-mode").textContent =
+      "discovery: " + (d.discovery || "auto") +
+      (d.discovery === "manual"
+        ? " — drivers probe but adopt nothing; use `script` or manifest_apply to take a candidate"
+        : " — recognised devices are adopted automatically");
+  } catch (e) {
+    toast(e.message);
+  }
+}
+
+async function loadTools() {
+  try {
+    const d = await api("/api/tools");
+    $("#tools-list").innerHTML = d.tools
+      .map(
+        (t) =>
+          '<details class="item-detail' + (t.visible ? "" : " faint") + '"><summary><b>' +
+          escapeHtml(t.name) + "</b> <span>" + escapeHtml(t.category) + (t.visible ? "" : " · hidden") +
+          "</span></summary><pre>" +
+          escapeHtml(
+            JSON.stringify(
+              {
+                name: t.name,
+                description: t.description,
+                category: t.category,
+                requires: t.requires || [],
+                visible: t.visible,
+                mutating: t.mutating,
+              },
+              null,
+              2
+            )
+          ) +
+          "</pre></details>"
+      )
+      .join("");
+  } catch (e) {
+    toast(e.message);
+  }
+}
+
+async function loadAgent() {
+  try {
+    const d = await api("/api/agent/config");
+    $("#agent-base").value = d.base_url || "";
+    $("#agent-model").value = d.model || "";
+    $("#agent-steps").value = d.max_steps;
+    $("#agent-temperature").value = d.temperature;
+    $("#auth-tick").value = d.tick_ms;
+    const prompt = await api("/api/agent/prompt");
+    kv($("#conversation-kv"), [
+      ["Messages", prompt.history],
+      ["Compressed lines", prompt.archive_lines],
+      ["System prompt", prompt.bytes + " B"],
+      ["Runs", d.run.runs],
+      ["Tokens (total)", d.run.usage_total ? d.run.usage_total.total_tokens : 0],
+    ]);
+  } catch (e) {
+    if (!String(e.message).includes("PIN")) toast(e.message);
+  }
+}
+
+async function loadSched() {
+  try {
+    const d = await api("/api/sched");
+    const tasks = d.tasks || [];
+    if (!tasks.length) {
+      $("#sched-list").innerHTML = '<div class="item faint">no tasks</div>';
+      return;
+    }
+    $("#sched-list").innerHTML = tasks
+      .map(
+        (t) =>
+          '<div class="item' + (t.enabled ? "" : " faint") + '"><b>' + escapeHtml(t.id) + "</b><span>" +
+          escapeHtml(t.every_s ? "every " + t.every_s + "s" : t.at_hhmm) + " · " +
+          escapeHtml((t.prompt || "").slice(0, 60)) + "</span>" +
+          '<button class="btn ghost" data-sched="' + escapeHtml(t.id) + '" data-op="' +
+          (t.enabled ? "sched_disable" : "sched_enable") + '">' + (t.enabled ? "Pause" : "Resume") +
+          "</button>" +
+          '<button class="btn ghost" data-sched="' + escapeHtml(t.id) + '" data-op="delete">Delete</button></div>'
+      )
+      .join("");
+    $$("[data-sched]").forEach((b) => (b.onclick = () => schedOp(b.dataset.sched, b.dataset.op)));
+  } catch (e) {
+    toast(e.message);
+  }
+}
+
+/** `sched_enable`, `sched_disable` and delete go through the same endpoint the CLI uses. */
+async function schedOp(id, op) {
+  try {
+    await api("/api/sched", { method: "POST", body: { kind: "task", op, id } });
+    loadSched();
+  } catch (e) {
+    toast(e.message);
+  }
+}
+
+async function loadLogs() {
+  try {
+    const d = await api("/api/logs?n=80");
+    $("#logs").textContent = (d.lines || [])
+      .map((l) => (l.t_ms / 1000).toFixed(1) + "s " + l.level + " " + l.target + ": " + l.msg)
+      .join("\n");
+  } catch (e) {
+    toast(e.message);
+  }
+}
+
+async function loadSettings() {
+  try {
+    const d = await api("/api/config");
+    $("#wifi-ssid").value = d.wifi.ssid || "";
+    $("#wifi-password").value = "";
+  } catch (e) {
+    if (!String(e.message).includes("PIN")) toast(e.message);
+  }
+}
+
+function showPanel(name) {
+  S.panel = name;
+  $$(".tabs button").forEach((b) => b.setAttribute("aria-selected", String(b.dataset.panel === name)));
+  $$(".panel").forEach((p) => (p.hidden = p.id !== "panel-" + name));
+  if (name === "devices") loadDevices();
+  if (name === "tools") loadTools();
+  if (name === "agent") loadAgent();
+  if (name === "schedule") loadSched();
+  if (name === "logs") loadLogs();
+  if (name === "settings") loadSettings();
+}
+
+// ---------------------------------------------------------------- wiring
+
+function autosize() {
+  const el = $("#input");
+  el.style.height = "auto";
+  el.style.height = Math.min(el.scrollHeight, 132) + "px";
+}
+
+function init() {
+  $("#menu-btn").onclick = () => {
+    $("#sheet").hidden = false;
+    showPanel(S.panel);
+  };
+  $("#sheet-close").onclick = () => ($("#sheet").hidden = true);
+  $$(".tabs button").forEach((b) => (b.onclick = () => showPanel(b.dataset.panel)));
+
+  $("#composer").onsubmit = (e) => {
+    e.preventDefault();
+    send($("#input").value);
+  };
+  $("#input").addEventListener("input", autosize);
+  $("#input").addEventListener("keydown", (e) => {
+    if (e.key === "Enter" && !e.shiftKey) {
+      e.preventDefault();
+      send($("#input").value);
+    }
+  });
+
+  $("#login-go").onclick = doLogin;
+  $("#login-pin").addEventListener("keydown", (e) => {
+    if (e.key === "Enter") doLogin();
+  });
+
+  $("#devices-probe").onclick = async () => {
+    try { await api("/api/devices/probe", { method: "POST", body: {} }); toast("probing"); setTimeout(loadDevices, 1500); }
+    catch (e) { toast(e.message); }
+  };
+  $("#devices-refresh").onclick = loadDevices;
+
+  $("#agent-save").onclick = async () => {
+    const body = {
+      base_url: $("#agent-base").value.trim(),
+      model: $("#agent-model").value.trim(),
+      max_steps: Number($("#agent-steps").value || 0),
+      temperature: Number($("#agent-temperature").value || 0.2),
+    };
+    const key = $("#agent-key").value.trim();
+    if (key) body.api_key = key;
+    try { await api("/api/agent/config", { method: "POST", body }); $("#agent-key").value = ""; toast("saved"); loadStatus(); }
+    catch (e) { toast(e.message); }
+  };
+
+  $("#forget-tail").onclick = async () => {
+    try { const r = await api("/api/agent/forget", { method: "POST", body: { keep: 1 } }); toast("forgot " + r.removed); loadHistory(); }
+    catch (e) { toast(e.message); }
+  };
+  $("#forget-all").onclick = async () => {
+    try { const r = await api("/api/agent/forget", { method: "POST", body: {} }); toast("forgot " + r.removed); loadHistory(); }
+    catch (e) { toast(e.message); }
+  };
+
+  $("#sched-add").onclick = async () => {
+    try {
+      await api("/api/sched", {
+        method: "POST",
+        body: {
+          kind: "task",
+          op: "add",
+          task: {
+            prompt: $("#sched-prompt").value.trim(),
+            every_s: Number($("#sched-every").value || 0),
+            at_hhmm: $("#sched-at").value.trim(),
+          },
+        },
+      });
+      $("#sched-prompt").value = "";
+      loadSched();
+      toast("task added");
+    } catch (e) { toast(e.message); }
+  };
+
+  $("#wifi-connect").onclick = async () => {
+    $("#wifi-result").textContent = "joining…";
+    try {
+      await api("/api/wifi/connect", {
+        method: "POST",
+        body: { ssid: $("#wifi-ssid").value.trim(), password: $("#wifi-password").value },
+      });
+      $("#wifi-result").textContent = "saved; the board is joining";
+      setTimeout(loadStatus, 4000);
+    } catch (e) { $("#wifi-result").textContent = e.message; }
+  };
+  $("#wifi-scan").onclick = async () => {
+    $("#wifi-result").textContent = "scanning…";
+    try {
+      const d = await api("/api/wifi/scan");
+      $("#wifi-result").textContent = (d.networks || []).map((n) => n.ssid + " (" + n.rssi + ")").join(", ") || "none";
+    } catch (e) { $("#wifi-result").textContent = e.message; }
+  };
+
+  $("#settings-save").onclick = async () => {
+    const body = { agent: { tick_ms: Number($("#auth-tick").value || 1000) } };
+    const pin = $("#auth-pin").value.trim();
+    if (pin) body.auth = { portal_pin: pin };
+    try {
+      await api("/api/config", { method: "POST", body });
+      $("#auth-pin").value = "";
+      // A new PIN invalidates the token the page is holding.
+      if (pin) { S.token = ""; localStorage.removeItem("esp32-agent.token"); }
+      toast("saved");
+    } catch (e) { toast(e.message); }
+  };
+
+  $("#reboot").onclick = async () => {
+    if (!confirm("Reboot the board?")) return;
+    try { await api("/api/reboot", { method: "POST", body: {} }); toast("rebooting"); }
+    catch (e) { toast(e.message); }
+  };
+
+  $("#logs-refresh").onclick = loadLogs;
+
+  loadHistory();
+  loadStatus();
+  // Not connected at load: the stream is opened when a run starts and closed when it ends.
   setInterval(() => {
-    refreshStatus().catch(() => {});
+    if (!$("#sheet").hidden) return;
+    loadStatus();
   }, 5000);
-  setInterval(() => {
-    if (state.tab !== "agent") return;
-    refreshSched().catch(() => {});
-    // The loop advances one iteration per tick on the board, so the card follows the
-    // same 4 s poll the schedule does, not the stream.
-    refreshGoal().catch(() => {});
-    // While the stream is up it carries the run as it happens; the transcript is
-    // refreshed on message_end instead of on a timer.
-    if (stream.state === "live") return;
-    refreshAgentHistory().catch(() => {});
-    refreshAgentConfig().catch(() => {});
-  }, 4000);
-})();
+}
+
+document.addEventListener("DOMContentLoaded", init);

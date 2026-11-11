@@ -85,11 +85,13 @@ pub fn call(transport: &mut dyn ChatTransport, name: &str, args: &Value) -> Opti
 
 fn get(transport: &mut dyn ChatTransport, args: &Value) -> Result<String, String> {
     let url = check_url(args)?;
-    let body = transport.post_json(&url, &[], "").map_err(transport_error)?;
+    // A real GET, not a POST with an empty body: half the web answers 405 to the latter,
+    // and the model has no way to tell the difference from the tool result.
+    let body = transport.request("GET", &url, &[], "").map_err(transport_error)?;
     Ok(result_json(
         json!({
             "url": url,
-            "method": "POST",
+            "method": "GET",
             "request_bytes": 0,
         }),
         &body,
@@ -106,7 +108,7 @@ fn post(transport: &mut dyn ChatTransport, args: &Value) -> Result<String, Strin
         }
     };
     let headers: [(&str, &str); 1] = [("Content-Type", "application/json")];
-    let body = transport.post_json(&url, &headers, &body_in).map_err(transport_error)?;
+    let body = transport.request("POST", &url, &headers, &body_in).map_err(transport_error)?;
     Ok(result_json(
         json!({
             "url": url,
@@ -192,6 +194,8 @@ mod tests {
     struct Fake {
         replies: VecDeque<Result<String, String>>,
         seen: Vec<Seen>,
+        /// Every verb the tools asked for, in order: `net_get` must say GET.
+        methods: Vec<String>,
     }
 
     impl Fake {
@@ -210,6 +214,17 @@ mod tests {
 
     impl ChatTransport for Fake {
         fn post_json(&mut self, url: &str, headers: &[(&str, &str)], body: &str) -> Result<String, String> {
+            self.request("POST", url, headers, body)
+        }
+
+        fn request(
+            &mut self,
+            method: &str,
+            url: &str,
+            headers: &[(&str, &str)],
+            body: &str,
+        ) -> Result<String, String> {
+            self.methods.push(method.to_string());
             self.seen.push((
                 url.to_string(),
                 headers.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
@@ -236,7 +251,9 @@ mod tests {
 
         assert_eq!(f.seen.len(), 1);
         assert_eq!(f.seen[0].0, "http://192.0.2.42/status");
-        assert_eq!(f.seen[0].2, "", "net_get sends an empty body through post_json");
+        assert_eq!(f.seen[0].2, "", "net_get sends no body");
+        assert_eq!(f.methods, vec!["GET".to_string()], "net_get must be a real GET");
+        assert_eq!(v["method"], "GET");
     }
 
     #[test]

@@ -141,6 +141,16 @@ fn read_all(conn: &mut Conn) -> Result<Vec<u8>, String> {
 
 impl ChatTransport for HostTransport {
     fn post_json(&mut self, url: &str, headers: &[(&str, &str)], body: &str) -> Result<String, String> {
+        self.request("POST", url, headers, body)
+    }
+
+    fn request(
+        &mut self,
+        method: &str,
+        url: &str,
+        headers: &[(&str, &str)],
+        body: &str,
+    ) -> Result<String, String> {
         let target = Target::parse(url)?;
         let addr = format!("{}:{}", target.host, target.port);
         let stream = TcpStream::connect(&addr).map_err(|e| format!("connect {addr} failed: {e}"))?;
@@ -149,18 +159,21 @@ impl ChatTransport for HostTransport {
         stream.set_nodelay(true).ok();
         let mut conn = if target.tls { tls(stream, &target.host)? } else { Conn::Plain(stream) };
 
-        let mut head = format!(
-            "POST {} HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n",
-            target.path,
-            target.host_header(),
-            body.len()
-        );
+        // GET carries no body and no framing headers, exactly like the board's transport.
+        let body = if method.eq_ignore_ascii_case("GET") { "" } else { body };
+        let mut head = format!("{method} {} HTTP/1.1\r\nHost: {}\r\n", target.path, target.host_header());
+        if !body.is_empty() {
+            head.push_str(&format!("Content-Type: application/json\r\nContent-Length: {}\r\n", body.len()));
+        }
+        head.push_str("Connection: close\r\n");
         for (k, v) in headers {
             head.push_str(&format!("{k}: {v}\r\n"));
         }
         head.push_str("\r\n");
         conn.write_all(head.as_bytes()).map_err(|e| format!("write failed: {e}"))?;
-        conn.write_all(body.as_bytes()).map_err(|e| format!("write failed: {e}"))?;
+        if !body.is_empty() {
+            conn.write_all(body.as_bytes()).map_err(|e| format!("write failed: {e}"))?;
+        }
         conn.flush().map_err(|e| format!("flush failed: {e}"))?;
 
         let raw = read_all(&mut conn)?;

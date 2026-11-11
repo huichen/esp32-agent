@@ -117,9 +117,22 @@ fn clamp_timeout(seconds: u32) -> u32 {
 
 impl ChatTransport for EspHttpTransport {
     fn post_json(&mut self, url: &str, headers: &[(&str, &str)], body: &str) -> Result<String, String> {
+        self.request("POST", url, headers, body)
+    }
+
+    fn request(
+        &mut self,
+        method: &str,
+        url: &str,
+        headers: &[(&str, &str)],
+        body: &str,
+    ) -> Result<String, String> {
         let target = Target::parse(url)?;
         let timeout = self.timeout();
-        let request = request_bytes(&target, headers, body);
+        // A GET carries no body and no content headers; sending them is what made every
+        // method-sensitive endpoint answer 405.
+        let body = if method.eq_ignore_ascii_case("GET") { "" } else { body };
+        let request = request_bytes(method, &target, headers, body);
 
         let mut conn = if target.tls {
             Conn::connect_tls(&target, timeout)?
@@ -176,15 +189,21 @@ impl Conn {
             // The clock is not a hint here: with the RTC at the epoch every certificate
             // reads as "not yet valid", and mbedTLS reports only ESP_FAIL. Say the time.
             format!(
-                "the TLS handshake with {} failed: {e} (board clock is {}s since the epoch{}; \
-                 a clock far from real time is the usual cause)",
+                "the TLS handshake with {} failed: {e} (board clock {}s{}; internal heap {} kB with a \
+                 {} kB largest block)",
                 target.authority(),
                 unsafe { esp_idf_svc::sys::time(std::ptr::null_mut()) },
                 if unsafe { esp_idf_svc::sys::time(std::ptr::null_mut()) } < 1_700_000_000 {
                     " — SNTP has not synced"
                 } else {
                     ""
-                }
+                },
+                unsafe { esp_idf_svc::sys::esp_get_free_internal_heap_size() } / 1024,
+                unsafe {
+                    esp_idf_svc::sys::heap_caps_get_largest_free_block(
+                        esp_idf_svc::sys::MALLOC_CAP_INTERNAL | esp_idf_svc::sys::MALLOC_CAP_8BIT,
+                    )
+                } / 1024
             )
         })?;
         Ok(Conn::Tls(Box::new(tls)))
@@ -195,7 +214,25 @@ impl Conn {
             Conn::Plain(stream) => {
                 stream.write_all(data).and_then(|()| stream.flush()).map_err(|e| format!("sending the request failed: {e}"))
             }
-            Conn::Tls(tls) => tls.write_all(data).map_err(|e| format!("sending the request over TLS failed: {e}")),
+            Conn::Tls(tls) => tls.write_all(data).map_err(|e| {
+                // A bare ESP_FAIL here says nothing: the request is routinely 20-30 kB
+                // (51 tool definitions plus the tool results), and the board has a few kB
+                // of internal RAM to spare. Report the size and the heap at the moment of
+                // failure — that is what decides whether this is a size or a memory fault.
+                let free = unsafe { esp_idf_svc::sys::esp_get_free_internal_heap_size() } / 1024;
+                let largest = unsafe {
+                    esp_idf_svc::sys::heap_caps_get_largest_free_block(
+                        esp_idf_svc::sys::MALLOC_CAP_INTERNAL | esp_idf_svc::sys::MALLOC_CAP_8BIT,
+                    )
+                } / 1024;
+                format!(
+                    "sending the request over TLS failed: {e} ({} bytes, internal heap {} kB, \
+                     largest block {} kB)",
+                    data.len(),
+                    free,
+                    largest
+                )
+            }),
         }
     }
 
@@ -303,9 +340,9 @@ impl Target {
 
 /// The request head plus body as one buffer, so a multi-byte UTF-8 body is never
 /// re-encoded on the way to the socket.
-fn request_bytes(target: &Target, headers: &[(&str, &str)], body: &str) -> Vec<u8> {
+fn request_bytes(method: &str, target: &Target, headers: &[(&str, &str)], body: &str) -> Vec<u8> {
     let mut head = String::with_capacity(256 + body.len());
-    head.push_str(&format!("POST {} HTTP/1.1\r\n", target.path));
+    head.push_str(&format!("{method} {} HTTP/1.1\r\n", target.path));
     head.push_str(&format!("Host: {}\r\n", target.authority()));
     // One request per connection: the reply is delimited by the close as well as by
     // its own framing, which is what lets the reader stay this small.
@@ -635,7 +672,7 @@ fn tick(
         app.agent.pending.as_ref().map(|pending| {
             (
                 pending.source.clone(),
-                app.llm.max_steps.max(1),
+                app.llm.max_steps,
                 clamp_timeout(app.llm.timeout_s),
             )
         })
@@ -646,7 +683,10 @@ fn tick(
     };
     log.info(
         "agent",
-        format!("run starting (source `{source}`, <= {steps} step(s), {timeout} s per call)"),
+        format!(
+            "run starting (source `{source}`, {} , {timeout} s per call)",
+            if steps == 0 { "no step limit".to_string() } else { format!("<= {steps} step(s)") }
+        ),
     );
     let started = Instant::now();
     match esp32_agent_core::app::drive_agent(shared, transport) {
