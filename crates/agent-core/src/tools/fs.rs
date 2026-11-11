@@ -180,6 +180,29 @@ pub fn specs() -> Value {
             ),
         ),
         function(
+            "fs_cp",
+            "Copy a file, or every file under a directory, inside the workspace. `to` is the new path itself, not a directory to copy into.",
+            params(
+                json!({
+                    "from": { "type": "string", "description": "existing file or directory" },
+                    "to": { "type": "string", "description": "new path" },
+                }),
+                &["from", "to"],
+            ),
+        ),
+        function(
+            "fs_mv",
+            "Move (rename) a file, or every file under a directory. Needs confirm=true: the source is removed.",
+            params(
+                json!({
+                    "from": { "type": "string", "description": "existing file or directory" },
+                    "to": { "type": "string", "description": "new path" },
+                    "confirm": { "type": "boolean", "description": "must be true" },
+                }),
+                &["from", "to", "confirm"],
+            ),
+        ),
+        function(
             "fs_grep",
             "Search the workspace for lines containing a literal substring. Walks files under `path` recursively.",
             params(
@@ -204,9 +227,75 @@ pub fn call(ws: &mut dyn Workspace, name: &str, args: &Value) -> Option<Result<S
         "fs_write" => Some(write(ws, args)),
         "fs_edit" => Some(edit(ws, args)),
         "fs_rm" => Some(rm(ws, args)),
+        "fs_cp" => Some(transfer(ws, args, false)),
+        "fs_mv" => Some(transfer(ws, args, true)),
         "fs_grep" => Some(grep(ws, args)),
         _ => None,
     }
+}
+
+/// Copy (`move_it == false`) or move a file or a whole directory tree.
+///
+/// The workspace has no real directories — a path with slashes only exists because some
+/// file lives under it — so "directory" here means "every file under this prefix", and
+/// a transfer copies that set. A failure says how much already happened: this is a
+/// filesystem with no transaction, and pretending otherwise would leave the caller
+/// guessing what state it is in.
+fn transfer(ws: &mut dyn Workspace, args: &Value, move_it: bool) -> Result<String, String> {
+    let from = normalize(&req_str(args, "from")?)?;
+    let to = normalize(&req_str(args, "to")?)?;
+    if from == "/" {
+        return Err("`from` must not be the workspace root".to_string());
+    }
+    if from == to {
+        return Err(format!("`from` and `to` are the same path (`{from}`)"));
+    }
+    if to.starts_with(&format!("{from}/")) {
+        return Err(format!("`{to}` is inside `{from}`; that would recurse"));
+    }
+    if move_it && !confirmed(args) {
+        return Err(format!("set confirm=true to move `{from}` (the source is removed)"));
+    }
+
+    let mut sources: Vec<String> = Vec::new();
+    let mut budget = MAX_FILES;
+    if ws.read(&from).is_ok() {
+        sources.push(from.clone());
+    } else {
+        walk(ws, &from, 1, &mut sources, &mut budget);
+    }
+    if sources.is_empty() {
+        return Err(format!("nothing at `{from}`"));
+    }
+
+    let total = sources.len();
+    let mut files = 0usize;
+    let mut bytes = 0usize;
+    for path in &sources {
+        let text =
+            ws.read(path).map_err(|e| format!("reading `{path}` failed: {e} ({files} of {total} done)"))?;
+        let target = if path == &from { to.clone() } else { format!("{to}{}", &path[from.len()..]) };
+        ws.write(&target, &text).map_err(|e| {
+            format!("writing `{target}` failed: {e} ({files} of {total} done, the rest untouched)")
+        })?;
+        bytes += text.len();
+        files += 1;
+    }
+    if move_it {
+        for path in &sources {
+            // The copy is already written, so a failed unlink leaves a duplicate rather
+            // than losing data; say which one.
+            ws.remove(path).map_err(|e| format!("copied to `{to}` but could not remove `{path}`: {e}"))?;
+        }
+    }
+    Ok(to_text(json!({
+        "ok": true,
+        "from": from,
+        "to": to,
+        "files": files,
+        "bytes": bytes,
+        "moved": move_it,
+    })))
 }
 
 /// Delete one file.
@@ -495,6 +584,57 @@ mod tests {
         assert!(run(&mut ws, "fs_rm", json!({"path": "../escape", "confirm": true})).is_err());
     }
 
+    #[test]
+    fn fs_cp_copies_a_file_and_a_directory_tree() {
+        let mut ws = Mem::default();
+        run(&mut ws, "fs_write", json!({"path": "/a.txt", "text": "alpha"})).unwrap();
+        let out = run(&mut ws, "fs_cp", json!({"from": "/a.txt", "to": "/b.txt"})).unwrap();
+        assert_eq!(out["files"], json!(1), "{out}");
+        assert_eq!(ws.read("/b.txt").unwrap(), "alpha");
+        assert!(ws.read("/a.txt").is_ok(), "a copy must leave the source alone");
+
+        // A directory is "every file under this prefix".
+        run(&mut ws, "fs_write", json!({"path": "/skills/pins/SKILL.md", "text": "pins"})).unwrap();
+        run(&mut ws, "fs_write", json!({"path": "/skills/pins/notes.md", "text": "low"})).unwrap();
+        let out = run(&mut ws, "fs_cp", json!({"from": "/skills/pins", "to": "/skills/copy"})).unwrap();
+        assert_eq!(out["files"], json!(2), "{out}");
+        assert_eq!(ws.read("/skills/copy/SKILL.md").unwrap(), "pins");
+        assert_eq!(ws.read("/skills/copy/notes.md").unwrap(), "low");
+    }
+
+    #[test]
+    fn fs_mv_moves_a_tree_only_with_a_confirmation() {
+        let mut ws = Mem::default();
+        run(&mut ws, "fs_write", json!({"path": "/skills/pins/SKILL.md", "text": "pins"})).unwrap();
+
+        let err = run(&mut ws, "fs_mv", json!({"from": "/skills/pins", "to": "/skills/moved"})).unwrap_err();
+        assert!(err.contains("confirm=true"), "{err}");
+        assert!(ws.read("/skills/pins/SKILL.md").is_ok(), "the move happened without a confirmation");
+
+        let out =
+            run(&mut ws, "fs_mv", json!({"from": "/skills/pins", "to": "/skills/moved", "confirm": true}))
+                .unwrap();
+        assert_eq!(out["moved"], json!(true), "{out}");
+        assert!(ws.read("/skills/moved/SKILL.md").is_ok());
+        assert!(ws.read("/skills/pins/SKILL.md").is_err(), "the source is still there");
+    }
+
+    #[test]
+    fn a_transfer_refuses_to_recurse_or_to_invent_a_source() {
+        let mut ws = Mem::default();
+        run(&mut ws, "fs_write", json!({"path": "/skills/pins/SKILL.md", "text": "pins"})).unwrap();
+
+        let err =
+            run(&mut ws, "fs_cp", json!({"from": "/skills/pins", "to": "/skills/pins/inner"})).unwrap_err();
+        assert!(err.contains("recurse"), "{err}");
+        let err = run(&mut ws, "fs_cp", json!({"from": "/nope", "to": "/x"})).unwrap_err();
+        assert!(err.contains("nothing at"), "{err}");
+        let err = run(&mut ws, "fs_cp", json!({"from": "/skills/pins", "to": "/skills/pins"})).unwrap_err();
+        assert!(err.contains("same path"), "{err}");
+        let err = run(&mut ws, "fs_cp", json!({"from": "/", "to": "/x"})).unwrap_err();
+        assert!(err.contains("root"), "{err}");
+    }
+
     // ------------------------------------------------------------ path rules
 
     #[test]
@@ -667,7 +807,10 @@ mod tests {
         let specs = specs();
         let list = specs.as_array().expect("tools array");
         let names: Vec<&str> = list.iter().map(|t| t["function"]["name"].as_str().unwrap()).collect();
-        assert_eq!(names, vec!["fs_ls", "fs_read", "fs_write", "fs_edit", "fs_rm", "fs_grep"]);
+        assert_eq!(
+            names,
+            vec!["fs_ls", "fs_read", "fs_write", "fs_edit", "fs_rm", "fs_cp", "fs_mv", "fs_grep"]
+        );
         for t in list {
             assert_eq!(t["type"], "function");
             assert_eq!(t["function"]["parameters"]["type"], "object");

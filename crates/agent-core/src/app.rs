@@ -406,7 +406,33 @@ impl App {
         let mut tools: Vec<Value> =
             self.tools.iter().filter(|d| self.is_visible(&d.spec.name)).map(|d| d.mcp_json()).collect();
         tools.sort_by_key(|t| t["name"].as_str().unwrap_or("").to_string());
+        // `fs_*` and `net_*` are not registry entries (their handlers need the workspace
+        // and an HTTP client), but an MCP client should be able to reach them, so they are
+        // appended in module order rather than sorted in.
+        tools.extend(self.extra_mcp_specs());
         json!({ "tools": tools })
+    }
+
+    /// The MCP view of the tools that live outside the registry: `fs_*` then `net_*`.
+    ///
+    /// `mcp.disabled_tools` still applies; `tools_mode` does not, because none of these
+    /// is a device tool.
+    fn extra_mcp_specs(&self) -> Vec<Value> {
+        let mut out = Vec::new();
+        for group in [fs_tools::specs(), net_tools::specs()] {
+            for tool in openai_tools(&group) {
+                let name = tool["function"]["name"].as_str().unwrap_or_default().to_string();
+                if self.cfg.mcp.disabled_tools.iter().any(|d| d == &name) {
+                    continue;
+                }
+                out.push(json!({
+                    "name": name,
+                    "description": tool["function"]["description"],
+                    "inputSchema": tool["function"]["parameters"],
+                }));
+            }
+        }
+        out
     }
 
     fn tools_portal_json(&self) -> Value {
@@ -1490,7 +1516,20 @@ impl App {
             .to_string();
         let args = params.get("arguments").cloned().unwrap_or_else(|| json!({}));
         let started = std::time::Instant::now();
-        let result = self.call_tool(&name, &args);
+        // The tools outside the registry go through `ToolHost`, which is the path the
+        // board's own agent uses, so an MCP caller and the agent share one behaviour.
+        let result = if name.starts_with("fs_") || name.starts_with("net_") {
+            if self.cfg.mcp.disabled_tools.iter().any(|d| d == &name) {
+                Err(McpError::not_found(format!("tool `{name}` is disabled")))
+            } else {
+                match ToolHost::call_tool(self, &name, &args) {
+                    Ok(text) => Ok(text_result(&text)),
+                    Err(message) => Err(McpError::invalid_params(message)),
+                }
+            }
+        } else {
+            self.call_tool(&name, &args)
+        };
         let ms = started.elapsed().as_millis();
         match result {
             Ok(v) => {
@@ -1613,6 +1652,15 @@ impl App {
             }
             first = false;
             out.push_str(&serde_json::to_string(&def.mcp_json()).ok()?);
+        }
+        // The registry tools are sorted; the extras follow in module order, exactly as
+        // in `tools_list_json`.
+        for spec in self.extra_mcp_specs() {
+            if !first {
+                out.push(',');
+            }
+            first = false;
+            out.push_str(&serde_json::to_string(&spec).ok()?);
         }
         out.push_str("]}}");
         Some(out)
@@ -2174,7 +2222,7 @@ impl ToolHost for App {
                 .ok_or_else(|| format!("`{name}` starts with fs_ but no such file tool exists"))?;
             let text = result?;
             // Only the mutating tools dirty the stored blob.
-            if matches!(name, "fs_write" | "fs_edit" | "fs_rm") {
+            if matches!(name, "fs_write" | "fs_edit" | "fs_rm" | "fs_cp" | "fs_mv") {
                 self.persist_workspace();
             }
             return Ok(text);
@@ -2212,6 +2260,18 @@ fn tool_text(v: &Value) -> String {
         }
     }
     serde_json::to_string(v).unwrap_or_else(|_| "{}".to_string())
+}
+
+/// The reverse of [`tool_text`]: a tool that answers with JSON text, shaped as an MCP
+/// result so an external client sees the same envelope as the registry tools.
+fn text_result(text: &str) -> Value {
+    match serde_json::from_str::<Value>(text) {
+        Ok(value) => protocol::tool_json(&value),
+        Err(_) => json!({
+            "content": [{ "type": "text", "text": text }],
+            "isError": false,
+        }),
+    }
 }
 
 /// Accept either an OpenAI tool or an MCP tool definition from an extra tool group
@@ -3803,6 +3863,50 @@ mod tests {
         assert!(app.tools_list_body(r#"{"jsonrpc":"2.0","method":"tools/list"}"#).is_none());
     }
 
+    /// The file and network tools are reachable over MCP too, not only from the board's
+    /// own agent: an outside client driving the board can read the workspace, write a
+    /// skill, or fetch a page — the same reach, one implementation.
+    #[test]
+    fn the_file_and_network_tools_are_in_the_mcp_list_and_callable() {
+        let mut app = test_app();
+        let names = tool_names(&mut app);
+        for needle in
+            ["fs_ls", "fs_read", "fs_write", "fs_rm", "fs_cp", "fs_mv", "fs_grep", "net_get", "net_post"]
+        {
+            assert!(names.contains(&needle.to_string()), "{needle} is missing from tools/list: {names:?}");
+        }
+
+        // The schema is the same object the model gets, in the MCP field name.
+        let list = app.handle_rpc(r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#, None).unwrap();
+        let fs_read = list["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["name"] == "fs_read")
+            .expect("fs_read in the list");
+        assert!(fs_read["inputSchema"]["properties"]["path"].is_object(), "{fs_read}");
+
+        // And a call goes through the same code the agent uses.
+        let write = app
+            .handle_rpc(
+                r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"fs_write","arguments":{"path":"/notes/a.txt","text":"from mcp"}}}"#,
+                None,
+            )
+            .unwrap();
+        assert_eq!(write["result"]["isError"], json!(false), "{write}");
+        let read = app
+            .handle_rpc(
+                r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"fs_read","arguments":{"path":"/notes/a.txt"}}}"#,
+                None,
+            )
+            .unwrap();
+        assert_eq!(read["result"]["structuredContent"]["text"], json!("from mcp"), "{read}");
+
+        // `mcp.disabled_tools` hides them like any other tool.
+        app.cfg.mcp.disabled_tools = vec!["fs_rm".into()];
+        assert!(!tool_names(&mut app).contains(&"fs_rm".to_string()), "disabled_tools did not hide fs_rm");
+    }
+
     #[test]
     fn tools_list_only_shows_detected_hardware() {
         let mut app = test_app();
@@ -4093,15 +4197,18 @@ mod tests {
         }
         assert!(!board.contains(&"aaa_manifest"), "a manifest tool is not in the board block: {board:?}");
 
-        // ... then the tools that are not MCP tools, in module order ...
+        // ... then the tools outside the registry — file and network — in module order ...
         assert_eq!(
-            &names[split..split + 8],
-            &["fs_ls", "fs_read", "fs_write", "fs_edit", "fs_rm", "fs_grep", "net_get", "net_post"],
+            &names[split..split + 10],
+            &[
+                "fs_ls", "fs_read", "fs_write", "fs_edit", "fs_rm", "fs_cp", "fs_mv", "fs_grep", "net_get",
+                "net_post"
+            ],
             "the file and network tools are not the trailing block: {names:?}"
         );
 
         // ... and the manifest block last, because it is the one the model rewrites.
-        assert_eq!(&names[split + 8..], &["aaa_manifest"], "{names:?}");
+        assert_eq!(&names[split + 10..], &["aaa_manifest"], "{names:?}");
     }
 
     /// The same board has to produce the same bytes, or the provider's prompt cache

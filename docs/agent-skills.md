@@ -87,8 +87,7 @@ Write one with `fs_write` — there are no dedicated tools (see below).
 ### No tools of their own
 
 Deliberately. `fs_ls`, `fs_read` and `fs_write` already reach both paths, and a wrapper
-per verb would add a definition to every request and one more choice for a small model —
-the same reason `net_*` and `fs_*` are not MCP tools either.
+per verb would add a definition to every request and one more choice for a small model.
 
 | Task | How |
 |---|---|

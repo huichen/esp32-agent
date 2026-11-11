@@ -92,6 +92,12 @@ version numbering follows semantic versioning.
 - **`fs_rm`**: deleting one workspace file (`confirm: true`). The workspace could write
   and edit but never remove, so a wrong skill stayed in every future prompt
 
+- **`fs_*` and `net_*` on the MCP surface**: an outside client can read and write the
+  workspace, fetch a page and post JSON, through the same implementation the board's own
+  agent uses. `mcp.disabled_tools` hides them like any other tool
+- **`fs_cp` / `fs_mv`**: copy or move a file, or every file under a directory (`mv` needs
+  `confirm: true`); the workspace had one-way writes only
+
 ### Fixed
 
 - `net_get` / `net_post` now work inside a turn. The model call borrowed the App's only
