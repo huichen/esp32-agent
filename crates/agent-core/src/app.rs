@@ -4029,6 +4029,62 @@ mod tests {
         assert!(err.contains("overview"), "{err}");
     }
 
+    /// The model cannot tell a driver tool from a manifest tool from a file tool.
+    ///
+    /// One array, one shape, no source tag: the `category`/`core`/`mutating` fields
+    /// exist for the portal and for `tools/list`, and are never sent. What differs is
+    /// only the *position* — the board's tools (driver, system and manifest alike) are
+    /// one alphabetical block, and `fs_*` then `net_*` follow, because those are not
+    /// MCP tools and are appended by `tool_specs` rather than registered.
+    #[test]
+    fn every_tool_reaches_the_model_in_one_shape_and_a_predictable_order() {
+        let mut app = test_app();
+        app.call_tool(
+            "manifest_apply",
+            &json!({ "manifest": { "tools": [{
+                "name": "aaa_manifest", "params": [],
+                "exec": { "type": "gpio_read", "pin": 3 }
+            }] } }),
+        )
+        .expect("manifest applied");
+
+        let specs = ToolHost::tool_specs(&app);
+        let tools = specs.as_array().expect("an array");
+        let names: Vec<&str> =
+            tools.iter().map(|t| t["function"]["name"].as_str().expect("a name")).collect();
+
+        // One shape for every entry, whichever module built it.
+        for tool in tools {
+            let top = tool.as_object().expect("an object");
+            assert_eq!(top.len(), 2, "extra fields reach the wire: {tool}");
+            assert!(top.contains_key("type") && top.contains_key("function"), "{tool}");
+            assert_eq!(tool["type"], "function");
+            let function = tool["function"].as_object().expect("a function object");
+            assert_eq!(function.len(), 3, "extra fields reach the wire: {tool}");
+            for key in ["name", "description", "parameters"] {
+                assert!(function.contains_key(key), "{tool}");
+            }
+            assert!(tool["function"]["parameters"].is_object(), "{tool}");
+        }
+
+        // The board's own tools are one alphabetical block, manifest tools included.
+        let split = names.iter().position(|n| n.starts_with("fs_")).expect("fs tools");
+        let board = &names[..split];
+        let mut sorted = board.to_vec();
+        sorted.sort_unstable();
+        assert_eq!(board, sorted.as_slice(), "the board tools are not one alphabetical block");
+        for needle in ["aaa_manifest", "board_status", "manifest_apply"] {
+            assert!(board.contains(&needle), "{needle} is not in the board block: {board:?}");
+        }
+
+        // ... and the tools that are not MCP tools are appended, in module order.
+        assert_eq!(
+            &names[split..],
+            &["fs_ls", "fs_read", "fs_write", "fs_edit", "fs_rm", "fs_grep", "net_get", "net_post"],
+            "the file and network tools are not the trailing block: {names:?}"
+        );
+    }
+
     /// `/AGENTS.md` and the skill index have to reach the model, or they are just files.
     ///
     /// The prompt is rebuilt every turn from the workspace, so editing the instructions
