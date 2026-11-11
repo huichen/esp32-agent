@@ -45,9 +45,12 @@ pub trait ChatTransport {
 
 /// Where the model lives and how the loop should treat it.
 ///
-/// `Default` is hand-written rather than derived: a zeroed `max_steps` or a zero
-/// timeout would make the first run fail in a confusing way, so the documented
-/// defaults (4 steps, 0.2, 45 s) are what `LlmConfig::default()` yields.
+/// `Default` is hand-written rather than derived: a zero timeout would make the first run
+/// fail in a confusing way, so the documented defaults (0.2, 45 s) are what
+/// `LlmConfig::default()` yields. `max_steps` is unlimited by default — the loop already
+/// stops on its own (a final answer, a transport error, or the history budget), and a
+/// fixed cap only truncates work that would have finished. Set it when a run has to be
+/// bounded, e.g. on a metered endpoint.
 #[derive(Clone, Debug)]
 pub struct LlmConfig {
     /// e.g. `http://192.0.2.10:8899/v1/chat/completions`
@@ -56,7 +59,7 @@ pub struct LlmConfig {
     pub model: String,
     /// Empty = no `Authorization` header.
     pub api_key: String,
-    /// Tool iterations, default 4.
+    /// Model calls per run; **0 means no limit**.
     pub max_steps: u8,
     /// Default 0.2.
     pub temperature: f32,
@@ -70,7 +73,7 @@ impl Default for LlmConfig {
             base_url: String::new(),
             model: String::new(),
             api_key: String::new(),
-            max_steps: 4,
+            max_steps: 0,
             temperature: 0.2,
             timeout_s: 45,
         }
@@ -392,7 +395,8 @@ mod tests {
     #[test]
     fn config_defaults_match_the_brief() {
         let cfg = LlmConfig::default();
-        assert_eq!(cfg.max_steps, 4);
+        // No step cap by default: a fixed one truncated work that would have finished.
+        assert_eq!(cfg.max_steps, 0);
         assert!((cfg.temperature - 0.2).abs() < f32::EPSILON);
         assert_eq!(cfg.timeout_s, 45);
         assert!(cfg.api_key.is_empty());

@@ -652,7 +652,7 @@ fn tick(
         app.agent.pending.as_ref().map(|pending| {
             (
                 pending.source.clone(),
-                app.llm.max_steps.max(1),
+                app.llm.max_steps,
                 clamp_timeout(app.llm.timeout_s),
             )
         })
@@ -663,7 +663,10 @@ fn tick(
     };
     log.info(
         "agent",
-        format!("run starting (source `{source}`, <= {steps} step(s), {timeout} s per call)"),
+        format!(
+            "run starting (source `{source}`, {} , {timeout} s per call)",
+            if steps == 0 { "no step limit".to_string() } else { format!("<= {steps} step(s)") }
+        ),
     );
     let started = Instant::now();
     match esp32_agent_core::app::drive_agent(shared, transport) {

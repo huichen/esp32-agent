@@ -308,6 +308,9 @@ pub const ROUTES: &[Route] = &[
         "",
         "{ok}",
     ),
+    r("POST", "/mcp", "mcp", Auth::Open,
+      "The MCP transport itself: initialize, tools/list, tools/call, resources/*. The path is `mcp.path`, so read it from the dynamic section before you connect",
+      "a JSON-RPC 2.0 message", "a JSON-RPC response, or text/event-stream when mcp.sse is on"),
     // --- the console ---------------------------------------------------------------
     r(
         "GET",
@@ -428,9 +431,11 @@ pub fn document(dynamic: Value) -> Value {
                 "event_streams": 2,
                 "manifest_tools": 48,
                 "sequence_steps": 8,
+                "model_steps": "unlimited by default; POST /api/agent/config max_steps sets a cap (0 = off, 200 max)",
             },
         },
         "endpoints": routed,
+        "settings": crate::settings::json(),
         "counts": {"endpoints": ROUTES.len()},
         "dynamic": dynamic,
     })
