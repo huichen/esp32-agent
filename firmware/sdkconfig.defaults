@@ -42,6 +42,15 @@ CONFIG_LWIP_MAX_SOCKETS=20
 # 120 s of TIME_WAIT per closed connection is a desktop default; on a LAN with one
 # client, 2x5 s is plenty and the slots come back fast.
 CONFIG_LWIP_TCP_MSL=5000
+# SNTP: the default retry after a failed first attempt is an hour, and until the clock is
+# set every https handshake fails (a certificate from 2024 reads as "not yet valid" to a
+# board in 1970). A minute is a fair compromise on a LAN that may have no NTP route.
+CONFIG_LWIP_SNTP_UPDATE_DELAY=60000
+# mbedTLS wants a 16 KB input buffer and a 4 KB output buffer per session. Internal RAM is
+# where the radio, the HTTP server and the agent live, and at handshake time only ~17 kB was
+# free with a 9 kB largest block: every https:// request failed with a bare ESP_FAIL.
+# Those buffers are not DMA memory, so PSRAM is the right home for them.
+CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC=y
 
 # Partition table from partitions.csv - factory app plus a two-slot OTA rotation with
 # the otadata record that selects between them.

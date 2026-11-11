@@ -285,6 +285,22 @@ fn run() -> anyhow::Result<()> {
     // the board's RTC starts at the epoch. `every_s` tasks work without this, so a
     // LAN with no route to an NTP server loses only the daily-time mode. The handle
     // is deliberately kept for the life of `run`: dropping it stops the sync.
+    // The scheduler's `at_hhmm` tasks, every message timestamp and — less obviously —
+    // every TLS handshake need a wall clock: the RTC starts at the epoch, and a certificate
+    // issued in 2024 reads as "not yet valid" to a clock in 1970. Starting SNTP before the
+    // station has an address wastes its first attempt, and the retry is a minute (see
+    // CONFIG_LWIP_SNTP_UPDATE_DELAY), so wait for the address first.
+    for _ in 0..120 {
+        let ip = wifi::status().ip;
+        if !ip.is_empty() && ip != "0.0.0.0" {
+            break;
+        }
+        FreeRtos::delay_ms(100);
+    }
+    //
+    // `every_s` tasks work without this, so a LAN with no route to an NTP server loses only
+    // the daily-time mode and https. The handle is deliberately kept for the life of
+    // `run`: dropping it stops the sync.
     let _sntp = match esp_idf_svc::sntp::EspSntp::new_default() {
         Ok(sntp) => {
             log.info("agent", "sntp: started (pool.ntp.org); at_hhmm tasks use the synced clock");
