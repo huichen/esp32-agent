@@ -565,11 +565,19 @@ pub fn instantiate(spec: &crate::manifest::DeviceSpec, hw: &mut dyn Hardware) ->
 }
 
 /// Board-level capabilities that are not owned by a device.
+///
+/// `hw` is kept in the signature: a capability that needs the driver's state (rather than
+/// the fact that the platform has the peripheral) reads it here, and the callers already
+/// have it in hand.
 pub fn board_caps(hw: &mut dyn Hardware, cfg: &Config, profile: &BoardProfile) -> Vec<String> {
+    let _ = hw;
     let mut caps = Vec::new();
-    if !matches!(hw.wifi_status().state.as_str(), "off") {
-        caps.push("wifi".to_string());
-    }
+    // The radio exists on this build whether or not it has come up yet. Asking the
+    // driver for its state at probe time hid `wifi_scan` and `wifi_status` on a boot
+    // where the probe ran before the radio did — which is the common case on the board,
+    // and the two tools are exactly what tell you the radio is not up. Measured on the
+    // device: a fresh flash listed 43 tools instead of 45 for that reason.
+    caps.push("wifi".to_string());
     caps.push("gpio".to_string());
     if !profile.adc_pins.is_empty() {
         caps.push("adc".to_string());
@@ -578,12 +586,11 @@ pub fn board_caps(hw: &mut dyn Hardware, cfg: &Config, profile: &BoardProfile) -
     if !cfg.bus.i2c.is_empty() {
         caps.push("i2c".to_string());
     }
-    if profile.mic.is_some() {
-        caps.push("mic".to_string());
-    }
-    if profile.amp.is_some() {
-        caps.push("speaker".to_string());
-    }
+    // Deliberately not advertised: `mic` and `speaker`. A profile can record the I2S
+    // pins (the xiaozhi wiring does: mic 4/5/6, amp 7/15/16), but there is no INMP441 or
+    // MAX98357A driver yet, so those caps would promise the model a capability that has
+    // no tool behind it — and I2S has no addressing or id register, so nothing about it
+    // can be probed either. They come back here when the drivers land.
     caps
 }
 
@@ -600,4 +607,25 @@ pub fn summary(devices: &Devices) -> Value {
         "by_kind": by_kind,
         "degraded": infos.iter().filter(|i| i.status != "ok").count(),
     })
+}
+
+#[cfg(test)]
+mod cap_tests {
+    use super::*;
+
+    /// A profile can record I2S pins (the xiaozhi wiring does: mic 4/5/6, amp 7/15/16),
+    /// but nothing on an I2S bus can be identified and there is no audio driver yet. The
+    /// capability must not be advertised, or the model is told about a device that has no
+    /// tool behind it — which is what this board reported before the fix.
+    #[test]
+    fn the_audio_pins_of_a_profile_do_not_become_capabilities() {
+        let mut hw = crate::virtual_board::VirtualBoard::new();
+        let cfg = crate::config::Config::default();
+        let profile = crate::boards::find("esp32s3-xiaozhi-bread").expect("the xiaozhi profile");
+        assert!(profile.mic.is_some() && profile.amp.is_some(), "the profile records I2S pins");
+        let caps = board_caps(&mut hw, &cfg, profile);
+        assert!(!caps.iter().any(|c| c == "mic"), "mic advertised with no driver: {caps:?}");
+        assert!(!caps.iter().any(|c| c == "speaker"), "speaker advertised with no driver: {caps:?}");
+        assert!(caps.iter().any(|c| c == "gpio"), "the real caps are still there: {caps:?}");
+    }
 }

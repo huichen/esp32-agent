@@ -109,6 +109,11 @@ version numbering follows semantic versioning.
 
 ### Fixed
 
+- **`mic` / `speaker` were advertised as capabilities with nothing behind them.** A board
+  profile can record the I2S pins (the xiaozhi wiring does), and `board_caps` turned that
+  into `mic`/`speaker` caps — but there is no INMP441 or MAX98357A driver, so the model
+  was told about a device that has no tool, and no amount of probing would find it: I2S
+  has no addressing and no id register. The caps are gone until the drivers exist
 - **`tools_mode = "generic"` never took effect.** Two independent faults: the config
   patch accepted only `auto`/`all` and ignored anything else in silence, and
   `Config::sanitized` rewrote every value except `all` back to `auto`, so the mode was
