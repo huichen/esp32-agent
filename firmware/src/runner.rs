@@ -186,11 +186,18 @@ impl Conn {
             ..Default::default()
         };
         tls.connect(&target.host, target.port, &cfg).map_err(|e| {
+            // The clock is not a hint here: with the RTC at the epoch every certificate
+            // reads as "not yet valid", and mbedTLS reports only ESP_FAIL. Say the time.
             format!(
-                "the TLS handshake with {} failed: {e} (board clock {}s, internal heap {} kB with a \
+                "the TLS handshake with {} failed: {e} (board clock {}s{}; internal heap {} kB with a \
                  {} kB largest block)",
                 target.authority(),
                 unsafe { esp_idf_svc::sys::time(std::ptr::null_mut()) },
+                if unsafe { esp_idf_svc::sys::time(std::ptr::null_mut()) } < 1_700_000_000 {
+                    " — SNTP has not synced"
+                } else {
+                    ""
+                },
                 unsafe { esp_idf_svc::sys::esp_get_free_internal_heap_size() } / 1024,
                 unsafe {
                     esp_idf_svc::sys::heap_caps_get_largest_free_block(

@@ -46,8 +46,8 @@ CONFIG_LWIP_MAX_SOCKETS=20
 # 120 s of TIME_WAIT per closed connection is a desktop default; on a LAN with one
 # client, 2x5 s is plenty and the slots come back fast.
 CONFIG_LWIP_TCP_MSL=5000
-# SNTP: the default retry after a failed first attempt is an hour, and until the clock is
-# set every https handshake fails (a certificate from 2024 reads as "not yet valid" to a
+# SNTP: the default retry after a failed first attempt is one hour, and until the clock is
+# set every https handshake fails (certificates from 2024 read as "not yet valid" to a
 # board in 1970). A minute is a fair compromise on a LAN that may have no NTP route.
 CONFIG_LWIP_SNTP_UPDATE_DELAY=60000
 # mbedTLS wants a 16 KB input buffer and a 4 KB output buffer per session. Internal RAM is
