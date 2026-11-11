@@ -357,17 +357,18 @@ impl Hardware for VirtualBoard {
         Ok(())
     }
 
-    fn i2s_mic_read(&mut self, out: &mut [i16], _timeout_ms: u32) -> Result<usize> {
+    fn i2s_mic_read(&mut self, out: &mut [i32], _timeout_ms: u32) -> Result<usize> {
         if !self.i2s_mic {
             return Err(McpError::unsupported("no I2S microphone on the virtual board"));
         }
         let t = self.start.elapsed().as_micros() as f32 / 1_000_000.0;
-        let rate = crate::drivers::audio::RATE_HZ as f32;
+        let rate = crate::drivers::audio::MIC_RATE_HZ as f32;
         for (i, s) in out.iter_mut().enumerate() {
             let phase = 2.0 * std::f32::consts::PI * 440.0 * (t + i as f32 / rate);
-            // ~ -20 dBFS	one plus a deterministic wobble, so the level is not a constant.
+            // 24 bits left-justified in 32, like the INMP441: about -20 dBFS plus a slow
+            // wobble, so the level is not a constant.
             let wobble = 1.0 + 0.1 * (i as f32 * 0.01).sin();
-            *s = (phase.sin() * 3280.0 * wobble) as i16;
+            *s = (phase.sin() * 3280.0 * wobble) as i32 * 65_536;
         }
         Ok(out.len())
     }

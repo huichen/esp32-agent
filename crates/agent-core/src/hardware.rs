@@ -130,11 +130,12 @@ pub trait Hardware: Send {
         Err(McpError::unsupported("no I2S audio on this board"))
     }
 
-    /// Read up to `out.len()` 16-bit mono samples from the microphone.
+    /// Read up to `out.len()` 32-bit samples from the microphone.
     ///
-    /// Returns how many arrived before `timeout_ms`; fewer than asked for is normal (the
-    /// caller's window was longer than the device's buffer).
-    fn i2s_mic_read(&mut self, _out: &mut [i16], _timeout_ms: u32) -> Result<usize> {
+    /// 32-bit because that is what an INMP441 sends: 24 bits left-justified in a 32-bit
+    /// slot, left channel only (measured on this board). The caller scales down to what a
+    /// tool result can carry. Returns how many arrived before `timeout_ms`.
+    fn i2s_mic_read(&mut self, _out: &mut [i32], _timeout_ms: u32) -> Result<usize> {
         Err(McpError::unsupported("no I2S microphone on this board"))
     }
 

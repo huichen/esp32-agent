@@ -6,10 +6,17 @@
 //! do the tools exist. That is also why the caps come from the devices rather than from
 //! `board_caps` — a capability without a working channel would be a promise.
 //!
+//! The formats are the ones measured on this board (`D:\esp32s3-probe\README.md`):
+//!
+//! * microphone: 16 kHz, 32-bit slots, **left channel only** — the INMP441 sends 24 bits
+//!   left-justified and the right slot is always zero;
+//! * amplifier: 24 kHz, 16-bit, Philips standard, mono; `SD` tied high so it is always
+//!   enabled, `GAIN` floating = 9 dB.
+//!
 //! The tools are deliberately small: a level meter, a bounded recording, a generated
-//! tone, and a bounded playback. A board with ~8 MB of PSRAM can hold far more, but a
-//! tool result is capped at 2 KB, so anything longer would be truncated rather than
-//! heard — 512 samples is the honest maximum for a tool that returns samples.
+//! tone, and a bounded playback. A tool result is capped at 2 KB, so anything longer
+//! would be truncated rather than heard — 512 samples is the honest maximum for a tool
+//! that returns samples.
 
 use crate::device::DeviceInfo;
 use crate::error::McpError;
@@ -19,9 +26,11 @@ use crate::tool::{integer, object_schema, string, ToolDef};
 use crate::util;
 use serde_json::{json, Value};
 
-/// Sample rate for both directions. 8 kHz is enough for a level meter, a test tone and a
-/// short recording, and it keeps the buffers small enough for the agent thread.
-pub const RATE_HZ: u32 = 8_000;
+/// Microphone rate: 16 kHz, 32-bit slots, left channel only.
+pub const MIC_RATE_HZ: u32 = 16_000;
+
+/// Amplifier rate: 24 kHz, 16-bit, Philips, mono.
+pub const AMP_RATE_HZ: u32 = 24_000;
 
 /// Largest recording a tool result can carry: 512 samples = 1024 bytes = ~1.4 KB of
 /// base64, which leaves room for the envelope inside the 2 KB tool result.
@@ -29,7 +38,7 @@ pub const MAX_RECORD_SAMPLES: usize = 512;
 
 /// A level measurement reads at most this many samples, so a long window cannot park the
 /// agent thread for seconds.
-const MAX_LEVEL_SAMPLES: usize = 4_096;
+const MAX_LEVEL_SAMPLES: usize = 8_192;
 
 pub struct Mic {
     pub id: String,
@@ -41,10 +50,10 @@ pub struct Speaker {
 
 impl Mic {
     fn info_of(&self) -> DeviceInfo {
-        let mut i = DeviceInfo::new("mic", "I2S microphone", "mic");
+        let mut i = DeviceInfo::new("mic", "I2S microphone (INMP441)", "mic");
         i.id = self.id.clone();
         i.caps = vec!["mic".into()];
-        i.detail = json!({ "rate_hz": RATE_HZ, "bits": 16 });
+        i.detail = json!({ "rate_hz": MIC_RATE_HZ, "bits": 32, "channel": "left" });
         i.tools = vec!["mic_level".into(), "mic_record".into()];
         i
     }
@@ -52,10 +61,10 @@ impl Mic {
 
 impl Speaker {
     fn info_of(&self) -> DeviceInfo {
-        let mut i = DeviceInfo::new("speaker", "I2S amplifier", "speaker");
+        let mut i = DeviceInfo::new("speaker", "I2S amplifier (MAX98357A)", "speaker");
         i.id = self.id.clone();
         i.caps = vec!["speaker".into()];
-        i.detail = json!({ "rate_hz": RATE_HZ, "bits": 16 });
+        i.detail = json!({ "rate_hz": AMP_RATE_HZ, "bits": 16 });
         i.tools = vec!["speaker_tone".into(), "speaker_play".into()];
         i
     }
@@ -87,17 +96,14 @@ impl crate::device::Device for Mic {
             }),
             ToolDef::new(
                 "mic_record",
-                "Record from the microphone and return base64 PCM (16-bit mono, 8 kHz). At most 512 samples — a tool result is capped at 2 KB, so longer audio belongs on a host",
+                "Record from the microphone and return base64 PCM (16-bit mono, 16 kHz, taken from the top 16 bits of the 24-bit samples). At most 512 samples — a tool result is capped at 2 KB, so longer audio belongs on a host",
             )
             .title("Record")
             .category("audio")
             .requires(&["mic"])
             .mutating()
             .schema(object_schema(
-                &[(
-                    "samples",
-                    integer(1, MAX_RECORD_SAMPLES as i64, "how many samples, default 256"),
-                )],
+                &[("samples", integer(1, MAX_RECORD_SAMPLES as i64, "how many samples, default 256"))],
                 &[],
             ))
             .bind(move |ctx, args| {
@@ -111,8 +117,8 @@ impl crate::device::Device for Mic {
         match tool {
             "mic_level" => {
                 let ms = j::opt_i64(args, "ms").unwrap_or(200).clamp(10, 2000) as usize;
-                let want = (RATE_HZ as usize / 1000 * ms).clamp(64, MAX_LEVEL_SAMPLES);
-                let mut buf = vec![0i16; want];
+                let want = (MIC_RATE_HZ as usize / 1000 * ms).clamp(64, MAX_LEVEL_SAMPLES);
+                let mut buf = vec![0i32; want];
                 let got = hw.i2s_mic_read(&mut buf, ms as u32 + 200)?;
                 if got == 0 {
                     return Ok(json!({
@@ -121,10 +127,13 @@ impl crate::device::Device for Mic {
                         "note": "the microphone returned no samples in the window",
                     }));
                 }
-                let (rms, peak) = levels(&buf[..got]);
+                // 24 bits left-justified in 32: shift down to 16 for dBFS arithmetic.
+                let samples: Vec<i16> = buf[..got].iter().map(|s| (*s >> 16) as i16).collect();
+                let (rms, peak) = levels(&samples);
                 Ok(json!({
                     "samples": got,
                     "ms": ms,
+                    "rate_hz": MIC_RATE_HZ,
                     "rms": rms as i64,
                     "peak": peak as i64,
                     "dbfs": if rms == 0.0 { Value::Null } else { json!(round1(20.0 * (rms / 32768.0).log10())) },
@@ -134,14 +143,16 @@ impl crate::device::Device for Mic {
             "mic_record" => {
                 let n =
                     j::opt_i64(args, "samples").unwrap_or(256).clamp(1, MAX_RECORD_SAMPLES as i64) as usize;
-                let mut buf = vec![0i16; n];
-                let got = hw.i2s_mic_read(&mut buf, (n as u32 * 1000 / RATE_HZ) + 300)?;
-                let bytes: Vec<u8> = buf[..got].iter().flat_map(|s| s.to_le_bytes()).collect();
+                let mut buf = vec![0i32; n];
+                let got = hw.i2s_mic_read(&mut buf, (n as u32 * 1000 / MIC_RATE_HZ) + 300)?;
+                let bytes: Vec<u8> =
+                    buf[..got].iter().flat_map(|s| ((*s >> 16) as i16).to_le_bytes()).collect();
                 Ok(json!({
                     "samples": got,
-                    "rate_hz": RATE_HZ,
+                    "rate_hz": MIC_RATE_HZ,
                     "bits": 16,
                     "channels": 1,
+                    "note": "16-bit values taken from the top of the 24-bit microphone samples",
                     "pcm_b64": util::b64_encode(&bytes),
                 }))
             }
@@ -181,7 +192,7 @@ impl crate::device::Device for Speaker {
             }),
             ToolDef::new(
                 "speaker_play",
-                "Play base64 PCM on the amplifier (16-bit mono, 8 kHz), at most 1024 bytes of audio",
+                "Play base64 PCM on the amplifier (16-bit mono, 24 kHz), at most 2048 bytes of audio",
             )
             .title("Play samples")
             .category("audio")
@@ -210,6 +221,7 @@ impl crate::device::Device for Speaker {
                     "ok": true,
                     "freq_hz": freq as i64,
                     "ms": ms,
+                    "rate_hz": AMP_RATE_HZ,
                     "volume_pct": (volume * 100.0) as i64,
                     "samples": samples.len(),
                 }))
@@ -233,7 +245,8 @@ impl crate::device::Device for Speaker {
                 Ok(json!({
                     "ok": true,
                     "samples": samples.len(),
-                    "ms": (samples.len() as u32 * 1000 / RATE_HZ),
+                    "rate_hz": AMP_RATE_HZ,
+                    "ms": (samples.len() as u32 * 1000 / AMP_RATE_HZ),
                 }))
             }
             other => Err(McpError::not_found(format!("speaker has no tool `{other}`"))),
@@ -243,12 +256,12 @@ impl crate::device::Device for Speaker {
 
 /// A sine at `freq` for `ms`, shaped with a short fade so the start and end do not click.
 fn tone(freq: f32, ms: u32, volume: f32) -> Vec<i16> {
-    let n = (RATE_HZ as u64 * ms as u64 / 1000) as usize;
+    let n = (AMP_RATE_HZ as u64 * ms as u64 / 1000) as usize;
     let amp = volume.clamp(0.0, 1.0) * 32767.0;
-    let fade = (RATE_HZ as usize / 200).max(8); // 5 ms
+    let fade = (AMP_RATE_HZ as usize / 200).max(8); // 5 ms
     (0..n)
         .map(|i| {
-            let phase = 2.0 * std::f32::consts::PI * freq * i as f32 / RATE_HZ as f32;
+            let phase = 2.0 * std::f32::consts::PI * freq * i as f32 / AMP_RATE_HZ as f32;
             let env = {
                 let head = (i as f32 / fade as f32).min(1.0);
                 let tail = ((n.saturating_sub(i)) as f32 / fade as f32).min(1.0);
@@ -283,16 +296,10 @@ mod tests {
     #[test]
     fn a_tone_is_bounded_and_shaped() {
         let t = tone(440.0, 100, 0.5);
-        assert_eq!(t.len(), 800, "8 kHz for 100 ms");
+        assert_eq!(t.len(), 2400, "24 kHz for 100 ms");
         assert!(t.iter().any(|s| s.abs() > 1000), "a half-volume tone must move");
         assert!(t.iter().all(|s| s.abs() <= 32767), "no wrap-around");
-        // The fade keeps the first and last samples near zero.
-        assert!(
-            t[0].abs() < 200 && t[t.len() - 1].abs() < 200,
-            "the ends click: {} {}",
-            t[0],
-            t[t.len() - 1]
-        );
+        assert!(t[0].abs() < 200 && t[t.len() - 1].abs() < 200, "the ends click");
     }
 
     #[test]
