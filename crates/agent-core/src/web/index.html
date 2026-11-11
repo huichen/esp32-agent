@@ -10,7 +10,7 @@
 </head>
 <body>
 
-<!-- Header: two lines at most. Title, one status line, one connection dot. -->
+<!-- Two lines at most: name + one status line, and the menu. -->
 <header class="bar">
   <div class="bar-main">
     <button id="menu-btn" class="icon" aria-label="Menu" title="Menu">&#9776;</button>
@@ -33,17 +33,16 @@
 
 <div id="toast" class="toast"></div>
 
-<!-- Everything that is not the conversation lives behind the menu. -->
 <section id="sheet" class="sheet" hidden>
   <div class="sheet-head">
     <h2>Board</h2>
     <button id="sheet-close" class="icon" aria-label="Close">&#10005;</button>
   </div>
+  <!-- Ordered by how often a person needs it, and only six: devices, tools, the
+       agent itself, the schedule, what it said, what it is set to. -->
   <nav class="tabs" role="tablist">
-    <button role="tab" data-panel="status" aria-selected="true">Status</button>
-    <button role="tab" data-panel="devices">Devices</button>
+    <button role="tab" data-panel="devices" aria-selected="true">Devices</button>
     <button role="tab" data-panel="tools">Tools</button>
-    <button role="tab" data-panel="manifest">Manifest</button>
     <button role="tab" data-panel="agent">Agent</button>
     <button role="tab" data-panel="schedule">Schedule</button>
     <button role="tab" data-panel="logs">Logs</button>
@@ -51,34 +50,29 @@
   </nav>
   <div class="sheet-body">
 
-    <div id="panel-status" class="panel">
-      <div class="card"><h3>Board</h3><div id="status-kv" class="kv"></div></div>
-      <div class="card"><h3>Connection</h3><div id="wifi-kv" class="kv"></div></div>
-      <div class="card"><h3>Model</h3><div id="model-kv" class="kv"></div></div>
-      <div class="buttons"><button id="devices-probe" class="btn">Probe devices</button></div>
-    </div>
-
-    <div id="panel-devices" class="panel" hidden>
-      <div class="card"><h3>Detected</h3><div id="devices-list" class="list"></div></div>
-      <div class="card"><h3>Unidentified</h3><div id="unidentified-list" class="list"></div>
-        <p class="hint">An address that answers with no driver: use <code>i2c_read</code> or describe it in the manifest.</p>
+    <div id="panel-devices" class="panel">
+      <div class="card">
+        <h3>Detected</h3>
+        <div id="devices-list" class="list"></div>
+        <div class="buttons">
+          <button id="devices-probe" class="btn primary">Probe devices</button>
+          <button id="devices-refresh" class="btn ghost">Refresh</button>
+        </div>
+        <p id="devices-mode" class="hint"></p>
       </div>
+      <div class="card">
+        <h3>Candidates</h3>
+        <div id="candidates-list" class="list"></div>
+        <p class="hint">With <code>discovery: manual</code> these are found but not adopted. Each one carries the <code>manifest_apply</code> body that adopts it.</p>
+      </div>
+      <div class="card"><h3>Unidentified</h3><div id="unidentified-list" class="list"></div></div>
     </div>
 
     <div id="panel-tools" class="panel" hidden>
-      <div class="card"><h3>Tools</h3><div id="tools-list" class="list"></div></div>
-    </div>
-
-    <div id="panel-manifest" class="panel" hidden>
       <div class="card">
-        <h3>Manifest</h3>
-        <textarea id="manifest-text" class="field" spellcheck="false"></textarea>
-        <div class="buttons">
-          <button id="manifest-validate" class="btn ghost">Validate</button>
-          <button id="manifest-apply" class="btn primary">Apply</button>
-          <button id="manifest-reload" class="btn ghost">Reload</button>
-        </div>
-        <p id="manifest-result" class="hint"></p>
+        <h3>Tools</h3>
+        <div id="tools-list" class="list"></div>
+        <p class="hint">Tap a tool for its declaration: category, capabilities it needs, and the argument schema the model sees.</p>
       </div>
     </div>
 
@@ -98,30 +92,20 @@
         <div class="buttons"><button id="agent-save" class="btn primary">Save</button></div>
       </div>
       <div class="card">
-        <h3>Goal</h3>
-        <label for="goal-objective">Objective</label>
-        <textarea id="goal-objective" class="field" placeholder="what the board should work towards"></textarea>
-        <label for="goal-max-iterations">Max iterations</label>
-        <input id="goal-max-iterations" type="number" min="1" max="50">
-        <div class="buttons">
-          <button id="goal-start" class="btn primary">Start</button>
-          <button id="goal-stop" class="btn ghost">Stop</button>
-        </div>
-        <pre id="goal-notes" class="log"></pre>
-        <p class="hint">A goal ends on GOAL MET or GOAL BLOCKED, or when the iterations run out.</p>
-      </div>
-      <div class="card">
         <h3>Conversation</h3>
+        <div class="kv" id="conversation-kv"></div>
         <div class="buttons">
           <button id="forget-tail" class="btn ghost">Keep last exchange</button>
           <button id="forget-all" class="btn ghost">Forget everything</button>
         </div>
-        <p class="hint">Memories are files (<code>/memory.md</code>) and survive this.</p>
+        <p class="hint">Memories are files (<code>/memory.md</code>) and survive this. The transcript itself lives in RAM, so a reboot starts a new one.</p>
       </div>
     </div>
 
     <div id="panel-schedule" class="panel" hidden>
-      <div class="card"><h3>Tasks</h3><div id="sched-list" class="list"></div></div>
+      <div class="card"><h3>Tasks</h3><div id="sched-list" class="list"></div>
+        <p class="hint">Daily times are UTC. The board gets UTC from SNTP; <code>Settings</code> says whether it has synced.</p>
+      </div>
       <div class="card">
         <h3>Add</h3>
         <label for="sched-prompt">Prompt</label>
@@ -141,8 +125,10 @@
     </div>
 
     <div id="panel-settings" class="panel" hidden>
+      <div class="card"><h3>Board</h3><div id="status-kv" class="kv"></div></div>
       <div class="card">
         <h3>WiFi</h3>
+        <div id="wifi-kv" class="kv"></div>
         <label for="wifi-ssid">Network</label>
         <input id="wifi-ssid" type="text" autocomplete="off">
         <label for="wifi-password">Password</label>
@@ -160,20 +146,16 @@
         <label for="auth-tick">Agent tick (ms)</label>
         <input id="auth-tick" type="number" min="200" max="5000" step="100">
         <div class="buttons"><button id="settings-save" class="btn primary">Save</button></div>
-        <p class="hint">With a PIN set, this page asks for it once and keeps a token; scripts send it as <code>Authorization: Bearer</code>.</p>
       </div>
       <div class="card">
-        <h3>Board</h3>
-        <div class="buttons">
-          <button id="reboot" class="btn ghost">Reboot</button>
-        </div>
+        <h3>Recovery</h3>
+        <div class="buttons"><button id="reboot" class="btn ghost">Reboot</button></div>
       </div>
     </div>
 
   </div>
 </section>
 
-<!-- Login: also a sheet, so it works the same on a phone and on a laptop. -->
 <section id="login" class="sheet" hidden>
   <div class="sheet-head"><h2>PIN required</h2></div>
   <div class="sheet-body">

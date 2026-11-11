@@ -19,8 +19,8 @@ mod tests {
     fn the_portal_is_self_contained() {
         assert!(INDEX_HTML.contains("/assets/app.js"));
         assert!(INDEX_HTML.contains("/assets/style.css"));
-        assert!(APP_JS.contains("/api/manifest"));
-        assert!(APP_JS.contains("/api/wifi/connect"));
+        // The page still talks to the board for the things a person does by hand.
+        assert!(APP_JS.contains("/api/devices") && APP_JS.contains("/api/wifi/connect"));
         assert!(STYLE_CSS.contains("--accent"));
         // No external CDN or font: the board must work on a captive-portal LAN. Checked
         // on the attributes that fetch rather than on the bare scheme, because the agent
@@ -33,10 +33,19 @@ mod tests {
     }
 
     #[test]
-    fn the_portal_offers_the_manifest_workflow() {
-        for needle in ["manifest-validate", "manifest-apply", "devices-probe", "wifi-connect"] {
+    fn the_portal_puts_the_controls_where_the_data_is() {
+        // Spending a device probe is a devices-page action; the button lives there.
+        for needle in ["devices-probe", "devices-refresh", "wifi-connect"] {
             assert!(INDEX_HTML.contains(needle), "missing {needle}");
         }
+        // A device or a tool row expands into its own JSON: `<details>` per row, one
+        // renderer each, and no truncation in the markup.
+        assert!(APP_JS.contains("item-detail"), "rows must be expandable");
+        assert!(APP_JS.contains("JSON.stringify(dev, null, 2)"), "a device row shows its detail");
+        assert!(
+            APP_JS.contains("JSON.stringify(t, null, 2)") || APP_JS.contains("requires: t.requires"),
+            "a tool row shows its declaration"
+        );
     }
 
     /// The console ships in English only. One pasted Chinese label would reach the bench
@@ -56,21 +65,29 @@ mod tests {
         assert!(INDEX_HTML.contains("<html lang=\"en\">"), "the document language must be English");
     }
 
-    /// The goal card is the only way to start a goal from a phone, so its wiring is worth
-    /// pinning: markup in the HTML, calls in the JS.
+    /// Six tabs, and only six: the conversation is the page, so everything else has to
+    /// earn a slot. Order is by how often a person needs it.
     #[test]
-    fn the_portal_can_start_and_stop_a_goal() {
-        for needle in ["goal-objective", "goal-max-iterations", "goal-start", "goal-stop", "goal-notes"] {
-            assert!(INDEX_HTML.contains(needle), "missing {needle}");
-        }
-        assert!(APP_JS.contains("/api/goal"));
-        assert!(APP_JS.contains("/api/goal/stop"));
-        for key in ["goal_objective", "goal_notes", "goal_started", "goal_status_stopped"] {
-            assert!(APP_JS.contains(&format!("{key}:")), "{key} must have a label in app.js");
-        }
-        // The card's own explanation: a goal ends on these words, so they are worth
-        // keeping in front of whoever writes an objective.
-        assert!(INDEX_HTML.contains("GOAL MET") && INDEX_HTML.contains("GOAL BLOCKED"));
+    fn the_board_sheet_stays_small_and_ordered() {
+        let tabs: Vec<&str> =
+            INDEX_HTML.split("data-panel=\"").skip(1).filter_map(|s| s.split('"').next()).collect();
+        assert_eq!(
+            tabs,
+            vec!["devices", "tools", "agent", "schedule", "logs", "settings"],
+            "the sheet is ordered by importance and nothing else is in it"
+        );
+        // Goal mode was removed from the portal: it read as a second, unexplained agent.
+        assert!(!INDEX_HTML.contains("goal-"), "the goal panel is gone");
+        assert!(!APP_JS.contains("/api/goal"), "and its calls with it");
+        assert!(!INDEX_HTML.contains("manifest-"), "the manifest editor moved to the agent's job");
+    }
+
+    /// Tool calls collapse into one line and expand on tap, like the rest of the chat.
+    #[test]
+    fn a_tool_call_is_a_collapsed_row() {
+        assert!(APP_JS.contains("<details") || APP_JS.contains("document.createElement(\"details\")"));
+        assert!(APP_JS.contains("tool_result") && APP_JS.contains("result: "));
+        assert!(STYLE_CSS.contains("details.tool") || STYLE_CSS.contains(".tool"), "the row needs a style");
     }
 
     /// CJK punctuation and fullwidth forms are rejected along with the ideographs: a

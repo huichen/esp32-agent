@@ -487,6 +487,18 @@ impl Hardware for EspHw {
             "pwm_channels": self.pwm,
         })
     }
+
+    /// Internal SRAM left, and the largest block a thread stack or a TLS buffer can use.
+    fn heap_internal(&mut self) -> Option<(u32, u32)> {
+        unsafe {
+            Some((
+                esp_idf_svc::sys::esp_get_free_internal_heap_size() as u32,
+                esp_idf_svc::sys::heap_caps_get_largest_free_block(
+                    esp_idf_svc::sys::MALLOC_CAP_INTERNAL | esp_idf_svc::sys::MALLOC_CAP_8BIT,
+                ) as u32,
+            ))
+        }
+    }
 }
 
 

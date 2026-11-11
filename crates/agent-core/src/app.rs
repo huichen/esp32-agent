@@ -537,6 +537,7 @@ impl App {
     pub fn status_json(&mut self) -> Value {
         let info = self.hw.board_info();
         let wifi = self.hw.wifi_status();
+        let internal = self.hw.heap_internal();
         let now = now_ms();
         json!({
             "device_name": self.cfg.device_name,
@@ -567,6 +568,10 @@ impl App {
             "memory": {
                 "free_heap_kb": info.free_heap_kb,
                 "min_free_heap_kb": info.min_free_heap_kb,
+                // Internal SRAM is what thread stacks, DMA and the TLS handshake come from;
+                // the total above includes PSRAM and can look healthy while this is empty.
+                "internal_kb": internal.map(|(free, _)| free / 1024),
+                "largest_internal_kb": internal.map(|(_, largest)| largest / 1024),
             },
             "uptime_s": self.runtime.uptime_s(now),
             "wifi": wifi,
