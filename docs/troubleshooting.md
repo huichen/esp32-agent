@@ -72,6 +72,24 @@ That is by design: `safety.min/max` and `params.min/max` are both checked on the
 the message carries the range, e.g. `` `ms` = 90000 is outside 10..=5000 ms ``. Change the
 argument, not the firmware.
 
+## The portal will not open
+
+Three things produce the same symptom — a browser showing nothing — and the board's log
+tells them apart:
+
+- `***ERROR*** A stack overflow in task pthread` → a handler outgrew its stack. `/api/tools`
+  serialising every tool descriptor is the heavy one; the accept thread runs with 16 kB for
+  that reason.
+- `could not spawn connection thread` → internal RAM, not PSRAM. Thread stacks come from
+  internal SRAM; check the `mem:` lines the firmware logs at boot (`boot`, `after devices`,
+  `after wifi`) and lower `log.ring` or the device count if `after wifi` is under 30 kB.
+- Connections reset with no log line at all → the socket pool. Every closed connection sits
+  in TIME_WAIT for 2x TCP MSL; `CONFIG_LWIP_MAX_SOCKETS=20` and a 5 s MSL keep the pool
+  usable after repeated page loads.
+
+`curl -sS -m 5 http://<board>:8080/api/tools | head -c 200` is the fastest check: it is the
+heaviest endpoint the portal calls, so if it answers, the page will load.
+
 ## The panel stays dark or shows garbage
 
 - Confusing 128x32 with 128x64 garbles it: set `pins["oled.height"]`, or `options.height` in
