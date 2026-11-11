@@ -173,10 +173,18 @@ impl Conn {
             ..Default::default()
         };
         tls.connect(&target.host, target.port, &cfg).map_err(|e| {
+            // The clock is not a hint here: with the RTC at the epoch every certificate
+            // reads as "not yet valid", and mbedTLS reports only ESP_FAIL. Say the time.
             format!(
-                "the TLS handshake with {} failed: {e} (a clock far from real time is the \
-                 usual cause; `wifi_status` shows whether SNTP has synced)",
-                target.authority()
+                "the TLS handshake with {} failed: {e} (board clock is {}s since the epoch{}; \
+                 a clock far from real time is the usual cause)",
+                target.authority(),
+                unsafe { esp_idf_svc::sys::time(std::ptr::null_mut()) },
+                if unsafe { esp_idf_svc::sys::time(std::ptr::null_mut()) } < 1_700_000_000 {
+                    " — SNTP has not synced"
+                } else {
+                    ""
+                }
             )
         })?;
         Ok(Conn::Tls(Box::new(tls)))
