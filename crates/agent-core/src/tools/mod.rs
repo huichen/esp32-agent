@@ -479,16 +479,24 @@ pub fn script_specs() -> Value {
         "type": "function",
         "function": {
             "name": "script",
-            "description": "Run a small script on the board: `let`, `if`, `while`, `break`, numbers, strings, lists, maps, and `tool(name, args)` to call any other board tool. Use it for loops and conditions the fixed tools cannot express, e.g. scan every bus, adopt what you recognise, then report. Bounded at 50000 steps; `tool(\"script\")` is refused.",
+            "description": "Run a small script on the board: `let`, `if`, `while`, `break`, numbers, strings, lists, maps, and `tool(name, args)` to call any other board tool. Call with {\"help\": true} (or {\"section\": \"overview\" | \"builtins\" | \"examples\"}) for the syntax — one tool result is capped at 2 KB, so the reference comes in sections. Bounded at 50000 steps; `tool(\"script\")` is refused.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "source": {
                         "type": "string",
                         "description": "the program; `#` starts a comment; the value of the last expression is returned"
+                    },
+                    "help": {
+                        "type": "boolean",
+                        "description": "return the syntax reference instead of running anything"
+                    },
+                    "section": {
+                        "type": "string",
+                        "enum": ["overview", "builtins", "examples"],
+                        "description": "which part of the reference to return"
                     }
                 },
-                "required": ["source"],
                 "additionalProperties": false
             }
         }

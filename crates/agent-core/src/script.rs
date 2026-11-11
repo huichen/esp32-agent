@@ -48,6 +48,94 @@ pub trait ScriptHost {
     fn call_tool(&mut self, name: &str, arguments: &Value) -> Result<Value, String>;
 }
 
+/// The reference the model reads before writing a script.
+///
+/// A tool description is one paragraph, and a language needs more than that: the first
+/// run of a real agent guessed `tool()` (the example was in the description) and then
+/// asked for `speaker_tone` without knowing it existed. Sections rather than one document
+/// because a tool result is capped at 2 KB and a truncated reference is worse than none.
+pub fn help(section: &str) -> Result<String, String> {
+    match section {
+        "" | "overview" => Ok(OVERVIEW.to_string()),
+        "builtins" => Ok(BUILTINS.to_string()),
+        "examples" => Ok(EXAMPLES.to_string()),
+        other => Err(format!("unknown section `{other}`; use overview, builtins or examples")),
+    }
+}
+
+const OVERVIEW: &str = r#"# board script — overview
+
+A small program the board runs: loops and conditions over tool calls.
+
+    let scan = tool("i2c_scan", {})
+    let i = 0
+    while i < len(scan.addresses) {
+      log("probe " + scan.addresses[i])
+      i = i + 1
+    }
+
+VALUES   number, string, bool, nil, list, map
+         [1, 2]   {a: 1}   "text"   true   nil
+STATEMENTS
+         let x = 1        declare
+         x = 2            assign
+         l[0] = 9 / m.k = 9
+         if cond { ... } else { ... }
+         while cond { ... }        break inside
+         # comment
+OPERATORS  + - * / %   == != < <= > >=   and or not   (unary -)
+           `+` also joins strings and concatenates lists
+ACCESS     d.field   d["field"]   list[0]   (missing key -> nil)
+RESULT     the value of the last expression is returned
+LIMITS     50000 steps, 32 nested blocks, 4 KB strings, 64 log lines
+"#;
+
+const BUILTINS: &str = r#"# board script — builtins
+
+Only these, plus `tool`:
+
+  len(x)        string chars, list items, map keys; len(nil) is 0
+  str(x)        printable text
+  num(x)        "12" -> 12, true -> 1
+  type(x)       "number" | "string" | "bool" | "nil" | "list" | "map"
+  log(x, ...)   one line into the run output (64 lines max)
+  tool(name, args)   call any board tool; args is a map; returns its JSON
+
+`tool` is the only way out: same permissions as the caller, and
+`tool("script", ...)` is refused.
+
+To find what you can call: `devices_list`, `tools/list`, or read `/memory.md`.
+"#;
+
+const EXAMPLES: &str = r#"# board script — examples
+
+Adopt every device a probe found but did not adopt:
+
+    let d = tool("devices_list", {})
+    let i = 0
+    while i < len(d.candidates) {
+      let c = d.candidates[i]
+      if c.adopted == false and c.adopt != nil {
+        tool("manifest_apply", {mode: "merge", manifest: {version: 1, devices: c.adopt.devices}})
+      }
+      i = i + 1
+    }
+
+Play a melody (notes are Hz; `speaker_tone` needs a speaker device):
+
+    let notes = [440, 494, 523, 587]
+    let i = 0
+    while i < 4 {
+      tool("speaker_tone", {freq_hz: notes[i], ms: 150, volume: 20})
+      i = i + 1
+    }
+
+Report and stop early on a failure:
+
+    let s = tool("board_status", {})
+    if s.heap_kb != nil { log("heap " + str(s.heap_kb)) }
+"#;
+
 /// The result of a run.
 #[derive(Debug)]
 pub struct Outcome {
