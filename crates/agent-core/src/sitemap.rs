@@ -203,6 +203,15 @@ pub const ROUTES: &[Route] = &[
     ),
     r("POST", "/api/agent/reset", "agent", Auth::Pin, "Clear the conversation", "", "{ok}"),
     r(
+        "POST",
+        "/api/agent/forget",
+        "agent",
+        Auth::Pin,
+        "Keep the last `keep` question-and-answer exchanges and drop the rest, or drop everything with 0; the compressed index goes with it",
+        "{keep?: integer}",
+        "{ok, removed, kept}",
+    ),
+    r(
         "GET",
         "/api/agent/config",
         "agent",
@@ -237,6 +246,15 @@ pub const ROUTES: &[Route] = &[
         "The same journal as server-sent events: replay, then follow",
         "?after=<seq>",
         "text/event-stream; 503 and Retry-After: 5 when two are open",
+    ),
+    r(
+        "GET",
+        "/api/agent/prompt",
+        "agent",
+        Auth::Open,
+        "The system prompt as the model receives it: memory index and the compressed view of earlier turns included",
+        "",
+        "{system, bytes, archive_lines, history}",
     ),
     // --- scheduling and goals ------------------------------------------------------
     r("GET", "/api/sched", "sched", Auth::Open, "Scheduled tasks and sensor rules", "", "{tasks, rules}"),

@@ -100,6 +100,8 @@ const GOAL: &[Field] = &[
     f("max_iterations", "integer", "10", "iterations before it stops"),
 ];
 
+const MEMORY: &[Field] = &[f("keep", "integer", "0", "exchanges to keep; 0 drops the whole conversation")];
+
 const TOOLS: &[Field] = &[
     f("tools/call name+arguments", "object", "", "every detected device, the manifest tools, fs_* and net_*"),
     f("manifest", "object", "", "POST /api/manifest to add devices and tools; live at once"),
@@ -130,6 +132,12 @@ pub const GROUPS: &[Group] = &[
         endpoint: "POST /api/goal",
         summary: "A long-running objective the board works on across runs",
         fields: GOAL,
+    },
+    Group {
+        group: "conversation",
+        endpoint: "POST /api/agent/forget",
+        summary: "Keep the last N exchanges or forget the whole transcript; memories live in files",
+        fields: MEMORY,
     },
     Group {
         group: "actions",

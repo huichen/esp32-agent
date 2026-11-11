@@ -30,6 +30,7 @@ runs — and the same document drives both the MCP endpoint and the board's own 
 | **Two kinds of caller, one surface** | 51 tools on the MCP endpoint — and the on-board agent sees that same list, `fs_*`/`net_*` included. No second description of the hardware to drift. |
 | **A body, not just hands** | Pins and buses, the manifest, runtime configuration, `/AGENTS.md`, `/skills/*`, the file workspace, timers, sensor rules and goals are all operations the agent can perform on itself. |
 | **It acts while you are not looking** | `POST /api/sched` runs prompts on a clock or a sensor threshold; `POST /api/goal` gives it an objective and lets it iterate, one step per round, with notes that survive reboots. |
+| **It remembers, and can forget** | `/memory.md` is an index the agent writes with `fs_write`, pointing at `/memory/<topic>.md`; the index is in every prompt, the bodies are opened only when needed. Old turns are compressed into a deterministic index (no summary, no model call), and `POST /api/agent/forget {"keep":N}` cuts the past away on purpose. |
 | **Bring your own brain** | Any OpenAI-compatible `/chat/completions`, `http://` or `https://` (esp-tls + certificate bundle). Measured on the bench with `future-os.cn` and `deepseek-flash`: four tools in one turn, 13.7 s. |
 
 Point an external agent at `GET /agent.json` and it can drive all of this without reading
@@ -249,6 +250,7 @@ which made the layering look like a duplicate. They are `agent.rs` (core) and
 - [Troubleshooting](docs/troubleshooting.md) — dark panel, empty I2C scan, portal that will not open
 - [Agent loop](docs/agent-loop.md) and [agent stream](docs/agent-stream.md)
 - [Instructions and skills](docs/agent-skills.md) — `/AGENTS.md` and `/skills/<name>.md`
+- [Memory, compression and forgetting](docs/agent-memory.md) — `/memory.md` as an index, a deterministic transcript index instead of a summary, and `POST /api/agent/forget`
 - [Goal mode](docs/agent-goal.md) — objectives, notes, when it stops
 
 ## Contributing
