@@ -194,7 +194,25 @@ impl Conn {
             Conn::Plain(stream) => {
                 stream.write_all(data).and_then(|()| stream.flush()).map_err(|e| format!("sending the request failed: {e}"))
             }
-            Conn::Tls(tls) => tls.write_all(data).map_err(|e| format!("sending the request over TLS failed: {e}")),
+            Conn::Tls(tls) => tls.write_all(data).map_err(|e| {
+                // A bare ESP_FAIL here says nothing: the request is routinely 20-30 kB
+                // (51 tool definitions plus the tool results), and the board has a few kB
+                // of internal RAM to spare. Report the size and the heap at the moment of
+                // failure — that is what decides whether this is a size or a memory fault.
+                let free = unsafe { esp_idf_svc::sys::esp_get_free_internal_heap_size() } / 1024;
+                let largest = unsafe {
+                    esp_idf_svc::sys::heap_caps_get_largest_free_block(
+                        esp_idf_svc::sys::MALLOC_CAP_INTERNAL | esp_idf_svc::sys::MALLOC_CAP_8BIT,
+                    )
+                } / 1024;
+                format!(
+                    "sending the request over TLS failed: {e} ({} bytes, internal heap {} kB, \
+                     largest block {} kB)",
+                    data.len(),
+                    free,
+                    largest
+                )
+            }),
         }
     }
 

@@ -226,8 +226,18 @@ impl Hardware for EspHw {
             .ok_or_else(|| McpError::hardware(format!("I2C bus {bus} is not open")))?;
         let mut found = Vec::new();
         for addr in 0x08u8..=0x77 {
-            let rc = unsafe { sys::i2c_master_probe(handle, addr as u16, I2C_TIMEOUT_MS) };
-            if rc == sys::ESP_OK {
+            let first = unsafe { sys::i2c_master_probe(handle, addr as u16, I2C_TIMEOUT_MS) };
+            if first != sys::ESP_OK {
+                continue;
+            }
+            // One ACK is not evidence on a breadboard bus: a glitch on SDA during the
+            // address byte's acknowledge bit reads as a device, and the same scan then
+            // reports 0x51, 0x73, 0x0D or nothing at all from one run to the next. The
+            // agent builds its picture of the hardware from this list, so an address has
+            // to answer twice to be reported.
+            esp_idf_svc::hal::delay::FreeRtos::delay_ms(1);
+            let second = unsafe { sys::i2c_master_probe(handle, addr as u16, I2C_TIMEOUT_MS) };
+            if second == sys::ESP_OK {
                 found.push(addr);
             }
         }
