@@ -23,7 +23,10 @@ Two buildable units and one firmware project:
 ## 2. Branching and worktrees
 
 - `main` is always green (`cargo test` passes).
-- Non-trivial work happens in a worktree, not by editing `main` directly:
+- **Every change happens in a worktree, never by editing `main` directly** — a one-line
+  documentation fix included. There is no change small enough to skip the branch: the
+  branch is what makes the work reviewable, and rollback is deleting it rather than
+  rewriting history someone else may already have.
 
   ```bash
   git worktree add --no-track .worktrees/<name> -b <type>/<name> origin/main
