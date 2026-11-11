@@ -23,17 +23,22 @@ Two buildable units and one firmware project:
 ## 2. Branching and worktrees
 
 - `main` is always green (`cargo test` passes).
-- Non-trivial work happens in a worktree, not by editing `main` directly:
+- **Every change happens in a worktree, never by editing `main` directly** — a one-line
+  documentation fix included. There is no change small enough to skip the branch: the
+  branch is what makes the work reviewable, and rollback is deleting it rather than
+  rewriting history someone else may already have.
 
   ```bash
-  git worktree add --no-track .worktrees/<name> -b <type>/<name> origin/main
+  git worktree add --no-track .worktrees/<name> -b <type>/<name> github/main
   ```
 
   `<type>` is `feat` / `fix` / `docs` / `refactor` / `test` / `ci` / `chore`, matching
   the commit prefix.
 - `.worktrees/` is untracked. When the change lands: `git worktree remove
   .worktrees/<name>`, delete the branch, `git worktree prune`, then fast-forward local
-  `main` from `origin/main`.
+  `main` from `github/main`. The remote is named `github` in this clone, not `origin`;
+  the command above fails with `fatal: invalid reference: origin/main` if copied as a
+  habit from another repository.
 - Never touch a worktree or branch you did not create. If `main` carries commits you did
   not author, report them; do not clean them up.
 
