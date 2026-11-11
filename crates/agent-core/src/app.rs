@@ -280,6 +280,7 @@ impl App {
         self.probe = ProbeReport {
             buses: res.buses,
             unknown: res.unknown,
+            candidates: res.candidates,
             at_ms: now_ms(),
             duration_ms: started.elapsed().as_millis() as u64,
         };
@@ -313,6 +314,16 @@ impl App {
                     self.log.warn("manifest", format!("device `{}` failed: {}", spec.id, e.message));
                     declared_errors.push(json!({ "device": spec.id, "error": e.message }));
                 }
+            }
+        }
+
+        // Mark which candidates are already live, so a script that adopts them does not
+        // have to diff two lists itself — and so a second run is visibly a no-op.
+        if !self.probe.candidates.is_empty() {
+            let live: Vec<String> = self.devices.infos().iter().map(|d| d.id.clone()).collect();
+            for candidate in self.probe.candidates.iter_mut() {
+                let id = candidate.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                candidate["adopted"] = json!(live.contains(&id));
             }
         }
 
@@ -445,7 +456,7 @@ impl App {
     /// is a device tool.
     fn extra_mcp_specs(&self) -> Vec<Value> {
         let mut out = Vec::new();
-        for group in [fs_tools::specs(), net_tools::specs()] {
+        for group in [fs_tools::specs(), net_tools::specs(), board_tools::script_specs()] {
             for tool in openai_tools(&group) {
                 let name = tool["function"]["name"].as_str().unwrap_or_default().to_string();
                 if self.cfg.mcp.disabled_tools.iter().any(|d| d == &name) {
@@ -684,7 +695,57 @@ impl App {
 
     // ---------------------------------------------------------------- tool calls
 
+    /// Run a board script (`script` tool).
+    ///
+    /// The script gets a host that calls back into this dispatcher, so `tool()` inside a
+    /// script has exactly the reach of the caller: no extra capability, no bypass of
+    /// `is_visible`, and `script` itself is refused to stop unbounded recursion.
+    fn run_script(&mut self, args: &Value) -> Result<Value> {
+        let source = crate::json::opt_str(args, "source")
+            .ok_or_else(|| McpError::invalid_params("`source` is required"))?;
+        struct Host<'a> {
+            app: &'a mut App,
+        }
+        impl crate::script::ScriptHost for Host<'_> {
+            fn call_tool(&mut self, name: &str, arguments: &Value) -> std::result::Result<Value, String> {
+                if name == "script" {
+                    return Err("a script may not call `script`".into());
+                }
+                // `App::call_tool` already returns the tool's JSON value.
+                self.app.call_tool(name, arguments).map_err(|e| e.message)
+            }
+        }
+        let mut host = Host { app: self };
+        let started = now_ms();
+        match crate::script::run(&source, &mut host) {
+            Ok(outcome) => {
+                self.log.info(
+                    "script",
+                    format!(
+                        "ran in {} ms: {} step(s), {} log line(s)",
+                        now_ms().saturating_sub(started),
+                        outcome.steps,
+                        outcome.output.len()
+                    ),
+                );
+                Ok(json!({
+                    "ok": true,
+                    "result": outcome.result,
+                    "output": outcome.output,
+                    "steps": outcome.steps,
+                }))
+            }
+            Err(e) => Err(McpError::invalid_params(format!("script failed: {e}"))),
+        }
+    }
+
     pub fn call_tool(&mut self, name: &str, args: &Value) -> Result<Value> {
+        // The script tool is the one tool that needs the dispatcher itself: `tool()` inside
+        // a script calls any other tool, so it cannot live in the registry where handlers
+        // only see a `ToolCtx`.
+        if name == "script" {
+            return self.run_script(args);
+        }
         if !self.is_visible(name) {
             let missing =
                 self.tools.get(name).map(|d| self.caps.missing(&d.spec.requires)).unwrap_or_default();
@@ -1869,6 +1930,8 @@ impl App {
                 "devices": self.devices.infos(),
                 "unidentified": self.probe.unknown,
                 "buses": self.probe.buses,
+                "candidates": self.probe.candidates,
+                "discovery": self.cfg.discovery,
                 "caps": self.caps.to_json(),
                 "summary": drivers::summary(&self.devices),
             })),
@@ -2389,7 +2452,7 @@ impl ToolHost for App {
         // File and HTTP tools gate on nothing the hardware must provide, so they are not
         // MCP tools; they are appended after the board's own list, and they come before
         // the manifest block because they never change at runtime.
-        for group in [fs_tools::specs(), net_tools::specs()] {
+        for group in [fs_tools::specs(), net_tools::specs(), board_tools::script_specs()] {
             tools.extend(openai_tools(&group));
         }
         tools.extend(volatile);
@@ -3244,6 +3307,53 @@ mod tests {
         assert!(!app.tasks[0].enabled);
         app.call_tool("schedule", &json!({"action":"remove","id":"t1"})).expect("remove");
         assert!(app.tasks.is_empty());
+    }
+
+    /// Manual discovery: the drivers probe, nothing is adopted, and the board's own agent
+    /// is the one that decides what the board has.
+    #[test]
+    fn manual_discovery_hands_the_decision_to_the_agent() {
+        let mut app = test_app();
+        let auto = app.devices.len();
+        assert!(auto > 0, "the virtual board reports a few devices");
+
+        app.cfg.discovery = "manual".into();
+        app.rebuild();
+        assert_eq!(app.devices.len(), 0, "manual discovery adopts nothing on its own");
+        assert!(app.probe.candidates.len() >= auto, "the drivers still saw them");
+        let candidate = app.probe.candidates[0].clone();
+        assert!(candidate["adopt"]["devices"].is_array(), "a candidate must say how to adopt it");
+
+        // The exact body a candidate hands back is a valid manifest.
+        let manifest = json!({
+            "version": 1,
+            "devices": candidate["adopt"]["devices"].clone(),
+            "tools": [],
+        });
+        app.call_tool("manifest_apply", &json!({"manifest": manifest})).expect("adopting a candidate works");
+        assert!(app.devices.len() >= 1, "the adopted device is live");
+    }
+
+    /// A script is how the model writes the loop the tool vocabulary cannot express — and
+    /// `tool()` inside it goes through the same dispatcher, so it cannot reach further than
+    /// the caller.
+    #[test]
+    fn a_script_can_drive_the_boards_tools() {
+        let mut app = test_app();
+        let out = app
+            .call_tool(
+                "script",
+                &json!({"source": "let d = tool(\"devices_list\", {})\nlet n = d.count\nlet i = 0\nwhile i < n { i = i + 1 }\nlog(\"devices: \" + str(n))\ni"}),
+            )
+            .expect("script runs");
+        assert_eq!(out["ok"], true);
+        assert!(out["steps"].as_u64().unwrap_or(0) > 0);
+        assert!(out["output"][0].as_str().unwrap().starts_with("devices: "));
+        assert_eq!(out["result"], json!(app.devices.len() as i64));
+
+        // A script that tries to recurse is refused rather than nesting until the stack dies.
+        let err = app.call_tool("script", &json!({"source": "tool(\"script\", {})"}));
+        assert!(err.is_err());
     }
 
     #[test]
@@ -4500,18 +4610,18 @@ mod tests {
         }
         assert!(!board.contains(&"aaa_manifest"), "a manifest tool is not in the board block: {board:?}");
 
-        // ... then the tools outside the registry — file and network — in module order ...
+        // ... then the tools outside the registry — file, network, script — in module order ...
         assert_eq!(
-            &names[split..split + 10],
+            &names[split..split + 11],
             &[
                 "fs_ls", "fs_read", "fs_write", "fs_edit", "fs_rm", "fs_cp", "fs_mv", "fs_grep", "net_get",
-                "net_post"
+                "net_post", "script"
             ],
-            "the file and network tools are not the trailing block: {names:?}"
+            "the file, network and script tools are not the trailing block: {names:?}"
         );
 
         // ... and the manifest block last, because it is the one the model rewrites.
-        assert_eq!(&names[split + 10..], &["aaa_manifest"], "{names:?}");
+        assert_eq!(&names[split + 11..], &["aaa_manifest"], "{names:?}");
     }
 
     /// The same board has to produce the same bytes, or the provider's prompt cache

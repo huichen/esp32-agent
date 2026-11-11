@@ -16,6 +16,10 @@ pub const CONFIG_VERSION: u32 = 1;
 fn default_true() -> bool {
     true
 }
+
+fn default_discovery() -> String {
+    "auto".to_string()
+}
 pub const NVS_KEY_CONFIG: &str = "config";
 pub const DEFAULT_PORT: u16 = 8080;
 pub const DEFAULT_PATH: &str = "/mcp";
@@ -55,6 +59,12 @@ pub struct Config {
     /// how a different devkit gets a small surface it grows on purpose.
     #[serde(default = "default_true")]
     pub auto_peripherals: bool,
+    /// `auto` (default) adopts every device a driver recognises. `manual` probes and
+    /// reports them as candidates but adopts nothing, so the board can boot with an empty
+    /// device list and grow it by `manifest_apply` — the agent discovers the hardware and
+    /// decides what the board has.
+    #[serde(default = "default_discovery")]
+    pub discovery: String,
     pub wifi: WifiCfg,
     pub mcp: McpCfg,
     pub bus: BusCfg,
@@ -185,6 +195,7 @@ impl Default for Config {
             device_name: "esp32-agent".into(),
             board: "auto".into(),
             auto_peripherals: true,
+            discovery: default_discovery(),
             wifi: WifiCfg::default(),
             mcp: McpCfg::default(),
             bus: BusCfg::default(),
@@ -306,6 +317,13 @@ impl Config {
         if let Some(b) = patch.get("auto_peripherals").and_then(|v| v.as_bool()) {
             self.auto_peripherals = b;
             touched.push("auto_peripherals".into());
+        }
+        if let Some(d) = patch.get("discovery").and_then(|v| v.as_str()) {
+            if d != "auto" && d != "manual" {
+                return Err(crate::error::McpError::invalid_params("discovery must be `auto` or `manual`"));
+            }
+            self.discovery = d.to_string();
+            touched.push("discovery".into());
         }
         if let Some(w) = patch.get("wifi").and_then(|v| v.as_object()) {
             if let Some(s) = w.get("ssid").and_then(|v| v.as_str()) {
