@@ -174,9 +174,16 @@ impl Conn {
         };
         tls.connect(&target.host, target.port, &cfg).map_err(|e| {
             format!(
-                "the TLS handshake with {} failed: {e} (a clock far from real time is the \
-                 usual cause; `wifi_status` shows whether SNTP has synced)",
-                target.authority()
+                "the TLS handshake with {} failed: {e} (board clock {}s, internal heap {} kB with a \
+                 {} kB largest block)",
+                target.authority(),
+                unsafe { esp_idf_svc::sys::time(std::ptr::null_mut()) },
+                unsafe { esp_idf_svc::sys::esp_get_free_internal_heap_size() } / 1024,
+                unsafe {
+                    esp_idf_svc::sys::heap_caps_get_largest_free_block(
+                        esp_idf_svc::sys::MALLOC_CAP_INTERNAL | esp_idf_svc::sys::MALLOC_CAP_8BIT,
+                    )
+                } / 1024
             )
         })?;
         Ok(Conn::Tls(Box::new(tls)))
