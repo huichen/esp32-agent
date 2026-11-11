@@ -529,6 +529,13 @@ impl App {
         let now = now_ms();
         json!({
             "device_name": self.cfg.device_name,
+            // The board's clock, because it decides whether https works at all: before
+            // SNTP syncs, every certificate reads as "not yet valid".
+            "time": {
+                "unix_s": now / 1000,
+                "synced": now > 1_700_000_000_000,
+                "note": "before SNTP syncs, https handshakes fail and http does not",
+            },
             "firmware": {
                 "name": self.firmware.name,
                 "version": self.firmware.version,
