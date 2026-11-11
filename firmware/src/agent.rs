@@ -5,9 +5,11 @@
 //! for the board is exactly three things:
 //!
 //! * [`EspHttpTransport`] — the single `POST` that the model call and the `net_*`
-//!   tools both need, spoken as HTTP/1.1 over `std::net::TcpStream`. v1 has no TLS,
-//!   so `https://` is refused before a socket is opened rather than as a failed
-//!   handshake nobody can read.
+//!   tools both need, spoken as HTTP/1.1 over `std::net::TcpStream` for `http://` and
+//!   over esp-tls (mbedTLS, verified against the ESP-IDF certificate bundle) for
+//!   `https://`. The TLS path adds a handshake and ~40 KB of heap for the session, not
+//!   a different request: the bytes after the handshake are the same ones the plain
+//!   socket would have carried.
 //! * [`attach`] — hands that transport to the `App`, which owns the only place the
 //!   rest of the firmware looks for it.
 //! * [`start`] — one thread, one tick per configured interval (`agent.tick_ms`, re-read
@@ -29,9 +31,10 @@
 //!   wall-clock time once the clock is real; the thread says which it is at boot.
 //!
 //! The blocks between the `===` markers (transport, one tick, the clock) depend
-//! deliberately on nothing but `std`, `log` and `esp32_agent_core`, so the same lines
-//! can be compiled and run on the host: this crate cannot run `cargo test`, and an
-//! untested HTTP client is where the bench would lose a day.
+//! deliberately on nothing but `std`, `log`, `esp32_agent_core` and — for the TLS
+//! handshake only — `esp_idf_svc::tls`, so the HTTP framing below is the same code on
+//! both sides: this crate cannot run `cargo test`, and an untested HTTP client is
+//! where the bench would lose a day.
 
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, MutexGuard};
@@ -58,6 +61,9 @@ const CLOCK_SET_AFTER_S: u64 = 1_700_000_000;
 use std::io::{ErrorKind, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 
+/// esp-tls for `https://`: mbedTLS with the certificate bundle compiled into the image.
+use esp_idf_svc::tls::{Config as TlsConfig, EspTls, InternalSocket};
+
 /// Reply headers larger than this are refused instead of buffered.
 const MAX_HEADER_BYTES: usize = 16 * 1024;
 
@@ -71,7 +77,7 @@ const DEFAULT_TIMEOUT_S: u32 = 45;
 const MIN_TIMEOUT_S: u32 = 5;
 const MAX_TIMEOUT_S: u32 = 300;
 
-/// Plain-HTTP `POST` for one OpenAI-compatible chat endpoint.
+/// `POST` for one OpenAI-compatible chat endpoint, plain or TLS.
 ///
 /// The timeout sits behind an `Arc<AtomicU32>` because the portal can change it
 /// while the transport is already owned by the `App`: the agent thread copies the
@@ -113,21 +119,15 @@ impl ChatTransport for EspHttpTransport {
     fn post_json(&mut self, url: &str, headers: &[(&str, &str)], body: &str) -> Result<String, String> {
         let target = Target::parse(url)?;
         let timeout = self.timeout();
-        let mut stream = target.connect(timeout)?;
-        stream.set_read_timeout(Some(timeout)).map_err(|e| format!("could not set the read timeout: {e}"))?;
-        stream
-            .set_write_timeout(Some(timeout))
-            .map_err(|e| format!("could not set the write timeout: {e}"))?;
-        // One request per connection and no interactive traffic: Nagle would only
-        // add latency to the header/body split.
-        let _ = stream.set_nodelay(true);
-
         let request = request_bytes(&target, headers, body);
-        stream.write_all(&request).and_then(|()| stream.flush()).map_err(|e| {
-            format!("sending the request to {}:{}{} failed: {e}", target.host, target.port, target.path)
-        })?;
 
-        let response = read_response(&mut stream, timeout)?;
+        let mut conn = if target.tls {
+            Conn::connect_tls(&target, timeout)?
+        } else {
+            Conn::connect_plain(&target, timeout)?
+        };
+        conn.write_all(&request)?;
+        let response = read_response(&mut conn, timeout)?;
         if (200..300).contains(&response.status) {
             Ok(response.body)
         } else {
@@ -138,9 +138,82 @@ impl ChatTransport for EspHttpTransport {
     }
 }
 
-/// `http://host[:port]/path`, parsed out of the config string.
+/// The socket a reply arrives on: plain TCP, or esp-tls when the endpoint is `https`.
+///
+/// Both arms expose the same three operations, so [`read_response`] — the part with
+/// the framing rules in it — is written once and cannot drift between the two schemes.
+enum Conn {
+    Plain(TcpStream),
+    Tls(Box<EspTls<InternalSocket>>),
+}
+
+impl Conn {
+    fn connect_plain(target: &Target, timeout: Duration) -> Result<Self, String> {
+        let stream = target.connect(timeout)?;
+        stream.set_read_timeout(Some(timeout)).map_err(|e| format!("could not set the read timeout: {e}"))?;
+        stream
+            .set_write_timeout(Some(timeout))
+            .map_err(|e| format!("could not set the write timeout: {e}"))?;
+        // One request per connection and no interactive traffic: Nagle would only
+        // add latency to the header/body split.
+        let _ = stream.set_nodelay(true);
+        Ok(Conn::Plain(stream))
+    }
+
+    /// A TLS session verified against the certificate bundle in the image.
+    ///
+    /// There is deliberately no "trust anything" switch: a board that accepts any
+    /// certificate cannot tell the provider from an impostor on the same WiFi, which
+    /// is the one thing TLS is here to answer. A private CA belongs in `ca_cert`.
+    fn connect_tls(target: &Target, timeout: Duration) -> Result<Self, String> {
+        let mut tls = EspTls::new().map_err(|e| format!("could not create the TLS session: {e}"))?;
+        let cfg = TlsConfig {
+            use_crt_bundle_attach: true,
+            timeout_ms: timeout.as_millis().min(u32::MAX as u128) as u32,
+            ..Default::default()
+        };
+        tls.connect(&target.host, target.port, &cfg).map_err(|e| {
+            format!(
+                "the TLS handshake with {} failed: {e} (a clock far from real time is the \
+                 usual cause; `wifi_status` shows whether SNTP has synced)",
+                target.authority()
+            )
+        })?;
+        Ok(Conn::Tls(Box::new(tls)))
+    }
+
+    fn write_all(&mut self, data: &[u8]) -> Result<(), String> {
+        match self {
+            Conn::Plain(stream) => {
+                stream.write_all(data).and_then(|()| stream.flush()).map_err(|e| format!("sending the request failed: {e}"))
+            }
+            Conn::Tls(tls) => tls.write_all(data).map_err(|e| format!("sending the request over TLS failed: {e}")),
+        }
+    }
+
+    /// One read. Interrupted reads are retried here so every caller sees the same
+    /// contract the plain socket has.
+    fn read(&mut self, buf: &mut [u8], timeout: Duration) -> Result<usize, String> {
+        match self {
+            Conn::Plain(stream) => loop {
+                match stream.read(buf) {
+                    Ok(n) => return Ok(n),
+                    Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+                    Err(e) => return Err(read_error(&e, timeout)),
+                }
+            },
+            Conn::Tls(tls) => tls.read(buf).map_err(|e| {
+                format!("reading the reply over TLS failed: {e} (the session times out after {} s)", timeout.as_secs())
+            }),
+        }
+    }
+}
+
+/// `http://host[:port]/path` or `https://host[:port]/path`, parsed out of the config
+/// string.
 #[derive(Debug)]
 struct Target {
+    tls: bool,
     host: String,
     port: u16,
     path: String,
@@ -150,19 +223,19 @@ impl Target {
     fn parse(url: &str) -> Result<Self, String> {
         let url = url.trim();
         let lower = url.to_ascii_lowercase();
-        if lower.starts_with("https://") {
-            return Err(
-                "https:// is not supported on the board (no TLS); point base_url at an http:// LAN endpoint"
-                    .to_string(),
-            );
-        }
-        if !lower.starts_with("http://") {
+        // Both schemes are supported; TLS is a property of this struct, not a
+        // separate code path above it.
+        let (tls, rest) = if lower.starts_with("https://") {
+            (true, &url["https://".len()..])
+        } else if lower.starts_with("http://") {
+            (false, &url["http://".len()..])
+        } else {
             return Err(format!(
-                "the model endpoint must start with http://, got `{}`",
+                "the model endpoint must start with http:// or https://, got `{}`",
                 llm::body_prefix(url, 80)
             ));
-        }
-        let rest = &url["http://".len()..];
+        };
+        let default_port = if tls { 443u16 } else { 80u16 };
         let (authority, path) = match rest.find('/') {
             Some(index) => (&rest[..index], &rest[index..]),
             None => (rest, "/"),
@@ -172,8 +245,8 @@ impl Target {
         }
         if authority.starts_with('[') {
             // getaddrinfo wants the bare `::1`, so a bracketed literal would have to
-            // be unwrapped here; a LAN proxy is an IPv4 address, so say so instead of
-            // resolving something subtly wrong.
+            // be unwrapped here; a LAN address or a provider name is v4 or DNS, so say
+            // so instead of resolving something subtly wrong.
             return Err("IPv6 literals are not supported; use an IPv4 address or a host name".to_string());
         }
         let (host, port) = match authority.rsplit_once(':') {
@@ -181,16 +254,27 @@ impl Target {
                 let port = port.parse::<u16>().map_err(|_| format!("`{port}` is not a port number"))?;
                 (host, port)
             }
-            _ => (authority, 80u16),
+            _ => (authority, default_port),
         };
         if host.is_empty() {
             return Err(format!("`{}` has no host part", llm::body_prefix(url, 80)));
         }
-        Ok(Self { host: host.to_string(), port, path: path.to_string() })
+        Ok(Self { tls, host: host.to_string(), port, path: path.to_string() })
     }
 
+    /// `host:port` for messages, and the `Host` header with the scheme's default port
+    /// left off.
     fn authority(&self) -> String {
-        format!("{}:{}", self.host, self.port)
+        self.host_header()
+    }
+
+    fn host_header(&self) -> String {
+        let default_port = if self.tls { 443 } else { 80 };
+        if self.port == default_port {
+            self.host.clone()
+        } else {
+            format!("{}:{}", self.host, self.port)
+        }
     }
 
     /// Resolve, then connect to each candidate address, `timeout` per attempt.
@@ -243,7 +327,7 @@ struct Response {
     body: String,
 }
 
-fn read_response(stream: &mut TcpStream, timeout: Duration) -> Result<Response, String> {
+fn read_response(conn: &mut Conn, timeout: Duration) -> Result<Response, String> {
     let mut raw: Vec<u8> = Vec::with_capacity(2048);
     let mut buf = [0u8; 512];
     let header_end = loop {
@@ -253,7 +337,7 @@ fn read_response(stream: &mut TcpStream, timeout: Duration) -> Result<Response, 
         if raw.len() > MAX_HEADER_BYTES {
             return Err(format!("the reply headers exceed {MAX_HEADER_BYTES} bytes"));
         }
-        match stream.read(&mut buf) {
+        match conn.read(&mut buf, timeout) {
             Ok(0) => {
                 if raw.is_empty() {
                     return Err("the server closed the connection without a reply".to_string());
@@ -264,8 +348,7 @@ fn read_response(stream: &mut TcpStream, timeout: Duration) -> Result<Response, 
                 ));
             }
             Ok(n) => raw.extend_from_slice(&buf[..n]),
-            Err(e) if e.kind() == ErrorKind::Interrupted => continue,
-            Err(e) => return Err(read_error(&e, timeout)),
+            Err(e) => return Err(e),
         }
     };
 
@@ -290,15 +373,15 @@ fn read_response(stream: &mut TcpStream, timeout: Duration) -> Result<Response, 
     if chunked {
         // `Connection: close` means the last chunk and the close agree: read to the
         // end and decode afterwards, so a chunk split across reads costs nothing.
-        fill_to_end(stream, &mut body);
+        fill_to_end(conn, &mut body, timeout);
         body = dechunk(&body);
     } else if let Some(length) = content_length {
         if body.len() < length {
-            fill_length(stream, &mut body, length, timeout)?;
+            fill_length(conn, &mut body, length, timeout)?;
         }
         body.truncate(length.min(body.len()));
     } else {
-        fill_to_end(stream, &mut body);
+        fill_to_end(conn, &mut body, timeout);
     }
     if body.len() > MAX_BODY_BYTES {
         body.truncate(MAX_BODY_BYTES);
@@ -308,19 +391,13 @@ fn read_response(stream: &mut TcpStream, timeout: Duration) -> Result<Response, 
 
 /// Read until `body` holds `length` bytes. A close before that is an error: the
 /// caller asked for a specific body and a short one would parse as something else.
-fn fill_length(
-    stream: &mut TcpStream,
-    body: &mut Vec<u8>,
-    length: usize,
-    timeout: Duration,
-) -> Result<(), String> {
+fn fill_length(conn: &mut Conn, body: &mut Vec<u8>, length: usize, timeout: Duration) -> Result<(), String> {
     let mut buf = [0u8; 512];
     while body.len() < length && body.len() <= MAX_BODY_BYTES {
-        match stream.read(&mut buf) {
+        match conn.read(&mut buf, timeout) {
             Ok(0) => return Err(format!("the reply ended after {} of {length} bytes", body.len())),
             Ok(n) => body.extend_from_slice(&buf[..n]),
-            Err(e) if e.kind() == ErrorKind::Interrupted => continue,
-            Err(e) => return Err(read_error(&e, timeout)),
+            Err(e) => return Err(e),
         }
     }
     Ok(())
@@ -328,13 +405,12 @@ fn fill_length(
 
 /// Read to the close, bounded. A read error after the body started is tolerated:
 /// some endpoints close without a clean FIN, and what arrived is still useful.
-fn fill_to_end(stream: &mut TcpStream, body: &mut Vec<u8>) {
+fn fill_to_end(conn: &mut Conn, body: &mut Vec<u8>, timeout: Duration) {
     let mut buf = [0u8; 512];
     while body.len() <= MAX_BODY_BYTES {
-        match stream.read(&mut buf) {
+        match conn.read(&mut buf, timeout) {
             Ok(0) => break,
             Ok(n) => body.extend_from_slice(&buf[..n]),
-            Err(e) if e.kind() == ErrorKind::Interrupted => continue,
             Err(e) => {
                 log::debug!("agent: body read stopped early: {e}");
                 break;
@@ -432,10 +508,10 @@ pub fn attach(shared: &Shared, log: &LogBuf) -> (Arc<AtomicU32>, EspHttpTranspor
     let model = app.llm.model.clone();
     let url = app.llm.base_url.clone();
     // One client stays in the `App` for the `net_*` tools.
-    app.attach_transport(Box::new(EspHttpTransport::new()));
+    app.attach_tool_transport(Box::new(EspHttpTransport::new()));
     drop(app);
 
-    log.info("agent", "HTTP transport attached to the agent (plain http only, no TLS)");
+    log.info("agent", "HTTP transport attached to the agent for the net_* tools (http and https)");
     if url.trim().is_empty() || model.trim().is_empty() {
         log.warn(
             "agent",

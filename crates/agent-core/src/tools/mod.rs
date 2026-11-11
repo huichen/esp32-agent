@@ -5,6 +5,7 @@
 //! their driver in [`crate::drivers`].
 
 pub mod fs;
+pub mod knowledge;
 pub mod net;
 
 use crate::capability::{cap, CapSet};
@@ -333,6 +334,11 @@ pub fn system_tools() -> Vec<ToolDef> {
                 .any(|t| t.starts_with("wifi") || t == "mcp.port" || t == "mcp.enabled" || t == "bus.i2c");
             if needs_restart {
                 ctx.runtime.restart_requested = true;
+            }
+            // Turning the board's own peripherals on or off changes the device list, which
+            // only a fresh probe can do.
+            if touched.iter().any(|t| t == "auto_peripherals" || t == "board") {
+                ctx.runtime.reprobe_requested = true;
             }
             Ok(json!({ "ok": true, "touched": touched, "restart_required": needs_restart }))
         }),

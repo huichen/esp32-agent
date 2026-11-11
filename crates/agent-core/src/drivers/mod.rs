@@ -11,6 +11,7 @@
 
 pub mod actuator;
 pub mod ads1115;
+pub mod audio;
 pub mod bme280;
 pub mod expander;
 pub mod ina219;
@@ -407,7 +408,10 @@ pub fn detect(
     // Declared GPIO peripherals.
     let pin_of = |key: &str| cfg.pins.get(key).copied();
 
-    // Buttons: configured pins win, otherwise the board profile's own buttons.
+    // Buttons and the LED are the devkit's own, so they follow `board.auto_peripherals`:
+    // a minimal board starts without them and has them back by declaring the device in
+    // the manifest. An explicitly configured pin (`pins["button.boot"]`, `pins["led"]`)
+    // still counts as a decision and wins either way.
     let mut buttons: Vec<(String, i32)> = Vec::new();
     for (k, v) in &cfg.pins {
         if let Some(rest) = k.strip_prefix("button.") {
@@ -418,7 +422,7 @@ pub fn detect(
             }
         }
     }
-    if buttons.is_empty() {
+    if buttons.is_empty() && cfg.auto_peripherals {
         for b in profile.buttons {
             buttons.push((b.name.to_string(), b.pin));
         }
@@ -431,8 +435,10 @@ pub fn detect(
         }
     }
 
-    // LED: an explicit pin wins over the profile.
-    let led_pin = pin_of("led").or_else(|| profile.led.map(|l| l.pin));
+    // LED: an explicit pin wins over the profile, and the profile only speaks when the
+    // board is allowed to bring its own peripherals up.
+    let led_pin =
+        pin_of("led").or_else(|| if cfg.auto_peripherals { profile.led.map(|l| l.pin) } else { None });
     if let Some(pin) = led_pin {
         let kind = if pin_of("led.pwm").unwrap_or(0) != 0 {
             "pwm"
@@ -475,6 +481,36 @@ pub fn detect(
         if dev.probe(hw).is_ok() {
             next_suffix("hcsr04");
             devices.push(Box::new(dev));
+        }
+    }
+
+    // I2S audio: nothing can be probed, so the pins come from the profile or
+    // `config.pins` (`mic.bclk`/`mic.ws`/`mic.din`, `amp.bclk`/`amp.ws`/`amp.dout`), and
+    // the channels either come up or the tools do not exist. The caps ride on the devices,
+    // so a board that cannot bring I2S up never claims `mic`/`speaker`.
+    let mic_pins = i2s_pins(cfg, profile.mic, "mic");
+    let amp_pins = i2s_pins(cfg, profile.amp, "amp");
+    if mic_pins.is_some() || amp_pins.is_some() {
+        match hw.i2s_setup(mic_pins, amp_pins) {
+            Ok(()) => {
+                if mic_pins.is_some() {
+                    let n = next_suffix("mic");
+                    devices.push(Box::new(audio::Mic {
+                        id: if n > 1 { format!("mic{n}") } else { "mic".into() },
+                    }));
+                }
+                if amp_pins.is_some() {
+                    let n = next_suffix("speaker");
+                    devices.push(Box::new(audio::Speaker {
+                        id: if n > 1 { format!("speaker{n}") } else { "speaker".into() },
+                    }));
+                }
+                log.info("probe", "I2S up: microphone and/or amplifier available");
+            }
+            Err(e) => log.warn(
+                "probe",
+                format!("I2S pins are configured but the channels did not come up: {}", e.message),
+            ),
         }
     }
 
@@ -541,6 +577,16 @@ pub fn instantiate(spec: &crate::manifest::DeviceSpec, hw: &mut dyn Hardware) ->
             },
             opt("count").and_then(|c| c.parse().ok()).unwrap_or(1),
         )),
+        // `pins` is a name→pin map, which is exactly what a button set is.
+        "buttons" => {
+            let mut buttons: Vec<(String, i32)> =
+                spec.pins.iter().map(|(name, pin)| (name.clone(), *pin)).collect();
+            buttons.sort_by(|a, b| a.0.cmp(&b.0));
+            if buttons.is_empty() {
+                return Err(McpError::invalid_params("driver `buttons` needs pins, e.g. {\"boot\": 0}"));
+            }
+            Box::new(actuator::Buttons::new(buttons))
+        }
         other => {
             return Err(McpError::invalid_params(format!(
                 "no compiled driver `{other}`; use primitives (gpio/pwm/adc/i2c) in the manifest instead"
@@ -550,11 +596,19 @@ pub fn instantiate(spec: &crate::manifest::DeviceSpec, hw: &mut dyn Hardware) ->
 }
 
 /// Board-level capabilities that are not owned by a device.
+///
+/// `hw` is kept in the signature: a capability that needs the driver's state (rather than
+/// the fact that the platform has the peripheral) reads it here, and the callers already
+/// have it in hand.
 pub fn board_caps(hw: &mut dyn Hardware, cfg: &Config, profile: &BoardProfile) -> Vec<String> {
+    let _ = hw;
     let mut caps = Vec::new();
-    if !matches!(hw.wifi_status().state.as_str(), "off") {
-        caps.push("wifi".to_string());
-    }
+    // The radio exists on this build whether or not it has come up yet. Asking the
+    // driver for its state at probe time hid `wifi_scan` and `wifi_status` on a boot
+    // where the probe ran before the radio did — which is the common case on the board,
+    // and the two tools are exactly what tell you the radio is not up. Measured on the
+    // device: a fresh flash listed 43 tools instead of 45 for that reason.
+    caps.push("wifi".to_string());
     caps.push("gpio".to_string());
     if !profile.adc_pins.is_empty() {
         caps.push("adc".to_string());
@@ -563,13 +617,32 @@ pub fn board_caps(hw: &mut dyn Hardware, cfg: &Config, profile: &BoardProfile) -
     if !cfg.bus.i2c.is_empty() {
         caps.push("i2c".to_string());
     }
-    if profile.mic.is_some() {
-        caps.push("mic".to_string());
-    }
-    if profile.amp.is_some() {
-        caps.push("speaker".to_string());
-    }
+    // Deliberately not advertised: `mic` and `speaker`. A profile can record the I2S
+    // pins (the xiaozhi wiring does: mic 4/5/6, amp 7/15/16), but there is no INMP441 or
+    // MAX98357A driver yet, so those caps would promise the model a capability that has
+    // no tool behind it — and I2S has no addressing or id register, so nothing about it
+    // can be probed either. They come back here when the drivers land.
     caps
+}
+
+/// The I2S pins for one direction: `config.pins` wins over the board profile, and both
+/// `bclk` and `ws` must be present and non-negative for the side to count as wired.
+fn i2s_pins(
+    cfg: &Config,
+    hint: Option<crate::boards::I2sPins>,
+    prefix: &str,
+) -> Option<crate::boards::I2sPins> {
+    let get = |suffix: &str| cfg.pins.get(&format!("{prefix}.{suffix}")).copied();
+    let bclk = get("bclk").or_else(|| hint.map(|h| h.bclk));
+    let ws = get("ws").or_else(|| hint.map(|h| h.ws));
+    let din = get("din").or_else(|| hint.map(|h| h.din));
+    let dout = get("dout").or_else(|| hint.map(|h| h.dout));
+    match (bclk, ws) {
+        (Some(bclk), Some(ws)) if bclk >= 0 && ws >= 0 => {
+            Some(crate::boards::I2sPins { bclk, ws, din: din.unwrap_or(-1), dout: dout.unwrap_or(-1) })
+        }
+        _ => None,
+    }
 }
 
 /// Device counts per kind, for the portal's summary line.
@@ -585,4 +658,25 @@ pub fn summary(devices: &Devices) -> Value {
         "by_kind": by_kind,
         "degraded": infos.iter().filter(|i| i.status != "ok").count(),
     })
+}
+
+#[cfg(test)]
+mod cap_tests {
+    use super::*;
+
+    /// A profile can record I2S pins (the xiaozhi wiring does: mic 4/5/6, amp 7/15/16),
+    /// but nothing on an I2S bus can be identified and there is no audio driver yet. The
+    /// capability must not be advertised, or the model is told about a device that has no
+    /// tool behind it — which is what this board reported before the fix.
+    #[test]
+    fn the_audio_pins_of_a_profile_do_not_become_capabilities() {
+        let mut hw = crate::virtual_board::VirtualBoard::new();
+        let cfg = crate::config::Config::default();
+        let profile = crate::boards::find("esp32s3-xiaozhi-bread").expect("the xiaozhi profile");
+        assert!(profile.mic.is_some() && profile.amp.is_some(), "the profile records I2S pins");
+        let caps = board_caps(&mut hw, &cfg, profile);
+        assert!(!caps.iter().any(|c| c == "mic"), "mic advertised with no driver: {caps:?}");
+        assert!(!caps.iter().any(|c| c == "speaker"), "speaker advertised with no driver: {caps:?}");
+        assert!(caps.iter().any(|c| c == "gpio"), "the real caps are still there: {caps:?}");
+    }
 }

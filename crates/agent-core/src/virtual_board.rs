@@ -195,6 +195,12 @@ pub struct VirtualBoard {
     pub pwm: BTreeMap<i32, (u32, f32)>,
     pub ring: BTreeMap<i32, (u8, u8, u8)>,
     pub adc: BTreeMap<i32, u32>,
+    /// Whether the virtual I2S channels are up (set by `i2s_setup`).
+    pub i2s_mic: bool,
+    pub i2s_amp: bool,
+    /// Samples written to the virtual amplifier, so a test can check that playback
+    /// reached the hardware instead of dying in the tool.
+    pub i2s_written: u64,
     pub scan: Vec<WifiAp>,
     pub wifi: WifiStatus,
     pub log: Vec<String>,
@@ -227,6 +233,9 @@ impl VirtualBoard {
             pwm: BTreeMap::new(),
             ring: BTreeMap::new(),
             adc: BTreeMap::new(),
+            i2s_mic: false,
+            i2s_amp: false,
+            i2s_written: 0,
             scan: vec![
                 WifiAp { ssid: "home-net".into(), rssi: -48, channel: 6, auth: "wpa2".into() },
                 WifiAp { ssid: "lab-5g".into(), rssi: -71, channel: 44, auth: "wpa3".into() },
@@ -333,6 +342,43 @@ impl Hardware for VirtualBoard {
 
     fn adc_mv(&mut self, pin: i32) -> Result<u32> {
         Ok(self.adc.get(&pin).copied().unwrap_or(1650))
+    }
+
+    /// The virtual board has I2S whenever pins are given, and the "microphone" is a 440 Hz
+    /// tone with a little noise: enough for a level meter and a recording to look sane
+    /// without pretending to model acoustics.
+    fn i2s_setup(
+        &mut self,
+        mic: Option<crate::boards::I2sPins>,
+        amp: Option<crate::boards::I2sPins>,
+    ) -> Result<()> {
+        self.i2s_mic = mic.is_some();
+        self.i2s_amp = amp.is_some();
+        Ok(())
+    }
+
+    fn i2s_mic_read(&mut self, out: &mut [i32], _timeout_ms: u32) -> Result<usize> {
+        if !self.i2s_mic {
+            return Err(McpError::unsupported("no I2S microphone on the virtual board"));
+        }
+        let t = self.start.elapsed().as_micros() as f32 / 1_000_000.0;
+        let rate = crate::drivers::audio::MIC_RATE_HZ as f32;
+        for (i, s) in out.iter_mut().enumerate() {
+            let phase = 2.0 * std::f32::consts::PI * 440.0 * (t + i as f32 / rate);
+            // 24 bits left-justified in 32, like the INMP441: about -20 dBFS plus a slow
+            // wobble, so the level is not a constant.
+            let wobble = 1.0 + 0.1 * (i as f32 * 0.01).sin();
+            *s = (phase.sin() * 3280.0 * wobble) as i32 * 65_536;
+        }
+        Ok(out.len())
+    }
+
+    fn i2s_out_write(&mut self, samples: &[i16]) -> Result<()> {
+        if !self.i2s_amp {
+            return Err(McpError::unsupported("no I2S speaker on the virtual board"));
+        }
+        self.i2s_written = self.i2s_written.saturating_add(samples.len() as u64);
+        Ok(())
     }
 
     fn ring_set(&mut self, pin: i32, rgb: (u8, u8, u8), _count: u16) -> Result<()> {

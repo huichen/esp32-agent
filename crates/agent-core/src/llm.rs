@@ -1,11 +1,12 @@
 //! OpenAI-compatible chat client: the single request shape the agent loop uses.
 //!
 //! The socket is injected as a [`ChatTransport`] because the board and the host
-//! simulator do HTTP differently (the firmware's ESP-IDF client vs `std::net`),
-//! while everything above the socket — the request body, the reply shape, the
-//! error text, the byte budget — has to behave identically on both. `chat` never
-//! opens anything itself: it serialises the request, hands it over, and turns the
-//! JSON body back into a bounded [`ModelReply`].
+//! simulator do HTTP differently (the firmware's ESP-IDF client with esp-tls for
+//! `https://`, the host's `std::net` with rustls), while everything above the
+//! socket — the request body, the reply shape, the error text, the byte budget —
+//! has to behave identically on both. `chat` never opens anything itself: it
+//! serialises the request, hands it over, and turns the JSON body back into a
+//! bounded [`ModelReply`].
 //!
 //! Two properties matter more than feature coverage here:
 //!
@@ -36,7 +37,9 @@ pub const ARGS_ERROR_KEY: &str = "__llm_arguments_error";
 /// status and the body prefix survive to the log without a second channel.
 pub trait ChatTransport {
     /// POST `body` to `url` with `headers`; return the response body.
-    /// Plain HTTP only; implementation enforces its own timeout.
+    ///
+    /// `url` is `http://` or `https://`; the scheme is the implementation's business
+    /// (plain socket or TLS), and the implementation enforces its own timeout.
     fn post_json(&mut self, url: &str, headers: &[(&str, &str)], body: &str) -> Result<String, String>;
 }
 
@@ -286,16 +289,13 @@ fn check_url(url: &str) -> Result<(), String> {
     if lower.is_empty() {
         return Err("llm: base_url is empty; set the chat endpoint in the agent config".to_string());
     }
-    if lower.starts_with("https://") {
-        // v1 has no TLS on the board: say so instead of letting the socket hang
-        // or return a handshake-sized body that looks like a model error.
-        return Err("llm: https:// is not supported on the board (no TLS); point base_url at an \
-             http:// LAN proxy"
-            .to_string());
-    }
-    if !lower.starts_with("http://") {
+    // Both schemes are allowed: `https://` is carried by the platform transport (TLS
+    // on the board via esp-tls, on the host via rustls), so there is nothing to refuse
+    // here. What is still refused is anything that is not HTTP at all — that would
+    // otherwise surface as an obscure socket error.
+    if !lower.starts_with("http://") && !lower.starts_with("https://") {
         return Err(format!(
-            "llm: base_url must start with http://host:port/…, got {}",
+            "llm: base_url must start with http:// or https://, got {}",
             body_prefix(url, 60)
         ));
     }
@@ -478,12 +478,21 @@ mod tests {
     }
 
     #[test]
-    fn https_is_rejected_before_any_socket_is_touched() {
+    fn an_https_endpoint_reaches_the_transport_untouched() {
         let mut t = StubTransport::answering(reply_body(json!({ "content": "x" })));
         let mut c = cfg();
-        c.base_url = "https://example.invalid/v1/chat/completions".to_string();
-        let err = chat(&mut t, &c, &messages(), &tools()).expect_err("https must fail");
-        assert!(err.contains("https"), "unexpected error text: {err}");
+        c.base_url = "https://api.example.com/v1/chat/completions".to_string();
+        chat(&mut t, &c, &messages(), &tools()).expect("https must be carried to the transport");
+        assert_eq!(t.urls, vec!["https://api.example.com/v1/chat/completions".to_string()]);
+    }
+
+    #[test]
+    fn a_scheme_that_is_not_http_is_refused_before_the_transport() {
+        let mut t = StubTransport::answering(reply_body(json!({ "content": "x" })));
+        let mut c = cfg();
+        c.base_url = "ftp://example.invalid/v1/chat/completions".to_string();
+        let err = chat(&mut t, &c, &messages(), &tools()).expect_err("ftp must fail");
+        assert!(err.contains("http"), "unexpected error text: {err}");
         assert!(t.urls.is_empty(), "the transport must not be called");
     }
 

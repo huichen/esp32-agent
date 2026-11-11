@@ -52,7 +52,7 @@ pub fn specs() -> Value {
     json!([
         function(
             "net_get",
-            "Fetch a plain-http URL from the board's network and return up to 2048 bytes of the response body. https:// is not supported.",
+            "Fetch a URL from the board's network and return up to 2048 bytes of the response body. http:// and https:// are both carried; the certificate chain is checked against the board's bundle.",
             params(
                 json!({
                     "url": { "type": "string", "description": "http:// URL" },
@@ -62,7 +62,7 @@ pub fn specs() -> Value {
         ),
         function(
             "net_post",
-            "POST a JSON body to a plain-http URL from the board's network and return up to 2048 bytes of the response body. https:// is not supported.",
+            "POST a JSON body to a URL from the board's network and return up to 2048 bytes of the response body. http:// and https:// are both carried.",
             params(
                 json!({
                     "url": { "type": "string", "description": "http:// URL" },
@@ -143,8 +143,11 @@ fn transport_error(e: String) -> String {
     }
 }
 
-/// Only plain HTTP, and never empty or absurdly long. Rejecting `https://` here
-/// says why, instead of letting a TLS handshake fail on a board that has no TLS.
+/// `http://` or `https://`, and never empty or absurdly long.
+///
+/// The scheme is the transport's business (`net_get` runs on the same client the model
+/// call uses), so this only refuses what is not HTTP at all — a `ftp://` or a bare host
+/// would otherwise surface as an obscure socket error.
 fn check_url(args: &Value) -> Result<String, String> {
     let url = match args.get("url") {
         Some(Value::String(s)) => s.trim().to_string(),
@@ -157,13 +160,8 @@ fn check_url(args: &Value) -> Result<String, String> {
         return Err(format!("`url` is {} bytes, limit is {MAX_URL_LEN}", url.len()));
     }
     let lower = url.to_ascii_lowercase();
-    if lower.starts_with("https://") {
-        return Err(
-            "https:// is not supported on the board (no TLS); use an http:// URL or a LAN proxy".to_string()
-        );
-    }
-    if !lower.starts_with("http://") {
-        return Err(format!("`url` must start with http://, got `{}`", body_prefix(&url, 40)));
+    if !lower.starts_with("http://") && !lower.starts_with("https://") {
+        return Err(format!("`url` must start with http:// or https://, got `{}`", body_prefix(&url, 40)));
     }
     Ok(url)
 }
@@ -308,16 +306,17 @@ mod tests {
     }
 
     #[test]
-    fn https_and_bad_urls_are_rejected_before_the_socket() {
-        let mut f = Fake::ok("should not be reached");
-        let err = run(&mut f, "net_get", json!({"url": "https://api.example.com/v1"})).unwrap_err();
-        assert!(err.contains("no TLS"), "{err}");
-        assert!(f.seen.is_empty(), "nothing may be sent for an https:// URL");
+    fn https_is_carried_and_bad_urls_are_rejected_before_the_socket() {
+        let mut f = Fake::ok("over tls");
+        let value = run(&mut f, "net_get", json!({"url": "https://api.example.com/v1"})).unwrap();
+        assert_eq!(value["body"], "over tls", "{value}");
+        assert_eq!(f.seen.len(), 1, "the request never reached the transport");
+        assert_eq!(f.seen[0].0, "https://api.example.com/v1", "the scheme must be carried, not rewritten");
 
         for (args, needle) in [
             (json!({}), "`url`"),
             (json!({"url": ""}), "must not be empty"),
-            (json!({"url": "ftp://host/x"}), "must start with http://"),
+            (json!({"url": "ftp://host/x"}), "must start with http:// or https://"),
             (json!({"url": 42}), "`url`"),
         ] {
             let err = run(&mut f, "net_get", args).unwrap_err();
@@ -326,7 +325,9 @@ mod tests {
         let too_long = format!("http://host/{}", "p".repeat(MAX_URL_LEN));
         let err = run(&mut f, "net_get", json!({"url": too_long})).unwrap_err();
         assert!(err.contains("limit is 512"), "{err}");
-        assert!(f.seen.is_empty());
+        // Only the one legal request reached the transport; every refusal above stopped
+        // before the socket.
+        assert_eq!(f.seen.len(), 1, "a refused URL still went out: {:?}", f.seen);
     }
 
     #[test]

@@ -23,7 +23,7 @@ use crate::protocol::{self, RpcIn};
 use crate::sched::{ScheduledTask, SensorRule};
 use crate::state::{make_session_id, ProbeReport, Runtime};
 use crate::store::KvStore;
-use crate::tool::{ToolCtx, ToolRegistry};
+use crate::tool::{ToolCtx, ToolDef, ToolRegistry};
 use crate::tools as board_tools;
 use crate::tools::{fs as fs_tools, net as net_tools};
 use crate::web;
@@ -149,9 +149,15 @@ pub struct App {
     /// the message itself is gone by the time the reply comes back. `agent_begin` and
     /// `agent_run_once` set it; `finish_turn` reads it.
     turn_source: String,
-    /// Outbound HTTP for `net_*` and for the model call. The platform layer
-    /// attaches it once; host tests leave it empty so nothing reaches the net.
-    pub transport: Option<Box<dyn ChatTransport + Send>>,
+    /// Outbound HTTP for the `net_*` tools. The platform layer attaches it once; host
+    /// tests leave it empty so nothing reaches the net. It is deliberately **not** the
+    /// transport the model call uses: that one is owned by whoever drives the turn
+    /// (`drive_agent`), so a `net_get` inside a turn and the model request never
+    /// compete for one client — and a turn can still reach the network.
+    pub tool_transport: Option<Box<dyn ChatTransport + Send>>,
+    /// The transport `agent_run_once` uses when nobody drives the turn from outside.
+    /// Platforms use [`drive_agent`] and pass their own, leaving this empty.
+    pub model_transport: Option<Box<dyn ChatTransport + Send>>,
     /// Slots for `GET /api/agent/stream`. A stream holds an HTTP connection for its
     /// whole life, so the cap is about the pool, not about this struct.
     streams: EventStreamGate,
@@ -170,7 +176,7 @@ impl App {
             .get(crate::config::NVS_KEY_CONFIG)
             .and_then(|s| Config::from_json_str(&s))
             .unwrap_or_default();
-        let (manifest, manifest_source) = match store.get(NVS_KEY_MANIFEST) {
+        let (mut manifest, manifest_source) = match store.get(NVS_KEY_MANIFEST) {
             Some(s) => match Manifest::from_json_str(&s) {
                 Ok(m) => (m, "nvs"),
                 Err(e) => {
@@ -180,8 +186,25 @@ impl App {
             },
             None => (Manifest::default(), "default"),
         };
+        // A manifest stored by an older build may name a tool the wire will not carry.
+        // It has to go before the first model call, because that is the call a repair
+        // would have to travel on (see `Manifest::drop_tools_with_unusable_names`).
+        let dropped_names = manifest.drop_tools_with_unusable_names();
+        if !dropped_names.is_empty() {
+            log.warn(
+                "manifest",
+                format!(
+                    "dropped {} stored tool(s) whose names no model endpoint accepts: {} — \
+                     re-add them with `_` instead of `.`",
+                    dropped_names.len(),
+                    dropped_names.join(", ")
+                ),
+            );
+        }
         let mut runtime = Runtime::new(now, &firmware.version, &firmware.build);
         runtime.manifest_rev = 1;
+        // Write the cleaned manifest back, so dropping happens once and not every boot.
+        runtime.manifest_dirty = !dropped_names.is_empty();
         let mut app = Self {
             cfg,
             manifest,
@@ -204,7 +227,8 @@ impl App {
             workspace: AppWorkspace::default(),
             goal: idle_goal(),
             turn_source: String::new(),
-            transport: None,
+            tool_transport: None,
+            model_transport: None,
             streams: EventStreamGate::new(),
             shared: Weak::new(),
             session_counter: 0,
@@ -280,7 +304,10 @@ impl App {
             match drivers::instantiate(spec, &mut *self.hw) {
                 Ok(dev) => {
                     self.log.info("manifest", format!("instantiated `{}` from the manifest", spec.id));
-                    self.devices.push(dev);
+                    // The manifest's id is the one `device_invoke` and `devices_list`
+                    // use; the driver's own default (`led`, `relay`) would make two
+                    // devices of one kind indistinguishable.
+                    self.devices.push(Box::new(crate::device::NamedDevice::new(dev, &spec.id)));
                 }
                 Err(e) => {
                     self.log.warn("manifest", format!("device `{}` failed: {}", spec.id, e.message));
@@ -297,7 +324,30 @@ impl App {
         tools.register_all(board_tools::always_tools());
         tools.register_all(board_tools::manifest_tools());
         tools.register_all(self.devices.tool_defs());
-        tools.register_all(self.manifest.tool_defs());
+        // A manifest may not take a name the board already uses (validation refuses it),
+        // but a manifest stored by an older build — or one applied before the hardware
+        // was plugged in — can still arrive here. The board's own tool wins, and the
+        // clash is logged: silently replacing `manifest_apply` would leave a board that
+        // cannot repair its own manifest.
+        let mut clashing: Vec<String> = Vec::new();
+        for def in self.manifest.tool_defs() {
+            let name = def.spec.name.clone();
+            if tools.get(&name).is_some() {
+                clashing.push(name);
+                continue;
+            }
+            tools.register(def);
+        }
+        if !clashing.is_empty() {
+            self.log.error(
+                "manifest",
+                format!(
+                    "ignored {} manifest tool(s) that reuse a tool the board provides: {} — rename them",
+                    clashing.len(),
+                    clashing.join(", ")
+                ),
+            );
+        }
         self.tools = tools;
         self.runtime.manifest_rev = self.runtime.manifest_rev.max(1);
 
@@ -382,7 +432,33 @@ impl App {
         let mut tools: Vec<Value> =
             self.tools.iter().filter(|d| self.is_visible(&d.spec.name)).map(|d| d.mcp_json()).collect();
         tools.sort_by_key(|t| t["name"].as_str().unwrap_or("").to_string());
+        // `fs_*` and `net_*` are not registry entries (their handlers need the workspace
+        // and an HTTP client), but an MCP client should be able to reach them, so they are
+        // appended in module order rather than sorted in.
+        tools.extend(self.extra_mcp_specs());
         json!({ "tools": tools })
+    }
+
+    /// The MCP view of the tools that live outside the registry: `fs_*` then `net_*`.
+    ///
+    /// `mcp.disabled_tools` still applies; `tools_mode` does not, because none of these
+    /// is a device tool.
+    fn extra_mcp_specs(&self) -> Vec<Value> {
+        let mut out = Vec::new();
+        for group in [fs_tools::specs(), net_tools::specs()] {
+            for tool in openai_tools(&group) {
+                let name = tool["function"]["name"].as_str().unwrap_or_default().to_string();
+                if self.cfg.mcp.disabled_tools.iter().any(|d| d == &name) {
+                    continue;
+                }
+                out.push(json!({
+                    "name": name,
+                    "description": tool["function"]["description"],
+                    "inputSchema": tool["function"]["parameters"],
+                }));
+            }
+        }
+        out
     }
 
     fn tools_portal_json(&self) -> Value {
@@ -589,8 +665,24 @@ impl App {
                 Some(d) => d,
                 None => return Err(McpError::not_found(format!("no tool `{name}`"))),
             };
-            let mut ctx =
-                ToolCtx { hw: &mut **hw, devices, cfg, runtime, log, caps, profile, probe, manifest };
+            // The names the board itself provides. `manifest_apply` validates against
+            // them, so a manifest cannot take over `manifest_apply` (or a driver tool
+            // that a later probe will bring back) and leave the board unable to repair
+            // itself.
+            let taken: Vec<String> =
+                tools.iter().filter(|d| !d.spec.from_manifest).map(|d| d.spec.name.clone()).collect();
+            let mut ctx = ToolCtx {
+                hw: &mut **hw,
+                devices,
+                cfg,
+                runtime,
+                log,
+                caps,
+                profile,
+                probe,
+                manifest,
+                taken: &taken,
+            };
             (def.handler)(&mut ctx, args)
         };
         self.runtime.record_tool_call(name, out.is_ok());
@@ -702,9 +794,18 @@ impl App {
 
     /// Hand over the HTTP client the `net_*` tools use. The model call has its own,
     /// owned by whoever drives the turn (`drive_agent`), so a `net_*` call inside a
-    /// turn and the model request never compete for one client.
-    pub fn attach_transport(&mut self, transport: Box<dyn ChatTransport + Send>) {
-        self.transport = Some(transport);
+    /// turn and the model request never compete for one client — and, unlike a client
+    /// the turn borrows, this one is still there while the turn runs.
+    pub fn attach_tool_transport(&mut self, transport: Box<dyn ChatTransport + Send>) {
+        self.tool_transport = Some(transport);
+    }
+
+    /// Hand over the client `agent_run_once` should call the model with.
+    ///
+    /// Only for a runner with no driver loop of its own (the host tests); the firmware
+    /// and the simulator both use [`drive_agent`] and pass their client in there.
+    pub fn attach_model_transport(&mut self, transport: Box<dyn ChatTransport + Send>) {
+        self.model_transport = Some(transport);
     }
 
     /// Phase 1 of a turn, and the answer to "is there work": take the queued message,
@@ -970,7 +1071,8 @@ impl App {
     pub fn agent_config_json(&self) -> Value {
         let mut v = llm_json(&self.llm, false);
         v["api_key_set"] = json!(!self.llm.api_key.is_empty());
-        v["endpoint_ok"] = json!(self.llm.base_url.starts_with("http://"));
+        v["endpoint_ok"] =
+            json!(self.llm.base_url.starts_with("http://") || self.llm.base_url.starts_with("https://"));
         // The platform tick, so the portal can show and edit it next to the model settings.
         v["tick_ms"] = json!(self.cfg.agent.tick_ms);
         v["run"] = json!({
@@ -1122,20 +1224,15 @@ impl App {
             Ok(v) => v,
             Err(e) => return Response::error_json(400, &format!("invalid JSON: {e}")),
         };
-        // No TLS on the board: an https:// endpoint would hang until the timeout,
-        // so it is refused with the reason rather than accepted and forgotten.
+        // Both schemes are carried by the platform transport (TLS on the board via
+        // esp-tls, on the host via rustls), so https:// is accepted here. Anything that
+        // is not HTTP at all is still refused by name.
         if let Some(url) = body.get("base_url").and_then(|u| u.as_str()) {
             let url = url.trim();
-            if url.starts_with("https://") {
+            if !url.is_empty() && !url.starts_with("http://") && !url.starts_with("https://") {
                 return Response::json_status(
                     400,
-                    &json!({ "error": "https:// is not supported: the board has no TLS. Use an http:// endpoint (a LAN proxy is the expected setup)." }),
-                );
-            }
-            if !url.is_empty() && !url.starts_with("http://") {
-                return Response::json_status(
-                    400,
-                    &json!({ "error": "`base_url` must start with http:// and point at the chat completions endpoint" }),
+                    &json!({ "error": "`base_url` must start with http:// or https:// and point at the chat completions endpoint" }),
                 );
             }
             self.llm.base_url = url.to_string();
@@ -1336,16 +1433,17 @@ impl App {
         // The agent lives in `self` and needs `self` as its tool host, so it is
         // moved out for the duration of the run and put back afterwards.
         let mut agent = std::mem::replace(&mut self.agent, Agent::new());
-        let mut transport = self.transport.take();
+        let mut transport = self.model_transport.take();
         let (out, ran) = match transport.as_mut() {
             Some(t) => (agent.run_pending(self, t.as_mut(), &cfg, now_ms), true),
             None => {
-                let why = "no HTTP transport is attached, so the model cannot be reached".to_string();
+                let why = "no HTTP transport is attached for the model call, so the model cannot be reached"
+                    .to_string();
                 agent.last_error = why.clone();
                 (Err(why), false)
             }
         };
-        self.transport = transport;
+        self.model_transport = transport;
         self.agent = agent;
         // Only a turn that actually ran is an iteration: a missing transport leaves the
         // message queued for a later attempt, and counting it would spend the goal's
@@ -1460,7 +1558,20 @@ impl App {
             .to_string();
         let args = params.get("arguments").cloned().unwrap_or_else(|| json!({}));
         let started = std::time::Instant::now();
-        let result = self.call_tool(&name, &args);
+        // The tools outside the registry go through `ToolHost`, which is the path the
+        // board's own agent uses, so an MCP caller and the agent share one behaviour.
+        let result = if name.starts_with("fs_") || name.starts_with("net_") {
+            if self.cfg.mcp.disabled_tools.iter().any(|d| d == &name) {
+                Err(McpError::not_found(format!("tool `{name}` is disabled")))
+            } else {
+                match ToolHost::call_tool(self, &name, &args) {
+                    Ok(text) => Ok(text_result(&text)),
+                    Err(message) => Err(McpError::invalid_params(message)),
+                }
+            }
+        } else {
+            self.call_tool(&name, &args)
+        };
         let ms = started.elapsed().as_millis();
         match result {
             Ok(v) => {
@@ -1584,6 +1695,15 @@ impl App {
             first = false;
             out.push_str(&serde_json::to_string(&def.mcp_json()).ok()?);
         }
+        // The registry tools are sorted; the extras follow in module order, exactly as
+        // in `tools_list_json`.
+        for spec in self.extra_mcp_specs() {
+            if !first {
+                out.push(',');
+            }
+            first = false;
+            out.push_str(&serde_json::to_string(&spec).ok()?);
+        }
         out.push_str("]}}");
         Some(out)
     }
@@ -1659,11 +1779,25 @@ impl App {
                 self.apply_manifest_http(req)
             }
             ("GET", "/api/manifest/schema") => {
-                let describe = self.call_tool("manifest_describe", &json!({}));
-                match describe {
-                    Ok(v) => Response::json(&v),
-                    Err(e) => Response::json_status(500, &json!({ "error": e.message })),
+                // An HTTP response has no 2 KB cap, so this route hands over the part of
+                // the reference needed to write a manifest in one go; the model asks for
+                // the same content one section at a time (`manifest_describe`).
+                let mut out = json!({});
+                for section in ["schema", "exec"] {
+                    match self.call_tool("manifest_describe", &json!({ "section": section })) {
+                        Ok(v) => {
+                            if let (Some(dst), Some(src)) = (out.as_object_mut(), v.as_object()) {
+                                for (key, value) in src {
+                                    if key != "section" && key != "note" {
+                                        dst.insert(key.clone(), value.clone());
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) => return Response::json_status(500, &json!({ "error": e.message })),
+                    }
                 }
+                Response::json(&out)
             }
             ("GET", "/api/devices") => Response::json(&json!({
                 "devices": self.devices.infos(),
@@ -2066,28 +2200,62 @@ impl App {
 /// two views cannot drift apart.
 impl ToolHost for App {
     fn tool_specs(&self) -> Value {
-        let mut tools: Vec<Value> = self
-            .tools
-            .iter()
-            .filter(|d| self.is_visible(&d.spec.name))
-            .map(|d| {
-                json!({
-                    "type": "function",
-                    "function": {
-                        "name": d.spec.name,
-                        "description": d.spec.description,
-                        "parameters": d.spec.input_schema,
-                    }
-                })
+        let visible: Vec<&ToolDef> = self.tools.iter().filter(|d| self.is_visible(&d.spec.name)).collect();
+        let load = |def: &ToolDef| {
+            json!({
+                "type": "function",
+                "function": {
+                    "name": def.spec.name,
+                    "description": def.spec.description,
+                    "parameters": def.spec.input_schema,
+                }
             })
-            .collect();
-        tools.sort_by_key(|t| t["function"]["name"].as_str().unwrap_or("").to_string());
-        // File and HTTP tools gate on nothing the hardware must provide, so they
-        // are not MCP tools; they are appended after the board's own list.
+        };
+
+        // Order is part of the contract, because a provider caches the request by its
+        // prefix: one reordered entry and every token after it is reprocessed. So the
+        // blocks run from least to most volatile, and each block is ordered by name.
+        //
+        //   1. the board's own tools — they change with the hardware or the firmware
+        //   2. fs_* and net_*         — fixed for a given build
+        //   3. manifest tools         — they change whenever the model rewrites one
+        //
+        // Alphabetical within a block, so two boards with the same hardware produce the
+        // same bytes however the probe happened to enumerate them.
+        let mut board: Vec<Value> =
+            visible.iter().filter(|d| !d.spec.from_manifest).map(|d| load(d)).collect();
+        board.sort_by_key(|t| t["function"]["name"].as_str().unwrap_or("").to_string());
+
+        let mut volatile: Vec<Value> =
+            visible.iter().filter(|d| d.spec.from_manifest).map(|d| load(d)).collect();
+        volatile.sort_by_key(|t| t["function"]["name"].as_str().unwrap_or("").to_string());
+
+        let mut tools = board;
+        // File and HTTP tools gate on nothing the hardware must provide, so they are not
+        // MCP tools; they are appended after the board's own list, and they come before
+        // the manifest block because they never change at runtime.
         for group in [fs_tools::specs(), net_tools::specs()] {
             tools.extend(openai_tools(&group));
         }
+        tools.extend(volatile);
         Value::Array(tools)
+    }
+
+    /// `/AGENTS.md`, bounded to what a small prompt can carry.
+    fn project_instructions(&self) -> Option<String> {
+        crate::tools::knowledge::instructions(&self.workspace)
+    }
+
+    /// The skill index: name and one line each, never the bodies.
+    /// The skill index: name, one line, and the path to read — never the bodies.
+    ///
+    /// Both shapes reach here: `/skills/<name>/SKILL.md` (a skill with material next to
+    /// it) and `/skills/<name>.md` (a skill that is one file).
+    fn skills(&self) -> Vec<crate::agent::SkillRef> {
+        crate::tools::knowledge::index(&self.workspace)
+            .into_iter()
+            .map(|s| crate::agent::SkillRef { name: s.name, description: s.description, path: s.path })
+            .collect()
     }
 
     fn call_tool(&mut self, name: &str, arguments: &Value) -> std::result::Result<String, String> {
@@ -2096,20 +2264,24 @@ impl ToolHost for App {
                 .ok_or_else(|| format!("`{name}` starts with fs_ but no such file tool exists"))?;
             let text = result?;
             // Only the mutating tools dirty the stored blob.
-            if matches!(name, "fs_write" | "fs_edit" | "fs_remove") {
+            if matches!(name, "fs_write" | "fs_edit" | "fs_rm" | "fs_cp" | "fs_mv") {
                 self.persist_workspace();
             }
             return Ok(text);
         }
         if name.starts_with("net_") {
-            let mut transport = self.transport.take();
+            // The turn's own client is elsewhere, so this one is free to be used from
+            // inside a tool call — which is what lets the agent reach the network
+            // mid-run instead of only between turns.
+            let mut transport = self.tool_transport.take();
             let result = match transport.as_mut() {
                 Some(t) => net_tools::call(t.as_mut(), name, arguments),
                 None => {
-                    Some(Err("no HTTP transport is attached on this build, so net_* cannot run".to_string()))
+                    Some(Err("no HTTP transport is attached for the network tools, so net_* cannot run"
+                        .to_string()))
                 }
             };
-            self.transport = transport;
+            self.tool_transport = transport;
             return result
                 .unwrap_or_else(|| Err(format!("`{name}` starts with net_ but no such HTTP tool exists")));
         }
@@ -2130,6 +2302,18 @@ fn tool_text(v: &Value) -> String {
         }
     }
     serde_json::to_string(v).unwrap_or_else(|_| "{}".to_string())
+}
+
+/// The reverse of [`tool_text`]: a tool that answers with JSON text, shaped as an MCP
+/// result so an external client sees the same envelope as the registry tools.
+fn text_result(text: &str) -> Value {
+    match serde_json::from_str::<Value>(text) {
+        Ok(value) => protocol::tool_json(&value),
+        Err(_) => json!({
+            "content": [{ "type": "text", "text": text }],
+            "isError": false,
+        }),
+    }
 }
 
 /// Accept either an OpenAI tool or an MCP tool definition from an extra tool group
@@ -2572,9 +2756,9 @@ fn selftest_completion(req: &Request) -> Value {
     const DESCRIBE: (&str, &str) = ("manifest_describe", "{}");
     const APPLY: (&str, &str) = (
         "manifest_apply",
-        r#"{"mode":"merge","manifest":{"tools":[{"name":"bench.mcp_probe","description":"Read the boot button on GPIO0 as a level, 1 released and 0 pressed","params":[],"exec":{"type":"gpio_read","pin":0}}]}}"#,
+        r#"{"mode":"merge","manifest":{"tools":[{"name":"bench_mcp_probe","description":"Read the boot button on GPIO0 as a level, 1 released and 0 pressed","params":[],"exec":{"type":"gpio_read","pin":0}}]}}"#,
     );
-    const CALL_NEW: (&str, &str) = ("bench.mcp_probe", "{}");
+    const CALL_NEW: (&str, &str) = ("bench_mcp_probe", "{}");
     let steps: &[(&str, &str)] = if has_word(&ask, "edit") || ask.contains("改") {
         &[WRITE, EDIT, READ]
     } else if has_word(&ask, "file") || ask.contains("文件") {
@@ -3148,7 +3332,7 @@ mod tests {
     }
 
     #[test]
-    fn the_model_key_is_never_echoed_and_https_is_refused() {
+    fn the_model_key_is_never_echoed_and_https_is_accepted() {
         let mut app = test_app();
         let saved = body_json(&app.route(&post(
             "/api/agent/config",
@@ -3167,14 +3351,20 @@ mod tests {
         app.route(&post("/api/agent/config", r#"{"api_key":"__set__"}"#));
         assert_eq!(app.llm.api_key, "sk-test-dummy");
 
-        // No TLS on the board: https is refused with a reason, not accepted.
-        let bad = app.route(&post(
+        // https is a normal endpoint, not a special case: the transport carries TLS.
+        let ok = app.route(&post(
             "/api/agent/config",
             r#"{"base_url":"https://api.example.com/v1/chat/completions"}"#,
         ));
+        assert_eq!(ok.status, 200, "https must be accepted: {}", String::from_utf8_lossy(&ok.body));
+        assert_eq!(app.llm.base_url, "https://api.example.com/v1/chat/completions");
+        assert_eq!(body_json(&ok)["endpoint_ok"], true);
+
+        // Something that is not HTTP at all still gets a reason.
+        let bad = app.route(&post("/api/agent/config", r#"{"base_url":"ftp://example.com/x"}"#));
         assert_eq!(bad.status, 400);
-        assert!(String::from_utf8_lossy(&bad.body).contains("TLS"));
-        assert_eq!(app.llm.base_url, "http://192.0.2.10:8899/v1/chat/completions");
+        assert!(String::from_utf8_lossy(&bad.body).contains("http://"));
+        assert_eq!(app.llm.base_url, "https://api.example.com/v1/chat/completions");
         assert_eq!(app.route(&post("/api/agent/config", r#"{"max_steps":99}"#)).status, 200);
         assert_eq!(app.llm.max_steps, 12, "max_steps is clamped, not trusted");
     }
@@ -3277,6 +3467,95 @@ mod tests {
         assert!(names.contains(&"net_get"), "the http tools are missing: {names:?}");
         // A tool whose hardware is absent is not offered, exactly as in tools/list.
         assert!(!names.contains(&"mpu6050_read"));
+    }
+
+    /// A turn has to be able to reach the network while it runs.
+    ///
+    /// The client the model call borrows is not the one `net_*` uses: the App owns a
+    /// separate tool transport. That split existed in name only — the simulator never
+    /// attached one, so every `net_get` inside a turn answered "no HTTP transport is
+    /// attached" on the desk while the same firmware code worked on a board.
+    #[test]
+    fn a_turn_can_use_the_network_tools_while_it_is_running() {
+        struct Fetching {
+            urls: Arc<Mutex<Vec<String>>>,
+            body: String,
+        }
+
+        impl ChatTransport for Fetching {
+            fn post_json(
+                &mut self,
+                url: &str,
+                _headers: &[(&str, &str)],
+                _body: &str,
+            ) -> std::result::Result<String, String> {
+                self.urls.lock().unwrap().push(url.to_string());
+                Ok(self.body.clone())
+            }
+        }
+
+        struct AsksForThePage {
+            seen: Arc<Mutex<Vec<String>>>,
+            calls: usize,
+        }
+
+        impl ChatTransport for AsksForThePage {
+            fn post_json(
+                &mut self,
+                _url: &str,
+                _headers: &[(&str, &str)],
+                body: &str,
+            ) -> std::result::Result<String, String> {
+                self.seen.lock().unwrap().push(body.to_string());
+                self.calls += 1;
+                if self.calls == 1 {
+                    Ok(json!({ "choices": [{ "message": {
+                        "role": "assistant", "content": null, "tool_calls": [{
+                            "id": "call_1", "type": "function",
+                            "function": { "name": "net_get", "arguments": "{\"url\":\"http://example.com/\"}" }
+                        }] } }] })
+                    .to_string())
+                } else {
+                    Ok(json!({ "choices": [{ "message": { "role": "assistant", "content": "fetched" } }] })
+                        .to_string())
+                }
+            }
+        }
+
+        let shared: Shared = Arc::new(Mutex::new(test_app()));
+        let urls = Arc::new(Mutex::new(Vec::new()));
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        {
+            let mut app = shared.lock().unwrap();
+            app.attach_tool_transport(Box::new(Fetching {
+                urls: urls.clone(),
+                body: "{\"page\":\"hello\"}".to_string(),
+            }));
+            app.route(&post(
+                "/api/agent/config",
+                r#"{"base_url":"http://127.0.0.1:9/v1/chat/completions","model":"stub","api_key":""}"#,
+            ));
+            assert_eq!(app.route(&post("/api/agent/message", r#"{"text":"fetch the page"}"#)).status, 202);
+        }
+
+        let mut model = AsksForThePage { seen: seen.clone(), calls: 0 };
+        let outcome = drive_agent(&shared, &mut model).expect("a queued turn");
+        assert!(matches!(outcome, Ok(_)), "the turn failed: {outcome:?}");
+
+        assert_eq!(
+            urls.lock().unwrap().as_slice(),
+            ["http://example.com/"],
+            "the tool transport was never used"
+        );
+        let sent = seen.lock().unwrap();
+        let second: Value = serde_json::from_str(&sent[1]).unwrap();
+        let tool_message = second["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["role"] == "tool")
+            .expect("the fetched body never reached the model");
+        assert!(tool_message["content"].as_str().unwrap().contains("hello"), "got {tool_message}");
     }
 
     #[test]
@@ -3495,7 +3774,7 @@ mod tests {
     fn a_queued_message_runs_the_loop_through_the_board_tools() {
         let mut app = test_app();
         let seen = Arc::new(Mutex::new(Vec::new()));
-        app.attach_transport(Box::new(StubModel { seen: seen.clone(), calls: 0 }));
+        app.attach_model_transport(Box::new(StubModel { seen: seen.clone(), calls: 0 }));
         app.route(&post(
             "/api/agent/config",
             r#"{"base_url":"http://127.0.0.1:9/v1/chat/completions","model":"stub","api_key":"sk-1"}"#,
@@ -3626,6 +3905,50 @@ mod tests {
         assert!(app.tools_list_body(r#"{"jsonrpc":"2.0","method":"tools/list"}"#).is_none());
     }
 
+    /// The file and network tools are reachable over MCP too, not only from the board's
+    /// own agent: an outside client driving the board can read the workspace, write a
+    /// skill, or fetch a page — the same reach, one implementation.
+    #[test]
+    fn the_file_and_network_tools_are_in_the_mcp_list_and_callable() {
+        let mut app = test_app();
+        let names = tool_names(&mut app);
+        for needle in
+            ["fs_ls", "fs_read", "fs_write", "fs_rm", "fs_cp", "fs_mv", "fs_grep", "net_get", "net_post"]
+        {
+            assert!(names.contains(&needle.to_string()), "{needle} is missing from tools/list: {names:?}");
+        }
+
+        // The schema is the same object the model gets, in the MCP field name.
+        let list = app.handle_rpc(r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#, None).unwrap();
+        let fs_read = list["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["name"] == "fs_read")
+            .expect("fs_read in the list");
+        assert!(fs_read["inputSchema"]["properties"]["path"].is_object(), "{fs_read}");
+
+        // And a call goes through the same code the agent uses.
+        let write = app
+            .handle_rpc(
+                r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"fs_write","arguments":{"path":"/notes/a.txt","text":"from mcp"}}}"#,
+                None,
+            )
+            .unwrap();
+        assert_eq!(write["result"]["isError"], json!(false), "{write}");
+        let read = app
+            .handle_rpc(
+                r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"fs_read","arguments":{"path":"/notes/a.txt"}}}"#,
+                None,
+            )
+            .unwrap();
+        assert_eq!(read["result"]["structuredContent"]["text"], json!("from mcp"), "{read}");
+
+        // `mcp.disabled_tools` hides them like any other tool.
+        app.cfg.mcp.disabled_tools = vec!["fs_rm".into()];
+        assert!(!tool_names(&mut app).contains(&"fs_rm".to_string()), "disabled_tools did not hide fs_rm");
+    }
+
     #[test]
     fn tools_list_only_shows_detected_hardware() {
         let mut app = test_app();
@@ -3730,14 +4053,14 @@ mod tests {
     #[test]
     fn a_manifest_is_applied_live_and_its_tool_works() {
         let mut app = test_app();
-        assert!(!app.is_visible("pin.led"));
+        assert!(!app.is_visible("pin_led"));
         let v = app
             .call_tool(
                 "manifest_apply",
                 &json!({
                     "manifest": {
                         "tools": [{
-                            "name": "pin.led",
+                            "name": "pin_led",
                             "description": "Drive the onboard LED pin",
                             "params": [{ "name": "on", "type": "boolean", "required": true }],
                             "exec": { "type": "gpio_write", "pin": 48, "level": { "param": "on" } }
@@ -3747,11 +4070,11 @@ mod tests {
             )
             .unwrap();
         assert_eq!(v["applied"], true);
-        assert!(app.is_visible("pin.led"), "no reboot, tool is live");
+        assert!(app.is_visible("pin_led"), "no reboot, tool is live");
         let names = tool_names(&mut app);
-        assert!(names.contains(&"pin.led".to_string()));
+        assert!(names.contains(&"pin_led".to_string()));
 
-        let out = app.call_tool("pin.led", &json!({ "on": true })).unwrap();
+        let out = app.call_tool("pin_led", &json!({ "on": true })).unwrap();
         assert_eq!(out["level"], 1);
         assert_eq!(out["pin"], 48);
     }
@@ -3772,13 +4095,686 @@ mod tests {
         assert!(!app.is_visible("bad name"));
     }
 
+    /// The name a model call is allowed to carry. Not a style rule: OpenAI-compatible
+    /// endpoints validate `function.name` against this class, and every request carries
+    /// the whole tool list.
+    fn wire_tool_name(name: &str) -> bool {
+        !name.is_empty()
+            && name.len() <= 64
+            && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    }
+
+    fn wire_names(app: &App) -> Vec<String> {
+        let specs = ToolHost::tool_specs(app);
+        specs
+            .as_array()
+            .expect("tool_specs is an array")
+            .iter()
+            .map(|t| t["function"]["name"].as_str().unwrap_or_default().to_string())
+            .collect()
+    }
+
+    fn dotted_pump() -> Value {
+        json!({ "manifest": { "tools": [{
+            "name": "pump.pulse",
+            "description": "Energise the pump relay for ms milliseconds",
+            "params": [{ "name": "ms", "type": "integer", "min": 10, "max": 5000, "required": true }],
+            "exec": { "type": "gpio_write", "pin": 12, "level": 1 }
+        }] } })
+    }
+
+    /// Every section of the reference has to arrive whole.
+    ///
+    /// A tool result is capped at `MAX_TOOL_RESULT_BYTES`; `manifest_describe` used to
+    /// return the schema, the exec primitives, the driver catalogue, the live device dump
+    /// and every example in one object. On a board the model therefore received the first
+    /// ~2 KB and nothing else — it guessed `exec` types and spent its step budget doing it.
+    #[test]
+    fn every_describe_section_arrives_without_being_cut() {
+        use crate::agent::MAX_TOOL_RESULT_BYTES;
+
+        let mut app = test_app();
+        for section in ["overview", "schema", "exec", "examples", "drivers"] {
+            let text = ToolHost::call_tool(&mut app, "manifest_describe", &json!({ "section": section }))
+                .unwrap_or_else(|e| panic!("section {section} failed: {e}"));
+            assert!(
+                text.len() <= MAX_TOOL_RESULT_BYTES,
+                "section {section} is {} bytes, over the {MAX_TOOL_RESULT_BYTES} the model sees",
+                text.len()
+            );
+            assert!(!text.contains("truncated"), "section {section} was cut: {text}");
+        }
+        for name in ["relay_with_safety", "servo_angle", "sensor_driver", "led_then_read_back"] {
+            let text = ToolHost::call_tool(
+                &mut app,
+                "manifest_describe",
+                &json!({ "section": "examples", "example": name }),
+            )
+            .unwrap();
+            assert!(text.len() <= MAX_TOOL_RESULT_BYTES, "example {name} is {} bytes", text.len());
+            assert!(text.contains("exec"), "example {name} arrived empty: {text}");
+        }
+
+        // The overview is the entry point: it names the sections and the examples.
+        let overview = ToolHost::call_tool(&mut app, "manifest_describe", &json!({})).unwrap();
+        for needle in ["exec", "schema", "relay_with_safety", "max_tools"] {
+            assert!(overview.contains(needle), "the overview does not mention {needle}: {overview}");
+        }
+
+        // The driver catalogue is paged for the same reason: fourteen entries in one
+        // result would be cut, so each one is asked for by name.
+        let listed =
+            ToolHost::call_tool(&mut app, "manifest_describe", &json!({ "section": "drivers" })).unwrap();
+        let listed: Value = serde_json::from_str(&listed).unwrap();
+        let kinds: Vec<String> = listed["drivers"]
+            .as_array()
+            .expect("a driver list")
+            .iter()
+            .filter_map(|d| d["kind"].as_str().map(|s| s.to_string()))
+            .collect();
+        assert!(kinds.len() >= 10, "the catalogue lost entries: {kinds:?}");
+        assert!(listed["hint"].as_str().unwrap().contains("driver="), "{listed}");
+        for kind in kinds {
+            let text = ToolHost::call_tool(
+                &mut app,
+                "manifest_describe",
+                &json!({ "section": "drivers", "driver": kind }),
+            )
+            .unwrap();
+            assert!(text.len() <= MAX_TOOL_RESULT_BYTES, "driver {kind} is {} bytes", text.len());
+            assert!(!text.contains("truncated"), "driver {kind} was cut");
+        }
+        // A section name that does not exist is refused with the list, not guessed at.
+        let err =
+            ToolHost::call_tool(&mut app, "manifest_describe", &json!({ "section": "nope" })).unwrap_err();
+        assert!(err.contains("overview"), "{err}");
+    }
+
+    /// The model cannot tell a driver tool from a manifest tool from a file tool.
+    ///
+    /// One array, one shape, no source tag: the `category`/`core`/`mutating` fields
+    /// exist for the portal and for `tools/list`, and are never sent. What differs is
+    /// only the *position* — the board's tools (driver, system and manifest alike) are
+    /// one alphabetical block, and `fs_*` then `net_*` follow, because those are not
+    /// MCP tools and are appended by `tool_specs` rather than registered.
+    #[test]
+    fn every_tool_reaches_the_model_in_one_shape_and_a_predictable_order() {
+        let mut app = test_app();
+        app.call_tool(
+            "manifest_apply",
+            &json!({ "manifest": { "tools": [{
+                "name": "aaa_manifest", "params": [],
+                "exec": { "type": "gpio_read", "pin": 3 }
+            }] } }),
+        )
+        .expect("manifest applied");
+
+        let specs = ToolHost::tool_specs(&app);
+        let tools = specs.as_array().expect("an array");
+        let names: Vec<&str> =
+            tools.iter().map(|t| t["function"]["name"].as_str().expect("a name")).collect();
+
+        // One shape for every entry, whichever module built it.
+        for tool in tools {
+            let top = tool.as_object().expect("an object");
+            assert_eq!(top.len(), 2, "extra fields reach the wire: {tool}");
+            assert!(top.contains_key("type") && top.contains_key("function"), "{tool}");
+            assert_eq!(tool["type"], "function");
+            let function = tool["function"].as_object().expect("a function object");
+            assert_eq!(function.len(), 3, "extra fields reach the wire: {tool}");
+            for key in ["name", "description", "parameters"] {
+                assert!(function.contains_key(key), "{tool}");
+            }
+            assert!(tool["function"]["parameters"].is_object(), "{tool}");
+        }
+
+        // The board's own tools are one alphabetical block, manifest tools excluded.
+        let split = names.iter().position(|n| n.starts_with("fs_")).expect("fs tools");
+        let board = &names[..split];
+        let mut sorted = board.to_vec();
+        sorted.sort_unstable();
+        assert_eq!(board, sorted.as_slice(), "the board tools are not one alphabetical block");
+        for needle in ["board_status", "manifest_apply"] {
+            assert!(board.contains(&needle), "{needle} is not in the board block: {board:?}");
+        }
+        assert!(!board.contains(&"aaa_manifest"), "a manifest tool is not in the board block: {board:?}");
+
+        // ... then the tools outside the registry — file and network — in module order ...
+        assert_eq!(
+            &names[split..split + 10],
+            &[
+                "fs_ls", "fs_read", "fs_write", "fs_edit", "fs_rm", "fs_cp", "fs_mv", "fs_grep", "net_get",
+                "net_post"
+            ],
+            "the file and network tools are not the trailing block: {names:?}"
+        );
+
+        // ... and the manifest block last, because it is the one the model rewrites.
+        assert_eq!(&names[split + 10..], &["aaa_manifest"], "{names:?}");
+    }
+
+    /// The same board has to produce the same bytes, or the provider's prompt cache
+    /// misses on every single turn.
+    #[test]
+    fn the_tool_list_is_byte_identical_for_the_same_board() {
+        let manifest = json!({ "manifest": { "tools": [{
+            "name": "bench_pulse",
+            "params": [{ "name": "ms", "type": "integer", "min": 10, "max": 5000, "required": true }],
+            "exec": { "type": "delay", "ms": { "param": "ms" } }
+        }] } });
+        let mut a = test_app();
+        let mut b = test_app();
+        a.call_tool("manifest_apply", &manifest).expect("apply a");
+        b.call_tool("manifest_apply", &manifest).expect("apply b");
+
+        let bytes = |app: &App| serde_json::to_string(&ToolHost::tool_specs(app)).expect("serialise");
+        let first = bytes(&a);
+        assert_eq!(first, bytes(&a), "two calls on one board produced different bytes");
+        assert_eq!(first, bytes(&b), "two identically configured boards produced different bytes");
+
+        // A re-probe must not reorder anything: same hardware, same bytes.
+        a.call_tool("devices_probe", &json!({})).expect("probe");
+        assert_eq!(first, bytes(&a), "a probe reshuffled the tool list");
+    }
+
+    /// `/AGENTS.md` and the skill index have to reach the model, or they are just files.
+    ///
+    /// The prompt is rebuilt every turn from the workspace, so editing the instructions
+    /// or adding a skill takes effect on the next turn — no restart, no transcript
+    /// rewrite, which is the only reason they are stored as files at all.
+    #[test]
+    fn the_instructions_and_the_skill_index_reach_the_system_prompt() {
+        let mut app = test_app();
+        ToolHost::call_tool(
+            &mut app,
+            "fs_write",
+            &json!({ "path": "/AGENTS.md", "text": "Pin 12 is the pump relay, active low.\nAsk before switching it." }),
+        )
+        .expect("instructions written");
+        ToolHost::call_tool(
+            &mut app,
+            "fs_write",
+            &json!({ "path": "/skills/deploy/SKILL.md", "text": "---\ndescription: roll the portal forward safely\n---\n1. snapshot\n2. flash\n" }),
+        )
+        .expect("skill written");
+
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        app.attach_model_transport(Box::new(StubModel { seen: seen.clone(), calls: 0 }));
+        app.route(&post(
+            "/api/agent/config",
+            r#"{"base_url":"http://127.0.0.1:9/v1/chat/completions","model":"stub","api_key":""}"#,
+        ));
+        app.agent.push_user("what is on pin 12?", "http", 0);
+        app.agent_run_once().expect("the turn should run");
+
+        let sent = seen.lock().unwrap();
+        let body: Value = serde_json::from_str(&sent[0].2).unwrap();
+        let system = body["messages"][0]["content"].as_str().expect("a system message");
+        assert_eq!(body["messages"][0]["role"], "system");
+        assert!(system.contains("Pin 12 is the pump relay"), "the instructions are missing: {system}");
+        assert!(system.contains("roll the portal forward safely"), "the skill index is missing: {system}");
+        assert!(!system.contains("1. snapshot"), "the skill *body* must not be in the prompt: {system}");
+        assert!(system.contains("fs_read"), "the prompt does not say how to load a skill: {system}");
+        assert!(
+            system.contains("/skills/deploy/SKILL.md"),
+            "the index must carry the path to open, not just a name: {system}"
+        );
+    }
+
+    /// A long file is carried as its head: the rest stays readable with `fs_read`.
+    #[test]
+    fn a_long_agents_md_is_cut_in_the_prompt_but_still_readable() {
+        let mut app = test_app();
+        let long = format!("rule: {}\n", "x".repeat(1600));
+        ToolHost::call_tool(&mut app, "fs_write", &json!({ "path": "/AGENTS.md", "text": long }))
+            .expect("instructions written");
+
+        let prompt = app.project_instructions().expect("instructions");
+        assert!(prompt.len() < 1600, "the prompt carried the whole file: {} bytes", prompt.len());
+        assert!(prompt.contains("truncated"), "{prompt}");
+        // ... and the file still holds everything for `fs_read` to return.
+        let text =
+            ToolHost::call_tool(&mut app, "fs_read", &json!({ "path": "/AGENTS.md" })).expect("read back");
+        assert!(text.len() > 1600, "the stored copy lost bytes: {}", text.len());
+    }
+
+    /// No dedicated tools for skills or instructions: they are files, and `fs_*` already
+    /// reaches them. One wrapper per verb would cost a definition in every request.
+    #[test]
+    fn skills_and_instructions_have_no_tools_of_their_own() {
+        let mut app = test_app();
+        let names: Vec<String> = ToolHost::tool_specs(&app)
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|t| t["function"]["name"].as_str().map(|s| s.to_string()))
+            .collect();
+        for absent in ["skill_list", "skill_read", "skill_write", "skill_delete", "agents_md"] {
+            assert!(!names.contains(&absent.to_string()), "{absent} is back in the tool list: {names:?}");
+        }
+        // The file tools that do reach them are still there.
+        for present in ["fs_ls", "fs_read", "fs_write"] {
+            assert!(names.contains(&present.to_string()), "{present} is missing: {names:?}");
+        }
+
+        // And the path works end to end: a skill directory written with `fs_write`,
+        // material next to it, seen by the index with the path to open.
+        ToolHost::call_tool(
+            &mut app,
+            "fs_write",
+            &json!({
+                "path": "/skills/pins/SKILL.md",
+                "text": "---\ndescription: GPIO map for the bench\n---\n12 relay\n"
+            }),
+        )
+        .expect("skill written");
+        ToolHost::call_tool(
+            &mut app,
+            "fs_write",
+            &json!({ "path": "/skills/pins/notes.md", "text": "relay is active low\n" }),
+        )
+        .expect("supporting file written");
+        let index = app.skills();
+        assert_eq!(index.len(), 1, "{index:?}");
+        assert_eq!(index[0].name, "pins");
+        assert_eq!(index[0].description, "GPIO map for the bench");
+        assert_eq!(index[0].path, "/skills/pins/SKILL.md");
+
+        let read = ToolHost::call_tool(&mut app, "fs_read", &json!({ "path": "/skills/pins/SKILL.md" }))
+            .expect("fs_read");
+        assert!(read.contains("12 relay"), "{read}");
+        let sibling = ToolHost::call_tool(&mut app, "fs_read", &json!({ "path": "/skills/pins/notes.md" }))
+            .expect("fs_read sibling");
+        assert!(sibling.contains("active low"), "{sibling}");
+    }
+
+    /// A flat file is still a skill: the shape for one that needs nothing else.
+    #[test]
+    fn a_one_file_skill_still_lands_in_the_index() {
+        let mut app = test_app();
+        ToolHost::call_tool(
+            &mut app,
+            "fs_write",
+            &json!({ "path": "/skills/quick.md", "text": "# quick\ndescription: one-file skill\nbody\n" }),
+        )
+        .expect("skill written");
+        let index = app.skills();
+        assert_eq!(index.len(), 1, "{index:?}");
+        assert_eq!(index[0].path, "/skills/quick.md");
+    }
+
+    /// Deleting the SKILL.md is how a skill leaves the prompt, which is why the workspace
+    /// needed a delete at all.
+    #[test]
+    fn deleting_a_skill_file_removes_it_from_the_index() {
+        let mut app = test_app();
+        ToolHost::call_tool(
+            &mut app,
+            "fs_write",
+            &json!({ "path": "/skills/pins/SKILL.md", "text": "---\ndescription: GPIO map\n---\n12 relay\n" }),
+        )
+        .unwrap();
+        assert_eq!(app.skills().len(), 1);
+
+        let gone = ToolHost::call_tool(
+            &mut app,
+            "fs_rm",
+            &json!({ "path": "/skills/pins/SKILL.md", "confirm": true }),
+        )
+        .expect("fs_rm");
+        assert!(gone.contains("removed"), "{gone}");
+        assert!(app.skills().is_empty(), "the index still lists a deleted skill: {:?}", app.skills());
+    }
+
+    /// `generic` is the lean mode: per-device tools fold into `device_invoke`, so a board
+    /// with six peripherals spends six definitions instead of twenty.
+    #[test]
+    fn generic_mode_folds_device_tools_and_can_be_set_from_a_config_patch() {
+        let mut app = test_app();
+        assert!(app.is_visible("bme280_read"), "the per-device tool starts visible");
+        assert!(app.is_visible("device_invoke"));
+
+        let v =
+            app.call_tool("config_set", &json!({ "patch": { "mcp": { "tools_mode": "generic" } } })).unwrap();
+        assert!(v["touched"].as_array().unwrap().iter().any(|t| t == "mcp.tools_mode"), "{v}");
+
+        for folded in ["bme280_read", "sht3x_read", "power_read", "oled_text"] {
+            assert!(
+                !app.is_visible(folded),
+                "{folded} survived generic mode (device_tool={:?}, mode={})",
+                app.tools.get(folded).map(|d| d.spec.device_tool),
+                app.cfg.mcp.tools_mode
+            );
+        }
+        assert!(app.is_visible("device_invoke"), "the way in must stay");
+        // ... and it still reaches the device.
+        let out = app
+            .call_tool("device_invoke", &json!({ "device": "bme280", "tool": "bme280_read" }))
+            .expect("device_invoke");
+        assert!(out["temperature_c"].is_number(), "{out}");
+    }
+
+    /// A typo in the mode used to be ignored, which left the board on the old value and
+    /// the caller believing it had changed.
+    #[test]
+    fn an_unknown_tools_mode_is_refused() {
+        let mut app = test_app();
+        let err = app
+            .call_tool("config_set", &json!({ "patch": { "mcp": { "tools_mode": "generik" } } }))
+            .unwrap_err();
+        assert!(err.message.contains("auto, generic or all"), "{err:?}");
+        assert_eq!(app.cfg.mcp.tools_mode, "auto", "the value changed anyway");
+    }
+
+    /// The devkit's own peripherals are opt-out: a board that wants the smallest possible
+    /// surface comes up with the bus, GPIO and manifest tools, and has its LED and button
+    /// back by declaring them — which is also how a different devkit starts small.
+    #[test]
+    fn a_minimal_board_starts_without_the_devkits_own_peripherals() {
+        let mut app = test_app();
+        assert!(app.is_visible("led_set"), "the profile's LED is there by default");
+
+        // Through the config path a person or the agent would use.
+        app.call_tool("config_set", &json!({ "patch": { "auto_peripherals": false } })).unwrap();
+        for gone in ["led_set", "led_blink", "buttons_read", "button_wait"] {
+            assert!(!app.is_visible(gone), "{gone} survived a minimal start");
+        }
+        assert!(app.is_visible("gpio_write"), "the primitives must stay");
+        assert!(app.is_visible("manifest_apply"), "self-configuration must stay");
+
+        // Declaring them in the manifest brings the tools back — the whole point.
+        let v = app
+            .call_tool(
+                "manifest_apply",
+                &json!({ "manifest": { "devices": [
+                    { "id": "rgb", "kind": "led", "driver": "led", "pins": { "out": 48 },
+                      "options": { "kind": "ws2812" } },
+                    { "id": "boot", "kind": "buttons", "driver": "buttons", "pins": { "boot": 0 } }
+                ] } }),
+            )
+            .unwrap();
+        assert_eq!(v["applied"], true, "{v}");
+        assert!(app.is_visible("led_set"), "the declared LED did not appear");
+        assert!(app.is_visible("buttons_read"), "the declared button did not appear");
+        let out = app.call_tool("led_set", &json!({ "color": "#010203" })).unwrap();
+        assert_eq!(out["color"], json!("#010203"), "{out}");
+    }
+
+    /// I2S cannot be probed, so the tools exist exactly when the pins are wired: the
+    /// devkit profile has no microphone, the xiaozhi wiring has both.
+    #[test]
+    fn the_microphone_and_amplifier_exist_only_when_the_i2s_pins_are_wired() {
+        let mut app = test_app();
+        assert!(!app.is_visible("mic_level"), "the devkit profile has no I2S");
+
+        app.cfg.board = "esp32s3-xiaozhi-bread".into();
+        app.rebuild();
+        for tool in ["mic_level", "mic_record", "speaker_tone", "speaker_play"] {
+            assert!(app.is_visible(tool), "{tool} missing: {:?}", app.visible_tool_names());
+        }
+
+        // The capabilities ride on the devices, so a board that cannot bring I2S up never
+        // claims them (that was the bench bug this replaces).
+        let inv = app.call_tool("inventory", &json!({})).unwrap();
+        let caps: Vec<String> =
+            inv["capabilities"].as_array().unwrap().iter().map(|c| c.as_str().unwrap().to_string()).collect();
+        assert!(caps.contains(&"mic".to_string()) && caps.contains(&"speaker".to_string()), "{caps:?}");
+
+        let level = app.call_tool("mic_level", &json!({ "ms": 50 })).unwrap();
+        assert!(level["dbfs"].is_number(), "the level meter read nothing: {level}");
+
+        let rec = app.call_tool("mic_record", &json!({ "samples": 64 })).unwrap();
+        assert_eq!(rec["samples"], json!(64), "{rec}");
+        assert!(rec["pcm_b64"].as_str().unwrap().len() <= 2048, "a tool result is capped at 2 KB");
+
+        let tone = app.call_tool("speaker_tone", &json!({ "freq_hz": 440, "ms": 50 })).unwrap();
+        assert_eq!(tone["ok"], json!(true), "{tone}");
+        assert!(tone["samples"].as_u64().unwrap() >= 400, "{tone}");
+    }
+
+    /// Two WS2812 outputs (the devkit's own on 48 and the xiaozhi strip on 18) both want
+    /// `led_set`; without distinct names the second silently replaced the first in the
+    /// registry, and `devices_list` still claimed both were reachable.
+    #[test]
+    fn two_devices_of_one_kind_get_distinct_tool_names() {
+        let mut app = test_app();
+        assert!(app.is_visible("led_set"), "the devkit's LED starts as `led_set`");
+
+        let v = app
+            .call_tool(
+                "manifest_apply",
+                &json!({ "manifest": { "devices": [
+                    { "id": "lamp", "kind": "led", "driver": "led", "pins": { "out": 18 },
+                      "options": { "kind": "ws2812", "count": "8" } }
+                ] } }),
+            )
+            .unwrap();
+        assert_eq!(v["applied"], true, "{v}");
+        assert!(app.is_visible("led_set_2"), "the strip has no tool: {:?}", app.visible_tool_names());
+
+        // The two views agree: `devices_list` names the same suffixed tool.
+        let inv = app.call_tool("devices_list", &json!({})).unwrap();
+        let ids: Vec<String> = inv["devices"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|d| d["id"].as_str().unwrap_or("?").to_string())
+            .collect();
+        let lamp = inv["devices"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|d| d["id"] == "lamp")
+            .unwrap_or_else(|| panic!("no lamp device: {ids:?}"));
+        let tools: Vec<String> =
+            lamp["tools"].as_array().unwrap().iter().map(|t| t.as_str().unwrap().to_string()).collect();
+        assert!(tools.contains(&"led_set_2".to_string()), "{tools:?}");
+
+        // ... and the second one is answered by the strip, not refused as unknown.
+        let out = app.call_tool("led_set_2", &json!({ "color": "#102030" })).unwrap();
+        assert_eq!(out["ok"], json!(true), "{out}");
+    }
+
+    #[test]
+    fn a_manifest_cannot_shadow_a_board_tool() {
+        let mut app = test_app();
+        let v = app
+            .call_tool(
+                "manifest_apply",
+                &json!({ "manifest": { "tools": [{
+                    "name": "manifest_apply", "params": [],
+                    "exec": { "type": "delay", "ms": 1 }
+                }] } }),
+            )
+            .unwrap();
+        assert_eq!(v["applied"], false, "a manifest tool took `manifest_apply`: {v}");
+        let issue = v["issues"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|i| i["path"] == "/tools/0/name")
+            .expect("an issue on the name");
+        assert!(issue["message"].as_str().unwrap().contains("manifest_apply"), "{issue}");
+        assert!(issue["hint"].as_str().unwrap().contains("my_"), "the hint must offer a rename: {issue}");
+        // The board kept its own tool.
+        let v = app.call_tool("manifest_apply", &json!({ "manifest": { "tools": [] } })).unwrap();
+        assert_eq!(v["applied"], true, "{v}");
+    }
+
+    /// The `manifest_` prefix is not reserved — only a name the board actually uses is.
+    #[test]
+    fn a_manifest_may_use_the_manifest_prefix_but_not_a_taken_name() {
+        let mut app = test_app();
+        let v = app
+            .call_tool(
+                "manifest_apply",
+                &json!({ "manifest": { "tools": [{
+                    "name": "bme280_read", "params": [],
+                    "exec": { "type": "delay", "ms": 1 }
+                }] } }),
+            )
+            .unwrap();
+        assert_eq!(v["applied"], false, "a manifest tool took a driver tool: {v}");
+
+        let v = app
+            .call_tool(
+                "manifest_apply",
+                &json!({ "manifest": { "tools": [{
+                    "name": "manifest_helper", "params": [],
+                    "exec": { "type": "delay", "ms": 1 }
+                }] } }),
+            )
+            .unwrap();
+        assert_eq!(v["applied"], true, "a free name with the prefix must be allowed: {v}");
+        assert!(app.is_visible("manifest_helper"));
+    }
+
+    /// A manifest stored by an older build is not re-validated on boot, so the rebuild
+    /// has to refuse the clash itself — the board's own tool wins.
+    #[test]
+    fn a_stale_manifest_cannot_take_a_board_tool_either() {
+        let mut app = test_app();
+        app.manifest = crate::manifest::Manifest::from_json_str(
+            r#"{"tools":[{"name":"manifest_apply","params":[],"exec":{"type":"delay","ms":1}}]}"#,
+        )
+        .expect("a manifest");
+        app.rebuild();
+        assert!(app.is_visible("manifest_apply"), "the built-in disappeared on rebuild");
+        let v = app.call_tool("manifest_apply", &json!({ "manifest": { "tools": [] } })).unwrap();
+        assert_eq!(v["applied"], true, "the built-in no longer applies: {v}");
+    }
+
+    /// A manifest must not be able to name a tool the endpoint will refuse.
+    ///
+    /// `apply` is where the refusal has to happen: a name that reaches the wire fails
+    /// the *model call*, and every later call with it, so the board cannot even ask the
+    /// model to fix the manifest. Remove the charset check and this assertion fails.
+    #[test]
+    fn a_dotted_tool_name_is_refused_by_name_and_charset() {
+        let mut app = test_app();
+        let v = app.call_tool("manifest_apply", &dotted_pump()).unwrap();
+        assert_eq!(v["applied"], false, "`pump.pulse` must not be applied: {v}");
+        let issues = v["issues"].as_array().expect("issues");
+        let issue = issues
+            .iter()
+            .find(|i| i["path"] == "/tools/0/name")
+            .unwrap_or_else(|| panic!("no /tools/0/name issue: {v}"));
+        let message = issue["message"].as_str().unwrap_or_default();
+        let hint = issue["hint"].as_str().unwrap_or_default();
+        assert!(message.contains("pump.pulse"), "the offender is not named: {message}");
+        for needle in ["a-z", "`_`", "`-`", "led_set"] {
+            assert!(hint.contains(needle), "the charset is not spelled out ({needle}): {hint}");
+        }
+        assert!(!app.is_visible("pump.pulse"), "the refused tool still answers");
+    }
+
+    /// A refused manifest leaves nothing behind: the list, a call and a model round
+    /// all still work. Turn the refusal into a pass-through and the wire carries
+    /// `pump.pulse`, which is what fails here.
+    #[test]
+    fn a_refused_manifest_poisons_nothing() {
+        let mut app = test_app();
+        let refused = app.call_tool("manifest_apply", &dotted_pump()).unwrap();
+        assert_eq!(refused["applied"], false);
+
+        // tools/list still answers, and the board's own tools are still in it.
+        let list = app.handle_rpc(r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#, None).unwrap();
+        let listed = list["result"]["tools"].as_array().expect("tools array");
+        assert!(listed.iter().any(|t| t["name"] == "board_status"), "tools/list lost the built-ins");
+
+        // A normal call still reaches the hardware.
+        assert!(app.call_tool("board_status", &json!({})).is_ok(), "the board stopped answering");
+
+        // And a model round still happens. The recorded request is the wire payload
+        // the endpoint would have refused.
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        app.attach_model_transport(Box::new(StubModel { seen: seen.clone(), calls: 0 }));
+        app.route(&post(
+            "/api/agent/config",
+            r#"{"base_url":"http://127.0.0.1:9/v1/chat/completions","model":"stub","api_key":""}"#,
+        ));
+        app.agent.push_user("is the board ok?", "http", 0);
+        let answer = app.agent_run_once().expect("the model call must still go out");
+        assert_eq!(answer, "The board is fine.");
+
+        for (_, _, body) in seen.lock().unwrap().iter() {
+            let sent: Value = serde_json::from_str(body).unwrap();
+            for tool in sent["tools"].as_array().expect("tools array") {
+                let name = tool["function"]["name"].as_str().unwrap_or_default();
+                assert!(wire_tool_name(name), "`{name}` would fail the model call: {body}");
+            }
+        }
+    }
+
+    /// Everything the board can put on the wire, manifest tools and built-ins alike.
+    #[test]
+    fn every_tool_name_on_the_wire_is_one_an_openai_endpoint_accepts() {
+        let mut app = test_app();
+        let refused = app.call_tool("manifest_apply", &dotted_pump()).unwrap();
+        assert_eq!(refused["applied"], false);
+        let applied = app
+            .call_tool(
+                "manifest_apply",
+                &json!({ "manifest": { "tools": [{
+                    "name": "pump_pulse",
+                    "params": [{ "name": "ms", "type": "integer", "required": true }],
+                    "exec": { "type": "gpio_write", "pin": 12, "level": 1 }
+                }] } }),
+            )
+            .unwrap();
+        assert_eq!(applied["applied"], true);
+
+        let names = wire_names(&app);
+        assert!(names.contains(&"pump_pulse".to_string()), "got {names:?}");
+        assert!(names.contains(&"board_status".to_string()), "got {names:?}");
+        for name in &names {
+            assert!(wire_tool_name(name), "`{name}` would be refused by the endpoint: {names:?}");
+        }
+    }
+
+    /// The shape error has to be actionable: deepseek-flash sent the tools array as the
+    /// whole document, got `schema mismatch: invalid type: sequence, expected a map`
+    /// back, and spent six steps guessing. Put that wording back and this fails.
+    #[test]
+    fn a_manifest_of_the_wrong_shape_is_told_which_shape_it_needs() {
+        let mut app = test_app();
+
+        let err = app
+            .call_tool("manifest_validate", &json!({ "manifest": [{ "name": "pump_pulse" }] }))
+            .unwrap_err();
+        let text = err.message;
+        for needle in ["must be a JSON object", "devices", "tools", "pump_pulse"] {
+            assert!(text.contains(needle), "the expected shape is not in the error ({needle}): {text}");
+        }
+
+        let err = app
+            .call_tool("manifest_validate", &json!({ "manifest": { "tools": [{ "name": 7, "exec": {} }] } }))
+            .unwrap_err();
+        assert!(err.message.contains("/tools/0/name"), "no field path: {}", err.message);
+        assert!(err.message.contains("devices") && err.message.contains("tools"), "{}", err.message);
+
+        let err = app.call_tool("manifest_validate", &json!({ "manifest": { "tool": [] } })).unwrap_err();
+        assert!(err.message.contains("/tool"), "a typo in a field name must be named: {}", err.message);
+
+        // A document of the right shape still validates.
+        let ok = app
+            .call_tool(
+                "manifest_validate",
+                &json!({ "manifest": { "tools": [{
+                    "name": "pump_pulse", "params": [],
+                    "exec": { "type": "gpio_write", "pin": 12, "level": 1 } }] } }),
+            )
+            .unwrap();
+        assert_eq!(ok["valid"], true, "{ok}");
+    }
+
     #[test]
     fn safety_limits_are_enforced_on_the_board() {
         let mut app = test_app();
         app.call_tool(
             "manifest_apply",
             &json!({ "manifest": { "tools": [{
-                "name": "servo.set",
+                "name": "servo_set",
                 "params": [{ "name": "deg", "type": "number", "required": true, "min": 0, "max": 180 }],
                 "exec": { "type": "pwm", "pin": 7, "freq_hz": 50, "duty_pct": { "param": "deg" } },
                 "safety": { "min": 5, "max": 175 }
@@ -3786,10 +4782,10 @@ mod tests {
         )
         .unwrap();
         // Schema range would allow 180; the safety range does not.
-        let err = app.call_tool("servo.set", &json!({ "deg": 180 })).unwrap_err();
+        let err = app.call_tool("servo_set", &json!({ "deg": 180 })).unwrap_err();
         assert_eq!(err.code, code::FORBIDDEN);
         assert!(err.message.contains("safety range"));
-        assert!(app.call_tool("servo.set", &json!({ "deg": 90 })).is_ok());
+        assert!(app.call_tool("servo_set", &json!({ "deg": 90 })).is_ok());
     }
 
     #[test]
@@ -3798,16 +4794,16 @@ mod tests {
         app.call_tool(
             "manifest_apply",
             &json!({ "manifest": { "tools": [{
-                "name": "relay.pulse",
+                "name": "relay_pulse",
                 "params": [],
                 "exec": { "type": "gpio_write", "pin": 5, "level": 1 },
                 "safety": { "confirm": true }
             }] } }),
         )
         .unwrap();
-        let err = app.call_tool("relay.pulse", &json!({})).unwrap_err();
+        let err = app.call_tool("relay_pulse", &json!({})).unwrap_err();
         assert_eq!(err.code, code::FORBIDDEN);
-        assert!(app.call_tool("relay.pulse", &json!({ "confirm": true })).is_ok());
+        assert!(app.call_tool("relay_pulse", &json!({ "confirm": true })).is_ok());
     }
 
     #[test]
@@ -3821,14 +4817,14 @@ mod tests {
         app.call_tool(
             "manifest_apply",
             &json!({ "manifest": { "tools": [{
-                "name": "p.keep", "params": [],
+                "name": "p_keep", "params": [],
                 "exec": { "type": "gpio_read", "pin": 3 } }] } }),
         )
         .unwrap();
         assert_eq!(app.runtime.manifest_rev, 2, "one for boot, one for the save");
         let saved = app.manifest.to_json_string();
         let reloaded = Manifest::from_json_str(&saved).unwrap();
-        assert_eq!(reloaded.tool_names(), vec!["p.keep".to_string()]);
+        assert_eq!(reloaded.tool_names(), vec!["p_keep".to_string()]);
     }
 
     #[test]
@@ -3912,7 +4908,7 @@ mod tests {
             .call_tool(
                 "manifest_apply",
                 &json!({ "manifest": { "tools": [{
-                    "name": "climate.read",
+                    "name": "climate_read",
                     "description": "blocking read, needs an explicit confirmation",
                     "params": [],
                     "exec": { "type": "driver", "driver": "bme280", "action": "bme280_read" },
@@ -3948,7 +4944,7 @@ mod tests {
         app.call_tool(
             "manifest_apply",
             &json!({ "manifest": { "tools": [{
-                "name": "climate.window",
+                "name": "climate_window",
                 "params": [{ "name": "ms", "type": "integer", "min": 10, "max": 5000, "required": true }],
                 "exec": { "type": "driver", "driver": "bme280", "action": "bme280_read" }
             }] } }),
@@ -3975,25 +4971,25 @@ mod tests {
         app.call_tool(
             "manifest_apply",
             &json!({ "manifest": { "tools": [{
-                "name": "imu.read",
+                "name": "imu_read",
                 "params": [],
                 "exec": { "type": "driver", "driver": "mpu6050", "action": "mpu6050_read" }
             }] } }),
         )
         .unwrap();
-        assert!(!app.is_visible("imu.read"), "no IMU on this board");
-        assert!(!tool_names(&mut app).contains(&"imu.read".to_string()));
+        assert!(!app.is_visible("imu_read"), "no IMU on this board");
+        assert!(!tool_names(&mut app).contains(&"imu_read".to_string()));
         // A tool for a device that *is* present stays listed.
         app.call_tool(
             "manifest_apply",
             &json!({ "mode": "merge", "manifest": { "tools": [{
-                "name": "climate.read",
+                "name": "climate_read",
                 "params": [],
                 "exec": { "type": "driver", "driver": "bme280", "action": "bme280_read" }
             }] } }),
         )
         .unwrap();
-        assert!(tool_names(&mut app).contains(&"climate.read".to_string()));
+        assert!(tool_names(&mut app).contains(&"climate_read".to_string()));
     }
 
     #[test]
@@ -4029,13 +5025,25 @@ mod tests {
     }
 
     #[test]
-    fn manifest_describe_carries_schema_primitives_and_examples() {
+    fn manifest_describe_carries_a_schema_primitives_and_examples() {
+        // One section per call: the whole reference does not fit a tool result, so it is
+        // split rather than truncated (the model used to receive 2 KB of an 8 KB answer).
         let mut app = test_app();
-        let v = app.call_tool("manifest_describe", &json!({})).unwrap();
-        assert!(v["manifest_schema"]["properties"]["tools"].is_object());
-        assert!(v["primitives"].as_array().unwrap().len() >= 8);
-        assert!(v["examples"]["relay_with_safety"].is_object());
-        assert!(v["drivers"].as_array().unwrap().iter().any(|d| d["kind"] == "bme280"));
+        let schema = app.call_tool("manifest_describe", &json!({ "section": "schema" })).unwrap();
+        assert!(schema["manifest_schema"]["properties"]["tools"].is_object());
+        let exec = app.call_tool("manifest_describe", &json!({ "section": "exec" })).unwrap();
+        assert!(exec["primitives"].as_array().unwrap().len() >= 8);
+        let examples = app.call_tool("manifest_describe", &json!({ "section": "examples" })).unwrap();
+        assert!(examples["names"].as_array().unwrap().iter().any(|n| n == "relay_with_safety"));
+        let drivers = app.call_tool("manifest_describe", &json!({ "section": "drivers" })).unwrap();
+        assert!(drivers["drivers"].as_array().unwrap().iter().any(|d| d["kind"] == "bme280"));
+        let one =
+            app.call_tool("manifest_describe", &json!({ "section": "drivers", "driver": "bme280" })).unwrap();
+        assert_eq!(one["driver"]["kind"], "bme280");
+        // The overview is what a first call gets, and it points at the rest.
+        let overview = app.call_tool("manifest_describe", &json!({})).unwrap();
+        assert_eq!(overview["section"], "overview");
+        assert!(overview["shape"]["tools"].is_array());
     }
 
     #[test]
@@ -4083,7 +5091,7 @@ mod tests {
     fn goal_app(text: &str, fail: bool) -> (App, Seen) {
         let seen: Seen = Arc::new(Mutex::new(Vec::new()));
         let mut app = test_app();
-        app.attach_transport(Box::new(FixedModel { text: text.to_string(), fail, seen: seen.clone() }));
+        app.attach_model_transport(Box::new(FixedModel { text: text.to_string(), fail, seen: seen.clone() }));
         app.route(&post(
             "/api/agent/config",
             r#"{"base_url":"http://127.0.0.1:9/v1/chat/completions","model":"stub","max_steps":3,"api_key":""}"#,

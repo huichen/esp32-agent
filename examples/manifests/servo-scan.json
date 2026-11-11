@@ -4,7 +4,7 @@
     "version": 1,
     "tools": [
       {
-        "name": "servo.angle",
+        "name": "servo_angle",
         "title": "Servo angle",
         "description": "Move a hobby servo on GPIO7 to an angle in degrees (0-180). 50 Hz PWM, 500-2500 us pulse.",
         "params": [
@@ -14,7 +14,7 @@
         "safety": { "min": 5, "max": 175, "max_calls_per_min": 60 }
       },
       {
-        "name": "servo.sweep",
+        "name": "servo_sweep",
         "title": "Servo sweep",
         "description": "Sweep the servo 30 -> 150 -> 30 degrees to show the travel is free.",
         "params": [],

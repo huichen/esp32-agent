@@ -91,6 +91,49 @@ pub struct Devices {
     items: Vec<Box<dyn Device>>,
 }
 
+/// A device that carries a name from the manifest instead of the one its driver picked.
+///
+/// `drivers::instantiate` builds the hardware object, but the id the manifest asked for
+/// (`lamp`) has to stick: two WS2812 outputs both call themselves `led` otherwise, and
+/// `device_invoke` — which routes by id — could only ever reach the first of them. Tools
+/// are routed by the id `Devices::tool_defs` reads from `info()`, so overriding it here is
+/// enough; no driver needs to change.
+pub struct NamedDevice {
+    inner: Box<dyn Device>,
+    info: DeviceInfo,
+}
+
+impl NamedDevice {
+    pub fn new(inner: Box<dyn Device>, id: &str) -> Self {
+        let mut info = inner.info();
+        info.id = id.to_string();
+        Self { inner, info }
+    }
+}
+
+impl Device for NamedDevice {
+    fn info(&self) -> DeviceInfo {
+        self.info.clone()
+    }
+
+    fn tools(&self) -> Vec<ToolDef> {
+        self.inner.tools()
+    }
+
+    fn call(
+        &mut self,
+        tool: &str,
+        args: &Value,
+        hw: &mut dyn crate::hardware::Hardware,
+    ) -> crate::error::Result<Value> {
+        self.inner.call(tool, args, hw)
+    }
+
+    fn describe(&mut self, hw: &mut dyn crate::hardware::Hardware) -> Value {
+        self.inner.describe(hw)
+    }
+}
+
 impl std::fmt::Debug for Devices {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Devices").field("count", &self.items.len()).finish()
@@ -115,7 +158,47 @@ impl Devices {
     }
 
     pub fn infos(&self) -> Vec<DeviceInfo> {
-        self.items.iter().map(|d| d.info()).collect()
+        let names = self.unique_tool_names();
+        self.items
+            .iter()
+            .enumerate()
+            .map(|(idx, d)| {
+                let mut info = d.info();
+                info.tools = info
+                    .tools
+                    .iter()
+                    .enumerate()
+                    .map(|(slot, raw)| names.get(&(idx, slot)).cloned().unwrap_or_else(|| raw.clone()))
+                    .collect();
+                info
+            })
+            .collect()
+    }
+
+    /// The name each device tool will actually carry.
+    ///
+    /// Two WS2812 outputs (the devkit's own and a strip on another pin) and two BME280s
+    /// both want `led_set` / `bme280_read`. The registry is keyed by name, so without this
+    /// the second device silently replaced the first. The first keeps the plain name and
+    /// the rest get `_2`, `_3`; `device_invoke` still routes by the device id, and
+    /// `devices_list` shows the suffixed names so the two views agree.
+    fn unique_tool_names(&self) -> std::collections::BTreeMap<(usize, usize), String> {
+        let mut taken: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        let mut out = std::collections::BTreeMap::new();
+        for (idx, d) in self.items.iter().enumerate() {
+            for (slot, def) in d.tools().iter().enumerate() {
+                let base = def.spec.name.clone();
+                let mut name = base.clone();
+                let mut n = 1usize;
+                while taken.contains(&name) {
+                    n += 1;
+                    name = format!("{base}_{n}");
+                }
+                taken.insert(name.clone());
+                out.insert((idx, slot), name);
+            }
+        }
+        out
     }
 
     /// Capability ids contributed by the devices, in first-seen order.
@@ -147,13 +230,20 @@ impl Devices {
     /// id. Routing by id rather than by index keeps the registry valid when a
     /// re-probe changes the order.
     pub fn tool_defs(&self) -> Vec<ToolDef> {
+        let names = self.unique_tool_names();
         let mut out: Vec<ToolDef> = Vec::new();
         for (idx, d) in self.items.iter().enumerate() {
             let device_id = d.info().id;
-            for def in d.tools() {
-                let tool_name = def.spec.name.clone();
-                let id = device_id.clone();
+            for (slot, def) in d.tools().into_iter().enumerate() {
                 let mut def = def;
+                // What the driver answers to, before any suffix: the handler routes with
+                // this, while the wire sees the (possibly suffixed) name.
+                let tool_name = def.spec.name.clone();
+                if let Some(name) = names.get(&(idx, slot)) {
+                    def.spec.name = name.clone();
+                    def.spec.title = name.clone();
+                }
+                let id = device_id.clone();
                 let handler: ToolHandler = Box::new(move |ctx: &mut ToolCtx, args: &Value| {
                     let ToolCtx { hw, devices, .. } = ctx;
                     let name = tool_name.clone();

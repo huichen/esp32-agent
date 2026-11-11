@@ -51,7 +51,7 @@ CORS is on by default (`mcp.cors`), so a browser MCP client can connect directly
 | POST | `/api/tools` | `{mode: auto|generic|all, disabled: [...]}` |
 | GET | `/api/manifest` | Current manifest + revision |
 | POST | `/api/manifest` | `{manifest, mode?, dry_run?}` |
-| GET | `/api/manifest/schema` | Same content as `manifest_describe` |
+| GET | `/api/manifest/schema` | `manifest_schema` + `primitives`, i.e. the `schema` and `exec` sections of `manifest_describe` (an HTTP response has no 2 KB cap) |
 | GET | `/api/wifi/scan` | Scan |
 | POST | `/api/wifi/connect` | `{ssid, password}`, save and reconnect |
 | POST | `/api/wifi/forget` | Clear the credentials |

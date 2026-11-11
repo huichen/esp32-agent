@@ -101,12 +101,19 @@ board's own tools.
 - Send a message: `POST /api/agent/message {"text":"what is on this board?"}` → 202
   (queued); the loop can call tools across several steps, and the final text lands in
   `/api/agent/history?after=`
-- Model: any OpenAI-compatible `/chat/completions` over plain `http://`; fill in
+- Model: any OpenAI-compatible `/chat/completions` over `http://` or `https://`; fill in
   `base_url` / `model` / `api_key` in the portal's agent panel (the key is stored in
-  NVS and never echoed back)
+  NVS and never echoed back). `https://` is carried by esp-tls with the ESP-IDF
+  certificate bundle; `http://` stays for a LAN endpoint and the board's own `/selftest`
 - Tools: every MCP tool on the board, plus the file tools
-  `fs_ls/fs_read/fs_write/fs_edit/fs_grep` over an NVS workspace, plus `net_get` /
-  `net_post`. There is no shell — `ls` and `grep` are the parts of one that matter here
+  `fs_ls/fs_read/fs_write/fs_edit/fs_rm/fs_cp/fs_mv/fs_grep` over an NVS workspace and
+  `net_get` / `net_post`. Those nine are on the MCP surface too, so an outside client has
+  the same reach as the board's own agent. There is no shell — `ls` and `grep` are the
+  parts of one that matter here
+- **Instructions and skills**: `/AGENTS.md` is injected into the system prompt (first
+  1 KB, the rest read with `fs_read`), and each `/skills/<name>.md` is listed by name and
+  one-line description until the model opens it. No tools of their own — they are files,
+  and `fs_*` already reaches them — [docs/agent-skills.md](docs/agent-skills.md)
 - Orchestration: `POST /api/sched` adds a scheduled prompt (`every_s` or `at_hhmm`
   plus the prompt) or a sensor rule (`tool` + `path` + `op` + `value`, rate limited);
   either way it enters the same one-slot queue as a user message
@@ -133,7 +140,7 @@ event names: `message_start`, `thinking_*`, `text_*`, `tool_use`, `tool_progress
 | Step | Tool | What it gives |
 |---|---|---|
 | Discover | `inventory`, `devices_list`, `i2c_scan`, `i2c_identify` | chip, buses, recognised devices, and **addresses that answer but have no driver** |
-| Model | `manifest_describe` | the manifest JSON Schema, the eleven primitives, the driver catalogue, limits, examples |
+| Model | `manifest_describe` | the manifest reference, one section per call — `overview` (shape, fields, limits), `schema`, `exec`, `examples`, `drivers`, each sized to arrive whole (a tool result is capped at 2 KB) |
 | Write | `manifest_apply` (`mode: merge/replace`, optional `dry_run`) | validated and applied **immediately**; failures come back as issues with a JSON Pointer |
 | Verify | `tools/list`, `mcp://manifest` | the new tool is listed; call it |
 | Iterate | edit the JSON, `manifest_apply` again | the tool list is rebuilt without a restart or a reflash |
@@ -144,7 +151,7 @@ One manifest fragment turns a relay nobody wrote code for into a tool:
 {
   "devices": [{ "id": "pump", "kind": "actuator", "pins": { "out": 12 }, "note": "active-low relay" }],
   "tools": [{
-    "name": "pump.pulse",
+    "name": "pump_pulse",
     "description": "Energise the pump relay for `ms` milliseconds",
     "params": [{ "name": "ms", "type": "integer", "min": 10, "max": 5000, "unit": "ms", "required": true }],
     "exec": { "type": "sequence", "steps": [
@@ -209,6 +216,7 @@ docs/                   architecture, manifest, capabilities, HTTP API, devices,
 - [Flashing and first setup](docs/flashing.md) — toolchain, partitions, the setup flow
 - [Troubleshooting](docs/troubleshooting.md) — dark panel, empty I2C scan, missing tools
 - [Agent loop contract](docs/agent-loop.md) and [agent stream](docs/agent-stream.md) — the on-board loop and its API
+- [Instructions and skills](docs/agent-skills.md) — `/AGENTS.md` and `/skills/<name>.md`
 
 ## Contributing
 

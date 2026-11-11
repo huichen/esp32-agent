@@ -11,6 +11,11 @@ use serde_json::{json, Value};
 use std::collections::BTreeMap;
 
 pub const CONFIG_VERSION: u32 = 1;
+
+/// Default for the flags that are on unless a board says otherwise.
+fn default_true() -> bool {
+    true
+}
 pub const NVS_KEY_CONFIG: &str = "config";
 pub const DEFAULT_PORT: u16 = 8080;
 pub const DEFAULT_PATH: &str = "/mcp";
@@ -42,6 +47,14 @@ pub struct Config {
     pub device_name: String,
     /// Board profile id, or `"auto"` to pick one from the SoC/flash it finds.
     pub board: String,
+    /// Instantiate the board profile's own peripherals (the devkit's RGB LED and its
+    /// BOOT button) at boot.
+    ///
+    /// `false` is the minimal start: the board comes up with the bus, GPIO and manifest
+    /// tools only, and those peripherals exist once a manifest declares them — which is
+    /// how a different devkit gets a small surface it grows on purpose.
+    #[serde(default = "default_true")]
+    pub auto_peripherals: bool,
     pub wifi: WifiCfg,
     pub mcp: McpCfg,
     pub bus: BusCfg,
@@ -171,6 +184,7 @@ impl Default for Config {
             version: CONFIG_VERSION,
             device_name: "esp32-agent".into(),
             board: "auto".into(),
+            auto_peripherals: true,
             wifi: WifiCfg::default(),
             mcp: McpCfg::default(),
             bus: BusCfg::default(),
@@ -289,6 +303,10 @@ impl Config {
                 touched.push("board".into());
             }
         }
+        if let Some(b) = patch.get("auto_peripherals").and_then(|v| v.as_bool()) {
+            self.auto_peripherals = b;
+            touched.push("auto_peripherals".into());
+        }
         if let Some(w) = patch.get("wifi").and_then(|v| v.as_object()) {
             if let Some(s) = w.get("ssid").and_then(|v| v.as_str()) {
                 self.wifi.ssid = s.trim().to_string();
@@ -354,9 +372,21 @@ impl Config {
                 touched.push("mcp.path".into());
             }
             if let Some(s) = m.get("tools_mode").and_then(|v| v.as_str()) {
-                if s == "auto" || s == "all" {
-                    self.mcp.tools_mode = s.to_string();
-                    touched.push("mcp.tools_mode".into());
+                // `generic` collapses the per-device tools into `device_invoke`, which is
+                // the lever that makes a small board's tool list small. It used to be
+                // accepted here only as `auto`/`all`, so the mode was documented but
+                // unreachable from `config_set` and `/api/config` — and a typo was
+                // ignored in silence.
+                match s {
+                    "auto" | "generic" | "all" => {
+                        self.mcp.tools_mode = s.to_string();
+                        touched.push("mcp.tools_mode".into());
+                    }
+                    other => {
+                        return Err(crate::error::McpError::invalid_params(format!(
+                            "`mcp.tools_mode` is `{other}`; use auto, generic or all"
+                        )))
+                    }
                 }
             }
             if let Some(a) = m.get("disabled_tools").and_then(|v| v.as_array()) {
@@ -488,7 +518,10 @@ impl Config {
         if self.mcp.port == 0 {
             self.mcp.port = DEFAULT_PORT;
         }
-        if self.mcp.tools_mode != "all" {
+        // Clamp to the known modes. This used to rewrite everything except `all` back to
+        // `auto`, which silently discarded `generic` on every config write — a patch
+        // accepted the value and the next `sanitized()` threw it away.
+        if !matches!(self.mcp.tools_mode.as_str(), "auto" | "generic" | "all") {
             self.mcp.tools_mode = "auto".into();
         }
         self.mcp.max_sessions = self.mcp.max_sessions.clamp(1, 16);

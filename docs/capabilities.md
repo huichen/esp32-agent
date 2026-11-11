@@ -21,8 +21,27 @@ At boot (and on every `devices_probe` / `/api/devices/probe`):
 3. 1-Wire: probe only the pins in `config.bus.onewire_pins` (sending a reset pulse on an
    arbitrary pin is not a harmless operation), and require a presence pulse plus a ROM CRC.
 4. Declarative peripherals (relay/servo/HC-SR04/LED/buttons): from the board profile or
-   `config.pins`, because they cannot be probed passively.
-5. An address no driver claims goes into `unidentified`; `i2c_identify` then reads the
+   `config.pins`, because they cannot be probed passively. The devkit's own LED and BOOT
+   button follow `config.auto_peripherals`: with `false` the board comes up without them
+   and they exist once a manifest declares the device —
+   `{"id":"rgb","kind":"led","driver":"led","pins":{"out":48},"options":{"kind":"ws2812"}}`
+   and `{"id":"boot","kind":"buttons","driver":"buttons","pins":{"boot":0}}`. That is
+   how a different devkit starts with a minimal surface (44 tools instead of 48 on an
+   S3-DevKitC-1) and grows on purpose. A pin set in `config.pins` (`led`, `button.boot`)
+   still wins either way, because an explicit pin is a decision.
+5. I2S audio (microphone, amplifier): **never detectable** — I2S is point-to-point with no
+   addressing and no id register, so nothing can answer a probe. The pins come from the
+   board profile or `config.pins` (`mic.bclk`/`mic.ws`/`mic.din`,
+   `amp.bclk`/`amp.ws`/`amp.dout`); when they are set and `Hardware::i2s_setup` brings
+   the channels up, the `mic`/`speaker` devices and their tools exist. The capability
+   rides on the device, so a board whose I2S does not come up never claims `mic` or
+   `speaker`. Formats are fixed per side and come from the bench measurements:
+   microphone **16 kHz, 32-bit slots, left channel only** (an INMP441 sends 24 bits
+   left-justified, right slot always zero); amplifier **24 kHz, 16-bit, Philips, mono**.
+   On the read side the driver judges by `bytes_read`, not by the return code: this
+   board's `i2s_channel_read` answers `ESP_ERR_TIMEOUT` while already holding samples, and
+   counting only `ESP_OK` makes a working microphone read as silence.
+6. An address no driver claims goes into `unidentified`; `i2c_identify` then reads the
    common id registers to suggest candidates.
 
 ## 2. Implemented drivers

@@ -11,7 +11,7 @@ those.
 
    ```json
    {"mode":"merge","manifest":{"tools":[{
-     "name":"light.level","description":"Read the photoresistor on GPIO1 in millivolts",
+     "name":"light_level","description":"Read the photoresistor on GPIO1 in millivolts",
      "params":[],"exec":{"type":"adc","pin":1}}]}}
    ```
 
@@ -120,7 +120,7 @@ Some chips are not worth a driver (low usage, one register to read). A manifest 
 is enough, and the model can follow it:
 
 ```json
-{"tools":[{"name":"mychip.raw","description":"Read 2 bytes at MyChip 0x10 (raw counts; divide by 1.2 for lux)",
+{"tools":[{"name":"mychip_raw","description":"Read 2 bytes at MyChip 0x10 (raw counts; divide by 1.2 for lux)",
   "params":[],"exec":{"type":"i2c_read","addr":64,"reg":16,"length":2}}]}
 ```
 

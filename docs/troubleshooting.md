@@ -41,8 +41,22 @@ Start with `GET /api/logs` (or the console's log tab). Every boot-time line carr
 - Did the user disable it? `mcp.disabled_tools`.
 - With `tools_mode = "generic"` the device tools are collapsed into `device_invoke`; switch
   back to `auto` if you want them individually.
-- Manifest tools: check that `enabled` is not `false` and the name is legal (`a-z0-9_-`
-  and `.`).
+- Manifest tools: check that `enabled` is not `false` and the name is legal (`a-z A-Z
+  0-9 _ -`, no `.`, at most 48 characters — the wire charset, see `docs/manifest.md`).
+
+## An `https://` model endpoint fails
+
+- `the TLS handshake with … failed` with a certificate error: the board's clock is far
+  from real time, so the certificate looks expired or not-yet-valid. `wifi_status` says
+  whether SNTP has synced; it happens within a minute of joining a network.
+- `ESP_ERR_ESP_TLS_CANNOT_RESOLVE_HOSTNAME`: DNS, not TLS. Try the LAN address, or give
+  `net_get` the same host to see whether name resolution is the problem.
+- A private CA or a self-signed endpoint: the chain is verified against the ESP-IDF
+  certificate bundle and there is no skip-verification switch, by design. Put the CA in
+  the image instead of disabling the check.
+- Out of memory during the handshake: a TLS session costs roughly 40 KB and the agent
+  thread has 16 KB of stack plus the heap. Lower `log.ring`, or set `tools_mode` to
+  `generic`, and run one turn at a time (which the queue already enforces).
 
 ## Applying a manifest fails
 

@@ -78,14 +78,14 @@ try {
 
   $manifest = @'
 {"mode":"merge","manifest":{"tools":[
-  {"name":"bench.pump","description":"Pulse the pump relay on GPIO12 for a given time",
+  {"name":"bench_pump","description":"Pulse the pump relay on GPIO12 for a given time",
    "params":[{"name":"ms","type":"integer","min":10,"max":5000,"unit":"ms","required":true}],
    "exec":{"type":"sequence","steps":[
      {"ms":0,"exec":{"type":"gpio_write","pin":12,"level":1}},
      {"ms":0,"exec":{"type":"delay","ms":{"param":"ms"}}},
      {"ms":0,"exec":{"type":"gpio_write","pin":12,"level":0}}]},
    "safety":{"max_calls_per_min":30,"confirm":false}},
-  {"name":"bench.led","description":"Set the onboard RGB LED",
+  {"name":"bench_led","description":"Set the onboard RGB LED",
    "params":[{"name":"color","type":"string","required":true}],
    "exec":{"type":"rgb","pin":48,"color":{"param":"color"}}}
 ]}}
@@ -96,13 +96,13 @@ try {
 
   $after = Rpc '{"jsonrpc":"2.0","id":3,"method":"tools/list"}'
   $afterNames = Tool-Names $after
-  Check 'the new tools are listed immediately' { ($afterNames -contains 'bench.pump') -and ($afterNames -contains 'bench.led') }
+  Check 'the new tools are listed immediately' { ($afterNames -contains 'bench_pump') -and ($afterNames -contains 'bench_led') }
 
-  $call = Rpc '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"bench.led","arguments":{"color":"#20ff80"}}}'
+  $call = Rpc '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"bench_led","arguments":{"color":"#20ff80"}}}'
   Write-Host ("led call -> " + ($call.result.content[0].text -replace "`n", ' ')) -ForegroundColor DarkGray
   Check 'the manifest tool reaches the hardware' { $call.result.isError -eq $false }
 
-  $bad = Rpc '{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"bench.pump","arguments":{"ms":90000}}}'
+  $bad = Rpc '{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"bench_pump","arguments":{"ms":90000}}}'
   Write-Host ("out-of-range -> " + ($bad.result.content[0].text -replace "`n", ' ')) -ForegroundColor DarkGray
   Check 'out-of-range argument is refused on the board' {
     $bad.result.isError -eq $true -and $bad.result.content[0].text -match 'outside'
@@ -111,10 +111,11 @@ try {
   $missing = Rpc '{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"lcd_text","arguments":{"text":"hi"}}}'
   Check 'a tool for absent hardware is not callable' { $missing.result.isError -eq $true }
 
-  $describe = Rpc '{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"manifest_describe","arguments":{}}}'
-  Check 'manifest_describe hands the model a schema and examples' {
-    $describe.result.structuredContent.manifest_schema.properties.tools -ne $null -and
-    $describe.result.structuredContent.primitives.Count -ge 8
+  $schema = Rpc '{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"manifest_describe","arguments":{"section":"schema"}}}'
+  $exec = Rpc '{"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"manifest_describe","arguments":{"section":"exec"}}}'
+  Check 'manifest_describe hands the model a schema and the exec types' {
+    $schema.result.structuredContent.manifest_schema.properties.tools -ne $null -and
+    $exec.result.structuredContent.primitives.Count -ge 8
   }
 
   $sessions = Invoke-RestMethod "http://127.0.0.1:$Port/api/sessions" -TimeoutSec 5
