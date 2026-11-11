@@ -100,6 +100,13 @@ version numbering follows semantic versioning.
 
 ### Fixed
 
+- A manifest can no longer take a name the board already provides. `manifest_apply`
+  registered manifest tools last, so a tool called `manifest_apply` (or `bme280_read`)
+  simply replaced the board's own: applying it removed the very tool needed to fix the
+  manifest, and a later probe could bring a driver tool back on top of the replacement.
+  Validation now refuses the clash with a rename hint, and `rebuild` skips a clashing tool
+  from a manifest stored by an older build (logging which names it ignored)
+
 - `net_get` / `net_post` now work inside a turn. The model call borrowed the App's only
   HTTP client, so a tool call during a turn found none — and the simulator never attached
   one at all, which is why the same code worked on a board and not on the desk. The App

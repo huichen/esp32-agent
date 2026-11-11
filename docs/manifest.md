@@ -45,6 +45,12 @@ Limits: `tools ≤ 48`, `sequence.steps ≤ 8`, cumulative `delay ≤ 5000 ms` p
   choice: `function.name` is validated against `^[a-zA-Z0-9_-]+$`, and every request
   carries the whole tool list — one name outside it fails **every** call, including the
   `manifest_apply` call that would repair the manifest.
+- `name` must not be one the board already provides: the built-in tools
+  (`board_status`, `manifest_apply`, `i2c_read`, …) and the driver tools of the detected
+  hardware (`bme280_read`, `led_set`, …). Reusing one is refused with
+  `` `manifest_apply` is already a tool the board provides `` — a manifest tool that took
+  `manifest_apply` would leave the board unable to fix its own manifest. The `manifest_`
+  prefix itself is not reserved: `manifest_helper` is fine, `manifest_apply` is not.
 - `description` is the only natural language the model sees; state **units and side
   effects**.
 - `params`: `{name, type: integer|number|string|boolean, required, min, max, unit, enum, default, description}`.

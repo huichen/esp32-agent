@@ -281,6 +281,9 @@ pub struct ValidateCtx<'a> {
     pub buses: Vec<u8>,
     pub drivers: Vec<String>,
     pub known_device_ids: Vec<String>,
+    /// Tool names the board already provides. A manifest tool that reuses one would
+    /// replace it — including `manifest_apply`, which is the way back.
+    pub taken: Vec<String>,
 }
 
 impl Manifest {
@@ -366,6 +369,18 @@ impl Manifest {
                         "Allowed: a-z, A-Z, 0-9, `_` and `-` (max 48), e.g. `led_set`. Got `{}`. \
                          Every request carries the whole tool list, so one name outside that class \
                          fails every model call until the manifest changes.",
+                        tool.name
+                    ),
+                ));
+            }
+            if ctx.taken.iter().any(|t| t == &tool.name) {
+                issues.push(Issue::new(
+                    &format!("{p}/name"),
+                    format!("`{}` is already a tool the board provides", tool.name),
+                    format!(
+                        "Pick another name, e.g. `my_{}`, or leave the existing tool alone — \
+                         replacing it would remove the board's own tool, and `manifest_apply` \
+                         replaced by a manifest tool is a board that can no longer fix its manifest.",
                         tool.name
                     ),
                 ));
@@ -1091,6 +1106,7 @@ mod tests {
             buses: vec![0],
             drivers: vec!["bme280".into(), "ssd1306".into()],
             known_device_ids: vec!["bme280".into()],
+            taken: vec!["board_status".into(), "manifest_apply".into(), "bme280_read".into()],
         }
     }
 

@@ -321,7 +321,30 @@ impl App {
         tools.register_all(board_tools::always_tools());
         tools.register_all(board_tools::manifest_tools());
         tools.register_all(self.devices.tool_defs());
-        tools.register_all(self.manifest.tool_defs());
+        // A manifest may not take a name the board already uses (validation refuses it),
+        // but a manifest stored by an older build — or one applied before the hardware
+        // was plugged in — can still arrive here. The board's own tool wins, and the
+        // clash is logged: silently replacing `manifest_apply` would leave a board that
+        // cannot repair its own manifest.
+        let mut clashing: Vec<String> = Vec::new();
+        for def in self.manifest.tool_defs() {
+            let name = def.spec.name.clone();
+            if tools.get(&name).is_some() {
+                clashing.push(name);
+                continue;
+            }
+            tools.register(def);
+        }
+        if !clashing.is_empty() {
+            self.log.error(
+                "manifest",
+                format!(
+                    "ignored {} manifest tool(s) that reuse a tool the board provides: {} — rename them",
+                    clashing.len(),
+                    clashing.join(", ")
+                ),
+            );
+        }
         self.tools = tools;
         self.runtime.manifest_rev = self.runtime.manifest_rev.max(1);
 
@@ -639,8 +662,24 @@ impl App {
                 Some(d) => d,
                 None => return Err(McpError::not_found(format!("no tool `{name}`"))),
             };
-            let mut ctx =
-                ToolCtx { hw: &mut **hw, devices, cfg, runtime, log, caps, profile, probe, manifest };
+            // The names the board itself provides. `manifest_apply` validates against
+            // them, so a manifest cannot take over `manifest_apply` (or a driver tool
+            // that a later probe will bring back) and leave the board unable to repair
+            // itself.
+            let taken: Vec<String> =
+                tools.iter().filter(|d| !d.spec.from_manifest).map(|d| d.spec.name.clone()).collect();
+            let mut ctx = ToolCtx {
+                hw: &mut **hw,
+                devices,
+                cfg,
+                runtime,
+                log,
+                caps,
+                profile,
+                probe,
+                manifest,
+                taken: &taken,
+            };
             (def.handler)(&mut ctx, args)
         };
         self.runtime.record_tool_call(name, out.is_ok());
@@ -4382,6 +4421,75 @@ mod tests {
         .expect("fs_rm");
         assert!(gone.contains("removed"), "{gone}");
         assert!(app.skills().is_empty(), "the index still lists a deleted skill: {:?}", app.skills());
+    }
+
+    #[test]
+    fn a_manifest_cannot_shadow_a_board_tool() {
+        let mut app = test_app();
+        let v = app
+            .call_tool(
+                "manifest_apply",
+                &json!({ "manifest": { "tools": [{
+                    "name": "manifest_apply", "params": [],
+                    "exec": { "type": "delay", "ms": 1 }
+                }] } }),
+            )
+            .unwrap();
+        assert_eq!(v["applied"], false, "a manifest tool took `manifest_apply`: {v}");
+        let issue = v["issues"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|i| i["path"] == "/tools/0/name")
+            .expect("an issue on the name");
+        assert!(issue["message"].as_str().unwrap().contains("manifest_apply"), "{issue}");
+        assert!(issue["hint"].as_str().unwrap().contains("my_"), "the hint must offer a rename: {issue}");
+        // The board kept its own tool.
+        let v = app.call_tool("manifest_apply", &json!({ "manifest": { "tools": [] } })).unwrap();
+        assert_eq!(v["applied"], true, "{v}");
+    }
+
+    /// The `manifest_` prefix is not reserved — only a name the board actually uses is.
+    #[test]
+    fn a_manifest_may_use_the_manifest_prefix_but_not_a_taken_name() {
+        let mut app = test_app();
+        let v = app
+            .call_tool(
+                "manifest_apply",
+                &json!({ "manifest": { "tools": [{
+                    "name": "bme280_read", "params": [],
+                    "exec": { "type": "delay", "ms": 1 }
+                }] } }),
+            )
+            .unwrap();
+        assert_eq!(v["applied"], false, "a manifest tool took a driver tool: {v}");
+
+        let v = app
+            .call_tool(
+                "manifest_apply",
+                &json!({ "manifest": { "tools": [{
+                    "name": "manifest_helper", "params": [],
+                    "exec": { "type": "delay", "ms": 1 }
+                }] } }),
+            )
+            .unwrap();
+        assert_eq!(v["applied"], true, "a free name with the prefix must be allowed: {v}");
+        assert!(app.is_visible("manifest_helper"));
+    }
+
+    /// A manifest stored by an older build is not re-validated on boot, so the rebuild
+    /// has to refuse the clash itself — the board's own tool wins.
+    #[test]
+    fn a_stale_manifest_cannot_take_a_board_tool_either() {
+        let mut app = test_app();
+        app.manifest = crate::manifest::Manifest::from_json_str(
+            r#"{"tools":[{"name":"manifest_apply","params":[],"exec":{"type":"delay","ms":1}}]}"#,
+        )
+        .expect("a manifest");
+        app.rebuild();
+        assert!(app.is_visible("manifest_apply"), "the built-in disappeared on rebuild");
+        let v = app.call_tool("manifest_apply", &json!({ "manifest": { "tools": [] } })).unwrap();
+        assert_eq!(v["applied"], true, "the built-in no longer applies: {v}");
     }
 
     /// A manifest must not be able to name a tool the endpoint will refuse.

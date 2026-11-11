@@ -33,6 +33,10 @@ pub struct ToolCtx<'a> {
     /// The manifest in force. A tool that changes it sets `runtime.manifest_dirty`;
     /// the app re-validates and rebuilds the registry after the call returns.
     pub manifest: &'a mut Manifest,
+    /// Names the board itself provides (built-in tools and driver tools). A manifest
+    /// tool may not use one: `manifest_apply` would otherwise be able to replace
+    /// itself, and the board would lose the tool it repairs its manifest with.
+    pub taken: &'a [String],
 }
 
 pub type ToolHandler = Box<dyn for<'a> Fn(&mut ToolCtx<'a>, &Value) -> Result<Value> + Send + Sync>;

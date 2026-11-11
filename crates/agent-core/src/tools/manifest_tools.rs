@@ -21,6 +21,7 @@ fn validate_ctx<'b>(ctx: &mut ToolCtx<'b>) -> ValidateCtx<'b> {
         buses: ctx.cfg.bus.i2c.iter().map(|b| b.bus).collect(),
         drivers: CATALOG.iter().filter(|e| e.status == "implemented").map(|e| e.kind.to_string()).collect(),
         known_device_ids: ctx.devices.ids(),
+        taken: ctx.taken.to_vec(),
     }
 }
 
