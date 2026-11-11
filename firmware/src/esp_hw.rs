@@ -1,4 +1,4 @@
-﻿//! The ESP-IDF implementation of [`Hardware`].
+//! The ESP-IDF implementation of [`Hardware`].
 //!
 //! Deliberately thin: every decision about *what* to read lives in
 //! `esp32-agent-core`. This file only moves bytes on buses and pins, using the
@@ -31,9 +31,14 @@ pub struct EspHw {
     adc: sys::adc_oneshot_unit_handle_t,
     rmt: sys::rmt_channel_handle_t,
     rmt_encoder: sys::rmt_encoder_handle_t,
+    /// Which pin the RMT channel is bound to; a channel serves one output.
+    rmt_pin: i32,
     boot_us: i64,
     mac: String,
     bus_pins: HashMap<u8, (i32, i32, u32)>,
+    /// I2S channel handles; null until `i2s_setup` brings them up.
+    i2s_rx: sys::i2s_chan_handle_t,
+    i2s_tx: sys::i2s_chan_handle_t,
 }
 
 // The handles are opaque pointers owned by ESP-IDF. They are only used from the
@@ -51,9 +56,12 @@ impl EspHw {
             adc: std::ptr::null_mut(),
             rmt: std::ptr::null_mut(),
             rmt_encoder: std::ptr::null_mut(),
+            rmt_pin: -1,
             boot_us: unsafe { sys::esp_timer_get_time() },
             mac: read_mac(),
             bus_pins: HashMap::new(),
+            i2s_rx: std::ptr::null_mut(),
+            i2s_tx: std::ptr::null_mut(),
         };
         for (bus, sda, scl, freq) in buses {
             if let Err(e) = hw.open_bus(*bus, *sda, *scl, *freq) {
@@ -311,11 +319,40 @@ impl Hardware for EspHw {
         Ok(((raw as u32) * 3100) / 4095)
     }
 
-    fn ring_set(&mut self, _pin: i32, _rgb: (u8, u8, u8), _count: u16) -> Result<()> {
-        // TODO(rmt): the rmt_symbol_word_t bitfield layout differs between IDF
-        // versions; the WS2812 path is postponed rather than guessed.
-        Err(McpError::unsupported("addressable RGB is not implemented on this firmware build"))
+    /// Drive a WS2812 chain with the RMT bytes encoder.
+    ///
+    /// Zero-plus-one encoding at 10 MHz: a `1` bit is 0.9 us high / 0.3 us low and a `0`
+    /// bit the other way round, i.e. 9/3 and 3/9 ticks. `rmt_new_bytes_encoder` expands
+    /// each payload byte into those symbols, so the buffer is plain WS2812 colour bytes in
+    /// the order the part expects: green, red, blue.
+    fn ring_set(&mut self, pin: i32, rgb: (u8, u8, u8), count: u16) -> Result<()> {
+        if self.rmt.is_null() || self.rmt_pin != pin {
+            self.ring_channel(pin)?;
+        }
+        let mut bytes: Vec<u8> = Vec::with_capacity(count as usize * 3);
+        for _ in 0..count.max(1) {
+            bytes.push(rgb.1);
+            bytes.push(rgb.0);
+            bytes.push(rgb.2);
+        }
+        unsafe {
+            let cfg: sys::rmt_transmit_config_t = std::mem::zeroed();
+            let rc = sys::rmt_transmit(
+                self.rmt,
+                self.rmt_encoder,
+                bytes.as_ptr() as *const core::ffi::c_void,
+                bytes.len(),
+                &cfg,
+            );
+            if rc != sys::ESP_OK {
+                return Err(McpError::hardware(format!("rmt_transmit: {rc}")));
+            }
+            // ~30 us per pixel plus the latch; 100 ms covers a long strip generously.
+            let _ = sys::rmt_tx_wait_all_done(self.rmt, 100);
+        }
+        Ok(())
     }
+
     fn delay_us(&mut self, us: u32) {
         unsafe { sys::esp_rom_delay_us(us) };
     }
@@ -326,6 +363,72 @@ impl Hardware for EspHw {
 
     fn wifi_status(&mut self) -> WifiStatus {
         wifi::status()
+    }
+
+    // ------------------------------------------------------------------ I2S audio
+
+    /// Bring up the two I2S channels with the formats measured on this board.
+    ///
+    /// Microphone: 16 kHz, 32-bit slots, left channel only (the INMP441 sends 24 bits
+    /// left-justified and the right slot stays zero). Amplifier: 24 kHz, 16-bit, Philips.
+    /// Both are master, no MCLK pin — the boards wire BCLK/WS and one data line.
+    fn i2s_setup(
+        &mut self,
+        mic: Option<esp32_agent_core::boards::I2sPins>,
+        amp: Option<esp32_agent_core::boards::I2sPins>,
+    ) -> Result<()> {
+        if let Some(pins) = mic {
+            self.i2s_rx = i2s_channel(true, 0, 16_000, 32, pins.bclk, pins.ws, pins.din)?;
+        }
+        if let Some(pins) = amp {
+            self.i2s_tx = i2s_channel(false, 1, 24_000, 16, pins.bclk, pins.ws, pins.dout)?;
+        }
+        Ok(())
+    }
+
+    /// Read 32-bit samples.
+    ///
+    /// The return code is **not** the judge: on this board `i2s_channel_read` answers
+    /// `ESP_ERR_TIMEOUT` while `bytes_read` already holds samples, and counting only on
+    /// `ESP_OK` is what makes a working microphone read as silence. So the count decides.
+    fn i2s_mic_read(&mut self, out: &mut [i32], timeout_ms: u32) -> Result<usize> {
+        if self.i2s_rx.is_null() {
+            return Err(McpError::unsupported("no I2S microphone on this board"));
+        }
+        let mut got: usize = 0;
+        let bytes = out.len() * core::mem::size_of::<i32>();
+        let _rc = unsafe {
+            sys::i2s_channel_read(
+                self.i2s_rx,
+                out.as_mut_ptr() as *mut core::ffi::c_void,
+                bytes,
+                &mut got,
+                timeout_ms,
+            )
+        };
+        Ok(got / core::mem::size_of::<i32>())
+    }
+
+    fn i2s_out_write(&mut self, samples: &[i16]) -> Result<()> {
+        if self.i2s_tx.is_null() {
+            return Err(McpError::unsupported("no I2S speaker on this board"));
+        }
+        let mut written: usize = 0;
+        let bytes = samples.len() * core::mem::size_of::<i16>();
+        let rc = unsafe {
+            sys::i2s_channel_write(
+                self.i2s_tx,
+                samples.as_ptr() as *const core::ffi::c_void,
+                bytes,
+                &mut written,
+                1000,
+            )
+        };
+        if written == 0 {
+            return Err(McpError::hardware(format!("i2s write accepted nothing (rc {rc})")));
+        }
+        // A short write is normal under load; the caller only needs to know it went out.
+        Ok(())
     }
 
     fn wifi_scan(&mut self) -> Result<Vec<WifiAp>> {
@@ -355,3 +458,125 @@ impl Hardware for EspHw {
 }
 
 
+
+// ---------------------------------------------------------------- I2S helpers
+
+/// Create and start one standard-mode I2S channel.
+///
+/// `bits` is the slot width: 32 for the microphone (24 bits left-justified in a 32-bit
+/// slot), 16 for the amplifier. Mono, Philips, master role, no MCLK pin — that is how
+/// both parts are wired on this board.
+fn i2s_channel(
+    rx: bool,
+    port: i32,
+    rate_hz: u32,
+    bits: u8,
+    bclk: i32,
+    ws: i32,
+    data: i32,
+) -> Result<sys::i2s_chan_handle_t> {
+    unsafe {
+        let mut chan: sys::i2s_chan_config_t = std::mem::zeroed();
+        chan.id = if port == 0 { sys::i2s_port_t_I2S_NUM_0 } else { sys::i2s_port_t_I2S_NUM_1 };
+        chan.role = sys::i2s_role_t_I2S_ROLE_MASTER;
+        chan.dma_desc_num = 4;
+        chan.dma_frame_num = 320;
+        let mut handle: sys::i2s_chan_handle_t = std::ptr::null_mut();
+        let rc = if rx {
+            sys::i2s_new_channel(&chan, std::ptr::null_mut(), &mut handle)
+        } else {
+            sys::i2s_new_channel(&chan, &mut handle, std::ptr::null_mut())
+        };
+        if rc != sys::ESP_OK || handle.is_null() {
+            return Err(McpError::hardware(format!("i2s_new_channel({port}): {rc}")));
+        }
+
+        let mut cfg: sys::i2s_std_config_t = std::mem::zeroed();
+        cfg.clk_cfg.sample_rate_hz = rate_hz;
+        cfg.clk_cfg.clk_src = sys::soc_periph_i2s_clk_src_t_I2S_CLK_SRC_DEFAULT;
+        cfg.clk_cfg.mclk_multiple = sys::i2s_mclk_multiple_t_I2S_MCLK_MULTIPLE_256;
+        cfg.slot_cfg.slot_mode = sys::i2s_slot_mode_t_I2S_SLOT_MODE_MONO;
+        cfg.slot_cfg.slot_mask = sys::i2s_std_slot_mask_t_I2S_STD_SLOT_LEFT;
+        cfg.slot_cfg.ws_width = bits as u32;
+        if bits == 32 {
+            cfg.slot_cfg.data_bit_width = sys::i2s_data_bit_width_t_I2S_DATA_BIT_WIDTH_32BIT;
+            cfg.slot_cfg.slot_bit_width = sys::i2s_slot_bit_width_t_I2S_SLOT_BIT_WIDTH_32BIT;
+        } else {
+            cfg.slot_cfg.data_bit_width = sys::i2s_data_bit_width_t_I2S_DATA_BIT_WIDTH_16BIT;
+            cfg.slot_cfg.slot_bit_width = sys::i2s_slot_bit_width_t_I2S_SLOT_BIT_WIDTH_16BIT;
+        }
+        cfg.gpio_cfg.mclk = -1;
+        cfg.gpio_cfg.bclk = bclk;
+        cfg.gpio_cfg.ws = ws;
+        cfg.gpio_cfg.din = if rx { data } else { -1 };
+        cfg.gpio_cfg.dout = if rx { -1 } else { data };
+
+        let rc = sys::i2s_channel_init_std_mode(handle, &cfg);
+        if rc != sys::ESP_OK {
+            return Err(McpError::hardware(format!("i2s_channel_init_std_mode({port}): {rc}")));
+        }
+        let rc = sys::i2s_channel_enable(handle);
+        if rc != sys::ESP_OK {
+            return Err(McpError::hardware(format!("i2s_channel_enable({port}): {rc}")));
+        }
+        Ok(handle)
+    }
+}
+// ---------------------------------------------------------------- WS2812 helpers
+
+impl EspHw {
+    /// Create the RMT transmit channel and its WS2812 byte encoder for one pin.
+    ///
+    /// 10 MHz resolution turns the part's 0.3/0.9 us bits into 3/9 and 9/3 ticks. A
+    /// channel is bound to one GPIO, so changing the output pin rebuilds it.
+    fn ring_channel(&mut self, pin: i32) -> Result<()> {
+        unsafe {
+            if !self.rmt.is_null() {
+                let _ = sys::rmt_disable(self.rmt);
+                sys::rmt_del_channel(self.rmt);
+                self.rmt = std::ptr::null_mut();
+            }
+            let mut ch: sys::rmt_tx_channel_config_t = std::mem::zeroed();
+            ch.gpio_num = pin;
+            ch.clk_src = sys::soc_periph_rmt_clk_src_t_RMT_CLK_SRC_DEFAULT;
+            ch.resolution_hz = 10_000_000;
+            ch.mem_block_symbols = 64usize;
+            ch.trans_queue_depth = 4;
+            let mut handle: sys::rmt_channel_handle_t = std::ptr::null_mut();
+            let rc = sys::rmt_new_tx_channel(&ch, &mut handle);
+            if rc != sys::ESP_OK || handle.is_null() {
+                return Err(McpError::hardware(format!("rmt_new_tx_channel({pin}): {rc}")));
+            }
+            let rc = sys::rmt_enable(handle);
+            if rc != sys::ESP_OK {
+                return Err(McpError::hardware(format!("rmt_enable: {rc}")));
+            }
+
+            let mut be: sys::rmt_bytes_encoder_config_t = std::mem::zeroed();
+            be.bit0 = ws2812_symbol(3, 9);
+            be.bit1 = ws2812_symbol(9, 3);
+            be.flags.set_msb_first(1);
+            let mut enc: sys::rmt_encoder_handle_t = std::ptr::null_mut();
+            let rc = sys::rmt_new_bytes_encoder(&be, &mut enc);
+            if rc != sys::ESP_OK || enc.is_null() {
+                return Err(McpError::hardware(format!("rmt_new_bytes_encoder: {rc}")));
+            }
+            self.rmt = handle;
+            self.rmt_encoder = enc;
+            self.rmt_pin = pin;
+            Ok(())
+        }
+    }
+}
+
+/// One WS2812 symbol: `high` ticks at level 1, then `low` ticks at level 0.
+fn ws2812_symbol(high: u16, low: u16) -> sys::rmt_symbol_word_t {
+    let mut s: sys::rmt_symbol_word_t = unsafe { std::mem::zeroed() };
+    unsafe {
+        s.__bindgen_anon_1.set_level0(1);
+        s.__bindgen_anon_1.set_duration0(high);
+        s.__bindgen_anon_1.set_level1(0);
+        s.__bindgen_anon_1.set_duration1(low);
+    }
+    s
+}
