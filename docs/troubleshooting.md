@@ -79,6 +79,35 @@ argument, not the firmware.
 - SH1106 clones: `options.controller = "sh1106"` (column offset 2).
 - Pure noise: `oled_contrast 0xCF` first, then check power and the 4.7 kΩ pull-ups.
 
+## The microphone reads one level and never moves
+
+- A line that sits at full scale (peak within a few counts of 2^31, dBFS around -3) is not
+  audio: nothing is driving the data pin. Check VDD/GND, `L/R` strapped to GND for the left
+  channel, and the data pin against `config.pins["mic.din"]`.
+- Before blaming the wiring, check the slot alignment. `I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG`
+  sets `bit_shift = true` and `left_align = true`; a zeroed struct right-aligns the sample
+  and drops the Philips shift, which on an INMP441 reads as a stuck full-scale line. Both
+  flags are set explicitly for that reason.
+- A quiet room on this bench reads about -65 dBFS after the alignment is right; a 1 kHz tone
+  from the amplifier puts it around -25 dBFS.
+
+## A tone keeps playing after the caller is gone
+
+- The I2S DMA descriptor is replayed, so a `speaker_tone` whose HTTP connection drops mid-way
+  loops that buffer forever and the amplifier keeps sounding. The TX channel now sets
+  `auto_clear_after_cb`, which sends silence once the written buffer has gone out.
+- If a board on older firmware is stuck this way, `speaker_play` with a block of zeros
+  (1024 samples = 2048 bytes, the per-call limit) replaces the buffer.
+- Keep `volume` modest: it is a percentage of full scale, and 90 against a 3 W amplifier at
+  desk distance is genuinely loud.
+
+## The microphone and the speaker vanish after `manifest_apply`
+
+- Every apply rebuilds the device list, so `Hardware::i2s_setup` runs again on channels that
+  are already open. `i2s_new_channel` refuses a port in use, and one failure there drops both
+  audio devices until the next reboot. The firmware now leaves an open channel alone, and
+  `devices_list` keeps `mic` and `speaker` across an apply.
+
 ## Performance and stability
 
 | Symptom | Cause / fix |

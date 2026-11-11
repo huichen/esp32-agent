@@ -63,8 +63,8 @@ At boot (and on every `devices_probe` / `/api/devices/probe`):
 
 ## 3. Planned (claim one)
 
-`dht11/dht22`, `rc522` (RFID), `vl53l0x` (ToF), `sdcard`, `inmp441` (I2S microphone),
-`max98357a` (I2S amplifier), `bme680` (gas), `sgp30`, `tsl2561` (light), `hmc5883`
+`dht11/dht22`, `rc522` (RFID), `vl53l0x` (ToF), `sdcard`,
+`bme680` (gas), `sgp30`, `tsl2561` (light), `hmc5883`
 (magnetometer), `pn532`, `max6675` (thermocouple), `aht20`, `bh1750`, multi-channel
 `sg90`, `step` (stepper motor).
 
