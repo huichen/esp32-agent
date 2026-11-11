@@ -21,7 +21,29 @@ use esp32_agent_core::http::Server;
 use esp32_agent_core::logbuf::LogBuf;
 use esp32_agent_core::store::KvStore;
 use esp_idf_svc::hal::delay::FreeRtos;
+use esp_idf_svc::sys;
 use std::sync::{Arc, Mutex};
+
+/// Log what the internal heap looks like at a boot milestone.
+///
+/// PSRAM can carry allocations but not thread stacks, and the HTTP server spawns one
+/// thread per connection: when internal RAM runs out the portal does not open and the only
+/// symptom is `could not spawn connection thread` in the log, long after the cause. The
+/// largest block matters as much as the total — ten 10 kB fragments do not make a stack.
+fn mem(label: &str) {
+    unsafe {
+        let free = sys::esp_get_free_internal_heap_size() as u32;
+        let largest =
+            sys::heap_caps_get_largest_free_block(sys::MALLOC_CAP_INTERNAL | sys::MALLOC_CAP_8BIT);
+        let msg = format!(
+            "{}: internal free {} kB, largest block {} kB",
+            label,
+            free / 1024,
+            largest / 1024
+        );
+        log::info!("{}", msg);
+    }
+}
 
 // The descriptor the bootloader prints as `Project name`. esp-idf-sys compiles the C
 // side as its own CMake project (`project(libespidf)`), and IDF's own descriptor is a
@@ -107,6 +129,7 @@ fn candidate_buses(cfg: &Config) -> Vec<(u8, i32, i32, u32)> {
 
 fn run() -> anyhow::Result<()> {
     log::info!("esp32-agent {} starting", esp32_agent_core::VERSION);
+    mem("boot");
     log_partitions();
     // Two initialisations must happen between the C runtime and the first socket:
     // the NVS partition this firmware stores its config in, and the network stack
@@ -159,7 +182,11 @@ fn run() -> anyhow::Result<()> {
         }
     }
 
-    let log = LogBuf::new(256);
+    // The ring is the single largest small allocation this firmware makes, and internal
+    // RAM is what thread stacks come from: 256 lines at ~150 bytes each cost ~38 kB and
+    // the HTTP server could not spawn a connection thread. The configured size is the
+    // one that applies; the old hardcoded 256 silently ignored it.
+    let log = LogBuf::new(cfg.log.ring.clamp(16, 256));
     let buses = candidate_buses(&cfg);
     let mut hw = match esp_hw::EspHw::new(&buses) {
         Ok(h) => h,
@@ -212,6 +239,7 @@ fn run() -> anyhow::Result<()> {
         build: option_env!("ESP32_AGENT_BUILD").unwrap_or("idf").into(),
     };
     let app: Shared = Arc::new(Mutex::new(App::new(hw, Box::new(store), log.clone(), firmware)));
+    mem("after devices");
 
     let mut port = {
         let guard = app.lock().map_err(|_| anyhow::anyhow!("app lock poisoned"))?;
@@ -233,6 +261,7 @@ fn run() -> anyhow::Result<()> {
         FreeRtos::delay_ms(100);
     }
     // Captive DNS only while the access point is up; harmless afterwards.
+    mem("after wifi");
     let _dns = match dns::MiniDns::start(std::net::Ipv4Addr::new(192, 168, 4, 1), 53) {
         Ok(d) => Some(d),
         Err(e) => {

@@ -504,8 +504,8 @@ fn i2s_channel(
         // The bench firmware that works on this hardware uses 8 descriptors of 512 frames;
         // matching it removes one variable. (`auto_clear` lives in an anonymous union in
         // these bindings and only affects TX callbacks, so it stays at its default.)
-        chan.dma_desc_num = 4;
-        chan.dma_frame_num = 320;
+        chan.dma_desc_num = 2;
+        chan.dma_frame_num = 200;
         // A DMA descriptor keeps being replayed, so a tone whose writer went away loops
         // forever — the amplifier screams until someone sends silence. Clearing the TX
         // buffer after each send makes an interrupted tone decay to silence instead.
