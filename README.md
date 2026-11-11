@@ -201,10 +201,10 @@ docs/                   architecture, manifest, capabilities, HTTP API, devices,
 
 | Part | Status |
 |---|---|
-| `agent-core` (protocol, HTTP, manifest, drivers, validation, console) | ✅ 184 unit/integration tests, `scripts/smoke.ps1` green end to end |
+| `agent-core` (protocol, HTTP, manifest, drivers, validation, console) | ✅ 273 unit/integration tests, `scripts/smoke.ps1` green end to end |
 | Host simulator | ✅ runs, console and MCP usable end to end; the agent loop runs there too |
-| ESP-IDF firmware | ✅ built, flashed and verified on an ESP32-S3-DevKitC-1 N16R8 (IDF v5.5.2): boots without reset, radio up, console and MCP served, agent loop runs with tools |
-| OTA, I2S audio, SD card, DHT/RC522/VL53L0X | 📋 see `ROADMAP.md` |
+| ESP-IDF firmware | ✅ built, flashed and verified on an ESP32-S3-DevKitC-1 N16R8 (IDF v5.5.2): boots without reset, radio up, console and MCP served, agent loop runs with tools, 51 tools with OLED + I²S mic/amplifier + WS2812 |
+| OTA, SD card, DHT/RC522/VL53L0X | 📋 see `ROADMAP.md` |
 
 ## Documentation
 

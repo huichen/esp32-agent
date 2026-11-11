@@ -1,4 +1,4 @@
-//! The ESP-IDF implementation of [`Hardware`].
+﻿//! The ESP-IDF implementation of [`Hardware`].
 //!
 //! Deliberately thin: every decision about *what* to read lives in
 //! `esp32-agent-core`. This file only moves bytes on buses and pins, using the
@@ -371,16 +371,22 @@ impl Hardware for EspHw {
     ///
     /// Microphone: 16 kHz, 32-bit slots, left channel only (the INMP441 sends 24 bits
     /// left-justified and the right slot stays zero). Amplifier: 24 kHz, 16-bit, Philips.
-    /// Both are master, no MCLK pin — the boards wire BCLK/WS and one data line.
+    /// Both are master, no MCLK pin 鈥?the boards wire BCLK/WS and one data line.
     fn i2s_setup(
         &mut self,
         mic: Option<esp32_agent_core::boards::I2sPins>,
         amp: Option<esp32_agent_core::boards::I2sPins>,
     ) -> Result<()> {
-        if let Some(pins) = mic {
+        // Every `manifest_apply` rebuilds the device list, so this runs again on a board whose
+        // channels are already open. `i2s_new_channel` fails on a port in use, and a failure
+        // here drops the mic and the speaker from the list until the next reboot - so an open
+        // channel is left alone rather than recreated.
+        if mic.is_some() && self.i2s_rx.is_null() {
+            let pins = mic.unwrap();
             self.i2s_rx = i2s_channel(true, 0, 16_000, 32, pins.bclk, pins.ws, pins.din)?;
         }
-        if let Some(pins) = amp {
+        if amp.is_some() && self.i2s_tx.is_null() {
+            let pins = amp.unwrap();
             self.i2s_tx = i2s_channel(false, 1, 24_000, 16, pins.bclk, pins.ws, pins.dout)?;
         }
         Ok(())
@@ -397,7 +403,7 @@ impl Hardware for EspHw {
         }
         // The channel is stereo (see `i2s_channel`): 8 bytes per frame, the microphone's
         // data in the left word and zeros in the right. Read the frames and keep the left
-        // word — reading it as mono moves the bit alignment half a frame and turns every
+        // word 鈥?reading it as mono moves the bit alignment half a frame and turns every
         // sample into full scale, which is exactly what the first attempt did.
         let mut got: usize = 0;
         let mut raw = vec![0i32; out.len().saturating_mul(2)];
@@ -480,7 +486,7 @@ impl Hardware for EspHw {
 /// Create and start one standard-mode I2S channel.
 ///
 /// `bits` is the slot width: 32 for the microphone (24 bits left-justified in a 32-bit
-/// slot), 16 for the amplifier. Mono, Philips, master role, no MCLK pin — that is how
+/// slot), 16 for the amplifier. Mono, Philips, master role, no MCLK pin 鈥?that is how
 /// both parts are wired on this board.
 fn i2s_channel(
     rx: bool,
@@ -495,8 +501,18 @@ fn i2s_channel(
         let mut chan: sys::i2s_chan_config_t = std::mem::zeroed();
         chan.id = if port == 0 { sys::i2s_port_t_I2S_NUM_0 } else { sys::i2s_port_t_I2S_NUM_1 };
         chan.role = sys::i2s_role_t_I2S_ROLE_MASTER;
+        // The bench firmware that works on this hardware uses 8 descriptors of 512 frames;
+        // matching it removes one variable. (`auto_clear` lives in an anonymous union in
+        // these bindings and only affects TX callbacks, so it stays at its default.)
         chan.dma_desc_num = 4;
         chan.dma_frame_num = 320;
+        // A DMA descriptor keeps being replayed, so a tone whose writer went away loops
+        // forever — the amplifier screams until someone sends silence. Clearing the TX
+        // buffer after each send makes an interrupted tone decay to silence instead.
+        if !rx {
+            chan.__bindgen_anon_1 =
+                sys::i2s_chan_config_t__bindgen_ty_1 { auto_clear_after_cb: true };
+        }
         let mut handle: sys::i2s_chan_handle_t = std::ptr::null_mut();
         let rc = if rx {
             sys::i2s_new_channel(&chan, std::ptr::null_mut(), &mut handle)
@@ -514,6 +530,14 @@ fn i2s_channel(
         cfg.slot_cfg.slot_mode = sys::i2s_slot_mode_t_I2S_SLOT_MODE_STEREO;
         cfg.slot_cfg.slot_mask = sys::i2s_std_slot_mask_t_I2S_STD_SLOT_BOTH;
         cfg.slot_cfg.ws_width = bits as u32;
+        // `I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG` sets these three; a zeroed struct leaves
+        // them false, which right-aligns the sample in its slot and drops the Philips bit
+        // shift. On an INMP441 that reads as a line that never leaves one level.
+        cfg.slot_cfg.ws_pol = false;
+        cfg.slot_cfg.bit_shift = true;
+        cfg.slot_cfg.left_align = true;
+        cfg.slot_cfg.big_endian = false;
+        cfg.slot_cfg.bit_order_lsb = false;
         if bits == 32 {
             cfg.slot_cfg.data_bit_width = sys::i2s_data_bit_width_t_I2S_DATA_BIT_WIDTH_32BIT;
             cfg.slot_cfg.slot_bit_width = sys::i2s_slot_bit_width_t_I2S_SLOT_BIT_WIDTH_32BIT;

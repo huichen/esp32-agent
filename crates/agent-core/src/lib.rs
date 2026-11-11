@@ -33,6 +33,7 @@ pub mod llm;
 pub mod logbuf;
 pub mod manifest;
 pub mod protocol;
+pub mod provision;
 pub mod sched;
 pub mod state;
 pub mod store;
