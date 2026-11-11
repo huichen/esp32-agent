@@ -377,10 +377,16 @@ impl Hardware for EspHw {
         mic: Option<esp32_agent_core::boards::I2sPins>,
         amp: Option<esp32_agent_core::boards::I2sPins>,
     ) -> Result<()> {
-        if let Some(pins) = mic {
+        // Every `manifest_apply` rebuilds the device list, so this runs again on a board whose
+        // channels are already open. `i2s_new_channel` fails on a port in use, and a failure
+        // here drops the mic and the speaker from the list until the next reboot - so an open
+        // channel is left alone rather than recreated.
+        if mic.is_some() && self.i2s_rx.is_null() {
+            let pins = mic.unwrap();
             self.i2s_rx = i2s_channel(true, 0, 16_000, 32, pins.bclk, pins.ws, pins.din)?;
         }
-        if let Some(pins) = amp {
+        if amp.is_some() && self.i2s_tx.is_null() {
+            let pins = amp.unwrap();
             self.i2s_tx = i2s_channel(false, 1, 24_000, 16, pins.bclk, pins.ws, pins.dout)?;
         }
         Ok(())
