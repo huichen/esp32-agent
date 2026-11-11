@@ -395,30 +395,46 @@ impl Hardware for EspHw {
         if self.i2s_rx.is_null() {
             return Err(McpError::unsupported("no I2S microphone on this board"));
         }
+        // The channel is stereo (see `i2s_channel`): 8 bytes per frame, the microphone's
+        // data in the left word and zeros in the right. Read the frames and keep the left
+        // word — reading it as mono moves the bit alignment half a frame and turns every
+        // sample into full scale, which is exactly what the first attempt did.
         let mut got: usize = 0;
-        let bytes = out.len() * core::mem::size_of::<i32>();
+        let mut raw = vec![0i32; out.len().saturating_mul(2)];
         let _rc = unsafe {
             sys::i2s_channel_read(
                 self.i2s_rx,
-                out.as_mut_ptr() as *mut core::ffi::c_void,
-                bytes,
+                raw.as_mut_ptr() as *mut core::ffi::c_void,
+                raw.len() * core::mem::size_of::<i32>(),
                 &mut got,
                 timeout_ms,
             )
         };
-        Ok(got / core::mem::size_of::<i32>())
+        let frames = got / (2 * core::mem::size_of::<i32>());
+        for i in 0..frames.min(out.len()) {
+            out[i] = raw[i * 2];
+        }
+        Ok(frames.min(out.len()))
     }
 
     fn i2s_out_write(&mut self, samples: &[i16]) -> Result<()> {
         if self.i2s_tx.is_null() {
             return Err(McpError::unsupported("no I2S speaker on this board"));
         }
+        // Stereo frames, the same sample in both slots: the amplifier plays one channel,
+        // and a mono framing here shifts the frame by half a slot (the bench firmware does
+        // the same duplication).
+        let mut frames: Vec<i16> = Vec::with_capacity(samples.len() * 2);
+        for s in samples {
+            frames.push(*s);
+            frames.push(*s);
+        }
         let mut written: usize = 0;
-        let bytes = samples.len() * core::mem::size_of::<i16>();
+        let bytes = frames.len() * core::mem::size_of::<i16>();
         let rc = unsafe {
             sys::i2s_channel_write(
                 self.i2s_tx,
-                samples.as_ptr() as *const core::ffi::c_void,
+                frames.as_ptr() as *const core::ffi::c_void,
                 bytes,
                 &mut written,
                 1000,
@@ -495,8 +511,8 @@ fn i2s_channel(
         cfg.clk_cfg.sample_rate_hz = rate_hz;
         cfg.clk_cfg.clk_src = sys::soc_periph_i2s_clk_src_t_I2S_CLK_SRC_DEFAULT;
         cfg.clk_cfg.mclk_multiple = sys::i2s_mclk_multiple_t_I2S_MCLK_MULTIPLE_256;
-        cfg.slot_cfg.slot_mode = sys::i2s_slot_mode_t_I2S_SLOT_MODE_MONO;
-        cfg.slot_cfg.slot_mask = sys::i2s_std_slot_mask_t_I2S_STD_SLOT_LEFT;
+        cfg.slot_cfg.slot_mode = sys::i2s_slot_mode_t_I2S_SLOT_MODE_STEREO;
+        cfg.slot_cfg.slot_mask = sys::i2s_std_slot_mask_t_I2S_STD_SLOT_BOTH;
         cfg.slot_cfg.ws_width = bits as u32;
         if bits == 32 {
             cfg.slot_cfg.data_bit_width = sys::i2s_data_bit_width_t_I2S_DATA_BIT_WIDTH_32BIT;

@@ -127,17 +127,18 @@ impl crate::device::Device for Mic {
                         "note": "the microphone returned no samples in the window",
                     }));
                 }
-                // 24 bits left-justified in 32: shift down to 16 for dBFS arithmetic.
-                let samples: Vec<i16> = buf[..got].iter().map(|s| (*s >> 16) as i16).collect();
-                let (rms, peak) = levels(&samples);
+                // Full scale is 2^31: the INMP441 sends 24 bits left-justified in a
+                // 32-bit slot, and the bench firmware measures dBFS the same way. Shifting
+                // down first would only move the rounding.
+                let (rms, peak) = levels32(&buf[..got]);
                 Ok(json!({
                     "samples": got,
                     "ms": ms,
                     "rate_hz": MIC_RATE_HZ,
                     "rms": rms as i64,
                     "peak": peak as i64,
-                    "dbfs": if rms == 0.0 { Value::Null } else { json!(round1(20.0 * (rms / 32768.0).log10())) },
-                    "peak_dbfs": if peak == 0 { Value::Null } else { json!(round1(20.0 * (peak as f32 / 32768.0).log10())) },
+                    "dbfs": if rms == 0.0 { Value::Null } else { json!(round1(20.0 * (rms / 2_147_483_648.0).log10())) },
+                    "peak_dbfs": if peak == 0 { Value::Null } else { json!(round1(20.0 * (peak as f64 / 2_147_483_648.0).log10())) },
                 }))
             }
             "mic_record" => {
@@ -272,21 +273,21 @@ fn tone(freq: f32, ms: u32, volume: f32) -> Vec<i16> {
         .collect()
 }
 
-/// RMS and peak magnitude of a window.
-fn levels(samples: &[i16]) -> (f32, i16) {
+/// RMS and peak magnitude of a 32-bit window (24 bits left-justified).
+fn levels32(samples: &[i32]) -> (f64, i32) {
     let mut sum = 0f64;
-    let mut peak = 0i16;
+    let mut peak = 0i32;
     for s in samples {
         let v = *s;
         sum += (v as f64) * (v as f64);
         peak = peak.max(v.saturating_abs());
     }
-    let rms = if samples.is_empty() { 0.0 } else { (sum / samples.len() as f64).sqrt() as f32 };
+    let rms = if samples.is_empty() { 0.0 } else { (sum / samples.len() as f64).sqrt() };
     (rms, peak)
 }
 
-fn round1(v: f32) -> f64 {
-    ((v * 10.0).round() / 10.0) as f64
+fn round1(v: f64) -> f64 {
+    (v * 10.0).round() / 10.0
 }
 
 #[cfg(test)]
@@ -304,9 +305,9 @@ mod tests {
 
     #[test]
     fn levels_report_rms_and_peak() {
-        let (rms, peak) = levels(&[0, 1000, -1000, 0]);
-        assert!((rms - 707.1).abs() < 1.0, "rms {rms}");
-        assert_eq!(peak, 1000);
-        assert_eq!(levels(&[]), (0.0, 0));
+        let (rms, peak) = levels32(&[0, 65_536, -65_536, 0]);
+        assert!((rms - 46_341.0).abs() < 10.0, "rms {rms}");
+        assert_eq!(peak, 65_536);
+        assert_eq!(levels32(&[]), (0.0, 0));
     }
 }
