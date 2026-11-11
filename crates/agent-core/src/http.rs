@@ -22,6 +22,12 @@ pub const MAX_BODY_BYTES: usize = 128 * 1024;
 const MAX_CONNECTIONS: usize = 6;
 const IDLE_TIMEOUT: Duration = Duration::from_secs(20);
 
+/// Sockets accepted but not yet sending. A browser warming connections can hold several,
+/// and they cost one descriptor each instead of a thread stack.
+const MAX_PENDING: usize = 8;
+/// How long a silent socket may sit in that list before it is closed.
+const PENDING_TTL: Duration = Duration::from_secs(30);
+
 /// How many sockets a long-lived event stream may hold.
 ///
 /// A stream keeps one pool slot for its whole life, so this is a slice of
@@ -299,11 +305,13 @@ struct BufferedReader {
 }
 
 impl BufferedReader {
-    fn new(stream: TcpStream) -> std::io::Result<Self> {
+    /// A reader that already holds the bytes read while the socket was still in the
+    /// waiting list.
+    fn with_prefix(stream: TcpStream, prefix: Vec<u8>) -> std::io::Result<Self> {
         stream.set_read_timeout(Some(IDLE_TIMEOUT))?;
         stream.set_write_timeout(Some(IDLE_TIMEOUT))?;
         stream.set_nodelay(true).ok();
-        Ok(Self { stream, buf: Vec::with_capacity(1024), pos: 0 })
+        Ok(Self { stream, buf: prefix, pos: 0 })
     }
 
     fn compact(&mut self) {
@@ -661,51 +669,112 @@ fn bind(addr: &str) -> std::io::Result<TcpListener> {
 
 fn accept_loop(listener: TcpListener, handler: Handler, stop: Arc<AtomicBool>, log: Arc<LogBuf>) {
     let active = Arc::new(AtomicUsize::new(0));
+    // Requests are answered on this thread — one stack instead of one per connection — but
+    // only once a socket actually has something to say. A browser opens idle sockets to
+    // warm the connection (and keeps them alive between page loads); reading one of those
+    // inline would park every other client for the whole read timeout, which on the bench
+    // is indistinguishable from the board being dead. So accepted sockets wait in this
+    // list until `peek` reports data.
+    let mut pending: Vec<(TcpStream, String, std::time::Instant, Vec<u8>)> = Vec::new();
     while !stop.load(Ordering::SeqCst) {
-        match listener.accept() {
-            Ok((stream, peer)) => {
-                let peer = peer.to_string();
-                // Plain requests are answered on this thread, one at a time. A thread per
-                // connection costs 6 kB of internal RAM the board does not have (~40 kB
-                // free once the radio is up), so six sockets — what a browser opening the
-                // portal asks for — could not all be served and the page never loaded.
-                // Only a streaming response keeps the socket on a thread of its own.
-                match serve_until_stream(stream, &peer, &handler, &log) {
-                    Serve::Done => {}
-                    Serve::Failed => {}
-                    Serve::Stream(conn, resp, body, head_only) => {
-                        if active.load(Ordering::SeqCst) >= MAX_CONNECTIONS {
-                            log.warn("http", format!("{peer}: too many streams, dropping"));
-                            continue;
+        loop {
+            match listener.accept() {
+                Ok((stream, peer)) => {
+                    if stream.set_nonblocking(true).is_err() {
+                        continue;
+                    }
+                    if pending.len() >= MAX_PENDING {
+                        log.warn("http", format!("{}: {MAX_PENDING} sockets waiting, dropping", peer));
+                        continue;
+                    }
+                    pending.push((stream, peer.to_string(), std::time::Instant::now(), Vec::new()));
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(e) => {
+                    log.warn("http", format!("accept failed: {e}"));
+                    std::thread::sleep(Duration::from_millis(50));
+                    break;
+                }
+            }
+        }
+
+        let now = std::time::Instant::now();
+        let mut index = 0;
+        while index < pending.len() {
+            // Bytes left over from the previous request on this socket count as ready:
+            // a pipelined request must not wait for more input that will never come.
+            let state = if !pending[index].3.is_empty() {
+                Ready::Data(std::mem::take(&mut pending[index].3))
+            } else {
+                // A non-blocking read is the readiness probe: `TcpStream::peek` is not
+                // available on this platform's std, and treating its error as "closed"
+                // dropped every connection the moment it was accepted. The bytes read here
+                // are handed to the parser instead of being thrown away.
+                let mut first = [0u8; 1024];
+                match pending[index].0.read(&mut first) {
+                    Ok(0) => Ready::Closed,
+                    Ok(n) => Ready::Data(first[..n].to_vec()),
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Ready::Idle,
+                    Err(_) => Ready::Closed,
+                }
+            };
+            let expired = now.duration_since(pending[index].2) > PENDING_TTL;
+            match state {
+                Ready::Data(prefix) => {
+                    let (stream, peer, _, _) = pending.remove(index);
+                    stream.set_nonblocking(false).ok();
+                    match serve_until_stream(stream, prefix, &peer, &handler, &log) {
+                        Serve::Done | Serve::Failed => {}
+                        Serve::KeepAlive(stream, rest) => {
+                            if stream.set_nonblocking(true).is_ok() {
+                                pending.push((stream, peer, std::time::Instant::now(), rest));
+                            }
                         }
-                        active.fetch_add(1, Ordering::SeqCst);
-                        let log_conn = log.clone();
-                        let active_conn = active.clone();
-                        let spawned = std::thread::Builder::new()
-                            .name("http-stream".into())
-                            .stack_size(CONN_STACK)
-                            .spawn(move || {
-                                let mut conn = conn;
-                                let _ = write_stream_response(&mut conn.stream, &resp, body, head_only);
-                                drop(log_conn);
-                                active_conn.fetch_sub(1, Ordering::SeqCst);
-                            });
-                        if spawned.is_err() {
-                            active.fetch_sub(1, Ordering::SeqCst);
-                            log.error("http", "could not spawn stream thread");
+                        Serve::Stream(conn, resp, body, head_only) => {
+                            if active.load(Ordering::SeqCst) >= MAX_CONNECTIONS {
+                                log.warn("http", format!("{peer}: too many streams, dropping"));
+                                continue;
+                            }
+                            active.fetch_add(1, Ordering::SeqCst);
+                            let log_conn = log.clone();
+                            let active_conn = active.clone();
+                            let spawned = std::thread::Builder::new()
+                                .name("http-stream".into())
+                                .stack_size(CONN_STACK)
+                                .spawn(move || {
+                                    let mut conn = conn;
+                                    let _ = write_stream_response(&mut conn.stream, &resp, body, head_only);
+                                    drop(log_conn);
+                                    active_conn.fetch_sub(1, Ordering::SeqCst);
+                                });
+                            if spawned.is_err() {
+                                active.fetch_sub(1, Ordering::SeqCst);
+                                log.error("http", "could not spawn stream thread");
+                            }
                         }
                     }
                 }
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                std::thread::sleep(Duration::from_millis(15));
-            }
-            Err(e) => {
-                log.warn("http", format!("accept failed: {e}"));
-                std::thread::sleep(Duration::from_millis(50));
+                Ready::Closed => {
+                    pending.remove(index);
+                }
+                Ready::Idle => {
+                    if expired {
+                        pending.remove(index);
+                    } else {
+                        index += 1;
+                    }
+                }
             }
         }
+        std::thread::sleep(Duration::from_millis(5));
     }
+}
+
+/// Whether an accepted socket has anything for us yet.
+enum Ready {
+    Data(Vec<u8>),
+    Idle,
+    Closed,
 }
 
 /// What serving one connection came to.
@@ -716,57 +785,76 @@ enum Serve {
     Failed,
     /// The response streams, so the socket moves to a thread of its own.
     Stream(BufferedReader, Response, StreamBody, bool),
+    /// One request answered, the client may send another: hand the socket back to the
+    /// waiting list instead of parking the accept thread in a second read. Chrome keeps
+    /// six warm connections open and would otherwise hold the whole server.
+    KeepAlive(TcpStream, Vec<u8>),
 }
 
-fn serve_until_stream(stream: TcpStream, peer: &str, handler: &Handler, log: &Arc<LogBuf>) -> Serve {
-    let mut conn = match BufferedReader::new(stream) {
+impl BufferedReader {
+    /// The stream plus any bytes already read past the request that was just answered.
+    fn into_parts(mut self) -> (TcpStream, Vec<u8>) {
+        let rest = self.buf.split_off(self.pos.min(self.buf.len()));
+        (self.stream, rest)
+    }
+}
+
+/// Serve **one** request. The caller decides what happens to the socket afterwards.
+fn serve_until_stream(
+    stream: TcpStream,
+    prefix: Vec<u8>,
+    peer: &str,
+    handler: &Handler,
+    log: &Arc<LogBuf>,
+) -> Serve {
+    let mut conn = match BufferedReader::with_prefix(stream, prefix) {
         Ok(c) => c,
         Err(_) => return Serve::Failed,
     };
-    for _ in 0..32 {
-        match parse_request(&mut conn, peer) {
-            Ok(Some(req)) => {
-                let keep_alive = match req.header("connection") {
-                    Some(v) => !v.eq_ignore_ascii_case("close"),
-                    None => true,
-                };
-                let head_only = req.method == "HEAD";
-                let started = std::time::Instant::now();
-                let mut resp = handler(&req);
-                if started.elapsed().as_millis() > 500 {
-                    log.warn(
-                        "http",
-                        format!("{} {} took {} ms", req.method, req.path, started.elapsed().as_millis()),
-                    );
-                }
-                conn.stream.set_write_timeout(Some(IDLE_TIMEOUT)).ok();
-                if let Some(body) = resp.stream.take() {
-                    // The handler has returned, so whatever lock it took is released:
-                    // the stream polls the app from here on, without holding it.
-                    return Serve::Stream(conn, resp, body, head_only);
-                }
-                if write_response(&mut conn.stream, &resp, keep_alive, head_only).is_err() {
-                    return Serve::Failed;
-                }
-                if !keep_alive {
-                    return Serve::Done;
-                }
+    match parse_request(&mut conn, peer) {
+        Ok(Some(req)) => {
+            let keep_alive = match req.header("connection") {
+                Some(v) => !v.eq_ignore_ascii_case("close"),
+                None => true,
+            };
+            let head_only = req.method == "HEAD";
+            let started = std::time::Instant::now();
+            let mut resp = handler(&req);
+            if started.elapsed().as_millis() > 500 {
+                log.warn(
+                    "http",
+                    format!("{} {} took {} ms", req.method, req.path, started.elapsed().as_millis()),
+                );
             }
-            Ok(None) => return Serve::Done,
-            Err(e) => {
-                log.warn("http", format!("{peer}: bad request: {e}"));
-                let mut s = conn.stream;
-                let _ = write_response(&mut s, &Response::error_json(400, "bad request"), false, false);
+            conn.stream.set_write_timeout(Some(IDLE_TIMEOUT)).ok();
+            if let Some(body) = resp.stream.take() {
+                // The handler has returned, so whatever lock it took is released:
+                // the stream polls the app from here on, without holding it.
+                return Serve::Stream(conn, resp, body, head_only);
+            }
+            if write_response(&mut conn.stream, &resp, keep_alive, head_only).is_err() {
                 return Serve::Failed;
             }
+            if !keep_alive {
+                return Serve::Done;
+            }
+            let (stream, rest) = conn.into_parts();
+            Serve::KeepAlive(stream, rest)
+        }
+        Ok(None) => Serve::Done,
+        Err(e) => {
+            log.warn("http", format!("{peer}: bad request: {e}"));
+            let mut s = conn.stream;
+            let _ = write_response(&mut s, &Response::error_json(400, "bad request"), false, false);
+            Serve::Failed
         }
     }
-    Serve::Done
 }
 
 #[allow(dead_code)]
 fn serve_connection(stream: TcpStream, peer: String, handler: Handler, log: Arc<LogBuf>) {
-    if let Serve::Stream(mut conn, resp, body, head_only) = serve_until_stream(stream, &peer, &handler, &log)
+    if let Serve::Stream(mut conn, resp, body, head_only) =
+        serve_until_stream(stream, Vec::new(), &peer, &handler, &log)
     {
         let _ = write_stream_response(&mut conn.stream, &resp, body, head_only);
     }
@@ -845,6 +933,66 @@ mod tests {
             })
             .unwrap_or(0);
         out.len() - (split + 4) >= len
+    }
+
+    /// A socket that connects and says nothing must not hold up anybody else.
+    ///
+    /// This is the failure that made the portal unreachable: the board accepted a warm-up
+    /// connection from a browser, sat in a blocking read on it, and every later request
+    /// timed out with no log line to explain it. The server now waits for the first byte
+    /// before serving, so a silent socket is just a descriptor.
+    #[test]
+    fn an_idle_socket_does_not_block_a_real_request() {
+        let (server, _log) = start_test_server();
+        let addr = server.local_addr();
+
+        let idle = TcpStream::connect(addr).expect("connect");
+        // No bytes: this is what a browser's preconnect looks like.
+        std::thread::sleep(Duration::from_millis(120));
+
+        let started = std::time::Instant::now();
+        let resp = raw_request(addr, "GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+        assert!(resp.starts_with("HTTP/1.1 200 OK"), "got {resp:?}");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "an idle socket delayed a real request by {:?}",
+            started.elapsed()
+        );
+
+        drop(idle);
+        drop(server);
+    }
+
+    /// A keep-alive socket must not hold the server.
+    ///
+    /// Chrome keeps six warm connections open and reuses them; if the accept thread waits
+    /// inside one for the next request, every other client times out — the portal "does not
+    /// open" while it is being loaded. The connection goes back to the waiting list
+    /// instead, and the next client is served in the meantime.
+    #[test]
+    fn a_kept_alive_socket_does_not_hold_the_server() {
+        let (server, _log) = start_test_server();
+        let addr = server.local_addr();
+
+        let mut warm = TcpStream::connect(addr).expect("connect");
+        warm.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        warm.write_all(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n").unwrap();
+        let mut first = [0u8; 128];
+        let n = warm.read(&mut first).expect("first response");
+        assert!(String::from_utf8_lossy(&first[..n]).starts_with("HTTP/1.1 200"));
+
+        // The warm socket is now idle and stays open, exactly like a browser's.
+        let started = std::time::Instant::now();
+        let resp = raw_request(addr, "GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+        assert!(resp.starts_with("HTTP/1.1 200 OK"), "got {resp:?}");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "a kept-alive socket delayed another client by {:?}",
+            started.elapsed()
+        );
+
+        drop(warm);
+        drop(server);
     }
 
     #[test]
