@@ -15,7 +15,13 @@ param(
   [string]$Target = 'xtensa-esp32s3-espidf',
   [switch]$Flash,
   [string]$Port = '',
-  [switch]$Release = $true
+  [switch]$Release = $true,
+  # esp-idf-sys refuses an output directory longer than 88 characters on Windows and
+  # tells you to keep the project path short. `firmware/target` blows past that in any
+  # clone with a name of its own, so artifacts go here instead (a path under the clone
+  # root, already gitignored). Override with a shorter path in a deep clone, e.g.
+  # -TargetDir D:\t
+  [string]$TargetDir = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -41,12 +47,18 @@ if (-not (Get-Command 'espflash' -ErrorAction SilentlyContinue)) {
 }
 
 # The toolchain config in firmware/.cargo/config.toml points at S3; keep them in sync.
+# Written only when something actually changed, and without a BOM: `Set-Content -Encoding
+# utf8` on PowerShell 5.1 stamps one, which then shows up as a one-line diff in every
+# build (and `cargo fmt --check` has no opinion about it).
 $cfg = Join-Path $fw '.cargo\config.toml'
-$text = Get-Content $cfg -Raw
-$text = $text -replace 'target = "[^"]+"', "target = `"$Target`""
+$before = [System.IO.File]::ReadAllText($cfg, [System.Text.Encoding]::UTF8)
+$text = $before -replace 'target = "[^"]+"', "target = `"$Target`""
 $text = $text -replace 'MCU = "[^"]+"', "MCU = `"$Mcpu`""
 $text = $text -replace 'runner = "[^"]+"', "runner = `"espflash flash --monitor`""
-Set-Content -Path $cfg -Value $text -Encoding utf8
+if ($text -ne $before) {
+  $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+  [System.IO.File]::WriteAllText($cfg, $text, $utf8NoBom)
+}
 
 Push-Location $fw
 try {
@@ -59,15 +71,32 @@ try {
     Write-Warning 'export-esp.ps1 not found — run `espup install` once, or set PATH manually'
   }
 
+  # bindgen (esp-idf-sys' first run) wants the directory holding libclang.dll, but
+  # export-esp.ps1 points LIBCLANG_PATH at the DLL itself; the first build then fails
+  # with "couldn't find libclang" instead of anything actionable.
+  if ($env:LIBCLANG_PATH -and (Test-Path $env:LIBCLANG_PATH -PathType Leaf)) {
+    $env:LIBCLANG_PATH = Split-Path -Parent $env:LIBCLANG_PATH
+  }
+
+  # The `esp` toolchain carries the xtensa/riscv target and build-std; the default one
+  # carries neither and the failure reads as `can't find crate for core`.
+  if (-not $env:CARGO_TARGET_DIR) {
+    $env:CARGO_TARGET_DIR = if ($TargetDir) { $TargetDir } else { Join-Path $repo 'target' }
+  }
+  $outProbe = "$env:CARGO_TARGET_DIR\$Target\release\build\esp-idf-sys-0000000000000000\out"
+  if ($outProbe.Length -gt 84) {
+    Write-Warning "the output path is $($outProbe.Length) characters; esp-idf-sys refuses more than 88 on Windows - pass -TargetDir with a shorter path"
+  }
+
   $profileArg = if ($Release) { '--release' } else { '' }
-  Write-Host "cargo build $profileArg --target $Target (MCU=$Mcpu)" -ForegroundColor Cyan
-  cargo build $profileArg --target $Target
+  Write-Host "cargo +esp build $profileArg --target $Target (MCU=$Mcpu, target-dir=$env:CARGO_TARGET_DIR)" -ForegroundColor Cyan
+  cargo +esp build $profileArg --target $Target
   if ($LASTEXITCODE -ne 0) { throw 'firmware build failed' }
 
   if ($Flash) {
     Need 'espflash' 'cargo install espflash'
-    $bin = Join-Path $fw "target\$Target\release\esp32-agent"
-    if (-not (Test-Path $bin)) { $bin = Join-Path $fw "target\$Target\debug\esp32-agent" }
+    $bin = Join-Path $env:CARGO_TARGET_DIR "$Target\release\esp32-agent"
+    if (-not (Test-Path $bin)) { $bin = Join-Path $env:CARGO_TARGET_DIR "$Target\debug\esp32-agent" }
     $args = @('flash', '--monitor', $bin)
     if ($Port) { $args += @('--port', $Port) }
     Write-Host "espflash $($args -join ' ')" -ForegroundColor Cyan

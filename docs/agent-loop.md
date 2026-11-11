@@ -6,7 +6,7 @@ the supervisor integrates, builds and verifies on the bench board.
 ## 1. What is being built
 
 An agent loop that runs **on the ESP32** and talks to an OpenAI-compatible chat
-endpoint over plain HTTP, using the board's own tools as its tool set:
+endpoint over HTTP or HTTPS, using the board's own tools as its tool set:
 
     user message / scheduled task / sensor rule
         -> queue (depth 1, coalesce)
@@ -22,8 +22,13 @@ endpoint over plain HTTP, using the board's own tools as its tool set:
 - **One agent run at a time.** The queue holds exactly one pending message; a new
   trigger while a run is in flight *coalesces* into it (newest text wins, source
   list appended). Never two concurrent model calls.
-- **No TLS in v1.** The endpoint is `http://`. A LAN proxy is the expected
-  deployment; `https://` is rejected with a clear error rather than hanging.
+- **TLS for `https://`, on the board.** The transport carries the scheme: plain
+  `http://` over a socket (a LAN endpoint, and the board's own
+  `/selftest/chat/completions`), `https://` over esp-tls with the ESP-IDF certificate
+  bundle. There is no "skip verification" switch. A handshake costs roughly 40 KB of
+  heap for the session, which is why the board has PSRAM and why one run still happens
+  at a time. Inbound traffic — the portal and `/mcp` on port 8080 — stays HTTP;
+  see `SECURITY.md` for why that is a reverse-proxy decision, not an oversight.
 - **Bounded everything.** History ring (<= 48 messages / <= 24 KB), tool result
   <= 2 KB (truncated with a marker), model reply <= 8 KB, `max_steps` default 4.
 - **No new ESP-IDF components.** The workspace for the file tools is an in-RAM
@@ -38,7 +43,8 @@ endpoint over plain HTTP, using the board's own tools as its tool set:
 ```rust
 pub trait ChatTransport {
     /// POST `body` to `url` with `headers`; return the response body.
-    /// Plain HTTP only; implementation enforces its own timeout.
+    /// POST `body` to `url` (http:// or https://); the scheme is the transport's business.
+    /// Implementation enforces its own timeout.
     fn post_json(&mut self, url: &str, headers: &[(&str, &str)], body: &str)
         -> Result<String, String>;
 }
@@ -98,6 +104,10 @@ pub trait ToolHost {
     fn tool_specs(&self) -> serde_json::Value;
     /// Run one tool call; the result is JSON text (<= 2 KB enforced here).
     fn call_tool(&mut self, name: &str, arguments: &serde_json::Value) -> Result<String, String>;
+    /// `/AGENTS.md`, already bounded by the host; `None` when there is none.
+    fn project_instructions(&self) -> Option<String> { None }
+    /// Skills the model may load on demand, as `(name, one-line description)`.
+    fn skills(&self) -> Vec<(String, String)> { Vec::new() }
 }
 
 pub struct Agent {
@@ -129,6 +139,24 @@ history trimming keeps the system prompt implicit and drops oldest user/assistan
 pairs beyond 48 messages; every tool result text is truncated to 2048 bytes with
 `"…(truncated)"`; `run_pending` with no pending message is `Ok(String::new())`.
 
+### 3.2a The order of the tool list is part of the contract
+
+A provider caches a request by its longest matching prefix, so the `tools` array has to
+be byte-identical between two turns that changed nothing — and as stable as possible when
+something does change. `ToolHost::tool_specs` therefore emits three blocks, least
+volatile first, each ordered by name:
+
+1. the board's own tools (drivers and system tools) — they change with the hardware or
+the firmware;
+2. `fs_*` and `net_*` — fixed for a given build;
+3. manifest tools — they change whenever the model rewrites one.
+
+Putting the manifest block last is what keeps a mid-turn `manifest_apply` from
+reprocessing the whole tool list: only the tail moves. Alphabetical order inside a block
+is what makes two boards with the same hardware produce the same bytes, whatever order
+the probe happened to enumerate them in. `the_tool_list_is_byte_identical_for_the_same_board`
+and `every_tool_reaches_the_model_in_one_shape_and_a_predictable_order` pin both halves.
+
 ### 3.3 `crates/agent-core/src/tools/fs.rs` (worker B)
 
 ```rust
@@ -153,6 +181,13 @@ occurrence of `find`, otherwise it errors (that is the safety property).
 `specs()` + `call(transport: &mut dyn ChatTransport, name, args)` for
 `net_get {url}` and `net_post {url, body}`; response body truncated to 2 KB;
 non-2xx returns the status plus body prefix as `Err`.
+
+The transport passed here is the `App`'s **tool transport** (`App::tool_transport`),
+which is a different client from the one the model call uses. That is deliberate: the
+model request borrows the driver's client for the length of the turn, so a shared one
+would leave `net_*` with nothing to send on — which is exactly what happened while the
+simulator never attached one: every `net_get` inside a turn answered "no HTTP transport
+is attached". `attach_tool_transport` is what the platform layer calls once at boot.
 
 ### 3.5 `crates/agent-core/src/sched.rs` (worker B)
 

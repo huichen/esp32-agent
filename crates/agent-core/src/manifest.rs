@@ -281,6 +281,9 @@ pub struct ValidateCtx<'a> {
     pub buses: Vec<u8>,
     pub drivers: Vec<String>,
     pub known_device_ids: Vec<String>,
+    /// Tool names the board already provides. A manifest tool that reuses one would
+    /// replace it — including `manifest_apply`, which is the way back.
+    pub taken: Vec<String>,
 }
 
 impl Manifest {
@@ -362,7 +365,24 @@ impl Manifest {
                 issues.push(Issue::new(
                     &format!("{p}/name"),
                     format!("`{}` is not a valid tool name", tool.name),
-                    "Use a-z, 0-9, `_`, `-` and `.` (max 48), e.g. `led.set`.",
+                    format!(
+                        "Allowed: a-z, A-Z, 0-9, `_` and `-` (max 48), e.g. `led_set`. Got `{}`. \
+                         Every request carries the whole tool list, so one name outside that class \
+                         fails every model call until the manifest changes.",
+                        tool.name
+                    ),
+                ));
+            }
+            if ctx.taken.iter().any(|t| t == &tool.name) {
+                issues.push(Issue::new(
+                    &format!("{p}/name"),
+                    format!("`{}` is already a tool the board provides", tool.name),
+                    format!(
+                        "Pick another name, e.g. `my_{}`, or leave the existing tool alone — \
+                         replacing it would remove the board's own tool, and `manifest_apply` \
+                         replaced by a manifest tool is a board that can no longer fix its manifest.",
+                        tool.name
+                    ),
                 ));
             }
             if let Some(first) = seen.insert(&tool.name, i) {
@@ -645,6 +665,7 @@ impl Manifest {
                 .title(if t.title.is_empty() { &t.name } else { &t.title })
                 .category("manifest")
                 .schema(schema)
+                .manifest_tool()
                 .requires(&requires);
             if t.exec_is_mutating() {
                 def = def.mutating();
@@ -694,6 +715,26 @@ impl Manifest {
     pub fn tool_names(&self) -> Vec<String> {
         self.tools.iter().filter(|t| t.enabled && !t.name.trim().is_empty()).map(|t| t.name.clone()).collect()
     }
+
+    /// Remove tools whose name the wire will not carry, and say which.
+    ///
+    /// [`Manifest::validate`] refuses such a name at `manifest_apply` time, so a board
+    /// configured through this build cannot reach the state below. One configured
+    /// before it can: the name sits in NVS, nothing re-validates it on boot, and every
+    /// model call fails — including the call that would let the agent repair its own
+    /// manifest. Dropping the entries at load is the only way back in, and the caller
+    /// logs what went, so it is not silent.
+    pub fn drop_tools_with_unusable_names(&mut self) -> Vec<String> {
+        let mut dropped = Vec::new();
+        self.tools.retain(|t| {
+            let ok = is_tool_name(&t.name);
+            if !ok {
+                dropped.push(t.name.clone());
+            }
+            ok
+        });
+        dropped
+    }
 }
 
 impl Exec {
@@ -713,9 +754,7 @@ fn is_ident(s: &str) -> bool {
 }
 
 fn is_tool_name(s: &str) -> bool {
-    !s.is_empty()
-        && s.len() <= 48
-        && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
+    !s.is_empty() && s.len() <= 48 && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
 }
 
 fn check_value(param: &Param, v: &Value, path: &str) -> Option<Issue> {
@@ -1067,6 +1106,7 @@ mod tests {
             buses: vec![0],
             drivers: vec!["bme280".into(), "ssd1306".into()],
             known_device_ids: vec!["bme280".into()],
+            taken: vec!["board_status".into(), "manifest_apply".into(), "bme280_read".into()],
         }
     }
 
@@ -1076,11 +1116,11 @@ mod tests {
               "version": 1,
               "devices": [{"id":"led","kind":"actuator","pins":{"out":48}}],
               "tools": [
-                {"name":"led.on","description":"Turn the LED on","enabled":true,
+                {"name":"led_on","description":"Turn the LED on","enabled":true,
                  "params":[{"name":"brightness","type":"integer","min":0,"max":255,"required":true}],
                  "exec":{"type":"gpio_write","pin":48,"level":1},
                  "safety":{"max_calls_per_min":30}},
-                {"name":"climate.read","device":"bme280","enabled":true,"params":[],
+                {"name":"climate_read","device":"bme280","enabled":true,"params":[],
                  "exec":{"type":"driver","driver":"bme280","action":"bme280_read"}},
                 {"name":"blink","enabled":true,"params":[],"safety":{"confirm":true},
                  "exec":{"type":"sequence","steps":[
@@ -1095,7 +1135,7 @@ mod tests {
     #[test]
     fn driver_tool_is_found_by_device_and_action() {
         let m = Manifest::from_json_str(
-            r#"{"tools":[{"name":"c.read","params":[],"exec":{"type":"driver","driver":"bme280","action":"bme280_read"},"safety":{"confirm":true}}]}"#,
+            r#"{"tools":[{"name":"c_read","params":[],"exec":{"type":"driver","driver":"bme280","action":"bme280_read"},"safety":{"confirm":true}}]}"#,
         )
         .unwrap();
         assert!(m.tools[0].enabled, "enabled must default to true");
@@ -1182,13 +1222,13 @@ mod tests {
     fn merge_adds_and_replaces_but_keeps_the_rest() {
         let base = sample();
         let patch = Manifest::from_json_str(
-            r#"{"tools":[{"name":"fan.on","params":[],"exec":{"type":"gpio_write","pin":5,"level":1}}]}"#,
+            r#"{"tools":[{"name":"fan_on","params":[],"exec":{"type":"gpio_write","pin":5,"level":1}}]}"#,
         )
         .unwrap();
         let merged = base.merged_with(&patch);
         assert_eq!(merged.tools.len(), 4);
-        assert!(merged.tool_names().contains(&"fan.on".to_string()));
-        assert!(merged.tool_names().contains(&"led.on".to_string()));
+        assert!(merged.tool_names().contains(&"fan_on".to_string()));
+        assert!(merged.tool_names().contains(&"led_on".to_string()));
     }
 
     #[test]

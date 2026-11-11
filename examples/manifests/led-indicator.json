@@ -4,7 +4,7 @@
     "version": 1,
     "tools": [
       {
-        "name": "led.notify",
+        "name": "led_notify",
         "title": "LED notify",
         "description": "Show a status colour on the onboard RGB LED (GPIO48): idle=green, busy=amber, error=red, off=black. Accepts any #rrggbb.",
         "params": [
@@ -21,7 +21,7 @@
         "safety": { "max_calls_per_min": 120 }
       },
       {
-        "name": "led.blink",
+        "name": "led_blink",
         "title": "LED blink",
         "description": "Blink the LED three times as an attention cue.",
         "params": [],

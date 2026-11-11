@@ -21,7 +21,133 @@ fn validate_ctx<'b>(ctx: &mut ToolCtx<'b>) -> ValidateCtx<'b> {
         buses: ctx.cfg.bus.i2c.iter().map(|b| b.bus).collect(),
         drivers: CATALOG.iter().filter(|e| e.status == "implemented").map(|e| e.kind.to_string()).collect(),
         known_device_ids: ctx.devices.ids(),
+        taken: ctx.taken.to_vec(),
     }
+}
+
+/// The parts [`manifest_describe`] can return, one per call.
+const DESCRIBE_SECTIONS: &[&str] = &["overview", "schema", "exec", "examples", "drivers"];
+
+/// The names in [`examples`], so the model can ask for one by name.
+fn example_names() -> Vec<String> {
+    match examples() {
+        Value::Object(map) => map.keys().cloned().collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// What a manifest document looks like, quoted in errors so the model has a shape to
+/// copy instead of a guess to make.
+const MANIFEST_SHAPE: &str = "{\"version\":1,\"devices\":[{\"id\":\"pump\",\"pins\":{\"out\":12}}],\
+     \"tools\":[{\"name\":\"pump_pulse\",\"exec\":{\"type\":\"gpio_write\",\"pin\":12,\"level\":1}}]}";
+
+fn json_kind(v: &Value) -> &'static str {
+    match v {
+        Value::Null => "null",
+        Value::Bool(_) => "a bool",
+        Value::Number(_) => "a number",
+        Value::String(_) => "a string",
+        Value::Array(_) => "an array",
+        Value::Object(_) => "an object",
+    }
+}
+
+/// Parse a manifest document, or say which field has the wrong shape.
+///
+/// `serde` answers a top-level array with `invalid type: sequence, expected a map`:
+/// it names neither the document the board wants nor the field that stopped fitting,
+/// so the only thing a model can do with it is guess again — and every guess costs a
+/// tool round. The checks below name the expected document and a JSON Pointer to the
+/// offender, the same vocabulary `issues` uses.
+fn parse_manifest(value: &Value) -> std::result::Result<Manifest, McpError> {
+    let expected = || {
+        format!("expected an object like {MANIFEST_SHAPE}, where `devices` and `tools` are arrays of objects")
+    };
+    let bad =
+        |path: &str, what: &str| McpError::invalid_params(format!("manifest{path} {what}; {}", expected()));
+    let Some(doc) = value.as_object() else {
+        return Err(bad("", &format!("must be a JSON object, not {}", json_kind(value))));
+    };
+    for key in doc.keys() {
+        if !matches!(key.as_str(), "version" | "devices" | "tools") {
+            return Err(bad(
+                &format!("/{key}"),
+                "is not a field of a manifest; the fields are `version`, `devices` and `tools`",
+            ));
+        }
+    }
+    for (field, shape) in [
+        ("devices", "{\"id\":\"pump\",\"pins\":{\"out\":12}}"),
+        ("tools", "{\"name\":\"pump_pulse\",\"exec\":{...}}"),
+    ] {
+        let Some(items) = doc.get(field) else { continue };
+        let Some(items) = items.as_array() else {
+            return Err(bad(
+                &format!("/{field}"),
+                &format!("must be an array of objects like {shape}, not {}", json_kind(items)),
+            ));
+        };
+        for (i, item) in items.iter().enumerate() {
+            if !item.is_object() {
+                return Err(bad(
+                    &format!("/{field}/{i}"),
+                    &format!("must be an object like {shape}, not {}", json_kind(item)),
+                ));
+            }
+        }
+    }
+    if let Some(tools) = doc.get("tools").and_then(Value::as_array) {
+        for (i, tool) in tools.iter().enumerate() {
+            let tool = tool.as_object().expect("checked above");
+            match tool.get("name") {
+                Some(Value::String(_)) => {}
+                Some(other) => {
+                    return Err(bad(
+                        &format!("/tools/{i}/name"),
+                        &format!("must be a string, not {}", json_kind(other)),
+                    ))
+                }
+                None => return Err(bad(&format!("/tools/{i}/name"), "is required")),
+            }
+            match tool.get("exec") {
+                Some(Value::Object(_)) => {}
+                Some(other) => {
+                    return Err(bad(
+                        &format!("/tools/{i}/exec"),
+                        &format!("must be an object with a `type`, not {}", json_kind(other)),
+                    ))
+                }
+                None => {
+                    return Err(bad(
+                        &format!("/tools/{i}/exec"),
+                        "is required, e.g. {\"type\":\"gpio_write\",\"pin\":12,\"level\":1}",
+                    ))
+                }
+            }
+            if let Some(params) = tool.get("params") {
+                let Some(params) = params.as_array() else {
+                    return Err(bad(
+                        &format!("/tools/{i}/params"),
+                        &format!("must be an array of objects, not {}", json_kind(params)),
+                    ));
+                };
+                for (k, param) in params.iter().enumerate() {
+                    if !param.is_object() {
+                        return Err(bad(
+                            &format!("/tools/{i}/params/{k}"),
+                            &format!(
+                                "must be an object like {{\"name\":\"ms\",\"type\":\"integer\"}}, not {}",
+                                json_kind(param)
+                            ),
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    serde_json::from_value::<Manifest>(value.clone()).map_err(|e| {
+        McpError::invalid_params(format!("manifest does not match the schema: {e}; {}", expected()))
+    })
 }
 
 pub fn manifest_tools() -> Vec<ToolDef> {
@@ -44,47 +170,143 @@ pub fn manifest_tools() -> Vec<ToolDef> {
         }),
         ToolDef::new(
             "manifest_describe",
-            "Everything needed to write a manifest: JSON schema, primitive exec types with their fields, driver catalogue, limits, detected hardware and worked examples",
+            "The manifest reference, one section per call: overview (default), schema, exec, examples, drivers. Each section arrives whole; the full reference does not fit one tool result, and a truncated reference is worse than none",
         )
         .title("Describe manifest")
         .category("manifest")
         .core()
-        .schema(object_schema(&[], &[]))
-        .bind(|ctx, _args| {
-            let devices = ctx.devices.infos();
-            let driver_actions: Vec<Value> = devices
-                .iter()
-                .map(|d| json!({ "device": d.id, "driver": d.kind, "actions": d.tools, "address": d.address, "pins": d.pins }))
-                .collect();
-            Ok(json!({
-                "manifest_schema": manifest_schema(),
-                "primitives": primitives_doc(),
-                "drivers": drivers::catalog_json(),
-                "available_driver_actions": driver_actions,
-                "limits": {
-                    "max_tools": MAX_TOOLS,
-                    "max_sequence_steps": MAX_STEPS,
-                    "max_total_delay_ms": MAX_TOTAL_DELAY_MS,
-                    "pin_range": [0, 48],
-                    "i2c_address_range": [1, 127],
+        .schema(object_schema(
+            &[
+                (
+                    "section",
+                    enumeration(
+                        DESCRIBE_SECTIONS,
+                        "which part to return: overview (default), schema, exec, examples, drivers",
+                    ),
+                ),
+                (
+                    "example",
+                    json!({ "type": "string", "description": "with section=examples: the one example to return in full" }),
+                ),
+                (
+                    "driver",
+                    json!({ "type": "string", "description": "with section=drivers: the one driver to return in full" }),
+                ),
+            ],
+            &[],
+        ))
+        .bind(|ctx, args| {
+            let section = j::opt_str(args, "section").unwrap_or_default().trim().to_ascii_lowercase();
+            match section.as_str() {
+                // The first call a model makes: what the document is, the shape to copy,
+                // the field names, the limits, and where to go next — deliberately small
+                // enough to arrive in one piece.
+                "" | "overview" => {
+                    let devices = ctx.devices.infos();
+                    Ok(json!({
+                        "section": "overview",
+                        "what": "The manifest is the document you rewrite with manifest_apply: `devices` declares hardware, `tools` declares what the model may call. It lives in NVS and applies without a reboot.",
+                        "shape": {
+                            "version": 1,
+                            "devices": [{ "id": "pump", "kind": "actuator", "pins": { "out": 12 } }],
+                            "tools": [{
+                                "name": "pump_pulse",
+                                "params": [{ "name": "ms", "type": "integer", "min": 10, "max": 5000, "required": true }],
+                                "exec": { "type": "gpio_write", "pin": 12, "level": 1 }
+                            }]
+                        },
+                        "tool_fields": ["name", "title", "description", "device", "enabled", "params", "exec", "safety"],
+                        "device_fields": ["id", "kind", "driver", "pins", "bus", "address", "options", "enabled", "note"],
+                        "param_fields": ["name", "type", "description", "required", "min", "max", "unit", "enum", "default"],
+                        "safety_fields": ["min", "max", "max_calls_per_min", "confirm"],
+                        "limits": {
+                            "max_tools": MAX_TOOLS,
+                            "max_sequence_steps": MAX_STEPS,
+                            "max_total_delay_ms": MAX_TOTAL_DELAY_MS,
+                            "pin_range": [0, 48],
+                            "i2c_address_range": [1, 127],
+                        },
+                        "next": {
+                            "section": DESCRIBE_SECTIONS,
+                            "example": example_names(),
+                            "note": "exec types are in section=exec; the JSON Schema for devices/tools/params/safety is in section=schema",
+                        },
+                        "detected": { "devices": devices.len(), "capabilities": ctx.caps.to_json() },
+                    }))
+                }
+                "schema" => Ok(json!({ "section": "schema", "manifest_schema": manifest_schema() })),
+                "exec" => Ok(json!({
+                    "section": "exec",
+                    "primitives": primitives_doc(),
+                    "note": "every value may be a literal or {\"param\":\"name\"} to read a call argument",
+                })),
+                "examples" => match j::opt_str(args, "example") {
+                    Some(name) => {
+                        let all = examples();
+                        match all.get(name.trim()) {
+                            Some(one) => Ok(json!({ "section": "examples", "name": name.trim(), "manifest": one })),
+                            None => Err(McpError::invalid_params(format!(
+                                "no example `{}`; the examples are {}",
+                                name.trim(),
+                                example_names().join(", ")
+                            ))),
+                        }
+                    }
+                    None => Ok(json!({
+                        "section": "examples",
+                        "names": example_names(),
+                        "hint": "call again with example=<name> for one in full",
+                    })),
                 },
-                "current": {
-                    "manifest": ctx.manifest,
-                    "capabilities": ctx.caps.to_json(),
-                    "buses": ctx.cfg.bus.i2c,
-                    "declared_pins": ctx.cfg.pins,
-                    "devices": devices,
-                    "unidentified_addresses": ctx.probe.unknown,
-                },
-                "workflow": [
-                    "1. inventory / devices_list / i2c_scan to see what is really wired.",
-                    "2. i2c_identify {addr} for an address no driver claimed.",
-                    "3. manifest_apply {mode:\"merge\", manifest:{...}} with the new device and tools.",
-                    "4. tools/list now contains the new tools (no reboot, no reflash).",
-                    "5. call the new tool; if the result looks wrong, edit the manifest and apply again.",
-                ],
-                "examples": examples(),
-            }))
+                "drivers" => {
+                    // The catalogue is ~3.5 KB for fourteen drivers, so it is listed and
+                    // then asked for one entry at a time: a truncated catalogue is the
+                    // same bug as a truncated schema.
+                    match j::opt_str(args, "driver") {
+                        Some(kind) => {
+                            let kind = kind.trim();
+                            let entry = drivers::catalog_json()
+                                .as_array()
+                                .and_then(|all| all.iter().find(|d| d["kind"] == kind).cloned());
+                            match entry {
+                                Some(one) => {
+                                    let actions: Vec<Value> = ctx
+                                        .devices
+                                        .infos()
+                                        .iter()
+                                        .filter(|d| d.kind == kind)
+                                        .map(|d| json!({ "device": d.id, "actions": d.tools, "address": d.address, "pins": d.pins }))
+                                        .collect();
+                                    Ok(json!({ "section": "drivers", "driver": one, "detected_actions": actions }))
+                                }
+                                None => Err(McpError::invalid_params(format!(
+                                    "no driver `{kind}` in the catalogue"
+                                ))),
+                            }
+                        }
+                        None => {
+                            let entries = drivers::catalog_json();
+                            let brief: Vec<Value> = entries
+                                .as_array()
+                                .map(|all| {
+                                    all.iter()
+                                        .map(|d| json!({ "kind": d["kind"], "status": d["status"] }))
+                                        .collect()
+                                })
+                                .unwrap_or_default();
+                            Ok(json!({
+                                "section": "drivers",
+                                "drivers": brief,
+                                "hint": "call again with driver=<kind> for one in full (detection, capabilities, source)",
+                            }))
+                        }
+                    }
+                }
+                other => Err(McpError::invalid_params(format!(
+                    "unknown section `{other}`; use {} (overview when omitted)",
+                    DESCRIBE_SECTIONS.join(", ")
+                ))),
+            }
         }),
         ToolDef::new(
             "manifest_apply",
@@ -108,8 +330,7 @@ pub fn manifest_tools() -> Vec<ToolDef> {
                 .ok_or_else(|| McpError::invalid_params("`manifest` is required"))?;
             let mode = j::opt_str(args, "mode").unwrap_or_else(|| "replace".into());
             let dry = j::opt_bool(args, "dry_run").unwrap_or(false);
-            let patch = serde_json::from_value::<Manifest>(value)
-                .map_err(|e| McpError::invalid_params(format!("manifest does not match the schema: {e}")))?;
+            let patch = parse_manifest(&value)?;
             let candidate = if mode == "merge" { ctx.manifest.merged_with(&patch) } else { patch };
             let issues = candidate.validate(&validate_ctx(ctx));
             if !issues.is_empty() {
@@ -155,8 +376,7 @@ pub fn manifest_tools() -> Vec<ToolDef> {
             let value = j::field(args, "manifest")
                 .cloned()
                 .ok_or_else(|| McpError::invalid_params("`manifest` is required"))?;
-            let m = serde_json::from_value::<Manifest>(value)
-                .map_err(|e| McpError::invalid_params(format!("schema mismatch: {e}")))?;
+            let m = parse_manifest(&value)?;
             let issues: Vec<Issue> = m.validate(&validate_ctx(ctx));
             Ok(json!({ "valid": issues.is_empty(), "issues": issues }))
         }),
@@ -287,7 +507,7 @@ fn manifest_schema() -> Value {
                     "type": "object",
                     "required": ["name", "exec"],
                     "properties": {
-                        "name": { "type": "string", "description": "a-z0-9_-., e.g. led.set" },
+                        "name": { "type": "string", "description": "a-z, A-Z, 0-9, _ and - (no `.`), max 48, e.g. led_set — it has to match the OpenAI tool-name charset ^[a-zA-Z0-9_-]+$" },
                         "title": { "type": "string" },
                         "description": { "type": "string" },
                         "device": { "type": "string" },
@@ -359,7 +579,7 @@ fn examples() -> Value {
         "relay_with_safety": {
             "devices": [{ "id": "pump", "kind": "actuator", "pins": { "out": 12 }, "note": "5 V relay board, active low" }],
             "tools": [{
-                "name": "pump.set",
+                "name": "pump_set",
                 "description": "Switch the pump relay. Refuses to run more than 20 times a minute.",
                 "params": [{ "name": "on", "type": "boolean", "required": true }],
                 "exec": { "type": "gpio_write", "pin": 12, "level": { "param": "on" } },
@@ -368,7 +588,7 @@ fn examples() -> Value {
         },
         "servo_angle": {
             "tools": [{
-                "name": "servo.angle",
+                "name": "servo_angle",
                 "description": "Servo angle in degrees",
                 "params": [{ "name": "deg", "type": "number", "min": 0, "max": 180, "unit": "deg", "required": true }],
                 "exec": { "type": "pwm", "pin": 7, "freq_hz": 50,
@@ -378,12 +598,12 @@ fn examples() -> Value {
         },
         "sensor_driver": {
             "devices": [{ "id": "bme280", "kind": "sensor", "driver": "bme280", "bus": 0, "address": 118 }],
-            "tools": [{ "name": "climate.read", "device": "bme280", "description": "Temperature, pressure and humidity",
+            "tools": [{ "name": "climate_read", "device": "bme280", "description": "Temperature, pressure and humidity",
                         "params": [], "exec": { "type": "driver", "driver": "bme280", "action": "bme280_read" } }]
         },
         "led_then_read_back": {
             "tools": [{
-                "name": "led.probe",
+                "name": "led_probe",
                 "description": "Blink the LED, then report the ADC level of a light sensor",
                 "params": [],
                 "exec": { "type": "sequence", "steps": [

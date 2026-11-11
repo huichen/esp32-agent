@@ -7,6 +7,15 @@ version numbering follows semantic versioning.
 
 ### Added
 
+- **`board.auto_peripherals`**: the devkit's own RGB LED and BOOT button are no longer
+  forced into the device list. With `false` the board comes up with the bus, GPIO and
+  manifest tools (44 instead of 48 on an S3-DevKitC-1) and gets them back by declaring
+  `led` / `buttons` in a manifest — the minimal start a different board can grow from.
+  Set from the portal, `config_set`, or `POST /api/config`; it takes effect on the next
+  probe, no reboot
+- **`buttons` as a manifest driver**: `pins` is a name→GPIO map, e.g. `{"boot": 0}`, so a
+  button set can be declared like any other device
+
 - **Goal loop**: state one objective (`POST /api/goal`) and the board iterates on its own
   — each iteration is one small step, its result becomes a note that the next iteration
   reads, and a reply saying `GOAL MET` / `GOAL BLOCKED` ends the run; the goal lives in
@@ -16,7 +25,7 @@ version numbering follows semantic versioning.
   an OpenAI-compatible `/chat/completions`; one turn may call tools in several steps, and
   history is persisted to NVS and visible in the portal
 - **Agent tools**: every MCP tool the board already had, plus file tools
-  (`fs_ls/fs_read/fs_write/fs_edit/fs_grep` over an NVS workspace) and network tools
+  (`fs_ls/fs_read/fs_write/fs_edit/fs_rm/fs_grep` over an NVS workspace) and network tools
   (`net_get/net_post`); there is no shell, because the device does not have one
 - **Orchestration layer**: scheduled tasks (`every_s` or `at_hhmm`, once a day, never
   twice in the same minute) and sensor rules (a tool, a JSON path in its result, a
@@ -55,10 +64,25 @@ version numbering follows semantic versioning.
   `192.168.4.1`, and answers DNS for everything
 - Host simulator `agent-sim`: a virtual register board running the same services, and it
   drives the agent loop and the scheduler too
+- **`https://` for model and `net_*` calls**: the firmware's transport carries the scheme
+  — plain `http://` over `std::net`, `https://` over esp-tls with the ESP-IDF
+  certificate bundle (no skip-verification switch) — and the simulator uses rustls with
+  the webpki roots, so the same endpoint can be tried on the desk before it is flashed
+- **Instructions and skills on the board**: `/AGENTS.md` is injected into the system
+  prompt (first 1 KB, the rest readable with `fs_read`), and each
+  `/skills/<name>/SKILL.md` is indexed with its path — a skill may keep other files next
+  to it. Deliberately no dedicated tools: the paths are ordinary files, and
+  `fs_ls`/`fs_read`/`fs_write`/`fs_rm` reach them. Contract: `docs/agent-skills.md`
 - Documentation: architecture, the manifest specification, the capability table, the HTTP
   API, adding a device, flashing, troubleshooting, the roadmap, AGENTS.md
 
 ### Changed
+
+- **The model's tool list is ordered least-volatile-first**: board tools, then `fs_*` and
+  `net_*`, then manifest tools — alphabetical inside each block. Providers cache a request
+  by prefix, so a mid-turn `manifest_apply` used to shift every tool after the inserted
+  name; now only the tail moves. Same board, same bytes: a test compares two identically
+  configured boards, a repeated call, and a re-probe
 
 - **Phased turn**: the model call no longer holds the `App` lock. `Agent::begin` computes
   the request and `Agent::apply` consumes the reply, so the platform layer releases the
@@ -74,8 +98,84 @@ version numbering follows semantic versioning.
   stored manifests and prompts), and the storage namespace stays `esp32mcp` (renaming it
   would wipe the settings and history of an already-flashed board)
 
+- **`fs_rm`**: deleting one workspace file (`confirm: true`). The workspace could write
+  and edit but never remove, so a wrong skill stayed in every future prompt
+
+- **`fs_*` and `net_*` on the MCP surface**: an outside client can read and write the
+  workspace, fetch a page and post JSON, through the same implementation the board's own
+  agent uses. `mcp.disabled_tools` hides them like any other tool
+- **`fs_cp` / `fs_mv`**: copy or move a file, or every file under a directory (`mv` needs
+  `confirm: true`); the workspace had one-way writes only
+
+### Added
+
+- **I2S audio: microphone and amplifier tools.** `mic_level` (RMS/peak in dBFS over a
+  window), `mic_record` (base64 PCM, at most 512 samples so the result fits one tool
+  reply), `speaker_tone` (generated sine) and `speaker_play` (base64 PCM). Nothing here
+  is *detected* — I2S has no addressing and no id register — so the pins come from the
+  board profile or `config.pins`, the channels are brought up once, and the tools exist
+  only if that succeeded. Formats are the ones measured on this board: microphone
+  16 kHz / 32-bit slots / left channel, amplifier 24 kHz / 16-bit / Philips. The
+  firmware backend is in `esp_hw.rs` and reads by `bytes_read` rather than by the return
+  code, because `i2s_channel_read` times out while still handing back samples
+- **WS2812 output actually works**: `ring_set` was a TODO answering "addressable RGB is
+  not implemented", so a board listed an LED whose tool always failed. It now drives the
+  chain through `rmt_new_bytes_encoder` (10 MHz, 3/9 and 9/3 tick symbols, GRB payload)
+- **`examples/manifests/lamp-strip.json`**: the xiaozhi demo strip on GPIO18, so a board
+  with two WS2812 outputs can carry both
+
 ### Fixed
 
+- **Two devices of one kind no longer share a tool name.** The board's second WS2812
+  output (a strip on GPIO18) registered its `led_set` over the devkit LED's, so the
+  second device silently made the first unreachable while `devices_list` claimed both
+  were callable — two BME280s had the same problem waiting. The first keeps the plain
+  name and the rest become `_2`, `_3`, in both `tools/list` and `devices_list`
+- **A manifest device keeps the id the manifest gave it.** `instantiate` returned the
+  driver's default id (`led`), so `device_invoke` could only reach the first device of a
+  kind; a `NamedDevice` wrapper now carries `spec.id`
+
+- **`mic` / `speaker` were advertised as capabilities with nothing behind them.** A board
+  profile can record the I2S pins (the xiaozhi wiring does), and `board_caps` turned that
+  into `mic`/`speaker` caps — but there is no INMP441 or MAX98357A driver, so the model
+  was told about a device that has no tool, and no amount of probing would find it: I2S
+  has no addressing and no id register. The caps are gone until the drivers exist
+- **`tools_mode = "generic"` never took effect.** Two independent faults: the config
+  patch accepted only `auto`/`all` and ignored anything else in silence, and
+  `Config::sanitized` rewrote every value except `all` back to `auto`, so the mode was
+  discarded on the next config write. With both fixed, folding the per-device tools into
+  `device_invoke` removes eight definitions on a populated S3-DevKitC-1
+  (48 tools → 36 with `auto_peripherals=false`), and an unknown `tools_mode` is now an
+  error instead of a no-op
+
+- A manifest can no longer take a name the board already provides. `manifest_apply`
+  registered manifest tools last, so a tool called `manifest_apply` (or `bme280_read`)
+  simply replaced the board's own: applying it removed the very tool needed to fix the
+  manifest, and a later probe could bring a driver tool back on top of the replacement.
+  Validation now refuses the clash with a rename hint, and `rebuild` skips a clashing tool
+  from a manifest stored by an older build (logging which names it ignored)
+
+- `net_get` / `net_post` now work inside a turn. The model call borrowed the App's only
+  HTTP client, so a tool call during a turn found none — and the simulator never attached
+  one at all, which is why the same code worked on a board and not on the desk. The App
+  owns a tool transport (`attach_tool_transport`), the driver loop owns the model one
+- `manifest_describe` answers one section per call (`overview`, `schema`, `exec`,
+  `examples`, `drivers`, with examples and drivers paged by name) instead of returning
+  8 KB into a 2 KB tool result: the model used to receive a quarter of the reference and
+  invent the rest
+- Manifest tool names are checked against the wire charset (`^[a-zA-Z0-9_-]+$`) when the
+  manifest is applied, not when the request is built: a dotted name such as `pump.pulse`
+  was accepted by the board and then rejected by every OpenAI-compatible endpoint, and
+  because each request carries the whole tool list it failed **every** call — including
+  the one that would have repaired the manifest. A name already stored in NVS is dropped
+  at load, with a log line, so an affected board recovers on reboot
+- `manifest_validate` / `manifest_apply` name the document shape and a JSON Pointer when
+  the body does not fit (`invalid type: sequence, expected a map` cost a model six steps
+  of guessing), and refuse a mistyped top-level field instead of silently ignoring it
+- `scripts/build-firmware.ps1` actually builds: it ran the default toolchain (`can't find
+  crate for core`), pointed `LIBCLANG_PATH` at a file instead of its directory, kept
+  artifacts under `firmware/target` (too long for esp-idf-sys' 88-character check on
+  Windows), and stamped a BOM into `firmware/.cargo/config.toml` on every run
 - `tools/list` serialises tool by tool instead of building one `Value` tree first: the
   tree for 28 tools exhausted the heap on an S3 and aborted (the board rebooted on a
   client's first `tools/list`)
@@ -126,8 +226,6 @@ version numbering follows semantic versioning.
 ### Known gaps
 
 - `net_*` pointing at one of the board's own routes deadlocks on the App lock
-- The model interface supports `http://` only (`https://` is refused with a clear error);
-  a LAN proxy is the expected deployment
 - The file workspace lives in memory and persists as one NVS blob (≤ 2 KB per file, ≤ 8 KB
   total); SPIFFS is still to come
 - `fs_grep` has host tests but has not been driven through the loop on hardware;
