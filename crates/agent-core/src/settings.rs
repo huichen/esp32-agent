@@ -41,7 +41,7 @@ const MODEL: &[Field] = &[
     f("model", "string", "", "the provider's model id"),
     f("api_key", "string", "\"\"", "write-only; GET returns __set__ and __set__ leaves it unchanged"),
     f("max_steps", "integer", "0", "model calls per run; 0 means no limit, capped at 200"),
-    f("temperature", "number", "0.2", "0.0 to 2.0"),
+    f("temperature", "number", "1.0", "0.0 to 2.0"),
     f("timeout_s", "integer", "45", "5 to 180 seconds per model call"),
 ];
 

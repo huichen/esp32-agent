@@ -149,6 +149,24 @@ impl Devices {
         self.items.push(d);
     }
 
+    /// Keep only the devices whose kind the predicate accepts, returning the ones it did
+    /// not. Manual discovery uses this to leave profile-provided hardware (I2S audio)
+    /// alone: it cannot be declared in a manifest, so withholding it would hide it for
+    /// good.
+    pub fn split_off_by_kind(&mut self, keep: impl Fn(&str) -> bool) -> Self {
+        let mut kept = Vec::with_capacity(self.items.len());
+        let mut moved = Vec::new();
+        for device in self.items.drain(..) {
+            if keep(&device.info().kind) {
+                kept.push(device);
+            } else {
+                moved.push(device);
+            }
+        }
+        self.items = kept;
+        Self { items: moved }
+    }
+
     pub fn is_empty(&self) -> bool {
         self.items.is_empty()
     }

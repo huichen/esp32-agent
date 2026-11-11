@@ -532,7 +532,8 @@ pub fn detect(
     // a guess about which pins the driver wanted.
     let mut candidates = Vec::new();
     if cfg.discovery == "manual" {
-        for info in devices.infos() {
+        let withheld = devices.split_off_by_kind(|kind| !DECLARABLE.contains(&kind));
+        for info in withheld.infos() {
             // The declaration is built the way `instantiate` reads it: `bus` is a number,
             // a missing address is omitted rather than sent as null, and `options` carries
             // what the probe learned (an OLED's height, an INA226's shunt).
@@ -593,7 +594,6 @@ pub fn detect(
                 format!("{} device(s) found and left as candidates: discovery is manual", candidates.len()),
             );
         }
-        devices = Devices::new();
     }
 
     DetectResult { devices, unknown, buses: buses_json, candidates }

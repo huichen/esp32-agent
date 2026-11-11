@@ -12,14 +12,6 @@
 const $ = (sel, root = document) => root.querySelector(sel);
 const $$ = (sel, root = document) => Array.from(root.querySelectorAll(sel));
 
-/** Words the tests and the UI share: one place, so a label cannot go missing. */
-const LABELS = {
-  goal_objective: "Objective",
-  goal_notes: "Notes",
-  goal_started: "Started",
-  goal_status_stopped: "Stopped",
-};
-
 const S = {
   token: localStorage.getItem("esp32-agent.token") || "",
   lastSeq: 0,
@@ -157,12 +149,27 @@ function addTools(row) {
   return tools;
 }
 
-function chip(tools, label) {
-  const el = document.createElement("span");
-  el.className = "chip run";
-  el.textContent = label;
-  tools.appendChild(el);
-  return el;
+function chip(tools, label, detail) {
+  // A tool call reads as one compact line; the arguments and the result live behind the
+  // disclosure triangle. A chat that shows every result inline is a log, not a chat.
+  const wrap = document.createElement("details");
+  wrap.className = "tool";
+  const summary = document.createElement("summary");
+  summary.textContent = label;
+  wrap.appendChild(summary);
+  for (const [name, text] of detail || []) {
+    const pre = document.createElement("pre");
+    pre.textContent = name + ": " + text;
+    wrap.appendChild(pre);
+  }
+  tools.appendChild(wrap);
+  return wrap;
+}
+
+/** Mark a tool row green or red once its result arrives. */
+function finishChip(wrap, ok) {
+  if (!wrap) return;
+  wrap.classList.add(ok ? "ok" : "err");
 }
 
 function scrollToEnd() {
@@ -180,8 +187,8 @@ function renderMessage(msg) {
   if (msg.tool_calls && msg.tool_calls.length) {
     const tools = addTools(row);
     for (const call of msg.tool_calls) {
-      const name = call.function ? call.function.name : call.name;
-      chip(tools, name);
+      const fn = call.function || call;
+      chip(tools, fn.name + "(…)", [["arguments", typeof fn.arguments === "string" ? fn.arguments : JSON.stringify(fn.arguments || {})]]);
     }
   }
   if (who === "agent") {
@@ -261,15 +268,22 @@ function handleEvent(name, data) {
     }
     case "tool_use": {
       const row = pendingRow || ensurePending();
-      chip(addTools(row), (data.name || "tool") + "()");
+      const args = data.text || "{}";
+      const wrap = chip(addTools(row), (data.name || "tool") + "()", [["arguments", args]]);
+      wrap.dataset.id = data.tool_call_id || "";
       break;
     }
     case "tool_result": {
       const row = pendingRow;
       if (!row) break;
-      const chips = Array.from(row.querySelectorAll(".chip.run"));
-      const last = chips[chips.length - 1];
-      if (last) last.className = "chip " + (data.is_error ? "err" : "ok");
+      const rows = Array.from(row.querySelectorAll("details.tool"));
+      const last = rows.filter((d) => !d.classList.contains("ok") && !d.classList.contains("err")).pop() || rows.pop();
+      if (last) {
+        const pre = document.createElement("pre");
+        pre.textContent = "result: " + (data.text || "");
+        last.appendChild(pre);
+        finishChip(last, !data.is_error);
+      }
       break;
     }
     case "error":
@@ -335,6 +349,7 @@ async function loadStatus() {
       ["Devices", d.devices.count],
       ["Tools", d.mcp.tools_visible],
       ["Clock", d.time && d.time.synced ? "synced" : "not synced"],
+      ["Internal", (d.memory.internal_kb ?? "?") + " kB (largest " + (d.memory.largest_internal_kb ?? "?") + ")"],
     ]);
     kv($("#wifi-kv"), [
       ["State", d.wifi.state],
@@ -342,15 +357,8 @@ async function loadStatus() {
       ["IP", d.wifi.ip || "-"],
       ["AP", d.wifi.ap_ip],
     ]);
+    // The model settings live in the Agent panel now; the header line is enough here.
     const model = await api("/api/agent/config");
-    kv($("#model-kv"), [
-      ["Model", model.model || "(none)"],
-      ["Endpoint", model.base_url || "(none)"],
-      ["Key", model.api_key_set ? "set" : "not set"],
-      ["Max steps", model.max_steps === 0 ? "unlimited" : model.max_steps],
-      ["Runs", model.run.runs],
-      ["Last error", (model.run.last_error || "-").slice(0, 60)],
-    ]);
     $("#sub").textContent =
       (d.wifi.ip || d.wifi.ap_ip) + " · " + d.devices.count + " devices · " + d.mcp.tools_visible + " tools · " +
       (model.model || "no model");
@@ -363,17 +371,31 @@ async function loadStatus() {
 async function loadDevices() {
   try {
     const d = await api("/api/devices");
-    $("#devices-list").innerHTML = d.devices
-      .map(
-        (dev) =>
-          '<div class="item"><b>' + escapeHtml(dev.id) + "</b><span>" + escapeHtml(dev.name) +
-          (dev.address ? " @ " + dev.address : "") + "</span></div>"
-      )
-      .join("") || '<div class="item faint">none</div>';
+    const detail = (dev) =>
+      '<details class="item-detail"><summary><b>' + escapeHtml(dev.id) + "</b> <span>" +
+      escapeHtml(dev.name) + (dev.address ? " @ " + dev.address : "") + "</span></summary><pre>" +
+      escapeHtml(JSON.stringify(dev, null, 2)) + "</pre></details>";
+    $("#devices-list").innerHTML =
+      d.devices.map(detail).join("") || '<div class="item faint">none — nothing adopted</div>';
+    $("#candidates-list").innerHTML =
+      (d.candidates || [])
+        .map(
+          (c) =>
+            '<details class="item-detail"><summary><b>' + escapeHtml(c.id) + "</b> <span>" +
+            escapeHtml(c.kind) + (c.address ? " @ " + c.address : "") +
+            (c.adopted ? " · adopted" : "") + "</span></summary><pre>" +
+            escapeHtml(JSON.stringify(c, null, 2)) + "</pre></details>"
+        )
+        .join("") || '<div class="item faint">no candidates</div>';
     $("#unidentified-list").innerHTML =
       (d.unidentified || [])
         .map((u) => '<div class="item"><b>' + escapeHtml(u.address) + "</b><span>" + escapeHtml(u.note || "") + "</span></div>")
         .join("") || '<div class="item faint">none</div>';
+    $("#devices-mode").textContent =
+      "discovery: " + (d.discovery || "auto") +
+      (d.discovery === "manual"
+        ? " — drivers probe but adopt nothing; use `script` or manifest_apply to take a candidate"
+        : " — recognised devices are adopted automatically");
   } catch (e) {
     toast(e.message);
   }
@@ -385,38 +407,28 @@ async function loadTools() {
     $("#tools-list").innerHTML = d.tools
       .map(
         (t) =>
-          '<div class="item' + (t.visible ? "" : " faint") + '"><b>' + escapeHtml(t.name) +
-          "</b><span>" + escapeHtml(t.category) + "</span></div>"
+          '<details class="item-detail' + (t.visible ? "" : " faint") + '"><summary><b>' +
+          escapeHtml(t.name) + "</b> <span>" + escapeHtml(t.category) + (t.visible ? "" : " · hidden") +
+          "</span></summary><pre>" +
+          escapeHtml(
+            JSON.stringify(
+              {
+                name: t.name,
+                description: t.description,
+                category: t.category,
+                requires: t.requires || [],
+                visible: t.visible,
+                mutating: t.mutating,
+              },
+              null,
+              2
+            )
+          ) +
+          "</pre></details>"
       )
       .join("");
   } catch (e) {
     toast(e.message);
-  }
-}
-
-async function loadManifest() {
-  try {
-    const d = await api("/api/manifest");
-    $("#manifest-text").value = JSON.stringify(d.manifest || {}, null, 2);
-  } catch (e) {
-    toast(e.message);
-  }
-}
-
-async function applyManifest(dryRun) {
-  const out = $("#manifest-result");
-  out.textContent = dryRun ? "validating…" : "applying…";
-  try {
-    const manifest = JSON.parse($("#manifest-text").value);
-    const d = await api("/api/manifest", { method: "POST", body: { manifest, dry_run: dryRun } });
-    const issues = d.issues || [];
-    out.textContent = (d.valid === false ? "invalid: " : "ok: ") + (issues.length ? JSON.stringify(issues).slice(0, 400) : "no issues");
-    if (!dryRun) {
-      loadTools();
-      loadStatus();
-    }
-  } catch (e) {
-    out.textContent = e.message;
   }
 }
 
@@ -428,11 +440,14 @@ async function loadAgent() {
     $("#agent-steps").value = d.max_steps;
     $("#agent-temperature").value = d.temperature;
     $("#auth-tick").value = d.tick_ms;
-    const goal = await api("/api/goal");
-    $("#goal-objective").value = goal.objective || "";
-    $("#goal-max-iterations").value = goal.max_iterations || 10;
-    $("#goal-notes").textContent =
-      (goal.status || "idle") + "\n" + (goal.notes || []).join("\n");
+    const prompt = await api("/api/agent/prompt");
+    kv($("#conversation-kv"), [
+      ["Messages", prompt.history],
+      ["Compressed lines", prompt.archive_lines],
+      ["System prompt", prompt.bytes + " B"],
+      ["Runs", d.run.runs],
+      ["Tokens (total)", d.run.usage_total ? d.run.usage_total.total_tokens : 0],
+    ]);
   } catch (e) {
     if (!String(e.message).includes("PIN")) toast(e.message);
   }
@@ -499,10 +514,8 @@ function showPanel(name) {
   S.panel = name;
   $$(".tabs button").forEach((b) => b.setAttribute("aria-selected", String(b.dataset.panel === name)));
   $$(".panel").forEach((p) => (p.hidden = p.id !== "panel-" + name));
-  if (name === "status") loadStatus();
   if (name === "devices") loadDevices();
   if (name === "tools") loadTools();
-  if (name === "manifest") loadManifest();
   if (name === "agent") loadAgent();
   if (name === "schedule") loadSched();
   if (name === "logs") loadLogs();
@@ -543,12 +556,10 @@ function init() {
   });
 
   $("#devices-probe").onclick = async () => {
-    try { await api("/api/devices/probe", { method: "POST", body: {} }); toast("probing"); setTimeout(loadDevices, 1200); }
+    try { await api("/api/devices/probe", { method: "POST", body: {} }); toast("probing"); setTimeout(loadDevices, 1500); }
     catch (e) { toast(e.message); }
   };
-  $("#manifest-validate").onclick = () => applyManifest(true);
-  $("#manifest-apply").onclick = () => applyManifest(false);
-  $("#manifest-reload").onclick = loadManifest;
+  $("#devices-refresh").onclick = loadDevices;
 
   $("#agent-save").onclick = async () => {
     const body = {
@@ -560,21 +571,6 @@ function init() {
     const key = $("#agent-key").value.trim();
     if (key) body.api_key = key;
     try { await api("/api/agent/config", { method: "POST", body }); $("#agent-key").value = ""; toast("saved"); loadStatus(); }
-    catch (e) { toast(e.message); }
-  };
-
-  $("#goal-start").onclick = async () => {
-    try {
-      await api("/api/goal", {
-        method: "POST",
-        body: { objective: $("#goal-objective").value.trim(), max_iterations: Number($("#goal-max-iterations").value || 10) },
-      });
-      toast(LABELS.goal_started);
-      loadAgent();
-    } catch (e) { toast(e.message); }
-  };
-  $("#goal-stop").onclick = async () => {
-    try { await api("/api/goal/stop", { method: "POST", body: {} }); toast(LABELS.goal_status_stopped); loadAgent(); }
     catch (e) { toast(e.message); }
   };
 

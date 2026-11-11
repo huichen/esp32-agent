@@ -61,7 +61,7 @@ pub struct LlmConfig {
     pub api_key: String,
     /// Model calls per run; **0 means no limit**.
     pub max_steps: u8,
-    /// Default 0.2.
+    /// Default 1.0: this board asks for tool calls, not prose.
     pub temperature: f32,
     /// Default 45. Used by the transport, not by `chat`.
     pub timeout_s: u32,
@@ -74,7 +74,7 @@ impl Default for LlmConfig {
             model: String::new(),
             api_key: String::new(),
             max_steps: 0,
-            temperature: 0.2,
+            temperature: 1.0,
             timeout_s: 45,
         }
     }
@@ -397,7 +397,7 @@ mod tests {
         let cfg = LlmConfig::default();
         // No step cap by default: a fixed one truncated work that would have finished.
         assert_eq!(cfg.max_steps, 0);
-        assert!((cfg.temperature - 0.2).abs() < f32::EPSILON);
+        assert!((cfg.temperature - 1.0).abs() < f32::EPSILON);
         assert_eq!(cfg.timeout_s, 45);
         assert!(cfg.api_key.is_empty());
     }
@@ -417,7 +417,7 @@ mod tests {
         assert_eq!(body["model"], "stub");
         assert_eq!(body["tool_choice"], "auto");
         let temperature = body["temperature"].as_f64().expect("a number");
-        assert!((temperature - 0.2).abs() < 1e-6, "temperature is {temperature}");
+        assert!((temperature - 1.0).abs() < 1e-6, "temperature is {temperature}");
         assert_eq!(body["messages"], messages());
         assert_eq!(body["tools"], tools());
     }
