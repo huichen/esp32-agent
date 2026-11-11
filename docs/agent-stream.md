@@ -56,7 +56,7 @@ portal edit takes effect on the next tick, not on reboot.
 |---|---|---|
 | SSE endpoint + stream registry | worker-a | `crates/agent-core/src/http.rs`, `crates/agent-core/src/app.rs` |
 | Portal: live console, tick field | worker-b | `crates/agent-core/src/web/` |
-| `tool_progress` + `tick_ms` config | worker-c | `crates/agent-core/src/agent.rs`, `crates/agent-core/src/config.rs`, `firmware/src/agent.rs` |
+| `tool_progress` + `tick_ms` config | worker-c | `crates/agent-core/src/agent.rs`, `crates/agent-core/src/config.rs`, `firmware/src/runner.rs` |
 | gate, flash, bench, commit | supervisor | — |
 
 Invariants nobody may break: MCP method names, `/mcp` path, tool names, the journal

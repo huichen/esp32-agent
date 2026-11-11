@@ -253,7 +253,7 @@ the answer is a scripted endpoint on the board, not somebody else's credential i
 `the_firmware_ships_with_no_endpoint_and_no_key` in `llm.rs` pins the default, so
 hard-coding an endpoint has to be a deliberate act with a failing test to justify it.
 
-### 3.7 `firmware/src/agent.rs` (worker D, second wave)
+### 3.7 `firmware/src/runner.rs` (worker D, second wave)
 
 Agent thread + `EspHttpClient` transport + NVS-backed `Workspace` + the scheduler
 tick that turns due tasks and fired rules into `push_user(...)`. Publishes counters
