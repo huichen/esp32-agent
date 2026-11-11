@@ -110,6 +110,8 @@ pub fn board_tools() -> Vec<ToolDef> {
                 "buses": ctx.probe.buses,
                 "devices": devices,
                 "unidentified": ctx.probe.unknown,
+                "candidates": ctx.probe.candidates,
+                "discovery": ctx.cfg.discovery,
                 "declared_pins": ctx.cfg.pins,
                 "board_extra": ctx.hw.inventory_extra(),
             }))
@@ -133,7 +135,16 @@ pub fn board_tools() -> Vec<ToolDef> {
                         })
                     })
                     .collect();
-                Ok(json!({ "count": devices.len(), "devices": devices, "caps": ctx.caps.to_json() }))
+                Ok(json!({
+                    "count": devices.len(),
+                    "devices": devices,
+                    "caps": ctx.caps.to_json(),
+                    // With `devices.discovery = manual` this is the list that matters: the
+                    // drivers recognised these and adopted none. `adopt` is the exact
+                    // `manifest_apply` body that would take one over.
+                    "candidates": ctx.probe.candidates,
+                    "discovery": ctx.cfg.discovery,
+                }))
             }),
         ToolDef::new("i2c_scan", "Scan an I2C bus and list the addresses that acknowledge")
             .title("I2C scan")
@@ -457,6 +468,31 @@ pub fn system_tools() -> Vec<ToolDef> {
                 Ok(json!({ "ok": true }))
             }),
     ]
+}
+
+/// The OpenAI `tools` array for the script tool.
+///
+/// One entry, because the language carries the generality: a script is how the model
+/// writes the loop it needs instead of asking for a new fixed tool every time.
+pub fn script_specs() -> Value {
+    json!([{
+        "type": "function",
+        "function": {
+            "name": "script",
+            "description": "Run a small script on the board: `let`, `if`, `while`, `break`, numbers, strings, lists, maps, and `tool(name, args)` to call any other board tool. Use it for loops and conditions the fixed tools cannot express, e.g. scan every bus, adopt what you recognise, then report. Bounded at 50000 steps; `tool(\"script\")` is refused.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "source": {
+                        "type": "string",
+                        "description": "the program; `#` starts a comment; the value of the last expression is returned"
+                    }
+                },
+                "required": ["source"],
+                "additionalProperties": false
+            }
+        }
+    }])
 }
 
 /// Every tool that needs no device at all.

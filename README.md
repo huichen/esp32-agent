@@ -28,7 +28,8 @@ runs — and the same document drives both the MCP endpoint and the board's own 
 | **Hardware it can find** | Built-in drivers probe I2C, 1-Wire and pins at boot; only what answered gets tools. Nothing is listed that the board cannot actually do. |
 | **A tool surface it can rewrite** | `manifest_apply` validates and rebuilds the tool list **without a restart or a reflash**; a device the agent just discovered is callable in the same turn. |
 | **Two kinds of caller, one surface** | 51 tools on the MCP endpoint — and the on-board agent sees that same list, `fs_*`/`net_*` included. No second description of the hardware to drift. |
-| **A body, not just hands** | Pins and buses, the manifest, runtime configuration, `/AGENTS.md`, `/skills/*`, the file workspace, timers, sensor rules and goals are all operations the agent can perform on itself. |
+| **A body, not just hands** | Pins and buses, the manifest, runtime configuration, `/AGENTS.md`, `/skills/*`, the memory index, the file workspace, timers, sensor rules and goals are all operations the agent can perform on itself. |
+| **It can start with nothing and build its surface** | With `discovery: manual` the drivers probe but adopt nothing: the board boots with an empty device list and a candidate list that carries the exact `manifest_apply` body for each. A script — loops, conditions, `tool()` calls — finds the hardware and declares it, and a re-probe after a hot-plug follows reality. |
 | **It acts while you are not looking** | `POST /api/sched` runs prompts on a clock or a sensor threshold; `POST /api/goal` gives it an objective and lets it iterate, one step per round, with notes that survive reboots. |
 | **It remembers, and can forget** | `/memory.md` is an index the agent writes with `fs_write`, pointing at `/memory/<topic>.md`; the index is in every prompt, the bodies are opened only when needed. Old turns are compressed into a deterministic index (no summary, no model call), and `POST /api/agent/forget {"keep":N}` cuts the past away on purpose. |
 | **Bring your own brain** | Any OpenAI-compatible `/chat/completions`, `http://` or `https://` (esp-tls + certificate bundle). Measured on the bench with `future-os.cn` and `deepseek-flash`: four tools in one turn, 13.7 s. |
@@ -107,7 +108,8 @@ Everything below is an operation, not a fixed menu:
 | Manifest | `manifest_get/describe/validate/apply/reset` — live, no reboot | MCP tools |
 | Files | `fs_ls/read/write/edit/rm/cp/mv/grep` over an NVS workspace | MCP tools |
 | Network | `net_get`, `net_post` over `http://` and `https://` | MCP tools |
-| Config | WiFi, MCP, buses, pins, auth, log, UI, tick | `POST /api/config` |
+| Config | WiFi, MCP, buses, pins, auth, log, UI, tick, discovery | `POST /api/config` |
+| Scripts | loops, conditions and `tool()` calls over every tool above | `script` tool |
 | Model | endpoint, model, key, steps, temperature, timeout | `POST /api/agent/config` |
 | Time | cron-ish prompts (`every_s`, `at_hhmm`) and sensor rules | `POST /api/sched` |
 | Purpose | a goal it iterates on across runs | `POST /api/goal` |
@@ -271,6 +273,7 @@ which made the layering look like a duplicate. They are `agent.rs` (core) and
 - [Agent loop](docs/agent-loop.md) and [agent stream](docs/agent-stream.md)
 - [Instructions and skills](docs/agent-skills.md) — `/AGENTS.md` and `/skills/<name>.md`
 - [Memory, compression and forgetting](docs/agent-memory.md) — `/memory.md` as an index, a deterministic transcript index instead of a summary, and `POST /api/agent/forget`
+- [Manual discovery and scripting](docs/scripting.md) — boot with no devices, let a script find and declare them, then write loops over tool calls
 - [Goal mode](docs/agent-goal.md) — objectives, notes, when it stops
 
 ## Contributing

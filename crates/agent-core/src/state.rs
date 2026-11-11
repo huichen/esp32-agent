@@ -17,6 +17,8 @@ const SANE_EPOCH_MS: u64 = 1_600_000_000_000;
 pub struct ProbeReport {
     pub buses: Vec<Value>,
     pub unknown: Vec<Value>,
+    /// Devices a driver recognised but did not adopt (`devices.discovery = manual`).
+    pub candidates: Vec<Value>,
     pub at_ms: u64,
     pub duration_ms: u64,
 }

@@ -224,7 +224,19 @@ pub struct DetectResult {
     pub devices: Devices,
     pub unknown: Vec<Value>,
     pub buses: Vec<Value>,
+    /// Devices a driver recognised but did not adopt, because `devices.discovery` is
+    /// `manual`. The agent sees them, decides, and adds the ones it wants — see
+    /// [`DetectResult::devices`] for the adopted set.
+    pub candidates: Vec<Value>,
 }
+
+/// Drivers a manifest can instantiate. A candidate whose kind is not here is reported
+/// without an `adopt` body: it comes from the board profile (I2S audio) and declaring it
+/// again would be a no-op that reads like a success.
+const DECLARABLE: &[&str] = &[
+    "ssd1306", "bme280", "sht3x", "ina219", "mpu6050", "ads1115", "pcf8574", "ds18b20", "hcsr04", "servo",
+    "relay", "led", "buttons", "lcd",
+];
 
 /// Probe every configured bus and every declared pin.
 pub fn detect(
@@ -514,7 +526,77 @@ pub fn detect(
         }
     }
 
-    DetectResult { devices, unknown, buses: buses_json }
+    // `devices.discovery = manual`: the drivers still probe, but nothing is adopted on
+    // the agent's behalf. What was found becomes a candidate list with the exact
+    // declaration that would adopt it, so the next step is a `manifest_apply` rather than
+    // a guess about which pins the driver wanted.
+    let mut candidates = Vec::new();
+    if cfg.discovery == "manual" {
+        for info in devices.infos() {
+            // The declaration is built the way `instantiate` reads it: `bus` is a number,
+            // a missing address is omitted rather than sent as null, and `options` carries
+            // what the probe learned (an OLED's height, an INA226's shunt).
+            let mut decl = serde_json::Map::new();
+            decl.insert("id".into(), json!(info.id));
+            decl.insert("kind".into(), json!(info.kind));
+            decl.insert("driver".into(), json!(info.kind));
+            if let Some(address) = info.address {
+                decl.insert("address".into(), json!(address));
+            }
+            let bus =
+                info.detail.get("bus").and_then(|b| b.as_u64()).or_else(|| (info.bus == "i2c").then_some(0));
+            if let Some(bus) = bus {
+                decl.insert("bus".into(), json!(bus));
+            }
+            let mut options = serde_json::Map::new();
+            for key in ["height", "controller", "shunt_mohm", "kind", "count"] {
+                if let Some(value) = info.detail.get(key) {
+                    options.insert(key.into(), json!(value.to_string().trim_matches('"')));
+                }
+            }
+            if !options.is_empty() {
+                decl.insert("options".into(), Value::Object(options));
+            }
+            if !info.pins.is_empty() {
+                let mut pins = serde_json::Map::new();
+                for (i, pin) in info.pins.iter().enumerate() {
+                    pins.insert(format!("p{i}"), json!(pin));
+                }
+                pins.insert("out".into(), json!(info.pins[0]));
+                decl.insert("pins".into(), Value::Object(pins));
+            }
+            let declarable = DECLARABLE.contains(&info.kind.as_str());
+            candidates.push(json!({
+                "id": info.id,
+                "kind": info.kind,
+                "name": info.name,
+                "bus": info.bus,
+                "address": info.address,
+                "pins": info.pins,
+                "caps": info.caps,
+                "tools": info.tools,
+                "adopt": if declarable {
+                    json!({ "devices": [Value::Object(decl)] })
+                } else {
+                    Value::Null
+                },
+                "note": if declarable {
+                    "manifest_apply {mode: \"merge\", manifest: adopt}"
+                } else {
+                    "provided by the board profile; there is nothing to declare"
+                },
+            }));
+        }
+        if !candidates.is_empty() {
+            log.info(
+                "probe",
+                format!("{} device(s) found and left as candidates: discovery is manual", candidates.len()),
+            );
+        }
+        devices = Devices::new();
+    }
+
+    DetectResult { devices, unknown, buses: buses_json, candidates }
 }
 
 /// Build a device from a manifest declaration: the "a device I typed in" path.
