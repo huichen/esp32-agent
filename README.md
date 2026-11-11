@@ -211,7 +211,7 @@ docs/                   architecture, manifest, capabilities, HTTP API, devices,
 - [Architecture](docs/architecture.md) — the three layers and why they are cut this way
 - [Manifest specification](docs/manifest.md) — fields, primitives, validation, examples
 - [Capabilities and devices](docs/capabilities.md) — driver catalogue, identification, pins
-- [HTTP / MCP API](docs/http-api.md) — routes, auth, sessions, tool conventions
+- [HTTP / MCP API](docs/http-api.md) — routes, auth, sessions, tool conventions. A running board describes itself at `GET /agent.json`: every route with its method, parameters and auth, the MCP surface, the error shape and the limits, generated from the table the router is tested against
 - [Adding a device](docs/adding-a-device.md) — manifest only, or a driver
 - [Flashing and first setup](docs/flashing.md) — toolchain, partitions, the setup flow
 - [Troubleshooting](docs/troubleshooting.md) — dark panel, empty I2C scan, missing tools

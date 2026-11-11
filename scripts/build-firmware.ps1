@@ -80,6 +80,16 @@ try {
 
   # The `esp` toolchain carries the xtensa/riscv target and build-std; the default one
   # carries neither and the failure reads as `can't find crate for core`.
+  #
+  # A machine-wide `rustc-wrapper = "sccache"` (D:\.cargo\config.toml on this bench) breaks
+  # esp-idf-sys on Windows: its rustc invocation carries thousands of `--cfg` flags, and
+  # sccache fails to spawn it with `os error 206` (the command line is too long). Cargo
+  # does not let an environment variable turn a configured wrapper off, so this has to be
+  # said out loud before it costs someone an hour.
+  $wrapped = & cargo +esp config get build.rustc-wrapper 2>$null
+  if ($wrapped -match 'sccache') {
+    Write-Warning "cargo is configured with rustc-wrapper = $wrapped; esp-idf-sys fails on Windows with 'os error 206' because its command line is too long. Move the [build] rustc-wrapper line out of the cargo config for this build."
+  }
   if (-not $env:CARGO_TARGET_DIR) {
     $env:CARGO_TARGET_DIR = if ($TargetDir) { $TargetDir } else { Join-Path $repo 'target' }
   }

@@ -113,12 +113,19 @@ impl Drop for EventStreamSlot {
 /// megabytes and a debug build with deep serde_json frames — so the numbers
 /// differ by target rather than by wishful thinking.
 #[cfg(target_os = "espidf")]
-const ACCEPT_STACK: usize = 6 * 1024;
+// Requests are served on the accept thread — one stack instead of one per connection — so
+// this stack carries the heaviest handler. `/api/tools` serialises 41 tool descriptors and
+// overflowed a 6 kB stack with a `***ERROR*** A stack overflow in task pthread` and a
+// reboot; 16 kB is what it takes with room to spare.
+const ACCEPT_STACK: usize = 16 * 1024;
 #[cfg(not(target_os = "espidf"))]
 const ACCEPT_STACK: usize = 256 * 1024;
 
 #[cfg(target_os = "espidf")]
-const CONN_STACK: usize = 10 * 1024;
+// 10 kB per connection could not be paid for out of the ~40 kB the board has left once
+// the radio is up, and six of them are what a browser opening the portal asks for. The
+// handlers are a request parse plus a JSON body; the body itself is built on the heap.
+const CONN_STACK: usize = 6 * 1024;
 #[cfg(not(target_os = "espidf"))]
 const CONN_STACK: usize = 512 * 1024;
 
@@ -657,31 +664,37 @@ fn accept_loop(listener: TcpListener, handler: Handler, stop: Arc<AtomicBool>, l
     while !stop.load(Ordering::SeqCst) {
         match listener.accept() {
             Ok((stream, peer)) => {
-                if active.load(Ordering::SeqCst) >= MAX_CONNECTIONS {
-                    log.warn("http", format!("{peer}: too many connections, dropping"));
-                    let mut s = stream;
-                    let _ = write_response(
-                        &mut s,
-                        &Response::error_json(503, "too many connections"),
-                        false,
-                        false,
-                    );
-                    continue;
-                }
-                active.fetch_add(1, Ordering::SeqCst);
-                let handler = handler.clone();
-                let log_conn = log.clone();
-                let active_conn = active.clone();
-                let spawned = std::thread::Builder::new()
-                    .name("http-conn".into())
-                    .stack_size(CONN_STACK)
-                    .spawn(move || {
-                        serve_connection(stream, peer.to_string(), handler, log_conn);
-                        active_conn.fetch_sub(1, Ordering::SeqCst);
-                    });
-                if spawned.is_err() {
-                    active.fetch_sub(1, Ordering::SeqCst);
-                    log.error("http", "could not spawn connection thread");
+                let peer = peer.to_string();
+                // Plain requests are answered on this thread, one at a time. A thread per
+                // connection costs 6 kB of internal RAM the board does not have (~40 kB
+                // free once the radio is up), so six sockets — what a browser opening the
+                // portal asks for — could not all be served and the page never loaded.
+                // Only a streaming response keeps the socket on a thread of its own.
+                match serve_until_stream(stream, &peer, &handler, &log) {
+                    Serve::Done => {}
+                    Serve::Failed => {}
+                    Serve::Stream(conn, resp, body, head_only) => {
+                        if active.load(Ordering::SeqCst) >= MAX_CONNECTIONS {
+                            log.warn("http", format!("{peer}: too many streams, dropping"));
+                            continue;
+                        }
+                        active.fetch_add(1, Ordering::SeqCst);
+                        let log_conn = log.clone();
+                        let active_conn = active.clone();
+                        let spawned = std::thread::Builder::new()
+                            .name("http-stream".into())
+                            .stack_size(CONN_STACK)
+                            .spawn(move || {
+                                let mut conn = conn;
+                                let _ = write_stream_response(&mut conn.stream, &resp, body, head_only);
+                                drop(log_conn);
+                                active_conn.fetch_sub(1, Ordering::SeqCst);
+                            });
+                        if spawned.is_err() {
+                            active.fetch_sub(1, Ordering::SeqCst);
+                            log.error("http", "could not spawn stream thread");
+                        }
+                    }
                 }
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -695,13 +708,23 @@ fn accept_loop(listener: TcpListener, handler: Handler, stop: Arc<AtomicBool>, l
     }
 }
 
-fn serve_connection(stream: TcpStream, peer: String, handler: Handler, log: Arc<LogBuf>) {
+/// What serving one connection came to.
+enum Serve {
+    /// Every request was answered; the socket is closed.
+    Done,
+    /// The socket died mid-request.
+    Failed,
+    /// The response streams, so the socket moves to a thread of its own.
+    Stream(BufferedReader, Response, StreamBody, bool),
+}
+
+fn serve_until_stream(stream: TcpStream, peer: &str, handler: &Handler, log: &Arc<LogBuf>) -> Serve {
     let mut conn = match BufferedReader::new(stream) {
         Ok(c) => c,
-        Err(_) => return,
+        Err(_) => return Serve::Failed,
     };
     for _ in 0..32 {
-        match parse_request(&mut conn, &peer) {
+        match parse_request(&mut conn, peer) {
             Ok(Some(req)) => {
                 let keep_alive = match req.header("connection") {
                     Some(v) => !v.eq_ignore_ascii_case("close"),
@@ -720,24 +743,32 @@ fn serve_connection(stream: TcpStream, peer: String, handler: Handler, log: Arc<
                 if let Some(body) = resp.stream.take() {
                     // The handler has returned, so whatever lock it took is released:
                     // the stream polls the app from here on, without holding it.
-                    let _ = write_stream_response(&mut conn.stream, &resp, body, head_only);
-                    return;
+                    return Serve::Stream(conn, resp, body, head_only);
                 }
                 if write_response(&mut conn.stream, &resp, keep_alive, head_only).is_err() {
-                    return;
+                    return Serve::Failed;
                 }
                 if !keep_alive {
-                    return;
+                    return Serve::Done;
                 }
             }
-            Ok(None) => return,
+            Ok(None) => return Serve::Done,
             Err(e) => {
                 log.warn("http", format!("{peer}: bad request: {e}"));
                 let mut s = conn.stream;
                 let _ = write_response(&mut s, &Response::error_json(400, "bad request"), false, false);
-                return;
+                return Serve::Failed;
             }
         }
+    }
+    Serve::Done
+}
+
+#[allow(dead_code)]
+fn serve_connection(stream: TcpStream, peer: String, handler: Handler, log: Arc<LogBuf>) {
+    if let Serve::Stream(mut conn, resp, body, head_only) = serve_until_stream(stream, &peer, &handler, &log)
+    {
+        let _ = write_stream_response(&mut conn.stream, &resp, body, head_only);
     }
 }
 

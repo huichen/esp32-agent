@@ -461,6 +461,37 @@ impl App {
         out
     }
 
+    /// The discovery document: the static map from `sitemap`, plus what only this board
+    /// knows — its address, its firmware, how many tools it actually exposes right now.
+    fn sitemap_json(&self, req: &Request) -> Value {
+        let host = req
+            .header("host")
+            .map(|h| h.to_string())
+            .unwrap_or_else(|| format!("<board>:{}", self.cfg.mcp.port));
+        let tool_count = self.tool_specs().as_array().map(|a| a.len()).unwrap_or(0);
+        crate::sitemap::document(json!({
+            "base_url": format!("http://{host}"),
+            "firmware": { "name": "esp32-agent", "version": crate::VERSION },
+            "board": { "profile": self.cfg.board, "devices": self.devices.len() },
+            "mcp": crate::sitemap::mcp_json(
+                &self.cfg.mcp.path,
+                tool_count,
+                !self.cfg.auth.mcp_token.is_empty(),
+            ),
+            "security": {
+                "portal_pin_set": !self.cfg.auth.portal_pin.is_empty(),
+                "mcp_token_set": !self.cfg.auth.mcp_token.is_empty(),
+                "note": "with neither set, every route above is open on the local network",
+            },
+            "model": {
+                "configured": !self.llm.base_url.is_empty() && !self.llm.model.is_empty(),
+                "endpoint": self.llm.base_url,
+                "name": self.llm.model,
+                "how_to_set": "POST /api/agent/config {base_url, model, api_key?}",
+            },
+        }))
+    }
+
     fn tools_portal_json(&self) -> Value {
         let mut tools: Vec<Value> = self
             .tools
@@ -1757,6 +1788,9 @@ impl App {
                 let up = self.runtime.uptime_s(now_ms());
                 Response::json(&json!({ "ok": true, "uptime_s": up, "devices": self.devices.len() }))
             }
+            // The map an external agent reads before it touches anything. Two paths so a
+            // client that guesses either name finds it.
+            ("GET", "/agent.json") | ("GET", "/sitemap.json") => Response::json(&self.sitemap_json(req)),
             ("GET", "/api/status") => {
                 let v = self.status_json();
                 Response::json(&v)
@@ -2967,6 +3001,42 @@ mod tests {
     fn test_app() -> App {
         let log = LogBuf::new(256);
         App::new(Box::new(VirtualBoard::new()), Box::new(MemoryStore::new()), log, FwMeta::default())
+    }
+
+    /// The map is only worth reading if it is true.
+    ///
+    /// Every documented route is called here on a real `App`; a 404 means the document
+    /// promises something the router does not serve. Mutations are included on purpose —
+    /// this is a throwaway app, and a route that answers is exactly what is being asserted.
+    #[test]
+    fn every_documented_route_actually_answers() {
+        let mut app = test_app();
+        let mut missing = Vec::new();
+        for route in crate::sitemap::ROUTES {
+            let mut req = post(route.path, "{}");
+            req.method = route.method.into();
+            req.headers.insert("host".into(), "board.test:8080".into());
+            let resp = app.route(&req);
+            if resp.status == 404 {
+                missing.push(format!("{} {}", route.method, route.path));
+            }
+        }
+        assert!(missing.is_empty(), "documented but not routed: {missing:?}");
+    }
+
+    #[test]
+    fn the_discovery_document_knows_where_it_is_served() {
+        let mut app = test_app();
+        let mut req = get("/agent.json");
+        req.headers.insert("host".into(), "192.168.3.7:8080".into());
+        let resp = app.route(&req);
+        assert_eq!(resp.status, 200);
+        let body = String::from_utf8(resp.body.clone()).expect("json");
+        let doc: Value = serde_json::from_str(&body).expect("parses");
+        assert_eq!(doc["dynamic"]["base_url"], "http://192.168.3.7:8080");
+        assert_eq!(doc["dynamic"]["mcp"]["path"], "/mcp");
+        let endpoints = doc["endpoints"].as_array().expect("endpoints");
+        assert!(endpoints.iter().any(|e| e["path"] == "/agent.json"));
     }
 
     /// A GET request; the query string is split off into `query` the way the
