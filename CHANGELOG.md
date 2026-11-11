@@ -69,6 +69,12 @@ version numbering follows semantic versioning.
 
 ### Changed
 
+- **The model's tool list is ordered least-volatile-first**: board tools, then `fs_*` and
+  `net_*`, then manifest tools — alphabetical inside each block. Providers cache a request
+  by prefix, so a mid-turn `manifest_apply` used to shift every tool after the inserted
+  name; now only the tail moves. Same board, same bytes: a test compares two identically
+  configured boards, a repeated call, and a re-probe
+
 - **Phased turn**: the model call no longer holds the `App` lock. `Agent::begin` computes
   the request and `Agent::apply` consumes the reply, so the platform layer releases the
   lock across the network wait — the portal stays responsive while a turn is in flight

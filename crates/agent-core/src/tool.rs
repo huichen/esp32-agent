@@ -53,6 +53,12 @@ pub struct ToolSpec {
     pub core: bool,
     /// True for tools contributed by a device driver (hidden in `generic` mode).
     pub device_tool: bool,
+    /// True for tools compiled out of the manifest.
+    ///
+    /// They are the volatile ones: the model rewrites the manifest while it works, so
+    /// they are ordered last in the model's tool list and a change moves only that tail
+    /// (see `ToolHost::tool_specs`).
+    pub from_manifest: bool,
 }
 
 pub struct ToolDef {
@@ -79,6 +85,7 @@ impl ToolDef {
                 mutating: false,
                 core: false,
                 device_tool: false,
+                from_manifest: false,
             },
             handler: Box::new(|_, _| Err(crate::error::McpError::internal("tool has no handler bound"))),
         }
@@ -112,6 +119,12 @@ impl ToolDef {
 
     pub fn core(mut self) -> Self {
         self.spec.core = true;
+        self
+    }
+
+    /// Marks a tool compiled out of the manifest, which is ordered last on the wire.
+    pub fn manifest_tool(mut self) -> Self {
+        self.spec.from_manifest = true;
         self
     }
 

@@ -23,7 +23,7 @@ use crate::protocol::{self, RpcIn};
 use crate::sched::{ScheduledTask, SensorRule};
 use crate::state::{make_session_id, ProbeReport, Runtime};
 use crate::store::KvStore;
-use crate::tool::{ToolCtx, ToolRegistry};
+use crate::tool::{ToolCtx, ToolDef, ToolRegistry};
 use crate::tools as board_tools;
 use crate::tools::{fs as fs_tools, net as net_tools};
 use crate::web;
@@ -2110,29 +2110,44 @@ impl App {
 /// two views cannot drift apart.
 impl ToolHost for App {
     fn tool_specs(&self) -> Value {
-        let mut tools: Vec<Value> = self
-            .tools
-            .iter()
-            .filter(|d| self.is_visible(&d.spec.name))
-            .map(|d| {
-                json!({
-                    "type": "function",
-                    "function": {
-                        "name": d.spec.name,
-                        "description": d.spec.description,
-                        "parameters": d.spec.input_schema,
-                    }
-                })
+        let visible: Vec<&ToolDef> = self.tools.iter().filter(|d| self.is_visible(&d.spec.name)).collect();
+        let load = |def: &ToolDef| {
+            json!({
+                "type": "function",
+                "function": {
+                    "name": def.spec.name,
+                    "description": def.spec.description,
+                    "parameters": def.spec.input_schema,
+                }
             })
-            .collect();
-        tools.sort_by_key(|t| t["function"]["name"].as_str().unwrap_or("").to_string());
+        };
+
+        // Order is part of the contract, because a provider caches the request by its
+        // prefix: one reordered entry and every token after it is reprocessed. So the
+        // blocks run from least to most volatile, and each block is ordered by name.
+        //
+        //   1. the board's own tools — they change with the hardware or the firmware
+        //   2. fs_* and net_*         — fixed for a given build
+        //   3. manifest tools         — they change whenever the model rewrites one
+        //
+        // Alphabetical within a block, so two boards with the same hardware produce the
+        // same bytes however the probe happened to enumerate them.
+        let mut board: Vec<Value> =
+            visible.iter().filter(|d| !d.spec.from_manifest).map(|d| load(d)).collect();
+        board.sort_by_key(|t| t["function"]["name"].as_str().unwrap_or("").to_string());
+
+        let mut volatile: Vec<Value> =
+            visible.iter().filter(|d| d.spec.from_manifest).map(|d| load(d)).collect();
+        volatile.sort_by_key(|t| t["function"]["name"].as_str().unwrap_or("").to_string());
+
+        let mut tools = board;
         // File and HTTP tools gate on nothing the hardware must provide, so they are not
-        // MCP tools; they are appended after the board's own list. Skills and
-        // `/AGENTS.md` are deliberately absent: they are files, and `fs_*` already reads
-        // and writes them — a wrapper per verb would only grow every request.
+        // MCP tools; they are appended after the board's own list, and they come before
+        // the manifest block because they never change at runtime.
         for group in [fs_tools::specs(), net_tools::specs()] {
             tools.extend(openai_tools(&group));
         }
+        tools.extend(volatile);
         Value::Array(tools)
     }
 
@@ -4067,22 +4082,50 @@ mod tests {
             assert!(tool["function"]["parameters"].is_object(), "{tool}");
         }
 
-        // The board's own tools are one alphabetical block, manifest tools included.
+        // The board's own tools are one alphabetical block, manifest tools excluded.
         let split = names.iter().position(|n| n.starts_with("fs_")).expect("fs tools");
         let board = &names[..split];
         let mut sorted = board.to_vec();
         sorted.sort_unstable();
         assert_eq!(board, sorted.as_slice(), "the board tools are not one alphabetical block");
-        for needle in ["aaa_manifest", "board_status", "manifest_apply"] {
+        for needle in ["board_status", "manifest_apply"] {
             assert!(board.contains(&needle), "{needle} is not in the board block: {board:?}");
         }
+        assert!(!board.contains(&"aaa_manifest"), "a manifest tool is not in the board block: {board:?}");
 
-        // ... and the tools that are not MCP tools are appended, in module order.
+        // ... then the tools that are not MCP tools, in module order ...
         assert_eq!(
-            &names[split..],
+            &names[split..split + 8],
             &["fs_ls", "fs_read", "fs_write", "fs_edit", "fs_rm", "fs_grep", "net_get", "net_post"],
             "the file and network tools are not the trailing block: {names:?}"
         );
+
+        // ... and the manifest block last, because it is the one the model rewrites.
+        assert_eq!(&names[split + 8..], &["aaa_manifest"], "{names:?}");
+    }
+
+    /// The same board has to produce the same bytes, or the provider's prompt cache
+    /// misses on every single turn.
+    #[test]
+    fn the_tool_list_is_byte_identical_for_the_same_board() {
+        let manifest = json!({ "manifest": { "tools": [{
+            "name": "bench_pulse",
+            "params": [{ "name": "ms", "type": "integer", "min": 10, "max": 5000, "required": true }],
+            "exec": { "type": "delay", "ms": { "param": "ms" } }
+        }] } });
+        let mut a = test_app();
+        let mut b = test_app();
+        a.call_tool("manifest_apply", &manifest).expect("apply a");
+        b.call_tool("manifest_apply", &manifest).expect("apply b");
+
+        let bytes = |app: &App| serde_json::to_string(&ToolHost::tool_specs(app)).expect("serialise");
+        let first = bytes(&a);
+        assert_eq!(first, bytes(&a), "two calls on one board produced different bytes");
+        assert_eq!(first, bytes(&b), "two identically configured boards produced different bytes");
+
+        // A re-probe must not reorder anything: same hardware, same bytes.
+        a.call_tool("devices_probe", &json!({})).expect("probe");
+        assert_eq!(first, bytes(&a), "a probe reshuffled the tool list");
     }
 
     /// `/AGENTS.md` and the skill index have to reach the model, or they are just files.

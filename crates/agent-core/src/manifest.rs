@@ -650,6 +650,7 @@ impl Manifest {
                 .title(if t.title.is_empty() { &t.name } else { &t.title })
                 .category("manifest")
                 .schema(schema)
+                .manifest_tool()
                 .requires(&requires);
             if t.exec_is_mutating() {
                 def = def.mutating();

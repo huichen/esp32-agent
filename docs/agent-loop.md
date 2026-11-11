@@ -139,6 +139,24 @@ history trimming keeps the system prompt implicit and drops oldest user/assistan
 pairs beyond 48 messages; every tool result text is truncated to 2048 bytes with
 `"…(truncated)"`; `run_pending` with no pending message is `Ok(String::new())`.
 
+### 3.2a The order of the tool list is part of the contract
+
+A provider caches a request by its longest matching prefix, so the `tools` array has to
+be byte-identical between two turns that changed nothing — and as stable as possible when
+something does change. `ToolHost::tool_specs` therefore emits three blocks, least
+volatile first, each ordered by name:
+
+1. the board's own tools (drivers and system tools) — they change with the hardware or
+the firmware;
+2. `fs_*` and `net_*` — fixed for a given build;
+3. manifest tools — they change whenever the model rewrites one.
+
+Putting the manifest block last is what keeps a mid-turn `manifest_apply` from
+reprocessing the whole tool list: only the tail moves. Alphabetical order inside a block
+is what makes two boards with the same hardware produce the same bytes, whatever order
+the probe happened to enumerate them in. `the_tool_list_is_byte_identical_for_the_same_board`
+and `every_tool_reaches_the_model_in_one_shape_and_a_predictable_order` pin both halves.
+
 ### 3.3 `crates/agent-core/src/tools/fs.rs` (worker B)
 
 ```rust
