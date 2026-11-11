@@ -614,12 +614,12 @@ fn tick(
         static LAST_WARN_S: AtomicU32 = AtomicU32::new(0);
         let now_s = (now / 1000) as u32;
         let last = LAST_WARN_S.load(Ordering::Relaxed);
-        if internal_kb < 40 && now_s.saturating_sub(last) > 60 {
+        if internal_kb < 24 && now_s.saturating_sub(last) > 60 {
             LAST_WARN_S.store(now_s, Ordering::Relaxed);
             log.warn(
                 "agent",
                 format!(
-                    "internal free heap is {internal_kb} kB: a connection thread needs ~10 kB of it, so streams and requests start failing here"
+                    "internal free heap is {internal_kb} kB: the HTTP accept thread needs ~16 kB of it, so requests and streams start failing here"
                 ),
             );
         }
