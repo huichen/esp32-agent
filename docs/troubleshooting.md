@@ -101,6 +101,13 @@ argument, not the firmware.
 - Keep `volume` modest: it is a percentage of full scale, and 90 against a 3 W amplifier at
   desk distance is genuinely loud.
 
+## The microphone and the speaker vanish after `manifest_apply`
+
+- Every apply rebuilds the device list, so `Hardware::i2s_setup` runs again on channels that
+  are already open. `i2s_new_channel` refuses a port in use, and one failure there drops both
+  audio devices until the next reboot. The firmware now leaves an open channel alone, and
+  `devices_list` keeps `mic` and `speaker` across an apply.
+
 ## Performance and stability
 
 | Symptom | Cause / fix |
