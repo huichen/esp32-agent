@@ -4423,6 +4423,46 @@ mod tests {
         assert!(app.skills().is_empty(), "the index still lists a deleted skill: {:?}", app.skills());
     }
 
+    /// `generic` is the lean mode: per-device tools fold into `device_invoke`, so a board
+    /// with six peripherals spends six definitions instead of twenty.
+    #[test]
+    fn generic_mode_folds_device_tools_and_can_be_set_from_a_config_patch() {
+        let mut app = test_app();
+        assert!(app.is_visible("bme280_read"), "the per-device tool starts visible");
+        assert!(app.is_visible("device_invoke"));
+
+        let v =
+            app.call_tool("config_set", &json!({ "patch": { "mcp": { "tools_mode": "generic" } } })).unwrap();
+        assert!(v["touched"].as_array().unwrap().iter().any(|t| t == "mcp.tools_mode"), "{v}");
+
+        for folded in ["bme280_read", "sht3x_read", "power_read", "oled_text"] {
+            assert!(
+                !app.is_visible(folded),
+                "{folded} survived generic mode (device_tool={:?}, mode={})",
+                app.tools.get(folded).map(|d| d.spec.device_tool),
+                app.cfg.mcp.tools_mode
+            );
+        }
+        assert!(app.is_visible("device_invoke"), "the way in must stay");
+        // ... and it still reaches the device.
+        let out = app
+            .call_tool("device_invoke", &json!({ "device": "bme280", "tool": "bme280_read" }))
+            .expect("device_invoke");
+        assert!(out["temperature_c"].is_number(), "{out}");
+    }
+
+    /// A typo in the mode used to be ignored, which left the board on the old value and
+    /// the caller believing it had changed.
+    #[test]
+    fn an_unknown_tools_mode_is_refused() {
+        let mut app = test_app();
+        let err = app
+            .call_tool("config_set", &json!({ "patch": { "mcp": { "tools_mode": "generik" } } }))
+            .unwrap_err();
+        assert!(err.message.contains("auto, generic or all"), "{err:?}");
+        assert_eq!(app.cfg.mcp.tools_mode, "auto", "the value changed anyway");
+    }
+
     /// The devkit's own peripherals are opt-out: a board that wants the smallest possible
     /// surface comes up with the bus, GPIO and manifest tools, and has its LED and button
     /// back by declaring them — which is also how a different devkit starts small.

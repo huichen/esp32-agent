@@ -372,9 +372,21 @@ impl Config {
                 touched.push("mcp.path".into());
             }
             if let Some(s) = m.get("tools_mode").and_then(|v| v.as_str()) {
-                if s == "auto" || s == "all" {
-                    self.mcp.tools_mode = s.to_string();
-                    touched.push("mcp.tools_mode".into());
+                // `generic` collapses the per-device tools into `device_invoke`, which is
+                // the lever that makes a small board's tool list small. It used to be
+                // accepted here only as `auto`/`all`, so the mode was documented but
+                // unreachable from `config_set` and `/api/config` — and a typo was
+                // ignored in silence.
+                match s {
+                    "auto" | "generic" | "all" => {
+                        self.mcp.tools_mode = s.to_string();
+                        touched.push("mcp.tools_mode".into());
+                    }
+                    other => {
+                        return Err(crate::error::McpError::invalid_params(format!(
+                            "`mcp.tools_mode` is `{other}`; use auto, generic or all"
+                        )))
+                    }
                 }
             }
             if let Some(a) = m.get("disabled_tools").and_then(|v| v.as_array()) {
@@ -506,7 +518,10 @@ impl Config {
         if self.mcp.port == 0 {
             self.mcp.port = DEFAULT_PORT;
         }
-        if self.mcp.tools_mode != "all" {
+        // Clamp to the known modes. This used to rewrite everything except `all` back to
+        // `auto`, which silently discarded `generic` on every config write — a patch
+        // accepted the value and the next `sanitized()` threw it away.
+        if !matches!(self.mcp.tools_mode.as_str(), "auto" | "generic" | "all") {
             self.mcp.tools_mode = "auto".into();
         }
         self.mcp.max_sessions = self.mcp.max_sessions.clamp(1, 16);

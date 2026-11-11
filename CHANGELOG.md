@@ -109,6 +109,14 @@ version numbering follows semantic versioning.
 
 ### Fixed
 
+- **`tools_mode = "generic"` never took effect.** Two independent faults: the config
+  patch accepted only `auto`/`all` and ignored anything else in silence, and
+  `Config::sanitized` rewrote every value except `all` back to `auto`, so the mode was
+  discarded on the next config write. With both fixed, folding the per-device tools into
+  `device_invoke` removes eight definitions on a populated S3-DevKitC-1
+  (48 tools → 36 with `auto_peripherals=false`), and an unknown `tools_mode` is now an
+  error instead of a no-op
+
 - A manifest can no longer take a name the board already provides. `manifest_apply`
   registered manifest tools last, so a tool called `manifest_apply` (or `bme280_read`)
   simply replaced the board's own: applying it removed the very tool needed to fix the
