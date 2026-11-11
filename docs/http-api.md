@@ -3,6 +3,23 @@
 One port serves both the web console and the MCP endpoint (default `8080`, changeable
 through `config.mcp.port`).
 
+## 0. Read this first: `GET /agent.json`
+
+Before anything else, fetch the map. It is written for an **external agent**, not a person:
+every route with its method, what it takes, what it returns, whether it needs the portal
+PIN, plus the MCP surface (transport, session header, methods, resources, a worked
+example), the error shape, and the limits that apply to a caller.
+
+```bash
+curl -sS http://<ip>:8080/agent.json | jq '.endpoints[] | "\(.method) \(.path) — \(.summary)"'
+```
+
+`GET /sitemap.json` is an alias. The document is generated from the same table the router
+is tested against: a test calls every documented route on a real `App` and fails on a 404,
+so the map cannot promise a route the firmware does not serve. The dynamic half —
+`base_url`, tool count, whether a PIN or MCP token is set, the model endpoint — comes from
+the running board, so the same document is correct on every unit.
+
 ## 1. MCP endpoint
 
 `POST /mcp` (changeable through `config.mcp.path`). Streamable HTTP, without SSE.
@@ -42,6 +59,7 @@ CORS is on by default (`mcp.cors`), so a browser MCP client can connect directly
 |---|---|---|
 | GET | `/` | Console (embedded HTML/CSS/JS, no external links) |
 | GET | `/healthz` | `{ok, uptime_s, devices}` |
+| GET | `/agent.json` | The map for an external agent: every route, the MCP surface, conventions and limits (`/sitemap.json` is an alias) |
 | GET | `/api/status` | Board, memory, WiFi, MCP, device count, counters |
 | GET | `/api/config` | Configuration (secrets shown as `__set__`) |
 | POST | `/api/config` | Partial update (JSON of the same shape) |
