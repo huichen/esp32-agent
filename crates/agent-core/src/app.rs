@@ -1890,11 +1890,43 @@ impl App {
                 if let Err(r) = self.require_pin(req) {
                     return r;
                 }
-                self.agent.reset();
+                let (removed, kept) = self.agent.forget(0);
                 self.log.info("agent", "transcript cleared from the portal");
-                Response::json(&json!({ "reset": true }))
+                Response::json(&json!({ "reset": true, "removed": removed, "kept": kept }))
+            }
+            // Forgetting with a boundary: keep the last N exchanges, or none. External
+            // agents use this to start a new task without losing what is in flight.
+            ("POST", "/api/agent/forget") => {
+                if let Err(r) = self.require_pin(req) {
+                    return r;
+                }
+                let body: Value = serde_json::from_str(&req.body_str()).unwrap_or(Value::Null);
+                let keep = body.get("keep").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                let (removed, kept) = self.agent.forget(keep);
+                self.log.info(
+                    "agent",
+                    format!("forgot {removed} message(s), kept the last {kept} toward {keep} exchange(s)"),
+                );
+                Response::json(&json!({
+                    "ok": true,
+                    "removed": removed,
+                    "kept": kept,
+                    "archive_cleared": true,
+                }))
             }
             ("GET", "/api/agent/config") => Response::json(&self.agent_config_json()),
+            // What the model is actually told, system part only. Memory, instructions and
+            // the compressed index live here, and a client that cannot see them cannot
+            // tell a bad prompt from a bad model.
+            ("GET", "/api/agent/prompt") => {
+                let text = self.agent.prompt_text(self);
+                Response::json(&json!({
+                    "bytes": text.len(),
+                    "system": text,
+                    "archive_lines": self.agent.archive.len(),
+                    "history": self.agent.history.len(),
+                }))
+            }
             ("POST", "/api/agent/config") => {
                 if let Err(r) = self.require_pin(req) {
                     return r;
@@ -2297,6 +2329,11 @@ impl ToolHost for App {
             .into_iter()
             .map(|s| crate::agent::SkillRef { name: s.name, description: s.description, path: s.path })
             .collect()
+    }
+
+    /// The memory index: `/memory.md`, one pointer per memory.
+    fn memory_index(&self) -> Option<String> {
+        crate::tools::knowledge::memory(&self.workspace)
     }
 
     fn call_tool(&mut self, name: &str, arguments: &Value) -> std::result::Result<String, String> {
@@ -5297,6 +5334,45 @@ mod tests {
 
     /// A model endpoint that is down must not burn the whole budget: three failed
     /// iterations in a row end the goal as blocked, and a failure still costs budget.
+    #[test]
+    fn forgetting_through_http_keeps_the_tail_and_reports_it() {
+        let mut app = test_app();
+        for i in 0..3 {
+            app.agent.history.push(crate::agent::Message::user(&format!("q{i}"), "http", 10 * i));
+            app.agent.history.push(crate::agent::Message::assistant("a", Vec::new(), 10 * i + 1));
+        }
+        let resp = app.route(&post("/api/agent/forget", r#"{"keep":1}"#));
+        assert_eq!(resp.status, 200);
+        let body: Value = serde_json::from_slice(&resp.body).expect("json");
+        assert_eq!(body["removed"], 4);
+        assert_eq!(body["kept"], 2);
+        assert_eq!(app.agent.history.len(), 2);
+        assert_eq!(app.agent.history[0].text, "q2");
+
+        // No `keep` means none: the whole conversation goes.
+        let resp = app.route(&post("/api/agent/forget", "{}"));
+        assert_eq!(resp.status, 200);
+        assert!(app.agent.history.is_empty());
+    }
+
+    #[test]
+    fn the_prompt_endpoint_shows_memory_and_the_compressed_view() {
+        let mut app = test_app();
+        use crate::tools::fs::Workspace as _;
+        app.workspace
+            .write("/memory.md", "- [pins](/memory/pins.md) — GPIO18 is the strip\n")
+            .expect("write");
+        app.agent.archive.push("called: board_status({})".into());
+        let resp = app.route(&get("/api/agent/prompt"));
+        assert_eq!(resp.status, 200);
+        let body: Value = serde_json::from_slice(&resp.body).expect("json");
+        let system = body["system"].as_str().expect("system");
+        assert!(system.contains("## Memory (/memory.md)"), "{system}");
+        assert!(system.contains("memory/pins.md"), "{system}");
+        assert!(system.contains("Earlier in this conversation"), "{system}");
+        assert_eq!(body["archive_lines"], 1);
+    }
+
     #[test]
     fn three_failed_iterations_in_a_row_block_the_goal() {
         let (mut app, _seen) = goal_app("", true);

@@ -29,6 +29,17 @@ use crate::tools::fs::Workspace;
 pub const AGENTS_MD: &str = "/AGENTS.md";
 /// Where skills live.
 pub const SKILLS_DIR: &str = "/skills";
+/// The memory index the agent writes and the prompt reads.
+pub const MEMORY_MD: &str = "/memory.md";
+/// Where the memories themselves live, one file per topic.
+pub const MEMORY_DIR: &str = "/memory";
+
+/// How much of the memory index reaches the system prompt, and how many lines.
+///
+/// The index is a table of contents: 24 lines at ~80 bytes is about 2 KB, the same order
+/// as the skill index, and it leaves the rest of the prompt to the tool definitions.
+pub const MEMORY_BUDGET: usize = 2048;
+pub const MEMORY_INDEX_MAX: usize = 24;
 
 /// How much of `/AGENTS.md` reaches the system prompt.
 ///
@@ -159,6 +170,45 @@ pub fn instructions(ws: &dyn Workspace) -> Option<String> {
     Some(body)
 }
 
+/// The memory index: `/memory.md`, one line per memory, each pointing at a file.
+///
+/// The shape is deliberate and mirrors how this project's own agent keeps its notes: the
+/// index is cheap and always present, the memories are files and only opened when one is
+/// relevant. Lines that are not pointers (prose, an empty bullet) are dropped, so a model
+/// that writes a paragraph instead of an index does not spend the prompt budget on it.
+pub fn memory(ws: &dyn Workspace) -> Option<String> {
+    let text = ws.read(MEMORY_MD).ok()?;
+    let mut out = String::new();
+    let mut lines = 0;
+    for line in text.lines() {
+        let line = line.trim_end();
+        if line.trim().is_empty() {
+            continue;
+        }
+        // A pointer: a bullet that names a path the reader can open.
+        let is_pointer = line.starts_with("- ") && line.contains("/memory/");
+        if !is_pointer {
+            continue;
+        }
+        if lines >= MEMORY_INDEX_MAX {
+            out.push_str(&format!("- (index full: {MEMORY_INDEX_MAX} lines; replace an entry)\n"));
+            break;
+        }
+        out.push_str(line);
+        out.push('\n');
+        lines += 1;
+        if out.len() >= MEMORY_BUDGET {
+            out.push_str(&format!("- (truncated; the rest is in {MEMORY_MD}, read it with fs_read)\n"));
+            break;
+        }
+    }
+    if out.trim().is_empty() {
+        None
+    } else {
+        Some(out)
+    }
+}
+
 /// The injected part: the first [`INSTRUCTIONS_BUDGET`] bytes, cut on a character
 /// boundary, with a marker that says where the rest is.
 fn injections(text: &str) -> String {
@@ -283,5 +333,36 @@ mod tests {
         let ws = ws_with(&[]);
         assert!(instructions(&ws).is_none());
         assert!(index(&ws).is_empty());
+        assert!(memory(&ws).is_none(), "a board that has written nothing has no memory index");
+    }
+
+    #[test]
+    fn the_memory_index_reaches_the_prompt_as_pointers() {
+        let index = "# memories\n\n- [pins](/{}/pins.md) — GPIO18 is the strip, active high (2026-11-11)\n- [wifi](/{}/wifi.md) — the 5 GHz SSID is not visible (2026-11-10)\n";
+        let text = index.replace("{}", "memory");
+        let ws = ws_with(&[(MEMORY_MD, &text), ("/memory/pins.md", "GPIO18 = strip")]);
+        let injected = memory(&ws).expect("index");
+        assert!(injected.contains("memory/pins.md"), "{injected}");
+        assert!(injected.contains("memory/wifi.md"), "{injected}");
+        assert!(!injected.contains("# memories"), "headings are not pointers: {injected}");
+    }
+
+    #[test]
+    fn prose_in_the_memory_file_does_not_spend_the_prompt_budget() {
+        let text = "This paragraph is not an index entry and must be ignored.\n- not a pointer either\n";
+        let ws = ws_with(&[(MEMORY_MD, text)]);
+        assert!(memory(&ws).is_none(), "nothing that a reader could follow");
+    }
+
+    #[test]
+    fn a_memory_index_that_grows_past_the_cap_says_so() {
+        let mut text = String::new();
+        for i in 0..MEMORY_INDEX_MAX + 3 {
+            text.push_str(&format!("- [t{i}](/memory/t{i}.md) — hook\n"));
+        }
+        let ws = ws_with(&[(MEMORY_MD, &text)]);
+        let injected = memory(&ws).expect("index");
+        assert_eq!(injected.matches("/memory/t").count(), MEMORY_INDEX_MAX, "{injected}");
+        assert!(injected.contains("index full"), "{injected}");
     }
 }
