@@ -11,6 +11,7 @@ mod agent;
 mod dns;
 mod esp_hw;
 mod nvs_store;
+mod provision;
 mod wifi;
 
 use esp32_agent_core::app::{make_handler, App, FwMeta, Shared};
@@ -216,6 +217,9 @@ fn run() -> anyhow::Result<()> {
         let guard = app.lock().map_err(|_| anyhow::anyhow!("app lock poisoned"))?;
         guard.cfg.mcp.port
     };
+
+    // The console is the provisioning path that does not cost anybody their network.
+    provision::start(app.clone(), log.clone());
 
     // Radio first: the portal is useless without an address, and the setup AP is
     // how a phone reaches it.

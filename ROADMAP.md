@@ -46,8 +46,9 @@ what is not done or not verified.
 
 ## Medium term
 
-7. **I2S audio**: INMP441 microphone + MAX98357A amplifier → `mic_level`, `tone`,
-   `record`.
+7. ~~**I2S audio**: INMP441 microphone + MAX98357A amplifier → `mic_level`, `speaker_tone`,
+   `mic_record`.~~ Done and measured on the bench: 16 kHz/32-bit/left mic, 24 kHz/16-bit
+   amplifier, -65 dBFS floor and a 1 kHz tone at -25 dBFS through the microphone.
 8. **More drivers**: DHT11/22, RC522, VL53L0X, BH1750, BME680, SD card, stepper motor.
 9. **Manifest template library**: grow `examples/manifests/` into a set of device recipes
    that the console can import in one click.
