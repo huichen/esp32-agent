@@ -35,6 +35,7 @@ pub mod manifest;
 pub mod protocol;
 pub mod provision;
 pub mod sched;
+pub mod sitemap;
 pub mod state;
 pub mod store;
 pub mod tool;
