@@ -24,6 +24,7 @@ use crate::state::{make_session_id, ProbeReport, Runtime};
 use crate::store::KvStore;
 use crate::tool::{ToolCtx, ToolDef, ToolRegistry};
 use crate::tools as board_tools;
+use crate::tools::family::Family;
 use crate::tools::{fs as fs_tools, net as net_tools};
 use crate::web;
 use serde_json::{json, Value};
@@ -523,6 +524,43 @@ impl App {
         }
         self.family_members = members;
         tools.register_all(self.devices.tool_defs());
+        // Device tools that belong together answer to one family name: six `oled_*` become
+        // `display`, four audio tools become `audio`, and the LED and the buttons become
+        // `indicators`. The grouping is the board's own vocabulary — a kind of device it
+        // detected — so a driver that is not in this list keeps its individual tools
+        // instead of being guessed at by name.
+        let mut groups: std::collections::BTreeMap<&'static str, Vec<String>> = Default::default();
+        for info in self.devices.infos() {
+            let Some((_, family)) = Self::DEVICE_FAMILIES.iter().find(|(kind, _)| *kind == info.kind) else {
+                continue;
+            };
+            groups.entry(family).or_default().extend(info.tools.iter().cloned());
+        }
+        for (family, declared) in groups {
+            // A second pass, because a family owns its commands while the old names stay in
+            // the registry: `oled_text` still answers, and `display oled_text` is the same
+            // handler behind one declaration.
+            let subs: Vec<ToolDef> = self
+                .devices
+                .tool_defs()
+                .into_iter()
+                .filter(|d| {
+                    declared.iter().any(|n| d.spec.name == *n || d.spec.name.starts_with(&format!("{n}_")))
+                })
+                .collect();
+            if subs.len() < 2 {
+                // One tool is not a family: the declaration would cost more than the tool.
+                continue;
+            }
+            let summary = format!(
+                "The {family} this board detected, in {} commands under one name; `command: help` lists what each takes",
+                subs.len()
+            );
+            for name in subs.iter().map(|d| d.spec.name.clone()).collect::<Vec<String>>() {
+                self.family_members.insert(name.clone(), format!("{family} {name}"));
+            }
+            tools.register(Family::new(family, summary, subs).into_tool().device_tool());
+        }
         // A manifest may not take a name the board already uses (validation refuses it),
         // but a manifest stored by an older build — or one applied before the hardware
         // was plugged in — can still arrive here. The board's own tool wins, and the
@@ -602,6 +640,20 @@ impl App {
     }
 
     // ---------------------------------------------------------------- queries
+
+    /// Device tools that belong together, by the kind of device the board detected.
+    ///
+    /// A driver names its own kind, so this is the board's vocabulary rather than a list of
+    /// tool names: every tool of every `ssd1306` on the board lands in `display`, and a
+    /// driver that is not here keeps its individual tools. Adding a driver to a family is
+    /// one line; guessing from a name prefix is what this avoids.
+    const DEVICE_FAMILIES: &'static [(&'static str, &'static str)] = &[
+        ("ssd1306", "display"),
+        ("led", "indicators"),
+        ("buttons", "indicators"),
+        ("mic", "audio"),
+        ("speaker", "audio"),
+    ];
 
     /// The tools `mcp.profile = "minimal"` hides: conveniences, never capabilities.
     ///
@@ -7914,7 +7966,7 @@ mod tests {
         // Every entry is in the shape the chat endpoint expects.
         assert!(tools.iter().all(|t| t["type"] == "function" && t["function"]["parameters"].is_object()));
         assert!(names.contains(&"board"), "got {names:?}");
-        assert!(names.contains(&"oled_text"));
+        assert!(names.contains(&"display"), "the OLED's tools are behind `display`: {names:?}");
         assert!(names.contains(&"shell"), "the file and network commands are missing: {names:?}");
         // A tool whose hardware is absent is not offered, exactly as in tools/list.
         assert!(!names.contains(&"mpu6050_read"));
@@ -8447,11 +8499,14 @@ mod tests {
         let names = |v: &Value| -> Vec<String> {
             v.as_array().unwrap().iter().map(|s| s.as_str().unwrap().to_string()).collect()
         };
-        let families = [
-            ("manifest", crate::tools::manifest_members()),
-            ("board", crate::tools::board_members()),
-            ("bus", crate::tools::bus_members()),
-        ];
+        // Every family the board actually has, discovered from the same map the listing uses:
+        // a driver that joins a family is covered here without this test being edited.
+        let mut families: std::collections::BTreeMap<String, Vec<String>> = Default::default();
+        for (name, reach) in &app.family_members {
+            let family = reach.split(' ').next().unwrap_or("").to_string();
+            families.entry(family).or_default().push(name.clone());
+        }
+        assert!(families.len() >= 4, "not every family formed: {families:?}");
         for (family, members) in families {
             let spec = ToolHost::tool_specs(&app)
                 .as_array()
@@ -8463,12 +8518,12 @@ mod tests {
             let mut declared = names(&spec["function"]["parameters"]["properties"]["command"]["enum"]);
             declared.retain(|c| c != "help");
 
-            let help = app.call_tool(family, &json!({ "command": "help" })).unwrap();
+            let help = app.call_tool(&family, &json!({ "command": "help" })).unwrap();
             let helped = names(&help["commands"]);
             assert_eq!(declared, helped, "{family}: the schema and `help` disagree");
 
             for command in helped.iter().chain(std::iter::once(&"help".to_string())) {
-                if let Err(e) = app.call_tool(family, &json!({ "command": command })) {
+                if let Err(e) = app.call_tool(&family, &json!({ "command": command })) {
                     assert!(
                         !e.message.contains("no command"),
                         "{family}: `help` lists `{command}` but dispatch refuses it: {}",
@@ -8476,7 +8531,7 @@ mod tests {
                     );
                 }
             }
-            let err = app.call_tool(family, &json!({ "command": "frobnicate" })).unwrap_err();
+            let err = app.call_tool(&family, &json!({ "command": "frobnicate" })).unwrap_err();
             assert!(
                 err.message.contains("no command"),
                 "{family}: an unknown command must be refused: {err:?}"
@@ -8512,7 +8567,7 @@ mod tests {
     fn tools_list_only_shows_detected_hardware() {
         let mut app = test_app();
         let names = tool_names(&mut app);
-        assert!(names.contains(&"oled_text".to_string()), "got {names:?}");
+        assert!(names.contains(&"display".to_string()), "got {names:?}");
         assert!(names.contains(&"bme280_read".to_string()));
         assert!(names.contains(&"board".to_string()));
         assert!(!names.contains(&"mpu6050_read".to_string()));
@@ -8522,9 +8577,12 @@ mod tests {
     #[test]
     fn disabled_tools_disappear_and_missing_caps_hide_devices() {
         let mut app = test_app();
-        app.cfg.mcp.disabled_tools = vec!["oled_text".into()];
-        assert!(!app.is_visible("oled_text"));
-        assert!(app.is_visible("oled_clear"));
+        app.cfg.mcp.disabled_tools = vec!["display".into()];
+        assert!(!app.is_visible("display"));
+        assert!(app
+            .hidden_tools()
+            .iter()
+            .any(|t| t["name"] == "display" && t["why"].as_str().unwrap_or("").contains("disabled_tools")));
         assert!(!app.is_visible("mpu6050_read"));
     }
 
@@ -8533,6 +8591,7 @@ mod tests {
         let mut app = test_app();
         app.cfg.mcp.tools_mode = "generic".into();
         assert!(!app.is_visible("oled_text"), "device tools hidden");
+        assert!(!app.is_visible("display"), "a device family collapses like the tools it groups");
         assert!(app.is_visible("board"));
         assert!(app.is_visible("devices_list"));
     }
@@ -8543,7 +8602,7 @@ mod tests {
         app.cfg.mcp.tools_mode = "all".into();
         // `all` skips capability filtering; it cannot invent a driver for a chip
         // that is not on the bus, so `mpu6050_read` stays absent either way.
-        assert!(app.is_visible("oled_text"));
+        assert!(app.is_visible("display"));
         assert!(app.is_visible("board"));
         assert!(!app.is_visible("mpu6050_read"));
     }
@@ -9380,7 +9439,7 @@ mod tests {
     #[test]
     fn a_minimal_board_starts_without_the_devkits_own_peripherals() {
         let mut app = test_app();
-        assert!(app.is_visible("led_set"), "the profile's LED is there by default");
+        assert!(app.is_visible("indicators"), "the profile's LED and buttons are there by default");
 
         // Through the config path a person or the agent would use.
         app.call_tool("config_set", &json!({ "patch": { "auto_peripherals": false } })).unwrap();
@@ -9402,8 +9461,8 @@ mod tests {
             )
             .unwrap();
         assert_eq!(v["applied"], true, "{v}");
-        assert!(app.is_visible("led_set"), "the declared LED did not appear");
-        assert!(app.is_visible("buttons_read"), "the declared button did not appear");
+        assert!(app.is_visible("indicators"), "the declared LED did not appear");
+        assert!(app.is_visible("indicators"), "the declared button did not appear");
         let out = app.call_tool("led_set", &json!({ "color": "#010203" })).unwrap();
         assert_eq!(out["color"], json!("#010203"), "{out}");
     }
@@ -9417,8 +9476,14 @@ mod tests {
 
         app.cfg.board = "esp32s3-xiaozhi-bread".into();
         app.rebuild();
+        // Both I2S devices are there, so the `audio` family is; its commands are the four
+        // tools, and `audio help` is what names them.
+        assert!(app.is_visible("audio"), "the microphone and amplifier must bring `audio`");
+        let help = app.call_tool("audio", &json!({ "command": "help" })).unwrap();
+        let commands: Vec<String> =
+            help["commands"].as_array().unwrap().iter().map(|s| s.as_str().unwrap().to_string()).collect();
         for tool in ["mic_level", "mic_record", "speaker_tone", "speaker_play"] {
-            assert!(app.is_visible(tool), "{tool} missing: {:?}", app.visible_tool_names());
+            assert!(commands.contains(&tool.to_string()), "{tool} missing: {commands:?}");
         }
 
         // The capabilities ride on the devices, so a board that cannot bring I2S up never
@@ -9452,7 +9517,7 @@ mod tests {
     #[test]
     fn two_devices_of_one_kind_get_distinct_tool_names() {
         let mut app = test_app();
-        assert!(app.is_visible("led_set"), "the devkit's LED starts as `led_set`");
+        assert!(app.is_visible("indicators"), "the devkit's LED starts inside `indicators`");
 
         let v = app
             .call_tool(
@@ -9464,7 +9529,12 @@ mod tests {
             )
             .unwrap();
         assert_eq!(v["applied"], true, "{v}");
-        assert!(app.is_visible("led_set_2"), "the strip has no tool: {:?}", app.visible_tool_names());
+        // The second strip's tools are suffixed, and the family is what carries both.
+        let help = app.call_tool("indicators", &json!({ "command": "help" })).unwrap();
+        let commands: Vec<String> =
+            help["commands"].as_array().unwrap().iter().map(|s| s.as_str().unwrap().to_string()).collect();
+        assert!(commands.contains(&"led_set".to_string()), "{commands:?}");
+        assert!(commands.contains(&"led_set_2".to_string()), "the strip has no tool: {commands:?}");
 
         // The two views agree: `devices_list` names the same suffixed tool.
         let inv = app.call_tool("devices_list", &json!({})).unwrap();

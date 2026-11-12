@@ -85,7 +85,14 @@ and `GET /api/catalog` serves the same table to a client. Tools are named as the
 | `mic` | INMP441 / ICS-43434 I2S microphone | I2S pins from the profile or `config.pins` | `mic_level` `mic_record` | 16 kHz, 32-bit slots, left channel |
 | `speaker` | MAX98357A I2S amplifier | I2S pins from the profile or `config.pins` | `speaker_tone` `speaker_play` | 24 kHz, 16-bit, mono |
 
-## 3. What is not implemented
+A detected device's tools are grouped: the model sees one declaration per family —
+`display` for an SSD1306's six, `audio` for a microphone and an amplifier,
+`indicators` for the LED and the buttons — and reaches them as
+`display {"command": "oled_text"}`, with `help` listing the rest. The names in the
+catalogue above are those commands, so a driver's own vocabulary is what `help` prints;
+the individual names still answer, so a stored script keeps working, and `/api/tools`
+says which family each one went to. Two devices of one kind share the family and get
+suffixed commands (`oled_text_2`).
 
 The catalogue is complete: every entry in `CATALOG` is implemented and probeable or
 declarable. What is left is not another driver but the things around it — a camera

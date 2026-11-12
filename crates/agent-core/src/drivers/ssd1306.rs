@@ -304,6 +304,16 @@ impl Ssd1306 {
         i.id = self.id.clone();
         i.address = Some(self.addr);
         i.caps = vec!["oled".into(), "i2c".into()];
+        // Named here as well as in `tools()`: `devices_list` and `/api/devices` are how a
+        // person (and the family grouping) finds out what a detected device can do.
+        i.tools = vec![
+            "oled_text".into(),
+            "oled_read".into(),
+            "oled_clear".into(),
+            "oled_rect".into(),
+            "oled_bitmap".into(),
+            "oled_contrast".into(),
+        ];
         i.detail = json!({
             "controller": match self.controller { Controller::Ssd1306 => "ssd1306", Controller::Sh1106 => "sh1106" },
             "width": self.width,
