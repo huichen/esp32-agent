@@ -30,6 +30,32 @@ pub const VALUE_MAX: usize = 4000;
 /// with room for the NUL terminator and for whatever an NVS entry adds around a value.
 pub const CHUNK_BYTES: usize = 3500;
 
+/// The longest key name NVS accepts: its `NVS_KEY_NAME_MAX_SIZE` is 16 *including* the
+/// terminator, so a name is at most 15 bytes (`nvs.h`).
+///
+/// This is not a guideline. A longer name is refused with `ESP_ERR_NVS_KEY_TOO_LONG`
+/// (0x1109) and *nothing is stored*, which for a while was the state of this board's
+/// transcript: `agent.transcript` is 16 bytes, so every transcript write and every
+/// `agent.run_in_flight` (19 bytes) was refused while `/api/status.store.failed` climbed —
+/// measured 2026-11-12, 23 refusals within 195 s of boot, `nvs write
+/// \`agent.transcript\`: ESP_ERR_NVS_KEY_TOO_LONG` on the console log. The queue checks the
+/// length before it reaches a backend, so a name that cannot work is reported like any
+/// other refusal instead of being discovered on a board.
+pub const KEY_MAX: usize = 15;
+
+/// `ESP_ERR_NVS_KEY_TOO_LONG` (`nvs.h`: `ESP_ERR_NVS_BASE + 0x09`): the code the board
+/// returns for a name over [`KEY_MAX`]. Named here so the host and the board classify that
+/// refusal with the same number instead of two vocabularies.
+pub const ERR_KEY_TOO_LONG: i32 = 0x1109;
+
+/// The name that number has on the board, for `/api/status` and the log line.
+pub const ERR_KEY_TOO_LONG_NAME: &str = "ESP_ERR_NVS_KEY_TOO_LONG";
+
+/// How many distinct keys [`StoreQueue::refused_keys`] keeps. A store that refuses key
+/// after key must not grow a map without bound on a board with 141 KB of internal RAM; the
+/// count of the rest is kept in [`StoreQueue::refused_other`].
+pub const REFUSED_KEYS_MAX: usize = 16;
+
 /// How one blob is spread over values, and how to tell it from one written before it was
 /// chunked.
 #[derive(Debug, Clone, Copy)]
@@ -286,6 +312,70 @@ pub trait KvStore: Send {
     fn set(&mut self, key: &str, value: &str) -> bool;
     fn remove(&mut self, key: &str) -> bool;
     fn keys(&self) -> Vec<String>;
+
+    /// Why the `set`/`remove` that just returned `false` was refused, if this backend can
+    /// say. Read immediately after the call, by the one task that drains the queue.
+    ///
+    /// `false` on its own is not a diagnosis: `ESP_ERR_NVS_NOT_ENOUGH_SPACE` and
+    /// `ESP_ERR_NVS_KEY_TOO_LONG` are the same `false` to a caller and need opposite fixes.
+    fn last_error(&self) -> Option<StoreError> {
+        None
+    }
+
+    /// How much room the backing store has, if it can be asked. Reported in
+    /// `/api/status.store.space`, so "it refused a write" and "it is full" stay two
+    /// different observations.
+    fn space(&self) -> Option<StoreSpace> {
+        None
+    }
+}
+
+/// One reason a store gave for refusing an operation: the platform's numeric code and the
+/// name that code has there (`esp_err_t` and `esp_err_to_name` on the board).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoreError {
+    pub code: i32,
+    pub name: String,
+}
+
+/// What one refused operation was.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StoreOp {
+    Set,
+    Remove,
+}
+
+impl StoreOp {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            StoreOp::Set => "set",
+            StoreOp::Remove => "remove",
+        }
+    }
+}
+
+/// A refusal with everything needed to act on it: which key, which operation, why, and
+/// when — the facts `/api/status.store.last_failure` and the `store` log line carry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Refusal {
+    pub key: String,
+    pub op: StoreOp,
+    /// The platform's code, or 0 when the backend could not say (a `false` with no
+    /// reason is still a refusal and is reported as one).
+    pub code: i32,
+    pub name: String,
+    /// Milliseconds since the queue was created: a few ms after boot on the board, which
+    /// is close enough to put next to a log line's `t_ms` (both are counts from that boot).
+    pub at_ms: u64,
+}
+
+/// Room left in the backing store, in the units the backend thinks in — NVS entries, which
+/// are 32 bytes each and 126 per 4 KB page.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StoreSpace {
+    pub used_entries: usize,
+    pub free_entries: usize,
+    pub total_entries: usize,
 }
 
 /// One queued operation: `Some` is a write, `None` is a removal.
@@ -302,6 +392,10 @@ pub struct FlushReport {
     pub failed: usize,
     /// The keys involved, in the order they were applied.
     pub keys: Vec<String>,
+    /// One entry per refusal, in the order they happened: the key, the operation and the
+    /// backend's own reason. `failed` is the count of these; this is what makes the count
+    /// actionable.
+    pub failures: Vec<Refusal>,
 }
 
 impl FlushReport {
@@ -332,6 +426,47 @@ pub struct StoreQueue {
     pending: Arc<Mutex<Pending>>,
     written: Arc<AtomicU32>,
     failed: Arc<AtomicU32>,
+    stats: Arc<Mutex<StoreStats>>,
+}
+
+/// What the queue remembers so `/api/status` can answer "which key, and why" without a
+/// serial terminal. Kept apart from the counters: `failed` is a number, this is the
+/// diagnosis.
+#[derive(Debug)]
+struct StoreStats {
+    origin: std::time::Instant,
+    last_failure: Option<Refusal>,
+    refused_keys: BTreeMap<String, u32>,
+    /// Refusals whose key did not fit [`REFUSED_KEYS_MAX`]; counted, not enumerated.
+    refused_other: u32,
+    space: Option<StoreSpace>,
+}
+
+impl StoreStats {
+    fn new(space: Option<StoreSpace>) -> Self {
+        Self {
+            origin: std::time::Instant::now(),
+            last_failure: None,
+            refused_keys: BTreeMap::new(),
+            refused_other: 0,
+            space,
+        }
+    }
+
+    fn now_ms(&self) -> u64 {
+        self.origin.elapsed().as_millis() as u64
+    }
+
+    fn note(&mut self, refusal: Refusal) {
+        if let Some(count) = self.refused_keys.get_mut(&refusal.key) {
+            *count += 1;
+        } else if self.refused_keys.len() < REFUSED_KEYS_MAX {
+            self.refused_keys.insert(refusal.key.clone(), 1);
+        } else {
+            self.refused_other = self.refused_other.saturating_add(1);
+        }
+        self.last_failure = Some(refusal);
+    }
 }
 
 impl std::fmt::Debug for StoreQueue {
@@ -346,11 +481,16 @@ impl std::fmt::Debug for StoreQueue {
 
 impl StoreQueue {
     pub fn new(inner: Box<dyn KvStore>) -> Self {
+        // Asked once, before the store is behind a lock: a backend that can report its
+        // size knows it before it has written anything, and this is the reading that
+        // separates "refused" from "full".
+        let space = inner.space();
         Self {
             inner: Arc::new(Mutex::new(inner)),
             pending: Arc::new(Mutex::new(Vec::new())),
             written: Arc::new(AtomicU32::new(0)),
             failed: Arc::new(AtomicU32::new(0)),
+            stats: Arc::new(Mutex::new(StoreStats::new(space))),
         }
     }
 
@@ -406,25 +546,67 @@ impl StoreQueue {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         };
+        let mut stats = match self.stats.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
         for (key, value) in pending.drain(..) {
-            let ok = match &value {
-                Some(text) => inner.set(&key, text),
-                // "It was not there" is not a failure: a removal that removes nothing is
-                // what a second boot asks for.
-                None => {
-                    inner.remove(&key);
-                    true
+            let op = match &value {
+                Some(_) => StoreOp::Set,
+                None => StoreOp::Remove,
+            };
+            let refusal = if key.len() > KEY_MAX {
+                // A name the board cannot hold. Reported here, with the code the board
+                // would return, so it costs a log line instead of a flash round trip that
+                // ends in `false` with no reason.
+                Some(Refusal {
+                    key: key.clone(),
+                    op,
+                    code: ERR_KEY_TOO_LONG,
+                    name: ERR_KEY_TOO_LONG_NAME.to_string(),
+                    at_ms: stats.now_ms(),
+                })
+            } else {
+                let ok = match &value {
+                    Some(text) => inner.set(&key, text),
+                    // "It was not there" is not a failure: a removal that removes nothing is
+                    // what a second boot asks for. A removal the *backend* failed is, and
+                    // that is the difference `last_error` makes.
+                    None => {
+                        let removed = inner.remove(&key);
+                        removed || inner.last_error().is_none()
+                    }
+                };
+                if ok {
+                    None
+                } else {
+                    let why = inner.last_error();
+                    Some(Refusal {
+                        key: key.clone(),
+                        op,
+                        code: why.as_ref().map(|e| e.code).unwrap_or(0),
+                        name: why.map(|e| e.name).unwrap_or_else(|| "refused".to_string()),
+                        at_ms: stats.now_ms(),
+                    })
                 }
             };
-            if ok {
-                report.written += 1;
-                self.written.fetch_add(1, Ordering::Relaxed);
-            } else {
-                report.failed += 1;
-                self.failed.fetch_add(1, Ordering::Relaxed);
+            match refusal {
+                Some(refusal) => {
+                    report.failed += 1;
+                    self.failed.fetch_add(1, Ordering::Relaxed);
+                    report.failures.push(refusal.clone());
+                    stats.note(refusal);
+                }
+                None => {
+                    report.written += 1;
+                    self.written.fetch_add(1, Ordering::Relaxed);
+                }
             }
             report.keys.push(key);
         }
+        // Re-read once per drain, not per operation: `nvs_get_stats` walks the pages, and
+        // the number is only interesting for what the drain just did to it.
+        stats.space = inner.space();
         report
     }
 
@@ -445,6 +627,44 @@ impl StoreQueue {
     /// change the caller was told about is not on flash.
     pub fn failed(&self) -> u32 {
         self.failed.load(Ordering::Relaxed)
+    }
+
+    /// The most recent refusal: which key, which operation, the backend's code and name,
+    /// and how long after the queue was created it happened. `None` until something is
+    /// refused. This is what `/api/status.store.last_failure` reports.
+    pub fn last_failure(&self) -> Option<Refusal> {
+        match self.stats.lock() {
+            Ok(stats) => stats.last_failure.clone(),
+            Err(poisoned) => poisoned.into_inner().last_failure.clone(),
+        }
+    }
+
+    /// Refusals per key since boot, most refused first — so a board that cannot be
+    /// attached to a serial terminal still says *which* key is the problem.
+    pub fn refused_keys(&self) -> Vec<(String, u32)> {
+        let refused = match self.stats.lock() {
+            Ok(stats) => stats.refused_keys.clone(),
+            Err(poisoned) => poisoned.into_inner().refused_keys.clone(),
+        };
+        let mut out: Vec<(String, u32)> = refused.into_iter().collect();
+        out.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        out
+    }
+
+    /// Refusals for keys beyond [`REFUSED_KEYS_MAX`], counted rather than enumerated.
+    pub fn refused_other(&self) -> u32 {
+        match self.stats.lock() {
+            Ok(stats) => stats.refused_other,
+            Err(poisoned) => poisoned.into_inner().refused_other,
+        }
+    }
+
+    /// Room left in the backing store, when the backend can report it.
+    pub fn space(&self) -> Option<StoreSpace> {
+        match self.stats.lock() {
+            Ok(stats) => stats.space,
+            Err(poisoned) => poisoned.into_inner().space,
+        }
     }
 
     /// Everything currently stored, queued changes included.
@@ -820,7 +1040,10 @@ mod tests {
         assert!(inner.all().is_empty(), "nothing may reach flash before the writer runs");
 
         let report = queue.flush();
-        assert_eq!(report, FlushReport { written: 1, failed: 0, keys: vec!["ws".into()] });
+        assert_eq!(
+            report,
+            FlushReport { written: 1, failed: 0, keys: vec!["ws".into()], failures: Vec::new() }
+        );
         assert_eq!(inner.get("ws").as_deref(), Some("hello"));
         assert_eq!(queue.pending(), 0);
         assert_eq!(queue.written(), 1);
@@ -888,6 +1111,157 @@ mod tests {
         assert_eq!(report.keys, vec!["ok".to_string(), "too_long".to_string()]);
         assert_eq!(queue.failed(), 1);
         assert_eq!(queue.pending(), 0, "a refused write is dropped, not retried forever");
+        // The count is not the diagnosis: the refusal names the key and the operation even
+        // when the backend cannot say why (`LimitedStore` returns a bare `false`).
+        assert_eq!(report.failures.len(), 1);
+        assert_eq!(report.failures[0].key, "too_long");
+        assert_eq!(report.failures[0].op, StoreOp::Set);
+        assert_eq!(report.failures[0].name, "refused");
+        assert_eq!(queue.last_failure().map(|f| f.key), Some("too_long".to_string()));
+        assert_eq!(queue.refused_keys(), vec![("too_long".to_string(), 1)]);
+    }
+
+    /// A store that refuses one key for a reason it can state, the way NVS refuses a value
+    /// it has no room for. `LimitedStore` covers the bare `false`; this covers the case the
+    /// board actually hits, where the answer is a code.
+    #[derive(Debug, Default)]
+    struct RefusingStore {
+        map: BTreeMap<String, String>,
+        refuse: Option<(String, i32, &'static str)>,
+        fail_remove: bool,
+        last: Option<StoreError>,
+    }
+
+    impl KvStore for RefusingStore {
+        fn get(&self, key: &str) -> Option<String> {
+            self.map.get(key).cloned()
+        }
+
+        fn set(&mut self, key: &str, value: &str) -> bool {
+            self.last = None;
+            if let Some((refused, code, name)) = &self.refuse {
+                if refused == key {
+                    self.last = Some(StoreError { code: *code, name: (*name).to_string() });
+                    return false;
+                }
+            }
+            self.map.insert(key.to_string(), value.to_string());
+            true
+        }
+
+        fn remove(&mut self, key: &str) -> bool {
+            self.last = None;
+            if self.fail_remove {
+                self.last =
+                    Some(StoreError { code: 0x1105, name: "ESP_ERR_NVS_NOT_ENOUGH_SPACE".to_string() });
+                return false;
+            }
+            self.map.remove(key).is_some()
+        }
+
+        fn keys(&self) -> Vec<String> {
+            self.map.keys().cloned().collect()
+        }
+
+        fn last_error(&self) -> Option<StoreError> {
+            self.last.clone()
+        }
+    }
+
+    #[test]
+    fn a_refused_write_is_recorded_with_its_key_and_the_stores_code() {
+        let queue = StoreQueue::new(Box::new(RefusingStore {
+            refuse: Some(("transcript.1".to_string(), 0x1105, "ESP_ERR_NVS_NOT_ENOUGH_SPACE")),
+            ..Default::default()
+        }));
+        let mut store = QueuedStore::new(queue.clone());
+        store.set("config", "{}");
+        store.set("transcript.1", "a chunk");
+        let report = queue.flush();
+
+        assert_eq!(report.written, 1);
+        assert_eq!(report.failed, 1);
+        let refusal = &report.failures[0];
+        assert_eq!(refusal.key, "transcript.1", "the key is the part that makes it actionable");
+        assert_eq!(refusal.op, StoreOp::Set);
+        assert_eq!(refusal.code, 0x1105);
+        assert_eq!(refusal.name, "ESP_ERR_NVS_NOT_ENOUGH_SPACE");
+
+        // And the same facts survive the flush, which is what `/api/status` reports.
+        let last = queue.last_failure().expect("a refusal must be remembered");
+        assert_eq!(last.key, "transcript.1");
+        assert_eq!(last.code, 0x1105);
+        assert_eq!(queue.failed(), 1);
+        assert_eq!(queue.refused_keys(), vec![("transcript.1".to_string(), 1)]);
+    }
+
+    #[test]
+    fn a_key_longer_than_nvs_allows_is_refused_with_the_boards_own_code() {
+        // The board keeps 15 bytes of key. A 16-byte one is not stored and cannot be read
+        // back, and the backend is not even asked: the refusal comes with the same code the
+        // board would have returned.
+        let queue = StoreQueue::new(Box::new(Shared::default()));
+        let mut store = QueuedStore::new(queue.clone());
+        store.set("agent.transcript", "the transcript"); // 16 bytes
+        let report = queue.flush();
+
+        assert_eq!(report.written, 0);
+        assert_eq!(report.failed, 1);
+        assert_eq!(report.failures[0].key, "agent.transcript");
+        assert_eq!(report.failures[0].code, ERR_KEY_TOO_LONG);
+        assert_eq!(report.failures[0].name, ERR_KEY_TOO_LONG_NAME);
+        assert_eq!(ERR_KEY_TOO_LONG, 0x1109, "ESP_ERR_NVS_KEY_TOO_LONG in nvs.h");
+        // Nothing reached the store, so a later read cannot find a value that is not there.
+        assert_eq!(store.get("agent.transcript"), None);
+        assert_eq!(store.keys(), Vec::<String>::new());
+
+        // Exactly KEY_MAX bytes is accepted: the limit is 15, not 14.
+        let longest = "x".repeat(KEY_MAX);
+        store.set(&longest, "v");
+        let report = queue.flush();
+        assert_eq!(report.failed, 0, "{:?}", report.failures);
+        assert_eq!(store.get(&longest).as_deref(), Some("v"));
+    }
+
+    #[test]
+    fn a_refused_removal_is_reported_but_removing_a_missing_key_is_not() {
+        let queue = StoreQueue::new(Box::new(RefusingStore { fail_remove: true, ..Default::default() }));
+        let mut store = QueuedStore::new(queue.clone());
+        store.remove("config");
+        let report = queue.flush();
+        assert_eq!(report.failed, 1, "a removal the store failed is a refusal");
+        assert_eq!(report.failures[0].op, StoreOp::Remove);
+        assert_eq!(report.failures[0].code, 0x1105);
+
+        // A store that answers "it was not there" without an error is not refusing: that
+        // is what a second boot's removals look like, and they must not be reported.
+        let queue = StoreQueue::new(Box::new(MemoryStore::new()));
+        let mut store = QueuedStore::new(queue.clone());
+        store.remove("never_written");
+        let report = queue.flush();
+        assert_eq!(report.failed, 0);
+        assert!(queue.last_failure().is_none());
+    }
+
+    #[test]
+    fn the_refused_key_list_is_bounded_and_counts_the_rest() {
+        let queue = StoreQueue::new(Box::new(LimitedStore::default()));
+        let mut store = QueuedStore::new(queue.clone());
+        let too_long = "x".repeat(VALUE_MAX + 1);
+        // More distinct keys than the list keeps.
+        // More distinct keys than the list keeps.
+        for index in 0..(REFUSED_KEYS_MAX + 3) {
+            store.set(&format!("k{index}"), &too_long);
+        }
+        let report = queue.flush();
+        assert_eq!(report.failed, REFUSED_KEYS_MAX + 3);
+        // … and one of them again, in a later drain: counted, not added twice.
+        store.set("k0", &too_long);
+        assert_eq!(queue.flush().failed, 1);
+        let refused = queue.refused_keys();
+        assert_eq!(refused.len(), REFUSED_KEYS_MAX, "the list must not grow without bound");
+        assert_eq!(refused[0], ("k0".to_string(), 2), "most refused first, counted per key");
+        assert_eq!(queue.refused_other(), 3);
     }
 
     #[test]

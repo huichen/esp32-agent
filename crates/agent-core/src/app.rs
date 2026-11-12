@@ -43,10 +43,20 @@ pub const NVS_KEY_WORKSPACE: &str = "ws";
 /// The board's NVS refuses a single string value above roughly 4000 bytes - the firmware
 /// reads through a fixed 4096-byte buffer (`firmware/src/nvs_store.rs`) and ESP-IDF
 /// rejects a longer write - so the blob is stored as a few values: this key holds the
-/// header and the first part, `agent.transcript.1`, `.2` ... hold the rest. The header
-/// carries a checksum over everything after it, so chunks from two different writes are
-/// detected instead of concatenated into a transcript that never existed.
-pub const NVS_KEY_TRANSCRIPT: &str = "agent.transcript";
+/// header and the first part, `transcript.1`, `.2` ... hold the rest. The header carries
+/// a checksum over everything after it, so chunks from two different writes are detected
+/// instead of concatenated into a transcript that never existed.
+///
+/// The name is `transcript`, not `agent.transcript`, because a key is at most
+/// [`store::KEY_MAX`] bytes and the longer name was refused with
+/// `ESP_ERR_NVS_KEY_TOO_LONG` on every write: the board had no transcript on flash at all
+/// and said so only as a number in `/api/status.store.failed`. A name is a hardware
+/// limit, not a label — `every_key_the_board_stores_fits_nvs` refuses the next one.
+pub const NVS_KEY_TRANSCRIPT: &str = "transcript";
+/// What a build before 2026-11-12 called the same value. 16 bytes, so NVS refused every
+/// write; only a host state file (`FileStore`) can hold it. Read so a simulator's
+/// conversation survives the rename, never written.
+const LEGACY_KEY_TRANSCRIPT: &str = "agent.transcript";
 /// The most bytes one stored value may hold: the board reads NVS through a fixed
 /// 4096-byte buffer (`firmware/src/nvs_store.rs`) and ESP-IDF rejects a longer write.
 pub const TRANSCRIPT_CHUNK_BYTES: usize = 3500;
@@ -56,7 +66,10 @@ pub const TRANSCRIPT_CHUNK_BYTES: usize = 3500;
 pub const TRANSCRIPT_CHUNKS_MAX: usize = 8;
 /// Written before a run starts and removed when it ends. Its presence at boot is the
 /// only evidence that a turn was cut off by a power loss rather than finished.
-pub const NVS_KEY_RUN_IN_FLIGHT: &str = "agent.run_in_flight";
+///
+/// `agent.run_in_flight` was 19 bytes and therefore never stored; the marker existed only
+/// in the RAM of the run that wrote it.
+pub const NVS_KEY_RUN_IN_FLIGHT: &str = "run_in_flight";
 /// The source a resumed turn carries, so a reply can be told apart from one the user just
 /// asked for.
 pub const RESUME_SOURCE: &str = "resume";
@@ -576,14 +589,19 @@ impl App {
     /// no such thing as a flash window.
     pub fn flush_store(&self, who: &str) -> store::FlushReport {
         let report = self.store_queue.flush();
-        if report.failed > 0 {
+        // One line per refusal, not one line for all of them: a count says something is
+        // wrong, and only the key says *what* is. `report.failed` is still the count, and
+        // `/api/status.store.last_failure` carries the newest one off the wire.
+        for refusal in &report.failures {
             self.log.error(
                 "store",
                 format!(
-                    "{} of {} store write(s) were refused by flash: {}",
-                    report.failed,
-                    report.failed + report.written,
-                    report.keys.join(", ")
+                    "`{who}`: `{}` was refused on `{}` at {} ms: {} ({}); the change is only in RAM",
+                    refusal.key,
+                    refusal.op.as_str(),
+                    refusal.at_ms,
+                    refusal.name,
+                    refusal.code
                 ),
             );
         }
@@ -1192,6 +1210,30 @@ impl App {
         let internal = self.hw.heap_internal();
         let threads = self.threads_json();
         let now = now_ms();
+        // Built before the object literal: `json!` reads a brace after a `:` as a nested
+        // object, so a block expression belongs in a local.
+        let store_last_failure = match self.store_queue.last_failure() {
+            Some(refusal) => json!({
+                "key": refusal.key,
+                "op": refusal.op.as_str(),
+                "err": refusal.code,
+                "err_name": refusal.name,
+                "at_ms": refusal.at_ms,
+            }),
+            None => Value::Null,
+        };
+        let mut refused = serde_json::Map::new();
+        for (key, count) in self.store_queue.refused_keys() {
+            refused.insert(key, json!(count));
+        }
+        let store_space = match self.store_queue.space() {
+            Some(space) => json!({
+                "used_entries": space.used_entries,
+                "free_entries": space.free_entries,
+                "total_entries": space.total_entries,
+            }),
+            None => Value::Null,
+        };
         json!({
             "device_name": self.cfg.device_name,
             // The board's clock, because it decides whether https works at all: before
@@ -1282,11 +1324,20 @@ impl App {
             },
             // What is queued and who drains it. A growing `pending` means the writer task
             // is not running; `internal_stack: false` means it must not write at all.
+            //
+            // `last_failure` and `refused_keys` are the diagnosis a `failed` count cannot
+            // give: a caller was told a change was accepted and it is not on flash, and
+            // these name the key and the store's own reason (an `esp_err_t` number and
+            // its name) so a board with no serial terminal attached still says why.
             "store": {
                 "pending": self.store_queue.pending(),
                 "written": self.store_queue.written(),
                 "failed": self.store_queue.failed(),
                 "writer": self.store_writer.as_json(),
+                "last_failure": store_last_failure,
+                "refused_keys": refused,
+                "refused_other": self.store_queue.refused_other(),
+                "space": store_space,
             },
             "pins": self.cfg.pins,
         })
@@ -1973,9 +2024,27 @@ impl App {
 
     /// The stored transcript, chunks joined in order, or `None` when nothing was stored.
     fn read_transcript(&self) -> Option<String> {
-        let mut text = self.store.get(NVS_KEY_TRANSCRIPT)?;
+        let Some(mut text) = self.store.get(NVS_KEY_TRANSCRIPT) else {
+            // Nothing under the name this build writes. A host state file from before the
+            // rename may still hold the old one; the board cannot, NVS refused that name.
+            return self.read_legacy_transcript();
+        };
         for index in 1..TRANSCRIPT_CHUNKS_MAX {
             match self.store.get(&Self::transcript_key(index)) {
+                Some(part) => text.push_str(&part),
+                None => break,
+            }
+        }
+        Some(text)
+    }
+
+    /// The transcript under the names a build before 2026-11-12 used. Read-only: the next
+    /// write stores under the current names, and [`remove_transcript`](Self::remove_transcript)
+    /// clears these too so a forgotten conversation cannot come back.
+    fn read_legacy_transcript(&self) -> Option<String> {
+        let mut text = self.store.get(LEGACY_KEY_TRANSCRIPT)?;
+        for index in 1..TRANSCRIPT_CHUNKS_MAX {
+            match self.store.get(&format!("{LEGACY_KEY_TRANSCRIPT}.{index}")) {
                 Some(part) => text.push_str(&part),
                 None => break,
             }
@@ -2032,6 +2101,24 @@ impl App {
                 break;
             }
             removed = self.store.remove(&Self::transcript_key(index)) || removed;
+        }
+        // A forgotten conversation must not come back under the old names on the next read.
+        removed = self.remove_legacy_transcript() || removed;
+        removed
+    }
+
+    fn remove_legacy_transcript(&mut self) -> bool {
+        let mut removed = self.store.get(LEGACY_KEY_TRANSCRIPT).is_some();
+        if removed {
+            self.store.remove(LEGACY_KEY_TRANSCRIPT);
+        }
+        for index in 1..TRANSCRIPT_CHUNKS_MAX {
+            let key = format!("{LEGACY_KEY_TRANSCRIPT}.{index}");
+            if self.store.get(&key).is_none() {
+                break;
+            }
+            self.store.remove(&key);
+            removed = true;
         }
         removed
     }
@@ -6953,8 +7040,8 @@ mod tests {
             TRANSCRIPT_CHUNKS_MAX
         );
         assert!(TRANSCRIPT_CHUNK_BYTES <= 4000, "ESP-IDF refuses an NVS string value above ~4000 bytes");
-        assert_eq!(NVS_KEY_TRANSCRIPT, "agent.transcript");
-        assert_eq!(NVS_KEY_RUN_IN_FLIGHT, "agent.run_in_flight");
+        assert_eq!(NVS_KEY_TRANSCRIPT, "transcript");
+        assert_eq!(NVS_KEY_RUN_IN_FLIGHT, "run_in_flight");
     }
 
     #[test]
@@ -7489,6 +7576,81 @@ mod tests {
         let status = body_json(&app.route(&get("/api/status")));
         assert_eq!(status["store"]["writer"]["task"], json!("nvs-writer"));
         assert_eq!(status["store"]["writer"]["internal_stack"], json!(true));
+    }
+
+    /// The other half of `store.failed`: *which* key, and why. A board with no serial
+    /// terminal attached has only this, so it has to be true before anything is refused and
+    /// complete after.
+    #[test]
+    fn a_refused_write_shows_up_in_the_status_with_its_key_and_code() {
+        let store = SharedStore::new();
+        let mut app = app_with(&store);
+        let fresh = body_json(&app.route(&get("/api/status")));
+        assert_eq!(fresh["store"]["last_failure"], Value::Null, "nothing refused yet");
+        assert_eq!(fresh["store"]["refused_keys"], json!({}));
+        assert_eq!(fresh["store"]["refused_other"], json!(0));
+
+        // The name that used to be here: 16 bytes, one over what NVS keeps.
+        app.store.set("agent.transcript", "a transcript");
+        app.flush_store("test-writer");
+        assert!(store.get("agent.transcript").is_none(), "and it really did not reach the store");
+
+        let status = body_json(&app.route(&get("/api/status")));
+        assert_eq!(status["store"]["failed"], json!(1), "the count stays what it was");
+        assert_eq!(status["store"]["last_failure"]["key"], json!("agent.transcript"));
+        assert_eq!(status["store"]["last_failure"]["op"], json!("set"));
+        assert_eq!(status["store"]["last_failure"]["err"], json!(store::ERR_KEY_TOO_LONG));
+        assert_eq!(status["store"]["last_failure"]["err_name"], json!(store::ERR_KEY_TOO_LONG_NAME));
+        assert!(status["store"]["last_failure"]["at_ms"].is_u64(), "{:?}", status["store"]);
+        assert_eq!(status["store"]["refused_keys"]["agent.transcript"], json!(1));
+
+        // A second refusal of the same key counts up and replaces the newest one.
+        app.store.set("agent.transcript", "again");
+        app.flush_store("test-writer");
+        let status = body_json(&app.route(&get("/api/status")));
+        assert_eq!(status["store"]["failed"], json!(2));
+        assert_eq!(status["store"]["refused_keys"]["agent.transcript"], json!(2));
+        // A key that fits is accepted and does not disturb the record of the one that did not.
+        app.store.set("config", "{}");
+        app.flush_store("test-writer");
+        let status = body_json(&app.route(&get("/api/status")));
+        assert_eq!(status["store"]["last_failure"]["key"], json!("agent.transcript"));
+    }
+
+    /// The board's NVS keeps 15 bytes of key name (`NVS_KEY_NAME_MAX_SIZE` is 16, with the
+    /// terminator). A longer one is not a long name: it is a value that is never stored and
+    /// never read — which is what `agent.transcript` and `agent.run_in_flight` were, on
+    /// every write, from the day they were named.
+    #[test]
+    fn every_key_the_board_stores_fits_nvs() {
+        let mut keys: Vec<String> = vec![
+            crate::config::NVS_KEY_CONFIG.to_string(),
+            crate::manifest::NVS_KEY_MANIFEST.to_string(),
+            NVS_KEY_AGENT_CFG.to_string(),
+            NVS_KEY_SCHED.to_string(),
+            NVS_KEY_WORKSPACE.to_string(),
+            NVS_KEY_TRANSCRIPT.to_string(),
+            NVS_KEY_RUN_IN_FLIGHT.to_string(),
+        ];
+        // Every chunk a blob of that plan can occupy, not only the first.
+        for index in 1..=WORKSPACE_PLAN.chunks_max {
+            keys.push(format!("{NVS_KEY_WORKSPACE}.{index}"));
+        }
+        for index in 1..TRANSCRIPT_CHUNKS_MAX {
+            keys.push(App::transcript_key(index));
+        }
+        for key in &keys {
+            assert!(
+                key.len() <= store::KEY_MAX,
+                "`{key}` is {} bytes and NVS keeps {} — it would be refused on every write",
+                key.len(),
+                store::KEY_MAX
+            );
+        }
+        // The names this test was written for. If a future rename brings one back, the loop
+        // above is what fails.
+        assert!("agent.transcript".len() > store::KEY_MAX);
+        assert!("agent.run_in_flight".len() > store::KEY_MAX);
     }
 
     /// The map is only worth reading if it is true.

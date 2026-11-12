@@ -23,6 +23,13 @@ what is not done or not verified.
 - ⚠️ Not measured: WS2812/RMT, ADC/PWM values, boot time and power draw under a full
   sdkconfig; the portal's live console has only been driven with `curl -N`, not in a
   browser
+- ⚠️ The `nvs` partition is 24 KB (`0x6000`) and the two blob plans declare more than it
+  holds: `TRANSCRIPT_CHUNKS_MAX` 8 and `WORKSPACE_PLAN` 5 are 13 values of up to 3500
+  bytes, about 45 KB. Whichever fills first wins and the other is refused with
+  `ESP_ERR_NVS_NOT_ENOUGH_SPACE` (visible in `/api/status.store`); what the right split is,
+  and whether the transcript belongs on NVS at all rather than on the 1 MB `storage`
+  partition, has not been measured. `store.space` now reports the entries used, so the
+  measurement is one board and one full workspace away
 - ⚠️ `POST /audio/pcm` and `POST /av` have been played on the board since: a 30.00 s clip
   with 362 frames completed in 30.19 s with the sound judged correct by ear, and its audio
   alone in 30.03 s. What the 128×32 panel *shows* of a dithered video has not been judged
