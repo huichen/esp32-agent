@@ -199,6 +199,7 @@ What this does **not** do: change the sample rate (the I2S TX clock is the const
 `AMP_RATE_HZ`, so `?rate=` accepts 24000 only), and hold two uploads at once. Both need a
 `i2s_open_tx(rate)` and a second thread, i.e. RAM this board does not have; they are
 `ROADMAP.md` items, not promises.
+
 ## 7. Playing a melody: send the score, not the samples
 
 §6 streams PCM, and for audio a host already holds that is the right answer. A melody is the
@@ -279,7 +280,44 @@ Two things are worth reading off that table:
   (1,025 `f32` entries); the app partition went from 87.08% to 87.24% of 3 MiB with it.
   `[measured]`: `espflash` prints `App/part. size` on every flash.
 
-## 8. How to check these numbers again
+## 8. Sound with a picture: `POST /av`
+
+The bench board played a 30 s clip with its animation on the 128x32 OLED: PCM down one TCP
+port, one frame per MCP `display` call out of the other. That pairing needs two things this
+board does not have at once — a speaker on a task of its own, and an HTTP thread free while
+the song plays — so the same content travels here as **one body**, and the order of the
+records is the synchronisation.
+
+| Record | Payload | What the board does |
+|---|---|---|
+| `A` | PCM16LE mono at 24 kHz | `i2s_out_write`, which blocks for exactly that much audio |
+| `F` | 512 bytes (128x32) or 1024 (128x64), 1-bpp page format | `oled_bitmap`, so a 512-byte frame lands in the top half of a 64-row panel |
+| `E` | nothing | end of the stream |
+
+A host writes `F`, then the `A` for that frame's interval, then the next `F`. By the time
+the board reads the next frame it has just finished playing the audio that belongs to the
+one before it: there is no clock to agree on and no drift to correct, because the I2S write
+**is** the clock. `tools/av_push.py` is the host side, and the probe's own strip is the
+content:
+
+```bash
+python tools/av_push.py --audio clip.pcm --frames clip.1bpp --host <ip> --fps 12
+# {"ok":true,"format":"av1","audio_bytes":1440000,"samples":720000,"ms":30000,"frames":362,...}
+```
+
+The costs are §6's costs: no new thread (the request runs where requests already run), no
+body buffer (records are parsed as they arrive, into two reused buffers), and the App mutex
+taken once per record rather than for the song. The limits differ in one place — audio is
+still capped at 30 s per body, while the body as a whole may reach 1.9 MB, which is 30 s of
+audio plus 512 KB of frames (30 s of 12 fps at 128x32 is 186 KB).
+
+Two things this does not do. Frames cannot run *ahead* of the audio: one way, in order, so
+seeking, looping or overlaying means a second body. And the panel's row count is not guessed
+— a board whose config says `oled.height = 64` on a 32-row panel gets the frame drawn into
+the top half of a taller buffer, which is the same thing the register setup already got
+wrong (see `docs/adding-a-device.md`, or set `pins: {"oled.height": 32}`).
+
+## 9. How to check these numbers again
 
 - Flash: `espflash flash --partition-table firmware/partitions.csv --target-app-partition
   factory <elf>` prints `App size … (N%)`; compare N with 86%.
@@ -297,3 +335,7 @@ Two things are worth reading off that table:
   16.7 ms of audio is still in the DMA ring when the call returns, so the call ends slightly
   *early*, never late), and `write_ms` should equal `ms` — a write that took longer than the
   audio means the stream ran dry and was refilled.
+- The picture: `python tools/av_push.py --audio clip.pcm --frames clip.1bpp --dry-run` prints
+  how many records and bytes a clip becomes; a real run answers with `frames` equal to the
+  strip's count and `ms` equal to the audio's length. If the OLED snows, its `height` is
+  wrong for the panel — `GET /api/devices` reports what the firmware thinks it is.

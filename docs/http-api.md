@@ -92,6 +92,7 @@ CORS is on by default (`mcp.cors`), so a browser MCP client can connect directly
 | POST | `/api/script` | Run a script: `{source, async?}`; the answer carries `result`/`output`/`steps`, or `{id, poll}` with `async: true` ([scripting](scripting.md)) |
 | GET | `/api/script/<id>` | One script job: `state` (`queued`/`running`/`done`/`failed`), `result`, `output`, `error` |
 | POST | `/audio/pcm` | Play PCM as it arrives: raw PCM16LE mono at 24000 Hz, chunked or with `Content-Length`, at most 30 s, never buffered ([streaming playback](audio.md#6-streaming-playback-post-audiopcm)) |
+| POST | `/av` | Play audio and draw frames from one body: `tag|u16le len|payload` records — `A` audio, `F` 512-byte 128x32 bitmap, `E` end — so a soundtrack and its animation stay in step ([sound with a picture](audio.md#8-sound-with-a-picture-post-av)) |
 | GET | `/api/attachment/<name>` | The file attached to the last message, with its own mime type ([attachments](#5-attachments)) |
 | POST | `/api/auth` | `{pin}`, check the console PIN |
 | POST | `/api/reboot` | Reboot |
@@ -148,6 +149,12 @@ is configured, and only 24000 Hz is wired, so `?rate=` accepts that value alone 
 otherwise). Past 30 s the upload is refused rather than truncated: send the next piece as a
 second request. There is one speaker, so one upload at a time — a second waits in the
 listen backlog like any other request.
+
+`POST /av` is the same route with a picture attached: the body is a sequence of
+`tag | u16le length | payload` records (`A` audio, `F` a 1-bpp frame, `E` end), consumed in
+order, so the frame written in front of an audio record is on screen while that audio plays
+([sound with a picture](audio.md#8-sound-with-a-picture-post-av)).
+`tools/av_push.py` writes that body from a PCM file and a frame strip.
 
 ## 3. Resources (`resources/*`)
 

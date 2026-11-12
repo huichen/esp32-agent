@@ -284,6 +284,15 @@ pub const ROUTES: &[Route] = &[
         "raw PCM16LE mono, 24000 Hz, chunked or Content-Length; at most 30 s",
         "{ok, rate_hz, channels, bits, bytes, samples, ms, limit_bytes}",
     ),
+    r(
+        "POST",
+        "/av",
+        "audio",
+        Auth::Pin,
+        "Play audio and draw frames from one streamed body: `A` audio records, `F` bitmap records, `E` end — a soundtrack with its animation, in step by construction (docs/audio.md)",
+        "`tag|u16le len|payload` records: `A` = PCM16LE mono 24000 Hz, `F` = 512-byte 128x32 or 1024-byte 128x64 bitmap, `E` = end",
+        "{ok, audio_bytes, samples, ms, frames, ended, limit_bytes}",
+    ),
     // --- scheduling ----------------------------------------------------------------
     r("GET", "/api/sched", "sched", Auth::Open, "Scheduled tasks and sensor rules", "", "{tasks, rules}"),
     r(
