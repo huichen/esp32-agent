@@ -10,8 +10,7 @@ becomes MCP tools. The agent on the board sees those same tools and answers with
 sensor can be declared in JSON while the board runs.
 
 > The agent loop follows [FutureOS](https://github.com/futuregene/future-os): transcript,
-> tool journal, stream events, protocol adapters, memory index. Where the firmware differs
-> (kilobytes instead of gigabytes of RAM, no model-written summaries) the code says why.
+> tool journal, stream events, protocol adapters, memory index. 
 
 | What | In detail |
 |---|---|
@@ -49,6 +48,53 @@ Port 443 serves the same routes over TLS with a certificate generated on first b
 warn, so compare the fingerprint. Port 80 stays open, so a bad certificate costs a URL rather
 than the board. `GET /agent.json` is the whole interface as data: 40 routes with method, body,
 return and auth, plus every writable setting with its type and default.
+
+## Give it a model
+
+The model is a setting, not a build:
+
+```bash
+curl -sS -X POST http://<board>/api/agent/config -H 'Content-Type: application/json' \
+  -d '{"base_url":"https://your-provider/v1/chat/completions","model":"…","api_key":"…"}'
+curl -sS -X POST http://<board>/api/agent/message -H 'Content-Type: application/json' \
+  -d '{"text":"write HELLO on the OLED and set the LED blue"}'
+```
+
+Three wire protocols (`chat`, `responses`, `anthropic`), a thinking level, a context window and
+an output ceiling — all in the console's Agent panel or the same `POST`. Without a key, point
+`base_url` at `http://127.0.0.1/selftest/chat/completions` and the loop still runs.
+[Model](docs/model.md) has the field list and the three protocols side by side.
+
+## Use it
+
+| From | What you get |
+|---|---|
+| `http://<board>/` on a phone | chat with the model, see devices and tools, change anything |
+| `POST /mcp` from an MCP client | the same tools the board's own agent uses |
+| `POST /api/script`, `POST /api/sched` | run a script now, or have one run on a timer |
+| `GET /agent.json` | the whole interface as data: routes, settings, limits |
+
+```bash
+curl -sS -X POST http://<board>/mcp -H 'Content-Type: application/json' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/call",
+       "params":{"name":"shell","arguments":{"command":"ls /"}}}'
+```
+
+The board's own agent can also give itself hardware (`manifest_apply`), a memory
+(`write /memory/…`) and shell access — the same calls, with the same PIN.
+
+## Safety notes
+
+- **Credentials stay on the board.** WiFi goes to NVS through `provision`, never into the
+  image; `api_key` is write-only and reads back as `__set__`.
+- **Set a PIN before the board leaves your desk.** `auth.portal_pin` guards every write and the
+  reads that expose the transcript, the prompt, the config and the logs.
+- **Compare the certificate.** The board's TLS certificate is self-signed; its fingerprint is at
+  `GET /api/tls`. Port 80 stays open on purpose, so a bad certificate costs a URL, not the board.
+- **`shell`, `script` and manifest tools move pins.** That is the point of the board; the PIN is
+  what separates the agent doing its job from a passer-by doing it.
+
+[Security](docs/security.md) states what is deliberately not defended.
 
 ## Repository layout
 
