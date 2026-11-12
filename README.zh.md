@@ -26,45 +26,43 @@
 
 ## 烧录与连接
 
-把 release 里的合并镜像写到偏移 0（或自己编译，见 [docs/flashing.md](docs/flashing.md)）：
-
 ```bash
 espflash write-bin --chip esp32s3 --flash-size 16mb 0x0 esp32-agent-vX.Y.Z.bin
 ```
 
-板子里没有凭据时会开一个叫 `esp32-agent-setup` 的热点。用手机连上它，打开
-**http://192.168.4.1/**，填入 WiFi 名称和密码。它们存进 NVS，不烧进镜像；而板子要连到
-局域网之外的东西（大模型、软件源、别人桌上的 `/agent.json`）就必须先有它们。
+板子里没有 WiFi 凭据，所以它开一个叫 `esp32-agent-setup` 的热点。连上它，打开
+`http://192.168.4.1/`，填网络名和密码，保存。凭据进 NVS，板子重连。在这一步完成之前，
+它到不了局域网以外的任何地方：模型端点、软件源都到不了。
 
 ## 使用
 
-它只服务两件事。
+**在浏览器里**：`http://<board>/`（或 `https://<board>/`）就是控制台。和模型对话、看探测到的
+设备、开关工具、看日志、设 PIN。
 
-**人在手机上用。** 打开 `http://<board>/`（或 443 上的 https）：和模型对话、看探测到的设备、
-关掉某个工具、翻日志、设 PIN。
-
-**把 `http://<board>/agent.json` 交给一个 agent。** 那份文档就是接口本身：每条路由的方法、
-请求体、鉴权，MCP 那一块，流式端点，带类型和默认值的设置表，以及各项上限。一个能取一个
-URL 的 agent，不需要读这份 README 的任何一行就能用这块板——这个端点就是为此存在的。
+**在 agent 里**：`GET http://<board>/agent.json` 返回接口本身，JSON 形式——每条路由的方法、
+请求体、鉴权，MCP 那一块，带类型和默认值的设置表，以及各项上限。能取一个 URL 的 agent
+不需要别的东西。
 
 ## 给它一个模型
 
-两种方式，同样三个字段。
+打开 `http://<board>/`，进 **Agent** 面板，填三个字段，保存：
 
-**在网页上。** 打开页面，Agent 面板，填端点、模型、key，保存。key 只写不读：进 NVS，
-读回来是 `__set__`。
+| 字段 | 值 |
+|---|---|
+| `base_url` | 完整的 chat-completions 地址 |
+| `model` | 提供方的模型 id |
+| `api_key` | 密钥；只写，读回来是 `__set__` |
 
-**让 agent 填。** 用同样的字段 `POST /api/agent/config`：
+同样的三个字段，走 HTTP：
 
 ```bash
 curl -sS -X POST http://<board>/api/agent/config -H 'Content-Type: application/json' \
   -d '{"base_url":"https://your-provider/v1/chat/completions","model":"…","api_key":"…"}'
 ```
 
-三种协议（`chat`、`responses`、`anthropic`）、思考等级、上下文窗口与输出上限，都在同一个面板
-和同一个路由上。完全没有 key 时，把 `base_url` 指向
-`http://127.0.0.1/selftest/chat/completions`，循环照样跑，所以没账号也能先验板子。字段表见
-[Model](docs/model.md)。
+`protocol` 选 `chat`、`responses` 或 `anthropic`；`reasoning`、`context_tokens`、
+`max_output_tokens` 都在同一个面板和同一个路由。完全没 key 时，把 `base_url` 设成
+`http://127.0.0.1/selftest/chat/completions`，循环照样跑。
 
 ## 安全须知
 
