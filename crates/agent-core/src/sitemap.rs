@@ -278,6 +278,15 @@ pub const ROUTES: &[Route] = &[
     r("GET", "/api/sched", "sched", Auth::Open, "Scheduled tasks and sensor rules", "", "{tasks, rules}"),
     r(
         "POST",
+        "/api/script",
+        "script",
+        Auth::Pin,
+        "Run a script with the caller's own permissions; inline by default, or queue it",
+        "{source, async?: bool}",
+        "inline: {ok, result, output, steps, ms, error}; async: {id, state, poll} — GET that `poll` path for the result",
+    ),
+    r(
+        "POST",
         "/api/sched",
         "sched",
         Auth::Pin,
