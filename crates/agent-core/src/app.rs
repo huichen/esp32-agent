@@ -2980,28 +2980,19 @@ impl App {
 impl App {
     /// `shell {op, …}`: pick the command, hand the rest of the arguments to the handler.
     fn run_shell(&mut self, args: &Value) -> std::result::Result<String, String> {
-        // Two ways in: a command line (`{"command":"ls -la /notes"}`), which is what a
-        // shell is, and the JSON form (`{"op":"ls","path":"/notes"}`), which is what a
-        // script or a client that builds objects prefers. The command line is parsed and
-        // then becomes the JSON form, so both reach the same handler with the same values.
-        if let Some(line) = args.get("command").and_then(|v| v.as_str()) {
-            let parsed = crate::tools::shell::parse(line)?;
-            let mut derived = crate::tools::shell::arguments(&parsed)?;
-            if args.get("help").and_then(|v| v.as_bool()).unwrap_or(false) {
-                derived["help"] = json!(true);
-            }
-            let mut object = derived.as_object().cloned().unwrap_or_default();
-            object.insert("op".into(), json!(parsed.name));
-            return self.run_shell(&Value::Object(object));
+        // One way in: a command line, as a shell has. No `op`, no parallel object form.
+        let line = args.get("command").and_then(|v| v.as_str()).unwrap_or("");
+        if line.trim().is_empty() {
+            return Err(format!("`command` is required.\n\n{}", crate::tools::shell::help_text()));
         }
-        let op = args.get("op").and_then(|v| v.as_str()).unwrap_or("").trim().to_ascii_lowercase();
-        if op.is_empty() {
-            return Err(format!("`command` (or `op`) is required.\n\n{}", crate::tools::shell::help_text()));
-        }
-        // `shell help`, `shell {"op":"rm","help":true}` and a bare unknown op all answer
-        // with the usage lines: a model that guessed the flags should not have to guess
-        // again to find out what they are.
-        let wants_help = op == "help" || args.get("help").and_then(|v| v.as_bool()).unwrap_or(false);
+        let parsed = crate::tools::shell::parse(line)?;
+        let op = parsed.name.clone();
+        // `help`, `-h` and `--help` answer before anything is validated, so `cp -h` does not
+        // fail for a missing argument on the way to its own usage line.
+        let wants_help = op == "help"
+            || args.get("help").and_then(|v| v.as_bool()).unwrap_or(false)
+            || parsed.flags.contains_key("help")
+            || parsed.flags.contains_key("h");
         if wants_help {
             let text = match crate::tools::shell::usage(&op) {
                 Some(line) if op != "help" => {
@@ -3011,14 +3002,13 @@ impl App {
             };
             return Ok(json!({ "help": text }).to_string());
         }
+        let mut inner = crate::tools::shell::arguments(&parsed)?;
+        if args.get("help").and_then(|v| v.as_bool()).unwrap_or(false) {
+            inner["help"] = json!(true);
+        }
         let tool = crate::tools::shell::route(&op).ok_or_else(|| {
             format!("`{op}` is not a shell command.\n\n{}", crate::tools::shell::help_text())
         })?;
-        // The command's own arguments are the same object minus `op`.
-        let mut inner = args.clone();
-        if let Some(map) = inner.as_object_mut() {
-            map.remove("op");
-        }
         let usage = crate::tools::shell::usage(&op).unwrap_or("");
         let result = match tool {
             "shell_zip" => self.shell_zip(&inner),
@@ -4615,18 +4605,19 @@ mod tests {
         let queued = |app: &mut App, args: Value| ToolHost::call_tool(app, "shell", &args);
 
         // Missing `confirm`: the error says how to write it.
-        let err = queued(&mut app, json!({"op":"rm","path":"/x"})).unwrap_err();
+        let err = queued(&mut app, json!({"command":"rm /x"})).unwrap_err();
         assert!(err.contains("usage: rm <path> --confirm"), "{err}");
 
         // An operator nobody has lists the ones that exist.
-        let err = queued(&mut app, json!({"op":"sudo"})).unwrap_err();
+        let err = queued(&mut app, json!({"command":"sudo"})).unwrap_err();
         assert!(err.contains("ls [path]"), "{err}");
 
         // `help` answers without doing anything.
-        let help: Value = serde_json::from_str(&queued(&mut app, json!({"op":"help"})).unwrap()).unwrap();
+        let help: Value =
+            serde_json::from_str(&queued(&mut app, json!({"command":"help"})).unwrap()).unwrap();
         assert!(help["help"].as_str().unwrap().contains("unzip <archive_b64>"), "{help}");
         let one: Value =
-            serde_json::from_str(&queued(&mut app, json!({"op":"cp","help":true})).unwrap()).unwrap();
+            serde_json::from_str(&queued(&mut app, json!({"command":"cp -h"})).unwrap()).unwrap();
         assert!(one["help"].as_str().unwrap().starts_with("usage: cp <from> <to>"), "{one}");
 
         // A standalone tool does the same.
