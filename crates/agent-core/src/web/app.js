@@ -433,6 +433,8 @@ async function loadTools() {
                 requires: t.requires || [],
                 visible: t.visible,
                 mutating: t.mutating,
+                mcp: t.mcp === undefined ? true : t.mcp,
+                input_schema: t.input_schema || {},
               },
               null,
               2

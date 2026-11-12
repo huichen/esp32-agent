@@ -328,12 +328,33 @@ impl App {
             if spec.driver.is_none() {
                 continue;
             }
-            let already = self
-                .devices
-                .infos()
-                .iter()
-                .any(|i| i.kind == spec.kind || spec.driver.as_deref() == Some(i.kind.as_str()));
-            if already && spec.address.is_none() && spec.pins.is_empty() {
+            // The manifest may declare what the probe has already adopted — that is the
+            // normal case once `discovery` is `auto` and someone leaves an earlier
+            // declaration in place. Declaring it again must not produce a second device:
+            // on the bench that showed up as eight devices, two of everything, with the
+            // copies renamed `led_set_2`. Same kind *and* same identity is the same
+            // device; a genuinely second sensor at another address still gets added.
+            let driver = spec.driver.as_deref().unwrap_or("");
+            // Compare pins as sets: a declaration written from a candidate template says
+            // `{out: 48, p0: 48}` where the probe reports `[48]`, and a raw list compare
+            // then declares a second LED on the same pin. A subset is enough — declaring
+            // part of what is already live cannot mean "another device".
+            let pins: std::collections::BTreeSet<i32> = spec.pins.values().copied().collect();
+            let already = self.devices.infos().iter().any(|i| {
+                if i.kind != spec.kind && i.kind != driver {
+                    return false;
+                }
+                match spec.address {
+                    Some(a) => i.address == Some(a),
+                    None if pins.is_empty() => true,
+                    None => pins.iter().all(|p| i.pins.contains(p)),
+                }
+            });
+            if already {
+                self.log.info(
+                    "manifest",
+                    format!("`{}` is already live from the probe; the declaration is a no-op", spec.id),
+                );
                 continue;
             }
             match drivers::instantiate(spec, &mut *self.hw) {
@@ -498,11 +519,12 @@ impl App {
     fn tools_list_json(&self) -> Value {
         let mut tools: Vec<Value> =
             self.tools.iter().filter(|d| self.is_visible(&d.spec.name)).map(|d| d.mcp_json()).collect();
-        tools.sort_by_key(|t| t["name"].as_str().unwrap_or("").to_string());
-        // `fs_*` and `net_*` are not registry entries (their handlers need the workspace
-        // and an HTTP client), but an MCP client should be able to reach them, so they are
-        // appended in module order rather than sorted in.
+        // `fs_*`, `net_*` and `script` are not registry entries (their handlers need the
+        // workspace and an HTTP client), but an MCP client can reach them, so they belong
+        // in the same list — and in the same order: one alphabetical run, matching what
+        // the model gets. Two views of the same set should not disagree about its shape.
         tools.extend(self.extra_mcp_specs());
+        tools.sort_by_key(|t| t["name"].as_str().unwrap_or("").to_string());
         json!({ "tools": tools })
     }
 
@@ -572,11 +594,32 @@ impl App {
                 v
             })
             .collect();
-        tools.sort_by(|a, b| {
-            let ka = (a["category"].as_str().unwrap_or(""), a["name"].as_str().unwrap_or(""));
-            let kb = (b["category"].as_str().unwrap_or(""), b["name"].as_str().unwrap_or(""));
-            ka.cmp(&kb)
-        });
+        // The agent's own tools are not in the registry (they need the workspace and the
+        // HTTP client), so they never appeared here — which is why the portal could show
+        // 40 tools while the model had 49 and `script` looked missing.
+        for group in [fs_tools::specs(), net_tools::specs(), board_tools::script_specs()] {
+            for entry in group.as_array().into_iter().flatten() {
+                let f = &entry["function"];
+                let name = f["name"].as_str().unwrap_or("");
+                // The read-only ones, by name: the specs are OpenAI-shaped and carry no
+                // `mutating` flag, and a made-up one would be worse than this list.
+                let read_only = matches!(name, "fs_ls" | "fs_read" | "fs_grep" | "net_get");
+                tools.push(json!({
+                    "name": name,
+                    "title": name,
+                    "description": f["description"],
+                    "category": "agent",
+                    "requires": [],
+                    "mutating": !read_only,
+                    "core": false,
+                    "visible": true,
+                    "mcp": true,
+                    "input_schema": f["parameters"],
+                }));
+            }
+        }
+        // Alphabetical, one list: the order the model gets, and the order a reader expects.
+        tools.sort_by_key(|t| t["name"].as_str().unwrap_or("").to_string());
         let visible = tools.iter().filter(|t| t["visible"] == json!(true)).count();
         json!({
             "tools": tools,
@@ -1963,33 +2006,28 @@ impl App {
         if self.cfg.mcp.reprobe_on_list {
             self.rebuild();
         }
-        let mut names: Vec<&str> =
-            self.tools.iter().map(|d| d.spec.name.as_str()).filter(|n| self.is_visible(n)).collect();
-        names.sort_unstable();
+        // One list, sorted by name across both sources, byte for byte what
+        // `tools_list_json` returns. The two paths exist because one avoids building a
+        // Value tree on a board with a few kB of heap; they must not disagree about order,
+        // or the same client sees a different list depending on the transport.
+        let mut entries: Vec<Value> =
+            self.tools.iter().filter(|d| self.is_visible(&d.spec.name)).map(|d| d.mcp_json()).collect();
+        entries.extend(self.extra_mcp_specs());
+        entries.sort_by_key(|t| t["name"].as_str().unwrap_or("").to_string());
 
         let id = serde_json::to_string(&msg.id.unwrap_or(Value::Null)).ok()?;
         // Same shape `protocol::ok` produces (serde_json orders object keys).
-        let mut out = String::with_capacity(512 + names.len() * 640);
+        let mut out = String::with_capacity(512 + entries.len() * 640);
         out.push_str("{\"id\":");
         out.push_str(&id);
         out.push_str(",\"jsonrpc\":\"2.0\",\"result\":{\"tools\":[");
         let mut first = true;
-        for name in names {
-            let def = self.tools.get(name)?;
+        for entry in entries {
             if !first {
                 out.push(',');
             }
             first = false;
-            out.push_str(&serde_json::to_string(&def.mcp_json()).ok()?);
-        }
-        // The registry tools are sorted; the extras follow in module order, exactly as
-        // in `tools_list_json`.
-        for spec in self.extra_mcp_specs() {
-            if !first {
-                out.push(',');
-            }
-            first = false;
-            out.push_str(&serde_json::to_string(&spec).ok()?);
+            out.push_str(&serde_json::to_string(&entry).ok()?);
         }
         out.push_str("]}}");
         Some(out)
@@ -2599,32 +2637,20 @@ impl ToolHost for App {
             })
         };
 
-        // Order is part of the contract, because a provider caches the request by its
-        // prefix: one reordered entry and every token after it is reprocessed. So the
-        // blocks run from least to most volatile, and each block is ordered by name.
-        //
-        //   1. the board's own tools — they change with the hardware or the firmware
-        //   2. fs_* and net_*         — fixed for a given build
-        //   3. manifest tools         — they change whenever the model rewrites one
-        //
-        // Alphabetical within a block, so two boards with the same hardware produce the
-        // same bytes however the probe happened to enumerate them.
-        let mut board: Vec<Value> =
-            visible.iter().filter(|d| !d.spec.from_manifest).map(|d| load(d)).collect();
-        board.sort_by_key(|t| t["function"]["name"].as_str().unwrap_or("").to_string());
-
-        let mut volatile: Vec<Value> =
-            visible.iter().filter(|d| d.spec.from_manifest).map(|d| load(d)).collect();
-        volatile.sort_by_key(|t| t["function"]["name"].as_str().unwrap_or("").to_string());
-
-        let mut tools = board;
-        // File and HTTP tools gate on nothing the hardware must provide, so they are not
-        // MCP tools; they are appended after the board's own list, and they come before
-        // the manifest block because they never change at runtime.
+        // Order is part of the contract: a provider caches the request by its prefix, so
+        // one reordered entry and every token after it is reprocessed. The list is
+        // therefore sorted by name across every source — board tools, manifest tools and
+        // the agent-only fs_*/net_*/script group — which is both stable for a given board
+        // and the order a person expects to read. A manifest edit now moves the entries it
+        // touches instead of everything after them, because the manifest tools are no
+        // longer kept in a block at the end.
+        let mut tools: Vec<Value> = visible.iter().map(|d| load(d)).collect();
+        // File, HTTP and script tools gate on nothing the hardware must provide, so they
+        // are not MCP tools; the model still gets them, in the same sorted list.
         for group in [fs_tools::specs(), net_tools::specs(), board_tools::script_specs()] {
             tools.extend(openai_tools(&group));
         }
-        tools.extend(volatile);
+        tools.sort_by_key(|t| t["function"]["name"].as_str().unwrap_or("").to_string());
         Value::Array(tools)
     }
 
@@ -4943,8 +4969,8 @@ mod tests {
     /// One array, one shape, no source tag: the `category`/`core`/`mutating` fields
     /// exist for the portal and for `tools/list`, and are never sent. What differs is
     /// only the *position* — the board's tools (driver, system and manifest alike) are
-    /// one alphabetical block, and `fs_*` then `net_*` follow, because those are not
-    /// MCP tools and are appended by `tool_specs` rather than registered.
+    /// one alphabetical list with everything else, because the model's view is built from
+    /// three sources (registry, agent-only tools, manifest) and a reader expects one order.
     #[test]
     fn every_tool_reaches_the_model_in_one_shape_and_a_predictable_order() {
         let mut app = test_app();
@@ -4976,29 +5002,84 @@ mod tests {
             assert!(tool["function"]["parameters"].is_object(), "{tool}");
         }
 
-        // The board's own tools are one alphabetical block, manifest tools excluded.
-        let split = names.iter().position(|n| n.starts_with("fs_")).expect("fs tools");
-        let board = &names[..split];
-        let mut sorted = board.to_vec();
+        // One list, sorted by name, whatever produced the entry: the board's own tools,
+        // the agent-only fs_*/net_*/script group, and the manifest-compiled tools all sit
+        // in the same alphabetical run. Stable for a given board (the next test checks the
+        // bytes), and the order a reader expects.
+        let mut sorted = names.clone();
         sorted.sort_unstable();
-        assert_eq!(board, sorted.as_slice(), "the board tools are not one alphabetical block");
-        for needle in ["board_status", "manifest_apply"] {
-            assert!(board.contains(&needle), "{needle} is not in the board block: {board:?}");
+        assert_eq!(names, sorted, "the tool list is not alphabetical: {names:?}");
+
+        for needle in ["board_status", "manifest_apply", "fs_read", "net_get", "script"] {
+            assert!(names.contains(&needle), "{needle} is missing: {names:?}");
         }
-        assert!(!board.contains(&"aaa_manifest"), "a manifest tool is not in the board block: {board:?}");
+        // A manifest tool sorts among the rest — `aaa_manifest` is first, not last.
+        assert_eq!(names.first(), Some(&"aaa_manifest"), "manifest tools are not in the same list");
+    }
 
-        // ... then the tools outside the registry — file, network, script — in module order ...
-        assert_eq!(
-            &names[split..split + 11],
-            &[
-                "fs_ls", "fs_read", "fs_write", "fs_edit", "fs_rm", "fs_cp", "fs_mv", "fs_grep", "net_get",
-                "net_post", "script"
-            ],
-            "the file, network and script tools are not the trailing block: {names:?}"
-        );
+    /// With `discovery = auto` the probe adopts what it finds, and an older manifest may
+    /// still declare the same sensor. Declaring it again must not add a second device —
+    /// on the bench that produced eight devices, two of everything, with copies renamed
+    /// `led_set_2`.
+    #[test]
+    fn a_declaration_the_probe_already_adopted_is_a_no_op() {
+        let mut app = test_app();
+        let before = app.devices.infos().len();
+        let declared: Vec<Value> = app
+            .devices
+            .infos()
+            .iter()
+            .filter(|i| i.address.is_some() || !i.pins.is_empty())
+            .map(|i| {
+                json!({
+                    "id": format!("again_{}", i.id),
+                    "kind": i.kind,
+                    "driver": i.kind,
+                    "bus": 0,
+                    "address": i.address,
+                    "pins": {},
+                })
+            })
+            .collect();
+        if declared.is_empty() {
+            return; // a board with no addressable devices has nothing to duplicate
+        }
+        app.call_tool("manifest_apply", &json!({ "manifest": { "devices": declared } })).expect("applied");
+        assert_eq!(app.devices.infos().len(), before, "a device declared twice became two devices");
+    }
 
-        // ... and the manifest block last, because it is the one the model rewrites.
-        assert_eq!(&names[split + 11..], &["aaa_manifest"], "{names:?}");
+    /// The portal's tool page is the only place a person can see what exists. It used to
+    /// list the registry only, so the agent's own tools — and `script` in particular —
+    /// looked missing while the model had them all along.
+    #[test]
+    fn the_portal_lists_every_tool_the_model_has() {
+        let mut app = test_app();
+        let body = body_json(&app.route(&get("/api/tools")));
+        let tools = body["tools"].as_array().expect("tools");
+        let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().expect("a name")).collect();
+
+        for needle in ["script", "fs_read", "fs_write", "net_get", "board_status"] {
+            assert!(names.contains(&needle), "{needle} is missing from the portal: {names:?}");
+        }
+        let mut sorted = names.clone();
+        sorted.sort_unstable();
+        assert_eq!(names, sorted, "the portal list is not alphabetical: {names:?}");
+
+        // The model has exactly this set: no tool is portal-only or model-only.
+        let model: Vec<String> = ToolHost::tool_specs(&app)
+            .as_array()
+            .expect("array")
+            .iter()
+            .map(|t| t["function"]["name"].as_str().expect("name").to_string())
+            .collect();
+        // Every model tool is in the portal list ...
+        for name in &model {
+            assert!(names.contains(&name.as_str()), "{name} reaches the model but not the portal");
+        }
+        // ... and the portal adds nothing the model cannot call.
+        for name in &names {
+            assert!(model.iter().any(|m| m == name), "{name} is in the portal but not in the model's list");
+        }
     }
 
     /// The same board has to produce the same bytes, or the provider's prompt cache
