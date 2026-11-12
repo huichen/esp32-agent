@@ -40,9 +40,9 @@ fn now_ms() -> u64 {
 /// A step count alone is the wrong bound: 50 000 steps is a few hundred milliseconds of
 /// real work, so the old limit stopped honest loops while saying nothing about a script
 /// that spends its steps waiting. Time is what the board can afford — the interpreter runs
-/// on the thread that also answers the portal, so ten seconds of spinning is ten seconds
+/// on the thread that also answers the portal, so thirty seconds of spinning is thirty seconds
 /// the board is unreachable.
-pub const MAX_MS: u64 = 10_000;
+pub const MAX_MS: u64 = 30_000;
 /// A backstop for cheap steps: even inside the time budget, this many means something is
 /// spinning. Large enough that no honest program notices it.
 pub const MAX_STEPS: u64 = 5_000_000;
@@ -104,7 +104,7 @@ RESULT     the value of the last expression is returned
 NOTE       the interpreter runs on the board's HTTP thread: a script that does not finish
            makes the portal unreachable until it does, so the clock, not the step count,
            is the limit that matters
-LIMITS     10 s or 5 000 000 steps, 32 nested blocks, 4 KB strings, 64 log lines
+LIMITS     30 s or 5 000 000 steps, 32 nested blocks, 4 KB strings, 64 log lines
 "#;
 
 const BUILTINS: &str = r#"# board script — builtins

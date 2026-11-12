@@ -17,6 +17,11 @@ flash ──▶ join WiFi ──▶ detect ──▶ MCP surface ──▶ a mod
                                   └─────────────── the board's own agent loop
 ```
 
+> **The agent loop here is modelled on [FutureOS](https://github.com/futuregene/future-os)'s
+> agent** — its transcript, tool-call journal, streaming event vocabulary, protocol
+> adapters and memory index. Where this firmware had to differ (a few kB of RAM instead of
+> gigabytes, no model-written summaries, deterministic compression) the code says why.
+
 ## Why this is different from "MCP on a microcontroller"
 
 MCP servers usually expose a fixed set of functions someone compiled in. Here the tool

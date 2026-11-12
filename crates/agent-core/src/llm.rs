@@ -94,6 +94,11 @@ pub struct LlmConfig {
     /// that from the model name, so it is a setting: on for a multimodal model, off for
     /// a text-only one, which would reject the request outright.
     pub vision: bool,
+    /// Which wire protocol the endpoint speaks: `chat` (OpenAI chat completions, the
+    /// default), `responses` (OpenAI's Responses API) or `anthropic` (Messages API).
+    /// Same routes as the host agent's three adapters — the shapes differ enough that a
+    /// request built for one is a 400 on the others.
+    pub protocol: String,
 }
 
 impl Default for LlmConfig {
@@ -107,6 +112,7 @@ impl Default for LlmConfig {
             timeout_s: 45,
             reasoning: String::new(),
             vision: true,
+            protocol: "chat".into(),
         }
     }
 }
@@ -160,6 +166,48 @@ pub fn chat(
     if cfg.model.trim().is_empty() {
         return Err("llm: model is empty; set one in the agent config".to_string());
     }
+    match Protocol::parse(&cfg.protocol) {
+        Protocol::Chat => chat_completions(transport, cfg, messages, tools, url),
+        Protocol::Responses => responses(transport, cfg, messages, tools, url),
+        Protocol::Anthropic => anthropic(transport, cfg, messages, tools, url),
+    }
+}
+
+/// The three wire dialects. Named the way the host agent names them; a value that is
+/// not recognised falls back to the OpenAI chat shape, which is what every
+/// OpenAI-compatible gateway speaks.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Protocol {
+    Chat,
+    Responses,
+    Anthropic,
+}
+
+impl Protocol {
+    pub fn parse(text: &str) -> Self {
+        match text.trim().to_ascii_lowercase().as_str() {
+            "responses" | "openai-responses" => Self::Responses,
+            "anthropic" | "anthropic-messages" => Self::Anthropic,
+            _ => Self::Chat,
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Chat => "chat",
+            Self::Responses => "responses",
+            Self::Anthropic => "anthropic",
+        }
+    }
+}
+
+fn chat_completions(
+    transport: &mut dyn ChatTransport,
+    cfg: &LlmConfig,
+    messages: &Value,
+    tools: &Value,
+    url: &str,
+) -> Result<ModelReply, String> {
     // A NaN/inf temperature serialises to `null`, which some servers reject.
     let temperature =
         if cfg.temperature.is_finite() { cfg.temperature } else { LlmConfig::default().temperature };
@@ -187,6 +235,311 @@ pub fn chat(
     let response =
         transport.post_json(url, &headers, &body).map_err(|e| format!("llm: POST {url} failed: {e}"))?;
     parse_reply(&response)
+}
+
+/// OpenAI's Responses API.
+///
+/// The differences that matter: `input` replaces `messages`, tools are flat objects
+/// (`{type:"function", name, …}` rather than `{type:"function", function:{…}}`), a tool
+/// call comes back as its own output item rather than inside a message, and the tool
+/// result goes back as a `function_call_output` item.
+fn responses(
+    transport: &mut dyn ChatTransport,
+    cfg: &LlmConfig,
+    messages: &Value,
+    tools: &Value,
+    url: &str,
+) -> Result<ModelReply, String> {
+    let input = responses_input(messages);
+    let mut body = json!({
+        "model": cfg.model.trim(),
+        "input": input,
+    });
+    let tool_list = responses_tools(tools);
+    if !tool_list.is_empty() {
+        body["tools"] = Value::Array(tool_list);
+    }
+    let reasoning = cfg.reasoning.trim();
+    if !reasoning.is_empty() {
+        body["reasoning"] = json!({ "effort": reasoning });
+    }
+
+    let auth = format!("Bearer {}", cfg.api_key.trim());
+    let mut headers: Vec<(&str, &str)> = vec![("Content-Type", "application/json")];
+    if !cfg.api_key.trim().is_empty() {
+        headers.push(("Authorization", &auth));
+    }
+    let response = transport
+        .post_json(url, &headers, &body.to_string())
+        .map_err(|e| format!("llm: POST {url} failed: {e}"))?;
+    parse_responses_reply(&response)
+}
+
+/// `messages` (chat shape) to the Responses `input` array.
+fn responses_input(messages: &Value) -> Value {
+    let mut out = Vec::new();
+    for message in messages.as_array().into_iter().flatten() {
+        let role = message["role"].as_str().unwrap_or("user");
+        match role {
+            "tool" => out.push(json!({
+                "type": "function_call_output",
+                "call_id": message["tool_call_id"].as_str().unwrap_or_default(),
+                "output": message["content"].as_str().unwrap_or_default(),
+            })),
+            "assistant" => {
+                let text = message["content"].as_str().unwrap_or_default();
+                if !text.is_empty() {
+                    out.push(json!({ "role": "assistant", "content": text }));
+                }
+                for call in message["tool_calls"].as_array().into_iter().flatten() {
+                    let f = &call["function"];
+                    out.push(json!({
+                        "type": "function_call",
+                        "call_id": call["id"].as_str().unwrap_or_default(),
+                        "name": f["name"].as_str().unwrap_or_default(),
+                        "arguments": f["arguments"].as_str().unwrap_or_default(),
+                    }));
+                }
+            }
+            "system" => out.push(json!({ "role": "system", "content": message["content"] })),
+            _ => out.push(json!({ "role": "user", "content": message["content"] })),
+        }
+    }
+    Value::Array(out)
+}
+
+fn responses_tools(tools: &Value) -> Vec<Value> {
+    tools
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|t| {
+            let f = &t["function"];
+            let name = f["name"].as_str()?;
+            Some(json!({
+                "type": "function",
+                "name": name,
+                "description": f["description"],
+                "parameters": f["parameters"],
+            }))
+        })
+        .collect()
+}
+
+fn parse_responses_reply(body: &str) -> Result<ModelReply, String> {
+    let value: Value = serde_json::from_str(body)
+        .map_err(|e| format!("llm: reply is not JSON ({e}): {}", body_prefix(body, 200)))?;
+    // An error object comes back with a 200 on some gateways.
+    if let Some(err) = value.get("error").and_then(|e| e.get("message")).and_then(|m| m.as_str()) {
+        return Err(format!("llm: {err}"));
+    }
+    let mut text = String::new();
+    let mut calls = Vec::new();
+    for item in value["output"].as_array().into_iter().flatten() {
+        match item["type"].as_str().unwrap_or("") {
+            "message" => {
+                for part in item["content"].as_array().into_iter().flatten() {
+                    if let Some(t) = part["text"].as_str() {
+                        text.push_str(t);
+                    }
+                }
+            }
+            "function_call" => {
+                let arguments = item["arguments"].as_str().unwrap_or("{}");
+                calls.push(ToolCall {
+                    id: item["call_id"].as_str().unwrap_or_default().to_string(),
+                    name: item["name"].as_str().unwrap_or_default().to_string(),
+                    arguments: serde_json::from_str(arguments).unwrap_or_else(|_| json!({})),
+                });
+            }
+            _ => {}
+        }
+    }
+    let usage = Usage {
+        prompt_tokens: value["usage"]["input_tokens"].as_u64().unwrap_or(0) as u32,
+        completion_tokens: value["usage"]["output_tokens"].as_u64().unwrap_or(0) as u32,
+    };
+    if text.is_empty() && calls.is_empty() {
+        return Err(format!("llm: no output items in reply: {}", body_prefix(body, 200)));
+    }
+    Ok(ModelReply { content: text, reasoning: String::new(), tool_calls: calls, usage })
+}
+
+/// Anthropic's Messages API.
+///
+/// The differences that matter: the system prompt is a field, not a message; a tool
+/// result is a `tool_result` block inside a **user** turn; tools carry `input_schema`
+/// rather than `parameters`; the reply is content blocks, not one message.
+fn anthropic(
+    transport: &mut dyn ChatTransport,
+    cfg: &LlmConfig,
+    messages: &Value,
+    tools: &Value,
+    url: &str,
+) -> Result<ModelReply, String> {
+    let (system, lowered) = anthropic_messages(messages);
+    let mut body = json!({
+        "model": cfg.model.trim(),
+        "max_tokens": ANTHROPIC_MAX_TOKENS,
+        "messages": lowered,
+    });
+    if !system.is_empty() {
+        body["system"] = json!(system);
+    }
+    let tool_list = anthropic_tools(tools);
+    if !tool_list.is_empty() {
+        body["tools"] = Value::Array(tool_list);
+    }
+    if (cfg.temperature - 1.0).abs() > f32::EPSILON && cfg.temperature.is_finite() {
+        body["temperature"] = json!(cfg.temperature);
+    }
+
+    // Anthropic authenticates with a header of its own; a bearer token there is a 401.
+    let mut headers: Vec<(&str, &str)> =
+        vec![("Content-Type", "application/json"), ("anthropic-version", ANTHROPIC_VERSION)];
+    if !cfg.api_key.trim().is_empty() {
+        headers.push(("x-api-key", cfg.api_key.trim()));
+    }
+    let response = transport
+        .post_json(url, &headers, &body.to_string())
+        .map_err(|e| format!("llm: POST {url} failed: {e}"))?;
+    parse_anthropic_reply(&response)
+}
+
+const ANTHROPIC_VERSION: &str = "2023-06-01";
+/// The Messages API requires a bound; the board never needs a long answer.
+const ANTHROPIC_MAX_TOKENS: u32 = 4096;
+
+fn anthropic_messages(messages: &Value) -> (String, Value) {
+    let mut system = String::new();
+    let mut out: Vec<Value> = Vec::new();
+    for message in messages.as_array().into_iter().flatten() {
+        let role = message["role"].as_str().unwrap_or("user");
+        match role {
+            "system" => {
+                if let Some(text) = message["content"].as_str() {
+                    if !system.is_empty() {
+                        system.push_str("\n\n");
+                    }
+                    system.push_str(text);
+                }
+            }
+            "tool" => {
+                let block = json!({
+                    "type": "tool_result",
+                    "tool_use_id": message["tool_call_id"].as_str().unwrap_or_default(),
+                    "content": message["content"].as_str().unwrap_or_default(),
+                });
+                // Consecutive tool results belong in one user turn.
+                match out.last_mut() {
+                    Some(last) if last["role"] == "user" => {
+                        if let Some(blocks) = last["content"].as_array_mut() {
+                            blocks.push(block);
+                        }
+                    }
+                    _ => out.push(json!({ "role": "user", "content": [block] })),
+                }
+            }
+            "assistant" => {
+                let mut blocks: Vec<Value> = Vec::new();
+                if let Some(text) = message["content"].as_str() {
+                    if !text.is_empty() {
+                        blocks.push(json!({ "type": "text", "text": text }));
+                    }
+                }
+                for call in message["tool_calls"].as_array().into_iter().flatten() {
+                    let f = &call["function"];
+                    let input = f["arguments"]
+                        .as_str()
+                        .and_then(|a| serde_json::from_str::<Value>(a).ok())
+                        .unwrap_or_else(|| json!({}));
+                    blocks.push(json!({
+                        "type": "tool_use",
+                        "id": call["id"].as_str().unwrap_or_default(),
+                        "name": f["name"].as_str().unwrap_or_default(),
+                        "input": input,
+                    }));
+                }
+                if !blocks.is_empty() {
+                    out.push(json!({ "role": "assistant", "content": blocks }));
+                }
+            }
+            _ => {
+                let content = match &message["content"] {
+                    Value::String(text) => json!([{ "type": "text", "text": text }]),
+                    Value::Array(parts) => Value::Array(parts.iter().filter_map(anthropic_part).collect()),
+                    other => json!([{ "type": "text", "text": other.to_string() }]),
+                };
+                out.push(json!({ "role": "user", "content": content }));
+            }
+        }
+    }
+    (system, Value::Array(out))
+}
+
+/// An OpenAI content part, in Anthropic's shape.
+fn anthropic_part(part: &Value) -> Option<Value> {
+    match part["type"].as_str()? {
+        "text" => Some(json!({ "type": "text", "text": part["text"] })),
+        "image_url" => {
+            let url = part["image_url"]["url"].as_str()?;
+            let rest = url.strip_prefix("data:")?;
+            let (media, data) = rest.split_once(";base64,")?;
+            Some(json!({
+                "type": "image",
+                "source": { "type": "base64", "media_type": media, "data": data },
+            }))
+        }
+        _ => None,
+    }
+}
+
+fn anthropic_tools(tools: &Value) -> Vec<Value> {
+    tools
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|t| {
+            let f = &t["function"];
+            Some(json!({
+                "name": f["name"].as_str()?,
+                "description": f["description"],
+                "input_schema": f["parameters"],
+            }))
+        })
+        .collect()
+}
+
+fn parse_anthropic_reply(body: &str) -> Result<ModelReply, String> {
+    let value: Value = serde_json::from_str(body)
+        .map_err(|e| format!("llm: reply is not JSON ({e}): {}", body_prefix(body, 200)))?;
+    if let Some(err) = value.get("error").and_then(|e| e.get("message")).and_then(|m| m.as_str()) {
+        return Err(format!("llm: {err}"));
+    }
+    let mut text = String::new();
+    let mut reasoning = String::new();
+    let mut calls = Vec::new();
+    for block in value["content"].as_array().into_iter().flatten() {
+        match block["type"].as_str().unwrap_or("") {
+            "text" => text.push_str(block["text"].as_str().unwrap_or("")),
+            // Extended thinking arrives as its own block type.
+            "thinking" => reasoning.push_str(block["thinking"].as_str().unwrap_or("")),
+            "tool_use" => calls.push(ToolCall {
+                id: block["id"].as_str().unwrap_or_default().to_string(),
+                name: block["name"].as_str().unwrap_or_default().to_string(),
+                arguments: block["input"].clone(),
+            }),
+            _ => {}
+        }
+    }
+    let usage = Usage {
+        prompt_tokens: value["usage"]["input_tokens"].as_u64().unwrap_or(0) as u32,
+        completion_tokens: value["usage"]["output_tokens"].as_u64().unwrap_or(0) as u32,
+    };
+    if text.is_empty() && calls.is_empty() {
+        return Err(format!("llm: no content blocks in reply: {}", body_prefix(body, 200)));
+    }
+    Ok(ModelReply { content: text, reasoning, tool_calls: calls, usage })
 }
 
 /// Split a reply body into the fields the loop needs.
@@ -356,6 +709,113 @@ fn json_kind(value: &Value) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::RefCell;
+
+    /// Records the request and answers with a canned body.
+    struct Stub {
+        reply: String,
+        seen: RefCell<Vec<(String, String)>>,
+    }
+
+    impl ChatTransport for Stub {
+        fn post_json(&mut self, url: &str, _headers: &[(&str, &str)], body: &str) -> Result<String, String> {
+            self.seen.borrow_mut().push((url.to_string(), body.to_string()));
+            Ok(self.reply.clone())
+        }
+    }
+
+    fn wire_messages() -> Value {
+        json!([
+            {"role": "system", "content": "you are a board"},
+            {"role": "user", "content": "read the screen"},
+            {"role": "assistant", "content": "", "tool_calls": [
+                {"id": "c1", "type": "function", "function": {"name": "oled_read", "arguments": "{}"}}
+            ]},
+            {"role": "tool", "tool_call_id": "c1", "content": "{\"text\":\"HI\"}"}
+        ])
+    }
+
+    fn wire_tools() -> Value {
+        json!([{"type": "function", "function": {
+            "name": "oled_read", "description": "read it", "parameters": {"type": "object"}
+        }}])
+    }
+
+    fn proto_cfg(protocol: &str) -> LlmConfig {
+        LlmConfig {
+            base_url: "https://example.test/v1/messages".into(),
+            model: "m".into(),
+            api_key: "k".into(),
+            protocol: protocol.into(),
+            ..LlmConfig::default()
+        }
+    }
+
+    #[test]
+    fn the_anthropic_request_uses_its_own_shape() {
+        let mut stub = Stub {
+            reply: json!({
+                "content": [
+                    {"type": "thinking", "thinking": "look first"},
+                    {"type": "text", "text": "it says HI"},
+                    {"type": "tool_use", "id": "t1", "name": "oled_read", "input": {"x": 1}}
+                ],
+                "usage": {"input_tokens": 11, "output_tokens": 7}
+            })
+            .to_string(),
+            seen: RefCell::new(Vec::new()),
+        };
+        let reply = chat(&mut stub, &proto_cfg("anthropic"), &wire_messages(), &wire_tools()).expect("reply");
+        assert_eq!(reply.content, "it says HI");
+        assert_eq!(reply.reasoning, "look first");
+        assert_eq!(reply.tool_calls.len(), 1);
+        assert_eq!(reply.tool_calls[0].arguments, json!({"x": 1}));
+        assert_eq!(reply.usage.prompt_tokens, 11);
+
+        let body: Value = serde_json::from_str(&stub.seen.borrow()[0].1).expect("json");
+        assert_eq!(body["system"], "you are a board", "the system prompt is a field, not a message");
+        let msgs = body["messages"].as_array().expect("messages");
+        // user, assistant(tool_use), user(tool_result) — no system message in the array.
+        assert_eq!(msgs.len(), 3, "{body}");
+        assert_eq!(msgs[1]["content"][0]["type"], "tool_use");
+        assert_eq!(msgs[2]["content"][0]["type"], "tool_result");
+        assert_eq!(msgs[2]["content"][0]["tool_use_id"], "c1");
+        assert_eq!(body["tools"][0]["input_schema"], json!({"type": "object"}));
+        assert!(body["max_tokens"].is_number(), "the Messages API requires it");
+    }
+
+    #[test]
+    fn the_responses_request_uses_its_own_shape() {
+        let mut stub = Stub {
+            reply: json!({
+                "output": [
+                    {"type": "message", "content": [{"type": "output_text", "text": "done"}]},
+                    {"type": "function_call", "call_id": "c9", "name": "oled_read", "arguments": "{}"}
+                ],
+                "usage": {"input_tokens": 3, "output_tokens": 2}
+            })
+            .to_string(),
+            seen: RefCell::new(Vec::new()),
+        };
+        let reply = chat(&mut stub, &proto_cfg("responses"), &wire_messages(), &wire_tools()).expect("reply");
+        assert_eq!(reply.content, "done");
+        assert_eq!(reply.tool_calls[0].id, "c9");
+        assert_eq!(reply.usage.prompt_tokens, 3);
+
+        let body: Value = serde_json::from_str(&stub.seen.borrow()[0].1).expect("json");
+        let input = body["input"].as_array().expect("input");
+        assert_eq!(input[0]["role"], "system");
+        assert_eq!(input[2]["type"], "function_call");
+        assert_eq!(input[3]["type"], "function_call_output");
+        assert_eq!(body["tools"][0]["name"], "oled_read", "flat tool objects, not nested");
+    }
+
+    #[test]
+    fn the_default_protocol_is_still_chat_completions() {
+        assert_eq!(Protocol::parse(""), Protocol::Chat);
+        assert_eq!(Protocol::parse("nonsense"), Protocol::Chat);
+        assert_eq!(Protocol::parse("anthropic").as_str(), "anthropic");
+    }
 
     /// A build must never carry somebody's model endpoint, and never their key.
     ///
@@ -464,7 +924,7 @@ mod tests {
         let mut t = StubTransport::answering(reply_body(json!({ "content": "x" })));
         let mut c = cfg();
         c.api_key = String::new();
-        chat(&mut t, &c, &messages(), &tools()).expect("reply");
+        chat(&mut t, &c, &wire_messages(), &wire_tools()).expect("reply");
         assert_eq!(t.header("Authorization"), None);
     }
 
@@ -478,7 +938,7 @@ mod tests {
                 "function": { "name": "board_status", "arguments": "{\"detail\":true}" }
             }]
         })));
-        let reply = chat(&mut t, &cfg(), &messages(), &tools()).expect("reply");
+        let reply = chat(&mut t, &cfg(), &wire_messages(), &wire_tools()).expect("reply");
         assert_eq!(reply.content, "");
         assert_eq!(reply.tool_calls.len(), 1);
         let call = &reply.tool_calls[0];
@@ -499,7 +959,7 @@ mod tests {
             }]
         })));
         // No panic, and nothing is invented: the call survives with `{}`.
-        let reply = chat(&mut t, &cfg(), &messages(), &tools()).expect("reply");
+        let reply = chat(&mut t, &cfg(), &wire_messages(), &wire_tools()).expect("reply");
         let call = &reply.tool_calls[0];
         assert_eq!(call.arguments.get("path"), None);
         let err = arguments_error(call).expect("a degraded call carries its error");
@@ -512,7 +972,7 @@ mod tests {
     fn a_non_2xx_from_the_transport_keeps_the_status_and_a_short_body() {
         let long = "upstream exploded ".repeat(60);
         let mut t = StubTransport::failing(503, &long);
-        let err = chat(&mut t, &cfg(), &messages(), &tools()).expect_err("must fail");
+        let err = chat(&mut t, &cfg(), &wire_messages(), &wire_tools()).expect_err("must fail");
         assert!(err.contains("HTTP 503"), "unexpected error text: {err}");
         assert!(err.chars().count() <= 400, "error text is not bounded: {} chars", err.chars().count());
         assert!(!err.contains('\n'), "error text spans lines: {err:?}");
@@ -523,7 +983,7 @@ mod tests {
         let mut t = StubTransport::answering(reply_body(json!({ "content": "x" })));
         let mut c = cfg();
         c.base_url = "https://api.example.com/v1/chat/completions".to_string();
-        chat(&mut t, &c, &messages(), &tools()).expect("https must be carried to the transport");
+        chat(&mut t, &c, &wire_messages(), &wire_tools()).expect("https must be carried to the transport");
         assert_eq!(t.urls, vec!["https://api.example.com/v1/chat/completions".to_string()]);
     }
 
@@ -532,7 +992,7 @@ mod tests {
         let mut t = StubTransport::answering(reply_body(json!({ "content": "x" })));
         let mut c = cfg();
         c.base_url = "ftp://example.invalid/v1/chat/completions".to_string();
-        let err = chat(&mut t, &c, &messages(), &tools()).expect_err("ftp must fail");
+        let err = chat(&mut t, &c, &wire_messages(), &wire_tools()).expect_err("ftp must fail");
         assert!(err.contains("http"), "unexpected error text: {err}");
         assert!(t.urls.is_empty(), "the transport must not be called");
     }
@@ -540,13 +1000,13 @@ mod tests {
     #[test]
     fn empty_config_is_a_clear_error() {
         let mut t = StubTransport::answering(reply_body(json!({ "content": "x" })));
-        let err =
-            chat(&mut t, &LlmConfig::default(), &messages(), &tools()).expect_err("empty base_url must fail");
+        let err = chat(&mut t, &LlmConfig::default(), &wire_messages(), &wire_tools())
+            .expect_err("empty base_url must fail");
         assert!(err.contains("base_url"), "unexpected error text: {err}");
 
         let mut c = cfg();
         c.model = "  ".to_string();
-        let err = chat(&mut t, &c, &messages(), &tools()).expect_err("empty model must fail");
+        let err = chat(&mut t, &c, &wire_messages(), &wire_tools()).expect_err("empty model must fail");
         assert!(err.contains("model"), "unexpected error text: {err}");
         assert!(t.urls.is_empty());
     }
@@ -554,7 +1014,7 @@ mod tests {
     #[test]
     fn a_reply_without_choices_reports_the_body_prefix() {
         let mut t = StubTransport::answering(json!({ "error": "no such model" }).to_string());
-        let err = chat(&mut t, &cfg(), &messages(), &tools()).expect_err("must fail");
+        let err = chat(&mut t, &cfg(), &wire_messages(), &wire_tools()).expect_err("must fail");
         assert!(err.contains("choices[0].message"), "unexpected: {err}");
         assert!(err.contains("no such model"), "unexpected: {err}");
     }
