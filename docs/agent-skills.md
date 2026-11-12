@@ -58,7 +58,7 @@ description: roll the portal forward without losing the transcript
 ---
 1. Read `/AGENTS.md` and confirm no turn is running.
 2. `write` a note to `/notes/deploy-<date>.md` first.
-3. Build, flash, then `board_status` and one `bme280_read`.
+3. Build, flash, then `board status` and one `bme280_read`.
 The pinout to check after flashing is in `pinout.md` next to this file.
 
 /skills/deploy/pinout.md

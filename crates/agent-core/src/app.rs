@@ -503,17 +503,22 @@ impl App {
         let mut tools = ToolRegistry::new();
         tools.register_all(board_tools::always_tools());
         tools.register_all(board_tools::manifest_tools());
-        // The manifest family is one tool with five commands; the five are still registered
-        // above, under their old names, so a stored script keeps calling the same handler.
-        // Remembering which is which is what lets the listing say "reachable as `manifest
-        // apply`" instead of silently dropping four names.
-        self.family_members = board_tools::manifest_members()
-            .into_iter()
-            .map(|name| {
-                let command = name.trim_start_matches("manifest_").to_string();
-                (name, format!("manifest {command}"))
-            })
-            .collect();
+        tools.register(board_tools::board_family());
+        // A family is one tool with several commands; the members are still registered under
+        // their old names, so a stored script keeps calling the same handler. Remembering
+        // which is which is what lets the listing say "reachable as `board status`" instead
+        // of dropping nine names without a word.
+        let mut members: std::collections::BTreeMap<String, String> = Default::default();
+        for (family, names) in
+            [("manifest", board_tools::manifest_members()), ("board", board_tools::board_members())]
+        {
+            let prefix = format!("{family}_");
+            for name in names {
+                let command = name.strip_prefix(&prefix).unwrap_or(&name).to_string();
+                members.insert(name, format!("{family} {command}"));
+            }
+        }
+        self.family_members = members;
         tools.register_all(self.devices.tool_defs());
         // A manifest may not take a name the board already uses (validation refuses it),
         // but a manifest stored by an older build — or one applied before the hardware
@@ -600,17 +605,12 @@ impl App {
     /// Each one has an HTTP route or a manifest equivalent, and a model that has only these
     /// removed loses no ability — it loses a shortcut.
     const MINIMAL_HIDDEN: &'static [&'static str] = &[
-        "board_config_get",
-        "delay",
-        "logs_tail",
         "wifi_scan",
         "wifi_status",
-        "reboot",
-        "factory_reset",
-        // `manifest_validate` and `manifest_reset` used to sit here. They are not hidden by
-        // the profile any more: the `manifest` family owns them, and the family is what an
-        // empty board needs to rebuild itself — so it stays, and the profile has nothing
-        // left to say about them.
+        // `board_config_get`, `delay`, `logs_tail`, `reboot` and `factory_reset` used to sit
+        // here. They belong to a family now, and a profile hides whole tools: a command is
+        // a few bytes of one declaration, so there is nothing left to save by hiding it —
+        // and a family that quietly drops commands costs a model a call to find out.
     ];
 
     /// May this tool appear in `tools/list` right now?
@@ -6660,7 +6660,7 @@ mod tests {
             assert!(!app.is_visible(hidden), "{hidden} should be hidden in minimal");
         }
         // The bootstrap survives: discovery, manifest, GPIO and the file tools.
-        for kept in ["board_status", "devices_list", "devices_probe", "i2c_scan", "manifest", "gpio_write"] {
+        for kept in ["board", "devices_list", "devices_probe", "i2c_scan", "manifest", "gpio_write"] {
             assert!(app.is_visible(kept), "{kept} must survive the minimal profile");
         }
         // `fs_*`, `net_*` and `script` live outside the registry, so they are checked in the
@@ -7910,7 +7910,7 @@ mod tests {
         let names: Vec<&str> = tools.iter().filter_map(|t| t["function"]["name"].as_str()).collect();
         // Every entry is in the shape the chat endpoint expects.
         assert!(tools.iter().all(|t| t["type"] == "function" && t["function"]["parameters"].is_object()));
-        assert!(names.contains(&"board_status"), "got {names:?}");
+        assert!(names.contains(&"board"), "got {names:?}");
         assert!(names.contains(&"oled_text"));
         assert!(names.contains(&"shell"), "the file and network commands are missing: {names:?}");
         // A tool whose hardware is absent is not offered, exactly as in tools/list.
@@ -8263,7 +8263,7 @@ mod tests {
             .iter()
             .filter_map(|t| t["function"]["name"].as_str())
             .collect();
-        assert!(names.contains(&"board_status"), "got {names:?}");
+        assert!(names.contains(&"board"), "got {names:?}");
         assert!(names.contains(&"shell"), "got {names:?}");
         assert_eq!(body1["model"], "stub");
 
@@ -8432,43 +8432,74 @@ mod tests {
     /// help`) and dispatchable (a call that is not "no command").
     ///
     /// This is the assertion the `jq` bug needed: a command that was documented in `help`
-    /// and absent from dispatch. It fails if a name is added to one list alone — which is
-    /// also why `help` costs at most a kilobyte here: past that, the saving the family made
-    /// leaks back out of the help text.
+    /// and absent from dispatch. It fails if a name is added to one list alone.
+    ///
+    /// It also measures what a family costs, rather than trusting the count of commands
+    /// grouped: one declaration plus one `help` reply must be no larger than the
+    /// declarations it replaced, so even a run that stops after a single step is not worse
+    /// off. Past that, the saving the family made would leak back out of the help text.
     #[test]
     fn a_family_declares_helps_and_dispatches_the_same_commands() {
         let mut app = test_app();
-        let spec = ToolHost::tool_specs(&app)
-            .as_array()
-            .expect("array")
-            .iter()
-            .find(|t| t["function"]["name"] == "manifest")
-            .cloned()
-            .expect("the manifest family is offered");
         let names = |v: &Value| -> Vec<String> {
             v.as_array().unwrap().iter().map(|s| s.as_str().unwrap().to_string()).collect()
         };
-        let mut declared = names(&spec["function"]["parameters"]["properties"]["command"]["enum"]);
-        declared.retain(|c| c != "help");
+        let families =
+            [("manifest", crate::tools::manifest_members()), ("board", crate::tools::board_members())];
+        for (family, members) in families {
+            let spec = ToolHost::tool_specs(&app)
+                .as_array()
+                .expect("array")
+                .iter()
+                .find(|t| t["function"]["name"] == family)
+                .cloned()
+                .unwrap_or_else(|| panic!("`{family}` is not offered"));
+            let mut declared = names(&spec["function"]["parameters"]["properties"]["command"]["enum"]);
+            declared.retain(|c| c != "help");
 
-        let help = app.call_tool("manifest", &json!({ "command": "help" })).unwrap();
-        let helped = names(&help["commands"]);
-        assert_eq!(declared, helped, "the schema and `help` disagree");
+            let help = app.call_tool(family, &json!({ "command": "help" })).unwrap();
+            let helped = names(&help["commands"]);
+            assert_eq!(declared, helped, "{family}: the schema and `help` disagree");
 
-        for command in helped.iter().chain(std::iter::once(&"help".to_string())) {
-            if let Err(e) = app.call_tool("manifest", &json!({ "command": command })) {
-                assert!(
-                    !e.message.contains("no command"),
-                    "`help` lists `{command}` but dispatch refuses it: {}",
-                    e.message
-                );
+            for command in helped.iter().chain(std::iter::once(&"help".to_string())) {
+                if let Err(e) = app.call_tool(family, &json!({ "command": command })) {
+                    assert!(
+                        !e.message.contains("no command"),
+                        "{family}: `help` lists `{command}` but dispatch refuses it: {}",
+                        e.message
+                    );
+                }
             }
-        }
-        let err = app.call_tool("manifest", &json!({ "command": "frobnicate" })).unwrap_err();
-        assert!(err.message.contains("no command"), "an unknown command must be refused: {err:?}");
+            let err = app.call_tool(family, &json!({ "command": "frobnicate" })).unwrap_err();
+            assert!(
+                err.message.contains("no command"),
+                "{family}: an unknown command must be refused: {err:?}"
+            );
 
-        let bytes = serde_json::to_string(&help).unwrap().len();
-        assert!(bytes <= 1024, "manifest help is {bytes} bytes; that eats the saving");
+            // What the model would have been sent for these tools, had they stayed separate.
+            let replaced: usize = members
+                .iter()
+                .map(|name| {
+                    let def = app.tools.get(name).expect("a member is still registered");
+                    json!({
+                        "type": "function",
+                        "function": {
+                            "name": def.spec.name,
+                            "description": def.spec.description,
+                            "parameters": def.spec.input_schema,
+                        }
+                    })
+                    .to_string()
+                    .len()
+                })
+                .sum();
+            let declared_bytes = spec.to_string().len();
+            let help_bytes = help.to_string().len();
+            assert!(
+                declared_bytes + help_bytes <= replaced,
+                "{family}: {declared_bytes} + {help_bytes} bytes is more than the {replaced} it replaced"
+            );
+        }
     }
 
     #[test]
@@ -8477,7 +8508,7 @@ mod tests {
         let names = tool_names(&mut app);
         assert!(names.contains(&"oled_text".to_string()), "got {names:?}");
         assert!(names.contains(&"bme280_read".to_string()));
-        assert!(names.contains(&"board_status".to_string()));
+        assert!(names.contains(&"board".to_string()));
         assert!(!names.contains(&"mpu6050_read".to_string()));
         assert!(!names.contains(&"lcd_text".to_string()));
     }
@@ -8496,7 +8527,7 @@ mod tests {
         let mut app = test_app();
         app.cfg.mcp.tools_mode = "generic".into();
         assert!(!app.is_visible("oled_text"), "device tools hidden");
-        assert!(app.is_visible("board_status"));
+        assert!(app.is_visible("board"));
         assert!(app.is_visible("devices_list"));
     }
 
@@ -8507,7 +8538,7 @@ mod tests {
         // `all` skips capability filtering; it cannot invent a driver for a chip
         // that is not on the bus, so `mpu6050_read` stays absent either way.
         assert!(app.is_visible("oled_text"));
-        assert!(app.is_visible("board_status"));
+        assert!(app.is_visible("board"));
         assert!(!app.is_visible("mpu6050_read"));
     }
 
@@ -8890,7 +8921,7 @@ mod tests {
         sorted.sort_unstable();
         assert_eq!(names, sorted, "the tool list is not alphabetical: {names:?}");
 
-        for needle in ["board_status", "manifest", "shell", "script", "read"] {
+        for needle in ["board", "manifest", "shell", "script", "read"] {
             assert!(names.contains(&needle), "{needle} is missing: {names:?}");
         }
         // A manifest tool sorts among the rest — `aaa_manifest` is first, not last.
@@ -8938,7 +8969,7 @@ mod tests {
         let tools = body["tools"].as_array().expect("tools");
         let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().expect("a name")).collect();
 
-        for needle in ["script", "shell", "read", "board_status"] {
+        for needle in ["script", "shell", "read", "board"] {
             assert!(names.contains(&needle), "{needle} is missing from the portal: {names:?}");
         }
         let mut sorted = names.clone();
@@ -9559,7 +9590,7 @@ mod tests {
         // tools/list still answers, and the board's own tools are still in it.
         let list = app.handle_rpc(r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#, None).unwrap();
         let listed = list["result"]["tools"].as_array().expect("tools array");
-        assert!(listed.iter().any(|t| t["name"] == "board_status"), "tools/list lost the built-ins");
+        assert!(listed.iter().any(|t| t["name"] == "board"), "tools/list lost the built-ins");
 
         // A normal call still reaches the hardware.
         assert!(app.call_tool("board_status", &json!({})).is_ok(), "the board stopped answering");
@@ -9605,7 +9636,7 @@ mod tests {
 
         let names = wire_names(&app);
         assert!(names.contains(&"pump_pulse".to_string()), "got {names:?}");
-        assert!(names.contains(&"board_status".to_string()), "got {names:?}");
+        assert!(names.contains(&"board".to_string()), "got {names:?}");
         for name in &names {
             assert!(wire_tool_name(name), "`{name}` would be refused by the endpoint: {names:?}");
         }

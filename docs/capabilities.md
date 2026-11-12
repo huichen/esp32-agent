@@ -130,15 +130,11 @@ authoritative when this table and a firmware disagree.
 
 | Tool | Answers |
 |---|---|
-| `board_status` | chip, firmware, uptime, die temperature, heap, WiFi, device count, tool counters |
-| `inventory` | the full picture: board profile, buses scanned, every device with pins and address, and addresses nothing claimed |
-| `board_config_get`, `config_set` | read the runtime configuration, patch part of it |
+| `board` | the board about itself, in nine commands: `status` (chip, firmware, uptime, die temperature, heap, WiFi, device count, tool counters), `inventory` (profile, buses scanned, every device with pins and address, addresses nothing claimed), `config_get`/`config_set`, `chip_temp` (the die's own sensor, not a board thermometer), `logs_tail`, `reboot`, `factory_reset`, `delay`; `command: help` lists each |
 | `devices_list`, `devices_probe` | the detected devices and their capabilities; re-scan the buses |
 | `i2c_scan`, `i2c_read`, `i2c_write`, `i2c_identify` | bus access for chips without a driver, and "what answers at this address" |
-| `gpio_mode`, `gpio_read`, `gpio_write`, `adc_read`, `delay` | the pins a manifest composes, as tools of their own |
-| `chip_temp` | the die's own sensor, not a board thermometer |
-| `logs_tail`, `reboot`, `factory_reset` | the ring log, a restart, and back to defaults |
+| `gpio_mode`, `gpio_read`, `gpio_write`, `adc_read` | the pins a manifest composes, as tools of their own |
 | `device_invoke` | one detected device's tool, by id — what `tools_mode: generic` collapses the device tools into |
 
-The `manifest` tool and its five commands are in [manifest](manifest.md); `shell`, `read`,
+The `manifest` (five commands) and `board` (nine) families are in [manifest](manifest.md) and here above; `shell`, `read`,
 `write`, `edit` and `script` are in [shell](shell.md) and [scripting](scripting.md).

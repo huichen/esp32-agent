@@ -409,7 +409,7 @@ pub fn manifest_commands() -> Vec<ToolDef> {
 
 /// The bus probe and the config reader: this module's other two responsibilities, which are
 /// not part of the manifest family.
-fn board_extra_tools() -> Vec<ToolDef> {
+pub(crate) fn board_extra_tools() -> Vec<ToolDef> {
     vec![
         ToolDef::new(
             "i2c_identify",
