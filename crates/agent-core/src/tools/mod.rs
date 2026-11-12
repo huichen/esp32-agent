@@ -690,7 +690,7 @@ pub fn board_commands() -> Vec<ToolDef> {
 pub fn board_family() -> ToolDef {
     Family::new(
         "board",
-        "The board itself: status, config, chip temperature, logs, restart, delay, inventory; `command: help` lists what each takes",
+        "The board itself: status, config, chip temperature, logs, restart, delay, inventory; `command: help` gives each one's arguments",
         board_commands(),
     )
     .into_tool()
@@ -722,7 +722,7 @@ const BUS_COMMANDS: &[&str] = &[
 pub fn bus_family() -> ToolDef {
     Family::new(
         "bus",
-        "Raw access to the pins and buses: I2C scan/read/write/identify, GPIO mode/read/write, one ADC pin. For chips without a driver; `command: help` lists what each takes",
+        "Raw access to the pins and buses: I2C scan/read/write/identify, GPIO mode/read/write, one ADC pin. For chips without a driver; `command: help` gives each one's arguments",
         bus_commands(),
     )
     .into_tool()
