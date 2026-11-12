@@ -25,7 +25,7 @@ marcha.
 | Un shell y un lenguaje de script | `shell` con 55 comandos con nombres de NuttX, y un intérprete para bucles sobre llamadas a herramientas. [Shell](docs/shell.md) · [Script](docs/scripting.md) |
 | Recuerda lo que se le dijo | Órdenes permanentes, `/AGENTS.md`, un índice `/MEMORY.md` y habilidades, ensamblados en el prompt en cada turno. [Lo que el modelo ve en cada turno](docs/context.md) |
 | Llega con habilidades | Tres procedimientos en el firmware — escribir una habilidad, levantar el cableado, recuperar una placa que parece rota — que aparecen en `/skills` al primer arranque; lo que edites queda tuyo. [Skills](docs/agent-skills.md) |
-| Sin nube en el camino | HTTPS desde la placa, un certificado que genera ella misma, un PIN para tres invocadores. [Autenticación](docs/security.md) |
+| La placa es el servidor | HTTPS desde la placa, un certificado que genera ella misma, un PIN para tres invocadores. [Autenticación](docs/security.md) |
 | Comprobable sin hardware | El simulador ejecuta el mismo `agent-core` contra una placa virtual. [Simulador](docs/simulator.md) |
 
 ## Grabar y conectar

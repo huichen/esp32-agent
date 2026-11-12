@@ -24,7 +24,7 @@ répond avec eux ; un nouveau capteur peut être déclaré en JSON pendant que
 | Un shell et un langage de script | `shell` avec 55 commandes nommées comme dans NuttX, et un interpréteur pour boucler sur des appels d’outils. [Shell](docs/shell.md) · [Script](docs/scripting.md) |
 | Il retient ce qu'on lui a dit | Consignes permanentes, `/AGENTS.md`, un index `/MEMORY.md` et des compétences, assemblés dans le prompt à chaque tour. [Ce que le modèle voit à chaque tour](docs/context.md) |
 | Il arrive avec des compétences | Trois procédures embarquées — écrire une compétence, relever le câblage, récupérer une carte qui semble cassée — installées dans `/skills` au premier démarrage ; une modification reste à vous. [Skills](docs/agent-skills.md) |
-| Aucun cloud sur le chemin | HTTPS servi par la carte, un certificat qu’elle génère, un seul PIN pour trois appelants. [Authentification](docs/security.md) |
+| La carte est le serveur | HTTPS servi par la carte, un certificat qu’elle génère, un seul PIN pour trois appelants. [Authentification](docs/security.md) |
 | Testable sans matériel | Le simulateur exécute le même `agent-core` contre une carte virtuelle. [Simulateur](docs/simulator.md) |
 
 ## Flasher et connecter
