@@ -21,7 +21,7 @@
 | 通过 HTTPS 的控制台 | 在手机上对话，并配置设备、工具、定时、日志、WiFi 与模型；证书由板子自己签发。[网页控制台](#网页控制台) |
 | 无人值守也会动作 | 定时提示，以及读数越过阈值时触发提示的传感器规则。[定时任务](#定时任务) |
 | 一个 shell 和一门脚本语言 | `shell` 有 26 个按 NuttX 命名的命令，还有一个对工具调用做循环的解释器。[Shell](#shell) · [脚本](#脚本) |
-| 常驻指令 | 系统提示词里的 2 KB，写这块板是用来做什么的，可从控制台、`shell` 与 HTTP 写入。[常驻指令](#常驻指令) |
+| 它会记住告诉过它的事 | 常驻指令、`/AGENTS.md`、`/memory.md` 索引与技能，每轮组装进提示词。[模型每轮都能看到什么](#模型每轮都能看到什么) |
 | 路径中没有云端 | 由板子提供 HTTPS，证书由它生成，三类调用方一个 PIN。[认证](#认证) |
 | 无需硬件即可测试 | 模拟器把同一份 `agent-core` 跑在虚拟板上。[模拟器](#模拟器) |
 
@@ -77,19 +77,29 @@ curl -sS -X POST http://<board>/api/agent/message -H 'Content-Type: application/
 `context_tokens` 与 `max_output_tokens` 设置窗口与回复预留，会话记录在窗口用到 80% 时压
 缩。没有密钥时，把 `base_url` 指向板子自身的 `/selftest/chat/completions`，循环仍然能跑。
 
-## 常驻指令
+## 模型每轮都能看到什么
 
-一个槽位，写这块板*用来做什么*，由所有者撰写，每一轮都会被读到：
+系统提示词里有四层，按这个顺序、**每一轮**都重新组装：一部分是主人写下的，一部分是 agent 自己学到的。它们都不在会话记录里，所以对话只有一条消息还是有一千条，代价都一样。
+
+| 层 | 位置 | 送给模型的部分 | 谁写 |
+|---|---|---|---|
+| 常驻指令 | `agent.system_prompt`（NVS） | 全文，上限 2 KB | 主人，通过 HTTP 或 `shell` |
+| 项目指令 | `/AGENTS.md` | 前 1 KB，后面接一句“其余仍在文件里” | 主人，用 `fs_write` |
+| 长期记忆 | `/memory.md`，一个指向 `/memory/<主题>.md` 的索引 | 只有索引，24 行 / 2 KB | agent 自己，边做边记 |
+| 技能 | `/skills/<名字>/SKILL.md`，以及它旁边的其它文件 | 每个一行，名字与描述 | 两者皆可 |
 
 ```bash
+# 主人的常驻指令：这块板为什么存在，以及必须先遵守的规矩。
 curl -sS -X POST http://<board>/api/agent/prompt -H 'Content-Type: application/json' \
-  -d '{"action":"set","text":"The pump relay is on GPIO12. Never run it past two minutes."}'
+  -d '{"action":"set","text":"水泵继电器在 GPIO12。每次不要超过两分钟。"}'
+
+# 模型究竟会收到什么，四层都在里面；这是唯一能核对的办法。
+curl -sS http://<board>/api/agent/prompt | jq -r .system
 ```
 
-`action` 取 `set`、`append` 或 `clear`，而 `system_prompt get` 从板上把它读回来；
-`GET /api/agent/prompt` 显示模型将收到的提示词，包括自定义部分；智能体用
-`shell {"command":"system_prompt set …"}` 到达它。存放在 NVS 中，上限 2 KB，因此重启后
-仍在。
+`action` 取 `set`、`append` 或 `clear`；`system_prompt get` 从板上把它读回来，`system_prompt set …` 从 agent 一侧写入。记忆和技能都是普通文件：`fs_write /memory/wiring.md "GPIO18 = 灯带"` 再加 `/memory.md` 里一行，一条记忆就有了；删掉文件就等于忘掉。改完的文件下一轮生效，不必重启、不必重刷、也不必重写会话记录。
+
+之所以分成四层，是因为尺寸：内部 SRAM 只有几 KB 的板子，不可能把“它知道的一切”塞进每个请求，所以每层要么是索引、要么是前缀，真正贵的内容等这一轮用得上时再用 `fs_read` 取。[docs/agent-memory.md](docs/agent-memory.md) 和 [docs/agent-skills.md](docs/agent-skills.md) 写了细节，包括索引如何限长。
 
 ## Shell
 
