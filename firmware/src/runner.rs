@@ -60,38 +60,10 @@ use esp32_agent_core::logbuf::LogBuf;
 /// It is asked for in **internal RAM** first, which is what a thread that touches flash
 /// needs: an NVS write or a partition read runs with both caches off, and at that moment a
 /// stack in PSRAM is not there at all (IDF asserts exactly this). PSRAM is the fallback for a
-/// boot where 16 KB contiguous internal RAM is gone 鈥?see [`with_stack_caps`] 鈥?and it is a
+/// boot where 16 KB contiguous internal RAM is gone 鈥?see [`crate::threads::spawn`] 鈥?and it is a
 /// safe fallback because no NVS write happens on this thread any more: they are queued and
 /// performed by `firmware/src/nvs_writer.rs`.
 const STACK_BYTES: usize = 16 * 1024;
-
-/// Run `f` with thread stacks allocated from `caps`.
-///
-/// `pthread_create` allocates stacks with `MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT` unless the
-/// calling thread's config says otherwise 鈥?even with
-/// `CONFIG_SPIRAM_ALLOW_STACK_EXTERNAL_MEMORY` in the sdkconfig, which only *permits* an
-/// external stack, it does not ask for one. That is the whole reason a board with 8 MB of
-/// PSRAM free can still fail to start a 16 KB thread with `ENOMEM`.
-///
-/// The config is per-thread and read by `pthread_create` from the *creating* thread, so it is
-/// set immediately around the one spawn and restored afterwards: everything else that starts
-/// later (a request thread, a stream, the store writer) keeps allocating where it used to.
-pub(crate) fn with_stack_caps<T>(caps: u32, create: impl FnOnce() -> T) -> T {
-    use esp_idf_svc::sys;
-    let mut before: sys::esp_pthread_cfg_t = unsafe { std::mem::zeroed() };
-    let have_before = unsafe { sys::esp_pthread_get_cfg(&mut before) } == sys::ESP_OK;
-    let mut cfg = unsafe { sys::esp_pthread_get_default_config() };
-    cfg.stack_alloc_caps = caps;
-    unsafe { sys::esp_pthread_set_cfg(&cfg) };
-    let out = create();
-    if have_before {
-        unsafe { sys::esp_pthread_set_cfg(&before) };
-    } else {
-        let back = unsafe { sys::esp_pthread_get_default_config() };
-        unsafe { sys::esp_pthread_set_cfg(&back) };
-    }
-    out
-}
 
 /// Before this instant (2023-11-14) the clock has never been set, so `at_hhmm`
 /// cannot mean a wall-clock time yet.
@@ -582,29 +554,23 @@ pub fn start(
     timeout_s: Arc<AtomicU32>,
     transport: EspHttpTransport,
 ) -> Result<(), String> {
-    use esp_idf_svc::sys;
-
-    let spawn =
-        |transport: EspHttpTransport, shared: &Shared, log: &Arc<LogBuf>, timeout_s: &Arc<AtomicU32>| {
-            let shared = shared.clone();
-            let log = log.clone();
-            let timeout_s = timeout_s.clone();
-            std::thread::Builder::new()
-                .name("mcp-agent".into())
-                .stack_size(STACK_BYTES)
-                // The model transport lives on this thread, not in the `App`: a turn is run in
-                // phases precisely so that the model call happens with the app lock released.
-                .spawn(move || run_loop(shared, log, timeout_s, transport))
-        };
+    // The model transport lives on this thread, not in the `App`: a turn is run in phases
+    // precisely so that the model call happens with the app lock released.
+    let spawn = |transport: EspHttpTransport, shared: &Shared, log: &Arc<LogBuf>, timeout_s: &Arc<AtomicU32>, caps: u32| {
+        let shared = shared.clone();
+        let log = log.clone();
+        let timeout_s = timeout_s.clone();
+        crate::threads::spawn(b"mcp-agent\0", STACK_BYTES, caps, None, move || {
+            run_loop(shared, log, timeout_s, transport)
+        })
+    };
 
     // Internal RAM first: this thread is where a turn runs, and a turn can reach flash (a
     // `net_*` tool, a script that reads NVS). A PSRAM stack cannot survive those, so PSRAM is
     // the second choice and only because the writes themselves now happen on the store
     // writer. Say which one happened: the choice was invisible for two sessions, and the
     // answer was "PSRAM" both times.
-    let internal = (sys::MALLOC_CAP_INTERNAL | sys::MALLOC_CAP_8BIT) as u32;
-    let psram = (sys::MALLOC_CAP_SPIRAM | sys::MALLOC_CAP_8BIT) as u32;
-    match with_stack_caps(internal, || spawn(transport, &shared, &log, &timeout_s)) {
+    match spawn(transport, &shared, &log, &timeout_s, crate::threads::INTERNAL) {
         Ok(_) => Ok(()),
         Err(first) => {
             log.warn(
@@ -613,9 +579,13 @@ pub fn start(
                     "no {STACK_BYTES} byte internal stack for the agent thread ({first}); retrying on a PSRAM stack, which cannot touch flash"
                 ),
             );
-            with_stack_caps(psram, || {
-                spawn(EspHttpTransport::with_timeout(timeout_s.clone()), &shared, &log, &timeout_s)
-            })
+            spawn(
+                EspHttpTransport::with_timeout(timeout_s.clone()),
+                &shared,
+                &log,
+                &timeout_s,
+                crate::threads::PSRAM,
+            )
             .map(|_| ())
             .map_err(|e| format!("could not start the agent thread: {e} (no internal stack either: {first})"))
         }

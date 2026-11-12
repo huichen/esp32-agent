@@ -197,17 +197,30 @@ The pools overlap on purpose: internal RAM is the DMA pool plus more, and PSRAM 
 of its own. `memory.free_heap_kb` in `/api/status` is the sum of them, which is how "8 MB of
 free heap" and "a thread stack did not fit" were both true at once.
 
-`/api/status.threads`, same run (a `pthread` has no name of its own; the stack size is the
-one in the source):
+`/api/status.threads`, same run. The name is the FreeRTOS task name, which is what `ps`
+prints — it is set by `firmware/src/threads.rs`, not by `std::thread::Builder::name` (that
+one only sets the pthread name, which nothing here reads):
 
-| Thread | Stack | Free at its worst point | Peak use |
-|---|---|---|---|
-| `mcp-main` (`firmware/src/main.rs`) | 20 kB | 13.5 kB | 6.5 kB |
-| http listener (`ACCEPT_STACK`, `http.rs`) | 16 kB | 10.2 kB | 5.8 kB |
-| agent (`STACK_BYTES`, `runner.rs`) | 16 kB | 8.3 kB | 7.7 kB |
-| radio (`wifi.rs`) | 12 kB | 6.5 kB | 5.5 kB |
-| console provisioning (`console.rs`) | 6 kB | 4.7 kB | 1.3 kB |
-| captive DNS (`dns.rs`) | 4 kB **in PSRAM** | 2.1 kB | 1.9 kB |
+| Task in `ps` | Source | Stack | Free at its worst point | Peak use |
+|---|---|---|---|---|
+| `mcp-main` | `main.rs` | 20 kB | 13.5 kB | 6.5 kB |
+| `pthread` (the http listener) | `ACCEPT_STACK`, `http.rs` | 16 kB | 10.2 kB | 5.8 kB |
+| `mcp-agent` | `STACK_BYTES`, `runner.rs` | 16 kB | 8.3 kB | 7.7 kB |
+| `radio` | `wifi.rs` | 12 kB | 6.5 kB | 5.5 kB |
+| `provision` | `console.rs` | 6 kB | 4.7 kB | 1.3 kB |
+| `dns` | `dns.rs` | 4 kB **in PSRAM** | 2.1 kB | 1.9 kB |
+| `nvs-writer` | `nvs_writer.rs` | 6 kB | 4.7 kB | 1.3 kB |
+
+A name is a fact about one thread and is never inherited. `esp_pthread_set_cfg` is read by
+`pthread_create` from the **creating** thread, so the name, the size and the stack
+capabilities are one decision made on the wrong side of the call: a config left behind
+becomes the next thread's name and priority. That happened — the store writer set
+`nvs-writer` at priority 2, and the console, radio and agent threads came up under it, so
+`ps` showed four `nvs-writer`s and three were the wrong task at the wrong priority. Every
+spawn now goes through `threads::spawn`, which sets its own name and capabilities and
+restores the defaults (with `inherit_cfg = false`) afterwards. The one thread that still
+prints as `pthread` is the HTTP listener: it is spawned in `agent-core/src/http.rs`, which
+also builds for the host and cannot know about FreeRTOS task names.
 
 74 kB of stack, about 29 kB of it ever touched — the largest single block of internal RAM
 the firmware reserves, and the reason these constants are worth measuring rather than

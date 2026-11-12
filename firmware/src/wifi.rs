@@ -114,19 +114,19 @@ pub fn start(
     let (tx, rx) = channel::<WifiCmd>();
     *CMD.get_or_init(|| Arc::new(Mutex::new(None))).lock().unwrap() = Some(tx);
 
-    std::thread::Builder::new()
-        .name("wifi".into())
-        .stack_size(12 * 1024)
-        .spawn(move || {
-            if let Err(e) = run(app, log.clone(), rx, modem, sys_loop, nvs) {
-                // Both sinks on purpose: the serial console is the only channel
-                // that exists when the portal never came up, which is exactly the
-                // failure this line is here to make visible.
-                log::error!("radio thread stopped: {e}");
-                log.error("wifi", format!("radio thread stopped: {e}"));
-                publish(|s| s.state = "error".into());
-            }
-        })?;
+    // Named `radio`, not `wifi`: the IDF driver already owns two tasks called `wifi` and
+    // `tiT`, and a third one under the same name makes `ps` unreadable. Internal RAM: this
+    // thread reaches NVS through the driver.
+    crate::threads::spawn(b"radio\0", 12 * 1024, crate::threads::INTERNAL, None, move || {
+        if let Err(e) = run(app, log.clone(), rx, modem, sys_loop, nvs) {
+            // Both sinks on purpose: the serial console is the only channel
+            // that exists when the portal never came up, which is exactly the
+            // failure this line is here to make visible.
+            log::error!("radio thread stopped: {e}");
+            log.error("wifi", format!("radio thread stopped: {e}"));
+            publish(|s| s.state = "error".into());
+        }
+    })?;
     Ok(())
 }
 
