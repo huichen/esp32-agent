@@ -739,8 +739,7 @@ impl App {
                 // One tool is not a family: the declaration would cost more than the tool.
                 continue;
             }
-            let summary =
-                format!("The {family} this board detected, in {} commands under one name", subs.len());
+            let summary = format!("{family} on this board, in {} commands", subs.len());
             for name in subs.iter().map(|d| d.spec.name.clone()).collect::<Vec<String>>() {
                 self.family_members.insert(name.clone(), format!("{family} {name}"));
             }
@@ -11870,6 +11869,12 @@ mod tests {
                 assert!(
                     description.contains(&command),
                     "`{family}` hides `{command}` from its description: {description}"
+                );
+                // The arguments too: told only the name, the model called `led_set` with
+                // `color: "green"` and was refused, which cost the second call this is for.
+                assert!(
+                    description.contains(&format!("{command}(")),
+                    "`{family}` names `{command}` without its arguments: {description}"
                 );
             }
             assert!(
