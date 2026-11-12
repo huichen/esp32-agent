@@ -25,7 +25,7 @@ marcha.
 | Una consola sobre HTTPS | Hablar con el modelo y configurar dispositivos, herramientas, programación, registros, WiFi y el modelo desde un teléfono; la placa emite su propio certificado. [Consola web](#consola-web) |
 | Actúa sin nadie delante | Prompts temporizados y reglas de sensores que lanzan uno cuando una lectura cruza un umbral. [Trabajo programado](#trabajo-programado) |
 | Un shell y un lenguaje de script | `shell` con 26 comandos con nombres de NuttX, y un intérprete para bucles sobre llamadas a herramientas. [Shell](#shell) · [Script](#script) |
-| Órdenes permanentes | 2 KB en el prompt de sistema para la finalidad de esta placa, escribibles desde la consola, `shell` y HTTP. [Órdenes permanentes](#órdenes-permanentes) |
+| Recuerda lo que se le dijo | Órdenes permanentes, `/AGENTS.md`, un índice `/memory.md` y habilidades, ensamblados en el prompt en cada turno. [Lo que el modelo ve en cada turno](#lo-que-el-modelo-ve-en-cada-turno) |
 | Sin nube en el camino | HTTPS desde la placa, un certificado que genera ella misma, un PIN para tres invocadores. [Autenticación](#autenticación) |
 | Comprobable sin hardware | El simulador ejecuta el mismo `agent-core` contra una placa virtual. [Simulador](#simulador) |
 
@@ -87,19 +87,29 @@ reserva de respuesta, y la transcripción se compacta al 80% de la ventana. Sin 
 apuntar `base_url` al `/selftest/chat/completions` de la propia placa y el bucle sigue
 funcionando.
 
-## Órdenes permanentes
+## Lo que el modelo ve en cada turno
 
-Un espacio para el *para qué* de esta placa, escrito por su propietario y leído en cada turno:
+Cuatro capas entran en el prompt del sistema, en este orden, en **cada** turno: lo que el propietario escribió una vez y lo que el agente ha aprendido después. Ninguna forma parte del transcript, así que cuestan lo mismo con una conversación de un mensaje que con una de mil.
+
+| Capa | Dónde vive | Qué llega al modelo | Quién la escribe |
+|---|---|---|---|
+| Órdenes permanentes | `agent.system_prompt` (NVS) | todo, con tope de 2 KB | el propietario, por HTTP o `shell` |
+| Instrucciones del proyecto | `/AGENTS.md` | los primeros 1 KB y una marca que dice que el resto está en el archivo | el propietario, con `fs_write` |
+| Memoria a largo plazo | `/memory.md`, un índice que apunta a `/memory/<tema>.md` | solo el índice, 24 líneas / 2 KB | el propio agente, según aprende |
+| Habilidades | `/skills/<nombre>/SKILL.md` y lo que haya al lado | una línea de cada una, nombre y descripción | cualquiera de los dos |
 
 ```bash
+# Las órdenes del propietario: para qué existe esta placa y las reglas que van primero.
 curl -sS -X POST http://<board>/api/agent/prompt -H 'Content-Type: application/json' \
-  -d '{"action":"set","text":"The pump relay is on GPIO12. Never run it past two minutes."}'
+  -d '{"action":"set","text":"El relé de la bomba está en GPIO12. Nunca más de dos minutos."}'
+
+# Lo que el modelo recibirá de verdad, con las cuatro capas: la única forma de comprobarlo.
+curl -sS http://<board>/api/agent/prompt | jq -r .system
 ```
 
-`action` es `set`, `append` o `clear`, y `system_prompt get` lo lee de vuelta desde la placa;
-`GET /api/agent/prompt` muestra el prompt que recibirá el modelo, incluida la parte
-personalizada, y el agente llega a él con `shell {"command":"system_prompt set …"}`. 2 KB en
-NVS, así que sobrevive a un reinicio.
+`action` es `set`, `append` o `clear`; `system_prompt get` la vuelve a leer desde la placa y `system_prompt set …` la escribe del lado del agente. La memoria y las habilidades son archivos normales: `fs_write /memory/wiring.md "GPIO18 = tira de LED"` más una línea en `/memory.md` y ya hay un recuerdo; borrar el archivo lo olvida. Un archivo editado surte efecto en el turno siguiente, sin reiniciar, sin reflashear y sin reescribir el transcript.
+
+El reparto existe por el tamaño: una placa con unos pocos kilobytes de SRAM interna no puede llevar todo lo que sabe en cada petición, así que cada capa es un índice o un prefijo, y lo caro se lee con `fs_read` cuando un turno lo necesita. [docs/agent-memory.md](docs/agent-memory.md) y [docs/agent-skills.md](docs/agent-skills.md) tienen los detalles, incluido cómo se limita el índice.
 
 ## Shell
 
