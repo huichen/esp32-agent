@@ -27,6 +27,16 @@ CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y
 # board that pings nothing and answers nothing, on an image whose own diff was 30 bytes.
 CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=0
 
+# The radio's own static data: lwIP, net80211, pp and wpa_supplicant keep ~18 kB of
+# zero-initialized state in `.bss`, and IDF will place those libraries' BSS in PSRAM when
+# this is on. It is the one remaining knob that moves *static* internal RAM, and the risk is
+# concentrated: this is the same radio whose buffer init failed with "Expected to init 16 rx
+# buffer, actual is 14" when small allocations were forced internal. Anything that touches
+# WiFi init has to be proved on the bench, not reasoned about: the board runs ten minutes,
+# scans once and serves one https request, and `internal_kb` before/after is the evidence.
+# If the radio does not come up, this line goes back out.
+CONFIG_SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY=y
+
 # Room for the HTTP request line and the JSON frames that go over it.
 CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
 CONFIG_FREERTOS_HZ=1000
