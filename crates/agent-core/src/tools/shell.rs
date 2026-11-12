@@ -315,8 +315,7 @@ pub fn split_sequence(line: &str) -> Result<Option<Vec<String>>, String> {
     let mut parts: Vec<String> = Vec::new();
     let mut current = String::new();
     let mut quote: Option<char> = None;
-    let mut rest = line.char_indices().peekable();
-    while let Some((at, ch)) = rest.next() {
+    for (at, ch) in line.char_indices() {
         let rest_after: &str = &line[at + ch.len_utf8()..];
         if let Some(q) = quote {
             current.push(ch);
@@ -328,7 +327,7 @@ pub fn split_sequence(line: &str) -> Result<Option<Vec<String>>, String> {
         if ch == '"' || ch == '\'' {
             quote = Some(ch);
             current.push(ch);
-        } else if ch == ';' && starts_a_command(&rest_after) {
+        } else if ch == ';' && starts_a_command(rest_after) {
             if current.trim().is_empty() {
                 return Err("`;` needs a command on both sides\n\n".to_string() + PIPE_USAGE);
             }
