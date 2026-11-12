@@ -168,7 +168,7 @@ Three paths add hardware: a manifest (no timing or state machine, applies live),
 driver (`drivers/<chip>.rs`, for state machines and strict timing), or a board profile (facts
 that cannot be probed, such as which pins the LED and buttons use). A driver is listed only
 when the probe finds the device, so a half-written one cannot report hardware that is not
-there. [docs/adding-a-device.md](docs/adding-a-device.md) covers both.
+there. [docs/adding-a-device.md](docs/adding-a-device.md) covers all three.
 
 ## Authentication
 
