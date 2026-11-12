@@ -159,6 +159,41 @@ heaviest endpoint the portal calls, so if it answers, the page will load.
   audio devices until the next reboot. The firmware now leaves an open channel alone, and
   `devices_list` keeps `mic` and `speaker` across an apply.
 
+## How much conversation the board can carry
+
+`MAX_HISTORY_BYTES` bounds the transcript. It started at 24 KB, which was a guess made
+before anything was measured; it is 64 KB today. What follows is the measurement that
+justified the change, taken on the bench board (ESP32-S3, `/api/status` read between
+turns, one long reply per turn so the transcript grew predictably).
+
+| Turn | Messages | History | Request body (history + ~18 KB of tool schemas) | Internal SRAM | Result |
+|---|---|---|---|---|---|
+| 3 | 5 | 4.7 KB | ~23 KB | 6 kB | ok |
+| 6 | 11 | 16.8 KB | ~35 KB | 6 kB | ok |
+| 9 | 17 | 35.3 KB | ~53 KB | 6 kB | ok |
+| 12 | 23 | 59.8 KB | ~78 KB | 6 kB | ok |
+| 13 | 21 | 63.5 KB | ~82 KB | 6 kB | **compacted**, then ok |
+| 14 | 17 | 59.6 KB | ~78 KB | 6 kB | **compacted**, then ok |
+| 15 | 17 | 62.5 KB | ~80 KB | 6 kB | send ok, reply timed out at 45 s |
+
+Read it as three facts:
+
+1. **Internal SRAM does not move.** It sat at 6 kB free throughout, because the transcript,
+   the JSON body and the mbedTLS buffers all live in PSRAM. A bigger transcript does not
+   cost internal RAM, which is the resource that actually runs out on this chip.
+2. **The cap engages and the run continues.** Turns 13 and 14 crossed 64 KB and were
+   compressed: history went 23 messages to 21, the index appeared in the prompt
+   (`/api/agent/prompt` grew by the lines it kept), and the next turn still went out.
+3. **The failure that eventually appeared was not memory.** It was
+   `reading the reply over TLS failed: ERROR (the session times out after 45 s)` — the model
+   was asked for thousands of characters and took longer than `timeout_s`. If you drive long
+   answers, raise `llm.timeout_s` before you raise the history cap.
+
+The ceiling is therefore not 24 KB and not 64 KB; above ~80 KB of request body nothing has
+been measured yet. Raise `MAX_HISTORY_BYTES` again only with this table extended, and watch
+`mem.internal_kb` rather than `free_heap_kb`: PSRAM is the number that looks comfortable and
+hides the one that matters.
+
 ## Performance and stability
 
 | Symptom | Cause / fix |
