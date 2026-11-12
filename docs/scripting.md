@@ -68,7 +68,7 @@ if n > 0 { "found" } else { "nothing" }  # the last expression is the result
 | Values | number, string, bool, nil, list, map |
 | Statements | `let`, assignment (`x = …`, `l[0] = …`, `m.k = …`), `if`/`else`, `while`, `break`, blocks |
 | Operators | `+ - * / %`, `== != < <= > >=`, `and or not`, unary `-` |
-| Builtins | `len`, `str`, `num`, `type`, `log`, `print`, `echo`, `tool(name, args)` |
+| Builtins | `len`, `str`, `num`, `type`, `log`, `print`, `echo`, `sleep(ms)`, `tool(name, args)` |
 | Comments | `#` and `//` |
 | Maps | `{a: 1}` reads like JSON; `{a = 1}` also parses |
 
@@ -82,7 +82,13 @@ out of stack.
 | Limit | Value | Why |
 |---|---|---|
 | Wall clock | 30 s | a runaway `while` stops with a message instead of a hung board |
+| `sleep(ms)` | 2 s per call, 5 s per script | it is a real wait on the thread that answers the portal |
 | Steps | 5 000 000 | the backstop when a loop does nothing but compute |
+
+`sleep` waits for real — the thread is parked in the scheduler, not spinning — but the caller
+still waits for the script to return, so the portal does not answer until it does. That is why
+the caps are seconds and not minutes: a job that has to wait longer is a scheduled task
+(`every_s`), whose wait costs nothing because the board keeps serving in between.
 | Nesting | 32 blocks | the interpreter recurses on the call stack |
 | String / list / map | 4 KB / 256 / 64 | these live in internal RAM |
 | Log lines | 64 | the result travels as a tool result (2 KB) |
