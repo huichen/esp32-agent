@@ -1565,6 +1565,18 @@ impl App {
         // removed from the board, so a script or a person who learned `manifest_apply`
         // before the family existed keeps working — and the listing says where it went.
         if !self.is_visible(name) && !self.family_members.contains_key(name) {
+            // A tool a person has and a model does not: the refusal has to be a sentence, not a
+            // bare "no such tool". A stored script that calls `reboot` was written by somebody
+            // who believed the model could restart the board; that person needs to be told
+            // where a restart lives now, not left guessing at a missing name.
+            if Self::NEVER_OFFERED.contains(&name) {
+                return Err(McpError::forbidden(
+                    "`reboot` restarts the board and ends the run that asked for it, so it is not a tool. \
+                     A restart is a person's action: the portal's restart button, or `POST /api/reboot` \
+                     behind the PIN. Nothing on this board reaches it through a tool call.",
+                )
+                .with_data(json!({ "restart_route": "/api/reboot" })));
+            }
             let missing =
                 self.tools.get(name).map(|d| self.caps.missing(&d.spec.requires)).unwrap_or_default();
             if missing.is_empty() {
@@ -7993,6 +8005,24 @@ mod tests {
             .find(|t| t["name"] == "reboot")
             .expect("`reboot` must be reported as hidden");
         assert!(why["why"].as_str().unwrap_or("").contains("person"), "{why}");
+
+        // And it is refused, with the sentence a script author needs: this is their mistake,
+        // not a model's, and a bare "no such tool" would leave them guessing.
+        let err = app.call_tool("reboot", &json!({})).unwrap_err();
+        assert_eq!(err.code, code::FORBIDDEN, "{err:?}");
+        for needle in ["restart", "portal", "/api/reboot"] {
+            assert!(err.message.contains(needle), "`{needle}` missing from: {}", err.message);
+        }
+        assert_eq!(err.data.as_ref().and_then(|d| d["restart_route"].as_str()), Some("/api/reboot"));
+
+        // Through a script too: a stored `tool("reboot", {})` is exactly the caller this
+        // sentence exists for.
+        let scripted = app.call_tool("script", &json!({ "source": "tool(\"reboot\", {})" }));
+        let text = match scripted {
+            Ok(value) => value.to_string(),
+            Err(error) => error.message,
+        };
+        assert!(text.contains("/api/reboot"), "a script must be told the same thing: {text}");
 
         // The portal's button is a route, not a tool: it keeps working.
         let resp = app.route(&post("/api/reboot", "{}"));
