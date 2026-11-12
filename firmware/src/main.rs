@@ -16,6 +16,7 @@ mod console;
 mod dns;
 mod esp_hw;
 mod nvs_store;
+mod nvs_writer;
 mod runner;
 mod tls_server;
 mod wifi;
@@ -95,7 +96,13 @@ fn main() -> anyhow::Result<()> {
     // this fixes showed no panic message, only an immediate RTC_SW_CPU_RST.
     std::thread::Builder::new()
         .name("mcp-main".into())
-        .stack_size(32 * 1024)
+        // 20 KB, down from 32: the high-water reading on the board said this thread has
+        // never had less than 22.2 kB free (9.8 kB peak use) over a run that included the
+        // portal, `/api/tools`, `/api/status` and `/api/memory`. The rule this size is
+        // judged by is max(2 x peak, peak + 4 kB) = 19.6 KB, so 20 KB is the floor with
+        // the rule applied, and 12 kB of internal RAM is the difference. `/api/status`
+        // now carries the reading, so the next change is measured, not guessed.
+        .stack_size(20 * 1024)
         .spawn(run)?
         .join()
         .map_err(|_| anyhow::anyhow!("main task panicked"))?
@@ -261,6 +268,14 @@ fn run() -> anyhow::Result<()> {
     };
     let app: Shared = Arc::new(Mutex::new(App::new(hw, Box::new(store), log.clone(), firmware)));
     mem("after devices");
+    // The task that turns the `App`'s queued writes into NVS writes. Started before anything
+    // can queue one (the boot itself queues the seeded skills) and before any other thread
+    // exists that could reach flash with the wrong stack — see `nvs_writer` for why the
+    // stack, and not the caller, is the thing that matters here.
+    if let Err(e) = nvs_writer::start(app.clone(), log.clone()) {
+        log::error!("nvs writer did not start: {e}");
+        log.error("store", format!("nvs writer did not start: {e}"));
+    }
 
     let (mut port, plain_http) = {
         let guard = app.lock().map_err(|_| anyhow::anyhow!("app lock poisoned"))?;
@@ -435,6 +450,13 @@ fn run() -> anyhow::Result<()> {
         };
         if restart {
             log.warn("system", "restart requested");
+            // The writes are queued, and `esp_restart` does not wait for the writer's next
+            // tick: a task added and a reboot asked for in the same breath would come back
+            // without the task. Flush here, on this thread, which has been writing NVS since
+            // boot — and let `flush_now` refuse if that is ever no longer true.
+            if !nvs_writer::flush_now(&app, &log, "mcp-main") {
+                log.warn("system", "restarting with store writes still queued");
+            }
             FreeRtos::delay_ms(200);
             esp_idf_svc::hal::reset::restart();
         }

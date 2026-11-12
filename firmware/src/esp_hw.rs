@@ -1,4 +1,4 @@
-﻿//! The ESP-IDF implementation of [`Hardware`].
+//! The ESP-IDF implementation of [`Hardware`].
 //!
 //! Deliberately thin: every decision about *what* to read lives in
 //! `esp32-agent-core`. This file only moves bytes on buses and pins, using the
@@ -12,7 +12,7 @@
 //! > Build gate: `scripts/build-firmware.ps1`.
 
 use esp32_agent_core::error::{McpError, Result};
-use esp32_agent_core::hardware::{BoardInfo, Hardware, PinMode, WifiAp, WifiStatus};
+use esp32_agent_core::hardware::{BoardInfo, Hardware, HeapPool, PinMode, WifiAp, WifiStatus};
 use esp_idf_sys as sys;
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -277,7 +277,10 @@ impl Hardware for EspHw {
                         "name": name,
                         "state": state,
                         "priority": t.uxCurrentPriority,
-                        "stack_free_words": t.usStackHighWaterMark,
+                        // Bytes, not words: this port's `StackType_t` is `uint8_t`, so the
+                        // high-water mark is already a byte count. Calling it "words" sent
+                        // one reading of this table to the wrong conclusion.
+                        "stack_free_bytes": t.usStackHighWaterMark,
                     })
                 })
                 .collect()
@@ -723,6 +726,52 @@ impl Hardware for EspHw {
                 ) as u32,
             ))
         }
+    }
+
+    /// The heap, split the way ESP-IDF splits it: one row per set of capability flags.
+    ///
+    /// `heap_caps_get_info` answers a pool by walking every heap region that satisfies the
+    /// flags, so the rows overlap on purpose — internal RAM is the DMA pool plus more, and
+    /// PSRAM is a pool of its own. That overlap is the fact the old three-number reading
+    /// could not express: "free heap is 8 MB" and "a thread stack does not fit" were both
+    /// true at once.
+    ///
+    /// A pool this chip does not register (IRAM as data, on the S3) is left out rather than
+    /// reported as a row of zeros, which a reader would take for "exhausted".
+    fn heap_pools(&mut self) -> Vec<HeapPool> {
+        use esp_idf_svc::sys;
+        let caps: [(&str, u32, &str); 4] = [
+            (
+                "internal_8bit",
+                sys::MALLOC_CAP_INTERNAL | sys::MALLOC_CAP_8BIT,
+                "thread stacks, queues and anything that must survive with the cache off",
+            ),
+            (
+                "dma",
+                sys::MALLOC_CAP_DMA | sys::MALLOC_CAP_8BIT,
+                "descriptors and buffers a peripheral reads or writes",
+            ),
+            ("iram_8bit", sys::MALLOC_CAP_IRAM_8BIT, "internal RAM that allows unaligned access"),
+            ("spiram", sys::MALLOC_CAP_SPIRAM, "PSRAM: allocation only, no stacks, no DMA descriptors"),
+        ];
+        caps.iter()
+            .filter_map(|(pool, flags, note)| {
+                let mut info: sys::multi_heap_info_t = unsafe { std::mem::zeroed() };
+                unsafe { sys::heap_caps_get_info(&mut info, *flags) };
+                let total = info.total_free_bytes + info.total_allocated_bytes;
+                if total == 0 {
+                    return None;
+                }
+                Some(HeapPool {
+                    pool: (*pool).into(),
+                    note: (*note).into(),
+                    total_kb: (total / 1024) as u32,
+                    free_kb: (info.total_free_bytes / 1024) as u32,
+                    largest_kb: (info.largest_free_block / 1024) as u32,
+                    min_free_kb: (info.minimum_free_bytes / 1024) as u32,
+                })
+            })
+            .collect()
     }
 }
 

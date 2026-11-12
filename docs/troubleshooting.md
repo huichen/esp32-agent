@@ -86,10 +86,17 @@ whether a certificate exists and why not.
 - The browser warns `ERR_CERT_AUTHORITY_INVALID`: **expected**. The certificate is
   self-signed. Compare the fingerprint it shows with `/api/tls` and click through —
   a warning that can be verified is the point of generating the key on the device.
-- `internal_kb` drops by about 11 kB the first time a TLS page is served and then stays
-  put: 17 kB after boot becomes 5-6 kB, and twenty more page loads leave it there. Budget
-  for that when raising `log.ring` or adding a listener; the agent still runs in what is
-  left, but the margin is thin.
+- `internal_kb` used to drop by about 11 kB the first time a TLS page was served: 17 kB
+  after boot became 5–6 kB, and twenty more page loads left it there. **It does not any
+  more, and the old figures are not a budget.** Measured on the bench (N16R8, IDF v5.5.2,
+  `internal_kb` read before and after four https requests): 161 kB before, 161 kB after.
+  The two changes behind that are in `firmware/sdkconfig.defaults` —
+  `CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC=y` keeps the session in PSRAM, and the 4 KB record
+  buffers (`CONFIG_MBEDTLS_SSL_IN_CONTENT_LEN` / `..._OUT_...`) replace the 16 KB default.
+  The 5–6 kB reading dates from before commit `10b16dd`, whose message records the same
+  numbers ("8 kB of internal heap, 6 kB largest block") as the reason it lowered
+  `SPIRAM_MALLOC_ALWAYSINTERNAL`; see [how much memory the board has](#how-much-memory-the-board-has)
+  for the current figures and how to read them.
 - The connection is served one at a time: a page that opens six sockets loads, just not in
   parallel. If a page seems to hang, check whether an event stream (`/api/agent/stream`) is
   open — streams run on their own thread, so this should not block, but that is the only
@@ -118,8 +125,10 @@ tells them apart:
   serialising every tool descriptor is the heavy one; the accept thread runs with 16 kB for
   that reason.
 - `could not spawn connection thread` → internal RAM, not PSRAM. Thread stacks come from
-  internal SRAM; check the `mem:` lines the firmware logs at boot (`boot`, `after devices`,
-  `after wifi`) and lower `log.ring` or the device count if `after wifi` is under 30 kB.
+  internal SRAM, and a stack needs one **contiguous** block: read `memory.largest_internal_kb`
+  in `/api/status` (the boot log's `mem:` lines report the same pair at `boot`, `after
+  devices` and `after wifi`) and lower `log.ring` or the device count when the largest free
+  block is smaller than the 6 kB a new connection thread asks for.
 - Connections reset with no log line at all → the socket pool. Every closed connection sits
   in TIME_WAIT for 2x TCP MSL; `CONFIG_LWIP_MAX_SOCKETS=20` and a 5 s MSL keep the pool
   usable after repeated page loads.
@@ -168,6 +177,77 @@ says why, and what would have to change for that to stop being true.
   audio devices until the next reboot. The firmware now leaves an open channel alone, and
   `devices_list` keeps `mic` and `speaker` across an apply.
 
+## How much memory the board has
+
+Four readings, and they answer different questions. `GET /api/memory` splits the heap by
+capability; `/api/status` carries `memory` (the one number that decides whether a socket or
+a handshake fits) and `threads` (each task and the stack it has left); `shell free` prints
+the total, which includes PSRAM and can look healthy while the internal pool is empty.
+
+Measured on the bench (ESP32-S3-DevKitC-1 N16R8, IDF v5.5.2, commit `93b0579`) after a boot,
+a portal load, `/api/tools`, two scans, two https requests and ten minutes of uptime:
+
+| Pool | Total | Free | Largest free block | What it is |
+|---|---|---|---|---|
+| `internal_8bit` | 370 kB | 168 kB | 98 kB | thread stacks, queues, anything that must work with the cache off |
+| `dma` | 363 kB | 161 kB | 98 kB | descriptors and buffers a peripheral reads or writes |
+| `spiram` | 8165 kB | 7901 kB | 7808 kB | PSRAM: allocation only, no stacks, no DMA descriptors |
+
+The pools overlap on purpose: internal RAM is the DMA pool plus more, and PSRAM is a region
+of its own. `memory.free_heap_kb` in `/api/status` is the sum of them, which is how "8 MB of
+free heap" and "a thread stack did not fit" were both true at once.
+
+`/api/status.threads`, same run (a `pthread` has no name of its own; the stack size is the
+one in the source):
+
+| Thread | Stack | Free at its worst point | Peak use |
+|---|---|---|---|
+| `mcp-main` (`firmware/src/main.rs`) | 20 kB | 13.5 kB | 6.5 kB |
+| http listener (`ACCEPT_STACK`, `http.rs`) | 16 kB | 10.2 kB | 5.8 kB |
+| agent (`STACK_BYTES`, `runner.rs`) | 16 kB | 8.3 kB | 7.7 kB |
+| radio (`wifi.rs`) | 12 kB | 6.5 kB | 5.5 kB |
+| console provisioning (`console.rs`) | 6 kB | 4.7 kB | 1.3 kB |
+| captive DNS (`dns.rs`) | 4 kB **in PSRAM** | 2.1 kB | 1.9 kB |
+
+74 kB of stack, about 29 kB of it ever touched — the largest single block of internal RAM
+the firmware reserves, and the reason these constants are worth measuring rather than
+guessing. IDF's own tasks (`main`, `esp_timer`, `wifi`, `tiT`, `Tmr Svc`, `sys_evt`, `ipc0`,
+`ipc1`, two `IDLE`) add roughly 26 kB and are not ours to size.
+
+The DNS responder is the only stack that could move, and it is in PSRAM: its whole body is
+`recvfrom`, an A-record reply and `send_to`, so it can never run while the flash cache is
+off. That is the condition — with the cache off, external RAM is not addressable, and a
+thread that commits to NVS from a PSRAM stack asserts in
+`esp_task_stack_is_sane_cache_disabled` and reboots the board. Every other thread here
+writes NVS somewhere (`mcp-main` on a config save, the http listener on a manifest apply,
+the agent on its transcript, the console on `provision`), which is why their stacks stay
+internal; `esp_pthread_set_cfg` is set for exactly one thread and restored immediately,
+because the listener is spawned from the same thread later.
+
+**The rule a stack is judged by: `target >= max(2 x peak, peak + 4 kB)`.** Peak use is the
+size in the source minus `high_water_kb`; FreeRTOS reports what is left of a stack, never
+how big it is, so the size stays in the source. A stack that is too small asserts and
+reboots, it does not slow down — which is why the readings are taken after the heavy paths
+(`/api/tools`, the portal, a TLS handshake) have run, and why they are re-read after a
+change: the WiFi thread read 1.4 kB of peak use on one boot and 5.5 kB on the next, so its
+12 kB stays. The 4 kB DNS stack is the one entry that does not clear the rule (2.1 kB peak
+needs 5.9 kB by it); it is a fixed `recvfrom` loop, and raising it would spend 2 kB of the
+pool everything else allocates from, so it is a decision, not an oversight.
+
+`SPIRAM_MALLOC_RESERVE_INTERNAL` (32 kB) is carved out of the internal pool for allocations
+that *must* be internal. Measured, it is not what binds: the I²S transmit ring is created at
+boot, a 400 ms tone plays with the `dma` pool still at 160 kB free, and lowering the reserve
+would not add capacity — it would only let `malloc` reach into memory held for DMA.
+
+What got the board here (each change one commit, each measured on the board):
+the 4 KB sine table moved from `.data` to flash (`refactor(audio)`), `mcp-main` 32 → 20 kB
+and the http listener 20 → 16 kB (`refactor(threads)`), and 14.6 kB of lwIP/net80211/pp/
+wpa_supplicant `.bss` into PSRAM (`CONFIG_SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY`,
+`refactor(spiram)`). The `.bss` move is the one to be careful with: it touches the radio's
+own state, and the failure it is proved against is WiFi init refusing to allocate its 16 rx
+buffers. Ten minutes, a scan and an https request, with `internal_8bit` free unchanged
+throughout, is what it took.
+
 ## How much conversation the board can carry
 
 `MAX_HISTORY_BYTES` bounds the transcript. It started at 24 KB, which was a guess made
@@ -175,7 +255,10 @@ before anything was measured; it is 512 KB today. Two measurements got it there,
 second one stopped short of where the asking went.
 
 **First ladder, against a real model.** One long reply per turn, `/api/status` read between
-turns:
+turns. Both ladders are historical in one respect: they were measured before commit
+`10b16dd` lowered `SPIRAM_MALLOC_ALWAYSINTERNAL`, so the "Internal SRAM" column is that
+firmware's 6 kB, not the 168 kB this one reports — the caps they justified are still in
+place, and the per-turn cost in PSRAM is what they are about.
 
 | Turn | Messages | History | Request body (history + ~18 KB of tool schemas) | Internal SRAM | Result |
 |---|---|---|---|---|---|
@@ -195,8 +278,10 @@ no tokens; same transport, same serialisation, 8 KB replies):
 
 What that says:
 
-1. **Internal SRAM never moves** (6 kB free throughout): transcript, JSON body and mbedTLS
-   buffers are all in PSRAM, so a bigger transcript costs the resource that does not run out.
+1. **Internal SRAM never moved in that firmware** (6 kB free throughout; today it is 168 kB
+   and the figure to watch is in [how much memory the board has](#how-much-memory-the-board-has)):
+   transcript, JSON body and mbedTLS buffers are all in PSRAM, so a bigger transcript costs
+   the resource that does not run out.
 2. **Each turn costs about four times its text.** PSRAM fell ~95 kB per ten 4 KB turns: the
    message, a copy in the event journal, and the serialised request all exist at once.
 3. **The 48-message cap was the first thing to bind**, not the byte cap: at 2 messages a turn
