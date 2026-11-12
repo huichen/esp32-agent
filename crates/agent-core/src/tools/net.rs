@@ -53,10 +53,15 @@ pub fn specs() -> Value {
     json!([
         function(
             "net_get",
-            "Fetch a URL from the board's network and return up to 2048 bytes of the response body. http:// and https:// are both carried; the certificate chain is checked against the board's bundle.",
+            "Fetch a URL from the board's network and return up to 2048 bytes. An HTML page is reduced to its text (title, headings, list items, paragraphs) so the bytes are content rather than markup; send format=\"raw\" for the document itself. http:// and https:// are both carried; the certificate chain is checked against the board's bundle.",
             params(
                 json!({
                     "url": { "type": "string", "description": "http:// URL" },
+                    "format": {
+                        "type": "string",
+                        "enum": ["text", "raw"],
+                        "description": "text (default) reduces an HTML page to the words on it; raw returns the document, tags and all",
+                    },
                 }),
                 &["url"],
             ),
@@ -114,11 +119,30 @@ fn get(transport: &mut dyn ChatTransport, args: &Value) -> Result<String, String
     // A real GET, not a POST with an empty body: half the web answers 405 to the latter,
     // and the model has no way to tell the difference from the tool result.
     let body = transport.request("GET", &url, &[], "").map_err(transport_error)?;
+    // Tags are not content. A page fetched raw is 2 KB of `<div class=…>` and the answer
+    // is somewhere past the cut; so an HTML response is reduced to its text before it is
+    // measured — the same tool then works for any site, which is the point of a general
+    // fetch rather than a per-site one.
+    let want_raw = args.get("format").and_then(|v| v.as_str()).unwrap_or("text") == "raw";
+    if !want_raw && looks_like_html(&body) {
+        let page = html_to_text(&body);
+        return Ok(result_json(
+            json!({
+                "url": url,
+                "method": "GET",
+                "request_bytes": 0,
+                "format": "text",
+                "title": page.title,
+            }),
+            &page.text,
+        ));
+    }
     Ok(result_json(
         json!({
             "url": url,
             "method": "GET",
             "request_bytes": 0,
+            "format": "raw",
         }),
         &body,
     ))
@@ -221,6 +245,155 @@ fn post(transport: &mut dyn ChatTransport, args: &Value) -> Result<String, Strin
 
 /// A successful tool answer: the (bounded) body plus enough context that the
 /// model knows whether it is looking at the whole thing.
+/// Does this look like a document rather than JSON or plain text?
+fn looks_like_html(body: &str) -> bool {
+    let head = body.trim_start();
+    let head = &head[..head.len().min(512)];
+    head.starts_with('<')
+        && (head.contains("<html")
+            || head.contains("<!doctype")
+            || head.contains("<body")
+            || head.contains("<div")
+            || head.contains("<head")
+            || head.contains("<p"))
+}
+
+struct Page {
+    title: String,
+    text: String,
+}
+
+/// Reduce an HTML document to the words on the page.
+///
+/// No parser and no DOM: a board with a few kB of heap cannot hold one, and this does not
+/// need to be exact. It drops what is never content (`script`, `style`, `noscript`, `svg`,
+/// comments), turns block-level tags into line breaks so headings and list items stay
+/// separate, strips the rest, decodes the handful of entities that matter, and collapses
+/// runs of blank space.
+fn html_to_text(html: &str) -> Page {
+    let low = html.to_ascii_lowercase();
+    let title = extract_title(&low, html).unwrap_or_default();
+
+    let mut out = String::with_capacity(html.len() / 2);
+    let bytes = html.as_bytes();
+    let mut i = 0;
+    let mut skip_until = 0usize;
+    while i < bytes.len() {
+        if i >= skip_until {
+            for tag in ["<script", "<style", "<noscript", "<svg", "<!--"] {
+                if low[i..].starts_with(tag) {
+                    let close = match tag {
+                        "<!--" => "--",
+                        _ => tag,
+                    };
+                    let end = if tag == "<!--" {
+                        low[i..].find("-->").map(|p| i + p + 3)
+                    } else {
+                        low[i..].find(&format!("</{}", &tag[1..])).map(|p| i + p)
+                    };
+                    if let Some(end) = end {
+                        skip_until = end;
+                    }
+                    i = end.unwrap_or(bytes.len());
+                    let _ = close;
+                    break;
+                }
+            }
+            if i >= skip_until && i < bytes.len() && bytes[i] == b'<' {
+                // A tag: block-level ones end a line, the rest vanish.
+                if let Some(rel) = html[i..].find('>') {
+                    let tag = &low[i..i + rel];
+                    let block = [
+                        "<p", "<br", "<div", "<li", "<tr", "<h1", "<h2", "<h3", "<h4", "<h5", "<h6",
+                        "<section", "<article", "<title",
+                    ]
+                    .iter()
+                    .any(|t| tag.starts_with(t));
+                    if block {
+                        out.push('\n');
+                    }
+                    i += rel + 1;
+                    continue;
+                }
+            }
+        }
+        if i >= skip_until {
+            let ch = html[i..].chars().next().unwrap_or(' ');
+            out.push(ch);
+            i += ch.len_utf8();
+        } else {
+            i += 1;
+        }
+    }
+
+    let decoded = decode_entities(&out);
+    let mut text = String::with_capacity(decoded.len());
+    for line in decoded.lines() {
+        let line = line.split_whitespace().collect::<Vec<_>>().join(" ");
+        if line.is_empty() {
+            continue;
+        }
+        text.push_str(&line);
+        text.push('\n');
+    }
+    Page { title, text: text.trim_end().to_string() }
+}
+
+fn extract_title(low: &str, html: &str) -> Option<String> {
+    let start = low.find("<title")?;
+    let open_end = low[start..].find('>')? + start + 1;
+    let end = low[open_end..].find("</title>")? + open_end;
+    let title = html.get(open_end..end)?.split_whitespace().collect::<Vec<_>>().join(" ");
+    if title.is_empty() {
+        None
+    } else {
+        Some(decode_entities(&title))
+    }
+}
+
+/// The entities a page actually uses in its text. Not a full table: `&#NNN;` handles the
+/// rest, and an unknown entity stays as written rather than becoming a character the
+/// model would have to guess at.
+fn decode_entities(text: &str) -> String {
+    if !text.contains('&') {
+        return text.to_string();
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(pos) = rest.find('&') {
+        out.push_str(&rest[..pos]);
+        rest = &rest[pos..];
+        let semi = match rest[..rest.len().min(12)].find(';') {
+            Some(p) => p,
+            None => {
+                out.push('&');
+                rest = &rest[1..];
+                continue;
+            }
+        };
+        let entity = &rest[1..semi];
+        let replacement = match entity {
+            "amp" => Some('&'),
+            "lt" => Some('<'),
+            "gt" => Some('>'),
+            "quot" => Some('"'),
+            "apos" | "#39" => Some('\''),
+            "nbsp" | "#160" => Some(' '),
+            "mdash" => Some('\u{2014}'),
+            "ndash" => Some('\u{2013}'),
+            "hellip" => Some('\u{2026}'),
+            other => other.strip_prefix('#').and_then(|n| n.parse::<u32>().ok()).and_then(char::from_u32),
+        };
+        match replacement {
+            Some(c) => out.push(c),
+            None => out.push_str(&rest[..semi + 1]),
+        }
+        rest = &rest[semi + 1..];
+    }
+    out.push_str(rest);
+    out
+}
+
 fn result_json(meta: Value, body: &str) -> String {
     let bytes = body.len();
     let truncated = bytes > MAX_BODY_BYTES;
@@ -445,6 +618,33 @@ mod tests {
         // Only the one legal request reached the transport; every refusal above stopped
         // before the socket.
         assert_eq!(f.seen.len(), 1, "a refused URL still went out: {:?}", f.seen);
+    }
+
+    /// A page is words, not tags: the point of a general fetch is that it works on a site
+    /// nobody wrote a tool for.
+    #[test]
+    fn an_html_page_arrives_as_its_text() {
+        let page = html_to_text(
+            "<!doctype html><html><head><title> Bench &amp; Board </title>\
+             <style>body{color:red}</style><script>var x = 1 < 2;</script></head>\
+             <body><h1>Headlines</h1><ul><li>First story</li><li>Second story</li></ul>\
+             <p>Some <b>bold</b> text &mdash; and an entity &#39;quoted&#39;.</p><!-- a comment -->\
+             </body></html>",
+        );
+        assert_eq!(page.title, "Bench & Board");
+        assert!(!page.text.contains('<'), "{}", page.text);
+        assert!(!page.text.contains("color:red"), "css leaked: {}", page.text);
+        assert!(!page.text.contains("var x"), "script leaked: {}", page.text);
+        assert!(page.text.contains("Headlines"), "{}", page.text);
+        assert!(page.text.contains("First story\n"), "list items keep their lines: {}", page.text);
+        assert!(page.text.contains("bold"), "{}", page.text);
+        assert!(page.text.contains('\u{2014}'), "entities decode: {}", page.text);
+        assert!(!page.text.contains("&amp;"), "{}", page.text);
+
+        // JSON and plain text are left alone: only a document is rewritten.
+        assert!(!looks_like_html("[1,2,3]"));
+        assert!(!looks_like_html("hello"));
+        assert!(looks_like_html("<!doctype html><html></html>"));
     }
 
     #[test]
