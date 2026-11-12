@@ -17,7 +17,7 @@ Start with `GET /api/logs` (or the console's log tab). Every boot-time line carr
 | Symptom | Check |
 |---|---|
 | The phone cannot see `esp32-agent-setup` | The board still has old credentials → the serial log says `wifi: joining ...`; `POST /api/wifi/forget` then reboot |
-| Joined the access point but no page | It must be `http://192.168.4.1:8080/` — note the port; the captive DNS only makes HTTP pop up automatically |
+| Joined the access point but no page | It must be `http://192.168.4.1:80/` — note the port; the captive DNS only makes HTTP pop up automatically |
 | Credentials entered but it will not connect | 2.4 GHz and WPA2 are what works (the ESP32 has no 5 GHz radio); watch `wifi: status=…` in the log; check for trailing spaces in a pasted password |
 | Connected but no IP found | Look for hostname `esp32-agent` in the router's DHCP list, or the `ip=` line in the serial log |
 
@@ -87,7 +87,7 @@ tells them apart:
   in TIME_WAIT for 2x TCP MSL; `CONFIG_LWIP_MAX_SOCKETS=20` and a 5 s MSL keep the pool
   usable after repeated page loads.
 
-`curl -sS -m 5 http://<board>:8080/api/tools | head -c 200` is the fastest check: it is the
+`curl -sS -m 5 http://<board>:80/api/tools | head -c 200` is the fastest check: it is the
 heaviest endpoint the portal calls, so if it answers, the page will load.
 
 ## The panel stays dark or shows garbage

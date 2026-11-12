@@ -9,7 +9,7 @@ By default (`devices.discovery = auto`) a driver that recognises a device adopts
 appears in `tools/list` straight away. Set it to `manual` and the drivers still probe — they
 just stop deciding:
 ```bash
-curl -sS -X POST http://<board>:8080/mcp -H 'Content-Type: application/json' -d '{
+curl -sS -X POST http://<board>:80/mcp -H 'Content-Type: application/json' -d '{
   "jsonrpc":"2.0","id":1,"method":"tools/call",
   "params":{"name":"config_set","arguments":{"patch":{"discovery":"manual"}}}}'
 ```

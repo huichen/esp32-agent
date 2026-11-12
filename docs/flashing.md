@@ -92,12 +92,12 @@ With **no WiFi credentials** stored, the board comes up in setup mode:
 
 ```
 wifi: setup mode: access point `esp32-agent-setup` at http://192.168.4.1/
-http: listening on http://0.0.0.0:8080/
+http: listening on http://0.0.0.0:80/
 ```
 
 1. Join `esp32-agent-setup` from a phone (no password by default; set
    `config.wifi.ap_password` if you want one).
-2. Open `http://192.168.4.1:8080/` (most phones open it automatically, because the captive
+2. Open `http://192.168.4.1:80/` (most phones open it automatically, because the captive
    DNS answers everything).
 3. Scan → pick the SSID → enter the password → "save and connect".
 4. The board writes it to NVS and reconnects — no reboot, no reflash. The access point
@@ -138,8 +138,8 @@ Two details decide whether it works on a given bench:
 ## 5. Reaching it afterwards
 
 - Look for `esp32-agent`'s DHCP lease on the router; the serial log prints the IP too.
-- Console: `http://<board-ip>:8080/`
-- MCP: `http://<board-ip>:8080/mcp`
+- Console: `http://<board-ip>:80/`
+- MCP: `http://<board-ip>:80/mcp`
 
 ## 6. Optional: console PIN and MCP token
 

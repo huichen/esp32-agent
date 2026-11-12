@@ -544,6 +544,32 @@ function autosize() {
   el.style.height = Math.min(el.scrollHeight, 132) + "px";
 }
 
+/** Keep the composer above the on-screen keyboard.
+ *
+ * A phone keyboard shrinks `visualViewport` without shrinking the layout viewport, so a
+ * fixed composer stays where it was and the last line of the field ends up under the keys.
+ * Binding the document height to the visual viewport (and scrolling the field into view on
+ * focus) puts it back on top of the keyboard. */
+function trackViewport() {
+  const vv = window.visualViewport;
+  const apply = () => {
+    const h = vv ? vv.height : window.innerHeight;
+    document.documentElement.style.setProperty("--vvh", h + "px");
+    const composer = $("#composer");
+    if (vv && composer) {
+      const gap = Math.max(0, window.innerHeight - (vv.height + vv.offsetTop));
+      composer.style.transform = `translateY(-${gap}px)`;
+    }
+    if (document.activeElement === $("#input")) scrollToEnd();
+  };
+  if (vv) {
+    vv.addEventListener("resize", apply);
+    vv.addEventListener("scroll", apply);
+  }
+  window.addEventListener("orientationchange", () => setTimeout(apply, 250));
+  apply();
+}
+
 function init() {
   $("#menu-btn").onclick = () => {
     $("#sheet").hidden = false;
@@ -659,6 +685,7 @@ function init() {
 
   loadHistory();
   loadStatus();
+  trackViewport();
   // Not connected at load: the stream is opened when a run starts and closed when it ends.
   setInterval(() => {
     if (!$("#sheet").hidden) return;

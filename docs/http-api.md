@@ -11,7 +11,7 @@ PIN, plus the MCP surface (transport, session header, methods, resources, a work
 example), the error shape, and the limits that apply to a caller.
 
 ```bash
-curl -sS http://<ip>:8080/agent.json | jq '.endpoints[] | "\(.method) \(.path) — \(.summary)"'
+curl -sS http://<ip>:80/agent.json | jq '.endpoints[] | "\(.method) \(.path) — \(.summary)"'
 ```
 
 `GET /sitemap.json` is an alias. The document is generated from the same table the router
@@ -26,12 +26,12 @@ the running board, so the same document is correct on every unit.
 
 ```bash
 # list tools
-curl -sS -X POST http://<ip>:8080/mcp \
+curl -sS -X POST http://<ip>:80/mcp \
   -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' \
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
 
 # call a tool
-curl -sS -X POST http://<ip>:8080/mcp -H 'Content-Type: application/json' \
+curl -sS -X POST http://<ip>:80/mcp -H 'Content-Type: application/json' \
   -d '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"board_status","arguments":{}}}'
 ```
 
@@ -130,6 +130,6 @@ error. Only protocol errors (unknown method, malformed JSON) use the `error` obj
 ## 5. Connecting a client
 
 - **Claude Desktop / Cursor and anything else that speaks HTTP**:
-  `{"mcpServers":{"esp32-agent":{"type":"http","url":"http://<ip>:8080/mcp"}}}`
+  `{"mcpServers":{"esp32-agent":{"type":"http","url":"http://<ip>:80/mcp"}}}`
 - **stdio-only clients**: use a bridge such as `mcp-remote` or `mcp2serial`.
 - **Your own script**: see the curl above; `/api/clients` returns a ready-made command.

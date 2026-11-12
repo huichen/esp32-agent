@@ -25,7 +25,7 @@ fn default_profile() -> String {
     "full".to_string()
 }
 pub const NVS_KEY_CONFIG: &str = "config";
-pub const DEFAULT_PORT: u16 = 8080;
+pub const DEFAULT_PORT: u16 = 80;
 pub const DEFAULT_PATH: &str = "/mcp";
 
 /// Default interval of the platform scheduler tick, and therefore the default
