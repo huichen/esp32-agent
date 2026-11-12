@@ -118,7 +118,8 @@ Because of what it displaces. The prompt is rebuilt every turn from the workspac
 per-run budget is small: `/AGENTS.md` gets 1 KB, the skill index about 1.2 KB, and the
 rest of the prompt is instructions and the transcript. A 6 KB "here is everything" prompt
 would push the tool schemas into the long tail of the model's attention — the same failure
-that made `manifest_describe` useless while it returned 8 KB (see the changelog).
+that made `manifest_describe` useless while it returned 8 KB, which is why it now answers in
+sections.
 
 ## Related
 
