@@ -26,6 +26,7 @@ const S = {
   busy: false,
   panel: "status",
   afterUnlock: null,
+  filesPath: "/",
 };
 
 // ---------------------------------------------------------------- transport
@@ -300,6 +301,12 @@ function finishChip(wrap, ok) {
 function scrollToEnd() {
   const chat = $("#chat");
   chat.scrollTop = chat.scrollHeight;
+}
+
+/** The header dot: `live` answered and idle, `busy` a run is in flight, `off` no answer. */
+function setLink(state) {
+  const el = $("#link");
+  if (el) el.className = "dot " + state;
 }
 
 /** One turn: a user message and everything the board did while answering it.
@@ -792,8 +799,16 @@ async function loadStatus() {
     $("#sub").textContent =
       d.devices.count + " devices · " + d.mcp.tools_visible + " tools · " + (model.model || "no model");
     $("#title").textContent = d.device_name || "esp32-agent";
+    // The dot follows what the page actually knows: a poll that answered, and whether a run is
+    // in flight. It used to be set only by the SSE stream, which this page deliberately does
+    // not open while idle — so a freshly loaded portal sat grey until the first turn, and a
+    // grey dot next to a working board reads as a fault.
+    setLink(d.agent && d.agent.pending ? "busy" : "live");
   } catch (e) {
-    if (!String(e.message).includes("PIN")) $("#sub").textContent = "offline";
+    if (!String(e.message).includes("PIN")) {
+      $("#sub").textContent = "offline";
+      setLink("off");
+    }
   }
 }
 
@@ -925,6 +940,79 @@ async function schedOp(id, op) {
   }
 }
 
+/** The workspace, one directory at a time: a file list you can tap into, and a file view.
+ *
+ * Read-only on purpose. Every write goes through the agent or the `write` tool, where the
+ * workspace's 8 KB budget and its one-blob-in-NVS storage are enforced; a portal editor that
+ * writes would need the same checks a second time and would be the place they drift apart. */
+async function loadFiles(path) {
+  S.filesPath = path || "/";
+  try {
+    const d = await api("/api/files?path=" + encodeURIComponent(S.filesPath));
+    if (!d.ok) {
+      toast(d.error || "cannot list that directory");
+      return;
+    }
+    S.filesPath = d.path || "/";
+    renderCrumbs(S.filesPath);
+    const rows = (d.entries || []).map((e) => {
+      const size = e.dir ? "dir" : e.size_bytes + " B";
+      return (
+        '<button class="item file-row" data-path="' + escapeHtml(e.path) + '" data-dir="' +
+        (e.dir ? "1" : "0") + '"><b>' + escapeHtml(e.name) + (e.dir ? "/" : "") +
+        "</b><span class='faint'>" + escapeHtml(size) + "</span></button>"
+      );
+    });
+    $("#files-list").innerHTML = rows.join("") || '<div class="item faint">empty</div>';
+    $("#files-total").textContent =
+      (d.count || 0) + " entries \u00b7 " + d.total_bytes + " of " + d.total_max +
+      " bytes used \u00b7 a file may be " + d.file_max + " bytes";
+    $("#files-viewer-card").hidden = true;
+    $$("#files-list .file-row").forEach((row) => {
+      row.onclick = () => {
+        if (row.dataset.dir === "1") loadFiles(row.dataset.path);
+        else openFile(row.dataset.path);
+      };
+    });
+  } catch (e) {
+    toast(e.message);
+  }
+}
+
+/** `/memory/pinout.md` as clickable parents, so a deep path is one tap from the root. */
+function renderCrumbs(path) {
+  const parts = String(path).split("/").filter(Boolean);
+  let built = "";
+  const crumbs = ['<a href="#" data-path="/">/</a>'];
+  for (const part of parts) {
+    built += "/" + part;
+    crumbs.push('<a href="#" data-path="' + escapeHtml(built) + '">' + escapeHtml(part) + "</a>");
+  }
+  $("#files-path").innerHTML = crumbs.join(" / ");
+  $$("#files-path a").forEach((a) => {
+    a.onclick = (ev) => {
+      ev.preventDefault();
+      loadFiles(a.dataset.path);
+    };
+  });
+}
+
+async function openFile(path) {
+  try {
+    const d = await api("/api/files/read?path=" + encodeURIComponent(path));
+    if (!d.ok) {
+      toast(d.error || "cannot read that file");
+      return;
+    }
+    $("#files-viewer-name").textContent = d.path + "  (" + d.size_bytes + " B)";
+    $("#files-viewer").textContent = d.text;
+    $("#files-viewer-card").hidden = false;
+    $("#files-viewer").scrollTop = 0;
+  } catch (e) {
+    toast(e.message);
+  }
+}
+
 async function loadLogs() {
   try {
     const d = await api("/api/logs?n=80");
@@ -954,10 +1042,11 @@ function showPanel(name) {
   $$(".panel").forEach((p) => (p.hidden = p.id !== "panel-" + name));
   if (name === "devices") loadDevices();
   if (name === "tools") loadTools();
-  if (name === "agent") loadAgent();
-  if (name === "schedule") loadSched();
-  if (name === "logs") loadLogs();
-  if (name === "settings") loadSettings();
+  // The schedule queues turns for this agent, so it lives on the Agent panel; the log is
+  // the other thing to read when the board misbehaves, so it lives on Settings.
+  if (name === "agent") { loadAgent(); loadSched(); }
+  if (name === "files") loadFiles(S.filesPath || "/");
+  if (name === "settings") { loadSettings(); loadLogs(); }
 }
 
 // ---------------------------------------------------------------- wiring
@@ -1183,6 +1272,10 @@ $("#attach").onclick = () => $("#attach-input").click();
   };
 
   $("#logs-refresh").onclick = loadLogs;
+  $("#files-back").onclick = () => {
+    $("#files-viewer-card").hidden = true;
+    loadFiles(S.filesPath);
+  };
 
   loadHistory();
   loadStatus();

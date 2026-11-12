@@ -2528,6 +2528,65 @@ impl App {
     /// a run would show nothing until the model answered — and look like it dropped
     /// the message. The pending turn is appended here, flagged, and disappears once
     /// the run appends the real one.
+    /// `GET /api/files?path=/dir`: one directory of the workspace, directories first.
+    ///
+    /// Shaped like the `ls` tool on purpose — one workspace, one meaning of `size_bytes` —
+    /// plus the two totals. The workspace is a single 8 KB blob stored in NVS chunks, so
+    /// "how much of it is used" is the question a person asks when a write is refused, and
+    /// a per-file number cannot answer it.
+    fn files_json(&self, path: &str) -> Value {
+        use crate::tools::fs::Workspace as _;
+        let dir = match fs_tools::normalize(path) {
+            Ok(d) => d,
+            Err(e) => return json!({ "ok": false, "error": e }),
+        };
+        let names = match self.workspace.list(&dir) {
+            Ok(n) => n,
+            Err(e) => return json!({ "ok": false, "path": dir, "error": e }),
+        };
+        let mut entries: Vec<Value> = Vec::new();
+        for name in names {
+            let child = fs_tools::join(&dir, &name);
+            // A name that does not read as a file is a directory: the trait's contract, and
+            // the same rule `ls` uses, so the two views cannot disagree.
+            match self.workspace.read(&child) {
+                Ok(text) => entries.push(json!({
+                    "name": name, "path": child, "dir": false, "size_bytes": text.len(),
+                })),
+                Err(_) => entries.push(json!({ "name": name, "path": child, "dir": true })),
+            }
+        }
+        entries.sort_by(|a, b| {
+            let ad = a["dir"].as_bool().unwrap_or(false);
+            let bd = b["dir"].as_bool().unwrap_or(false);
+            bd.cmp(&ad).then_with(|| a["name"].as_str().unwrap_or("").cmp(b["name"].as_str().unwrap_or("")))
+        });
+        json!({
+            "ok": true,
+            "path": dir,
+            "count": entries.len(),
+            "entries": entries,
+            "total_bytes": self.workspace.bytes(),
+            "total_max": WORKSPACE_TOTAL_MAX,
+            "file_max": WORKSPACE_FILE_MAX,
+        })
+    }
+
+    /// `GET /api/files/read?path=/x.md`: one file, as text.
+    fn file_text_json(&self, path: &str) -> Value {
+        use crate::tools::fs::Workspace as _;
+        let file = match fs_tools::normalize(path) {
+            Ok(f) => f,
+            Err(e) => return json!({ "ok": false, "error": e }),
+        };
+        match self.workspace.read(&file) {
+            Ok(text) => json!({
+                "ok": true, "path": file, "size_bytes": text.len(), "text": text,
+            }),
+            Err(e) => json!({ "ok": false, "path": file, "error": e }),
+        }
+    }
+
     fn agent_history_json(&self, after: usize) -> Value {
         let mut v = self.agent.messages_json(after);
         // Token accounting travels with the transcript, the way the host agent reports
@@ -3529,6 +3588,23 @@ impl App {
                 Response::json(&v)
             }
             ("GET", "/api/catalog") => Response::json(&drivers::catalog_json()),
+            // The portal's Files tab: read-only, so it needs no PIN like every other read.
+            // Both answers carry the same numbers the `ls` and `read` tools return, because
+            // there is one workspace and one meaning of "how big is it".
+            ("GET", "/api/files") => {
+                if let Err(r) = self.require_read(req) {
+                    return r;
+                }
+                let path = req.query_get("path").unwrap_or("/");
+                Response::json(&self.files_json(path))
+            }
+            ("GET", "/api/files/read") => {
+                if let Err(r) = self.require_read(req) {
+                    return r;
+                }
+                let path = req.query_get("path").unwrap_or("/");
+                Response::json(&self.file_text_json(path))
+            }
             ("GET", "/api/sessions") => Response::json(&json!({ "sessions": self.runtime.session_json() })),
             ("GET", "/api/clients") => Response::json(&self.client_snippets()),
             ("POST", "/api/auth") => {
@@ -11759,5 +11835,62 @@ mod tests {
         assert!(system.contains("/memory/pins.md"), "{system}");
         assert!(system.contains("Earlier in this conversation"), "{system}");
         assert_eq!(body["archive_lines"], 1);
+    }
+
+    /// The portal's Files tab reads the workspace through two routes, and reports the budget
+    /// the `write` tool enforces. A listing without the total would leave "the write was
+    /// refused" with nothing to compare against.
+    #[test]
+    fn the_files_routes_list_and_read_the_workspace() {
+        use crate::tools::fs::Workspace as _;
+        let mut app = test_app();
+        app.workspace.write("/notes/one.md", "hello").expect("a file in a subdirectory");
+        app.workspace.write("/top.md", "# title").expect("a root file");
+
+        let resp = app.route(&get("/api/files?path=/"));
+        assert_eq!(resp.status, 200, "{resp:?}");
+        let body: Value = serde_json::from_slice(&resp.body).expect("json");
+        // Directories first, then by name — whatever else the seeded workspace already holds.
+        let dirs: Vec<&str> = body["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|e| e["dir"] == true)
+            .map(|e| e["name"].as_str().unwrap())
+            .collect();
+        assert!(dirs.contains(&"notes"), "{body}");
+        let positions: Vec<usize> = body["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| e["name"] == "notes" || e["name"] == "top.md")
+            .map(|(i, e)| if e["name"] == "notes" { i } else { i + 100 })
+            .collect();
+        assert_eq!(positions.len(), 2, "{body}");
+        assert!(positions[0] < positions[1], "a directory comes before a file: {body}");
+        let top = body["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["name"] == "top.md")
+            .expect("top.md in the listing");
+        assert_eq!(top["size_bytes"], 7, "{body}");
+        assert_eq!(top["path"], "/top.md", "{body}");
+        assert_eq!(body["total_max"], WORKSPACE_TOTAL_MAX, "{body}");
+        assert!(body["total_bytes"].as_u64().unwrap_or(0) >= 12, "{body}");
+
+        // A file, then a directory: the second is an error with a sentence in it.
+        let resp = app.route(&get("/api/files/read?path=/top.md"));
+        let body: Value = serde_json::from_slice(&resp.body).expect("json");
+        assert_eq!(body["text"], "# title", "{body}");
+        let resp = app.route(&get("/api/files/read?path=/notes"));
+        let body: Value = serde_json::from_slice(&resp.body).expect("json");
+        assert_eq!(body["ok"], false, "{body}");
+
+        // `..` is refused by the same normaliser the tools use, not by a second rule here.
+        let resp = app.route(&get("/api/files?path=/../etc"));
+        let body: Value = serde_json::from_slice(&resp.body).expect("json");
+        assert_eq!(body["ok"], false, "{body}");
     }
 }
