@@ -14,6 +14,7 @@
 
 use crate::llm::{body_prefix, truncate_bytes, ChatTransport};
 use serde_json::{json, Value};
+use std::net::ToSocketAddrs;
 
 /// Response bodies larger than this are cut, with [`TRUNCATED_MARK`] appended.
 /// The agent truncates tool results at the same size; doing it here keeps the
@@ -61,6 +62,29 @@ pub fn specs() -> Value {
             ),
         ),
         function(
+            "net_dns",
+            "Resolve a hostname to IP addresses using the board's resolver. Use it when net_get fails: name resolution, routing and TLS all fail differently, and only this tells them apart.",
+            params(
+                json!({
+                    "host": { "type": "string", "description": "name to resolve, e.g. example.com" },
+                    "port": { "type": "integer", "minimum": 1, "maximum": 65535, "description": "port used for the lookup, default 443" },
+                }),
+                &["host"],
+            ),
+        ),
+        function(
+            "net_tcp",
+            "Open a TCP connection to host:port and close it. Tells \"host up, service down\" apart from \"nothing there\", without depending on HTTP.",
+            params(
+                json!({
+                    "host": { "type": "string", "description": "name or address" },
+                    "port": { "type": "integer", "minimum": 1, "maximum": 65535, "description": "port to try, default 80" },
+                    "timeout_ms": { "type": "integer", "minimum": 100, "maximum": 20000, "description": "give up after this, default 3000" },
+                }),
+                &["host"],
+            ),
+        ),
+        function(
             "net_post",
             "POST a JSON body to a URL from the board's network and return up to 2048 bytes of the response body. http:// and https:// are both carried.",
             params(
@@ -79,6 +103,8 @@ pub fn call(transport: &mut dyn ChatTransport, name: &str, args: &Value) -> Opti
     match name {
         "net_get" => Some(get(transport, args)),
         "net_post" => Some(post(transport, args)),
+        "net_dns" => Some(dns(args)),
+        "net_tcp" => Some(tcp(args)),
         _ => None,
     }
 }
@@ -96,6 +122,80 @@ fn get(transport: &mut dyn ChatTransport, args: &Value) -> Result<String, String
         }),
         &body,
     ))
+}
+
+/// Resolve a name the way the board's own sockets would.
+///
+/// DNS is the first thing to check when `net_get` fails on a hostname: until now the model
+/// had to guess whether the failure was the name, the route or the TLS handshake, and the
+/// three have completely different fixes.
+fn dns(args: &Value) -> Result<String, String> {
+    let host = args.get("host").and_then(|v| v.as_str()).unwrap_or("").trim();
+    if host.is_empty() {
+        return Err("`host` is required".into());
+    }
+    let port = args.get("port").and_then(|v| v.as_u64()).unwrap_or(443).min(65535) as u16;
+    let started = std::time::Instant::now();
+    match (host, port).to_socket_addrs() {
+        Ok(addrs) => {
+            let mut list: Vec<String> = addrs.map(|a| a.ip().to_string()).collect();
+            list.sort();
+            list.dedup();
+            Ok(json!({
+                "host": host,
+                "addresses": list,
+                "resolved": !list.is_empty(),
+                "ms": started.elapsed().as_millis() as u64,
+            })
+            .to_string())
+        }
+        Err(e) => Ok(json!({
+            "host": host,
+            "addresses": [],
+            "resolved": false,
+            "error": e.to_string(),
+            "ms": started.elapsed().as_millis() as u64,
+            "hint": "if this fails, check wifi.dns: a gateway can be reachable while the resolver is not",
+        })
+        .to_string()),
+    }
+}
+
+/// Open a TCP connection and close it again: is this port answering, and how fast.
+///
+/// The cheapest way to tell "the host is up but the service is not" from "nothing is
+/// there at all", which an HTTP error alone cannot distinguish.
+fn tcp(args: &Value) -> Result<String, String> {
+    let host = args.get("host").and_then(|v| v.as_str()).unwrap_or("").trim();
+    if host.is_empty() {
+        return Err("`host` is required".into());
+    }
+    let port = args.get("port").and_then(|v| v.as_u64()).unwrap_or(80).min(65535) as u16;
+    let timeout_ms = args.get("timeout_ms").and_then(|v| v.as_u64()).unwrap_or(3000).clamp(100, 20000);
+    let started = std::time::Instant::now();
+    let result = (host, port)
+        .to_socket_addrs()
+        .map_err(|e| format!("could not resolve `{host}`: {e}"))
+        .and_then(|mut addrs| match addrs.next() {
+            Some(addr) => {
+                std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(timeout_ms))
+                    .map(|_| addr)
+                    .map_err(|e| e.to_string())
+            }
+            None => Err(format!("`{host}` resolved to nothing")),
+        });
+    Ok(match result {
+        Ok(addr) => json!({
+            "host": host, "port": port, "address": addr.ip().to_string(),
+            "open": true, "ms": started.elapsed().as_millis() as u64,
+        })
+        .to_string(),
+        Err(e) => json!({
+            "host": host, "port": port, "open": false,
+            "error": e, "ms": started.elapsed().as_millis() as u64,
+        })
+        .to_string(),
+    })
 }
 
 fn post(transport: &mut dyn ChatTransport, args: &Value) -> Result<String, String> {
@@ -352,7 +452,7 @@ mod tests {
         let specs = specs();
         let list = specs.as_array().expect("tools array");
         let names: Vec<&str> = list.iter().map(|t| t["function"]["name"].as_str().unwrap()).collect();
-        assert_eq!(names, vec!["net_get", "net_post"]);
+        assert_eq!(names, vec!["net_get", "net_dns", "net_tcp", "net_post"]);
         for t in list {
             assert_eq!(t["type"], "function");
             assert_eq!(t["function"]["parameters"]["type"], "object");

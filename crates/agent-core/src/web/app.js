@@ -677,6 +677,7 @@ async function loadAgent() {
     $("#agent-model").value = d.model || "";
     $("#agent-steps").value = d.max_steps;
     $("#agent-temperature").value = d.temperature;
+    $("#agent-protocol").value = d.protocol || "chat";
     $("#agent-reasoning").value = d.reasoning || "";
     $("#agent-vision").value = d.vision === false ? "false" : "true";
     $("#auth-tick").value = d.tick_ms;
@@ -872,6 +873,7 @@ $("#attach").onclick = () => $("#attach-input").click();
       model: $("#agent-model").value.trim(),
       max_steps: Number($("#agent-steps").value || 0),
       temperature: Number($("#agent-temperature").value || 0.2),
+      protocol: $("#agent-protocol").value,
       reasoning: $("#agent-reasoning").value,
       vision: $("#agent-vision").value === "true",
     };
