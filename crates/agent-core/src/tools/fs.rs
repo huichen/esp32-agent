@@ -67,7 +67,7 @@ pub fn normalize(path: &str) -> Result<String, String> {
     Ok(if parts.is_empty() { "/".to_string() } else { format!("/{}", parts.join("/")) })
 }
 
-fn join(dir: &str, name: &str) -> String {
+pub fn join(dir: &str, name: &str) -> String {
     if dir == "/" {
         format!("/{name}")
     } else {

@@ -41,14 +41,15 @@
     <h2>Board</h2>
     <button id="sheet-close" class="icon" aria-label="Close">&#10005;</button>
   </div>
-  <!-- Ordered by how often a person needs it, and only six: devices, tools, the
-       agent itself, the schedule, what it said, what it is set to. -->
+  <!-- Ordered by how often a person needs it, and only five: devices, tools, the agent
+       itself, the workspace it reads and writes, and what it is set to. The schedule lives
+       inside Agent (it queues turns for the same agent) and the log inside Settings (it is
+       the other thing to look at when the board misbehaves). -->
   <nav class="tabs" role="tablist">
     <button role="tab" data-panel="devices" aria-selected="true">Devices</button>
     <button role="tab" data-panel="tools">Tools</button>
     <button role="tab" data-panel="agent">Agent</button>
-    <button role="tab" data-panel="schedule">Schedule</button>
-    <button role="tab" data-panel="logs">Logs</button>
+    <button role="tab" data-panel="files">Files</button>
     <button role="tab" data-panel="settings">Settings</button>
   </nav>
   <div class="sheet-body">
@@ -125,14 +126,12 @@
         </div>
         <p class="hint">Memories are files (<code>/memory.md</code>) and survive this. The transcript itself lives in RAM, so a reboot starts a new one.</p>
       </div>
-    </div>
 
-    <div id="panel-schedule" class="panel" hidden>
-      <div class="card"><h3>Tasks</h3><div id="sched-list" class="list"></div>
+      <div class="card"><h3>Schedule</h3><div id="sched-list" class="list"></div>
         <p class="hint">Daily times are UTC. The board gets UTC from SNTP; <code>Settings</code> says whether it has synced.</p>
       </div>
       <div class="card">
-        <h3>Add</h3>
+        <h3>Add a scheduled job</h3>
         <label for="sched-prompt">Prompt</label>
         <textarea id="sched-prompt" class="field" placeholder="what to ask when it fires"></textarea>
         <label for="sched-script">Script (runs without a model call)</label>
@@ -146,9 +145,17 @@
       </div>
     </div>
 
-    <div id="panel-logs" class="panel" hidden>
-      <div class="card"><h3>Log</h3><pre id="logs" class="log"></pre>
-        <div class="buttons"><button id="logs-refresh" class="btn ghost">Refresh</button></div>
+    <div id="panel-files" class="panel" hidden>
+      <div class="card">
+        <h3>Workspace</h3>
+        <p class="crumbs" id="files-path"></p>
+        <div id="files-list" class="list"></div>
+        <p id="files-total" class="hint"></p>
+      </div>
+      <div class="card" id="files-viewer-card" hidden>
+        <h3 id="files-viewer-name">File</h3>
+        <pre id="files-viewer" class="log"></pre>
+        <div class="buttons"><button id="files-back" class="btn ghost">Back to the list</button></div>
       </div>
     </div>
 
@@ -182,6 +189,9 @@
       <div class="card">
         <h3>Recovery</h3>
         <div class="buttons"><button id="reboot" class="btn ghost">Reboot</button></div>
+      </div>
+      <div class="card"><h3>Log</h3><pre id="logs" class="log"></pre>
+        <div class="buttons"><button id="logs-refresh" class="btn ghost">Refresh</button></div>
       </div>
     </div>
 
