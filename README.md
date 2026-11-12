@@ -33,6 +33,12 @@ espup install
 powershell scripts/build-firmware.ps1 -Flash -Port COM3
 ```
 
+**No toolchain?** Every tagged release ships a merged image built from that tag:
+`espflash write-bin --chip esp32s3 --flash-size 16mb 0x0 esp32-agent-vX.Y.Z.bin`. The
+`scripts/` helpers are PowerShell; on macOS or Linux the same steps are
+`. $HOME/export-esp.sh` and then `cargo build --release --target xtensa-esp32s3-espidf` in
+`firmware/` ([details](docs/flashing.md)).
+
 With no stored credentials the board raises its own access point. Join it from a phone and
 open `http://192.168.4.1/`, or send `provision <ssid> <password>` over USB. Credentials go
 to NVS, never into the image.

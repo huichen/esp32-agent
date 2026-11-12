@@ -34,6 +34,12 @@ espup install
 powershell scripts/build-firmware.ps1 -Flash -Port COM3
 ```
 
+**Pas de toolchain ?** Chaque release étiquetée contient une image fusionnée construite
+depuis ce tag : `espflash write-bin --chip esp32s3 --flash-size 16mb 0x0 esp32-agent-vX.Y.Z.bin`.
+Les scripts de `scripts/` sont en PowerShell ; sous macOS ou Linux, les mêmes étapes sont
+`. $HOME/export-esp.sh` puis `cargo build --release --target xtensa-esp32s3-espidf` dans
+`firmware/` ([détails](docs/flashing.md)).
+
 Sans identifiants enregistrés, la carte monte son propre point d’accès. Rejoignez-le depuis un
 téléphone et ouvrez `http://192.168.4.1/`, ou envoyez `provision <ssid> <password>` par USB. Les
 identifiants vont en NVS, jamais dans l’image.

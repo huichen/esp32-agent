@@ -32,6 +32,12 @@ espup install
 powershell scripts/build-firmware.ps1 -Flash -Port COM3
 ```
 
+**不想装工具链？** 每个 tag 的 release 都附带用该 tag 源码构建好的合并镜像：
+`espflash write-bin --chip esp32s3 --flash-size 16mb 0x0 esp32-agent-vX.Y.Z.bin`。
+`scripts/` 下的脚本是 PowerShell；macOS 或 Linux 上对应的是 `. $HOME/export-esp.sh`，
+然后在 `firmware/` 里 `cargo build --release --target xtensa-esp32s3-espidf`
+（[细节](docs/flashing.md)）。
+
 没有已保存的凭据时，板子会自己起一个接入点。用手机接入它并打开 `http://192.168.4.1/`，
 或者通过 USB 发送 `provision <ssid> <password>`。凭据写入 NVS，绝不进镜像。
 

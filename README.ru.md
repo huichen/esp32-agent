@@ -34,6 +34,12 @@ espup install
 powershell scripts/build-firmware.ps1 -Flash -Port COM3
 ```
 
+**Не хотите ставить тулчейн?** К каждому тегированному релизу прилагается собранный образ:
+`espflash write-bin --chip esp32s3 --flash-size 16mb 0x0 esp32-agent-vX.Y.Z.bin`.
+Скрипты в `scripts/` — PowerShell; в macOS и Linux те же шаги это `. $HOME/export-esp.sh`,
+затем `cargo build --release --target xtensa-esp32s3-espidf` в `firmware/`
+([подробности](docs/flashing.md)).
+
 Без сохранённых учётных данных плата поднимает собственную точку доступа. Подключитесь к ней с
 телефона и откройте `http://192.168.4.1/`, либо отправьте `provision <ssid> <password>` по USB.
 Учётные данные уходят в NVS и никогда в образ.

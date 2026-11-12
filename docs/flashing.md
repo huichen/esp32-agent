@@ -1,6 +1,53 @@
 # Flashing and first-time setup
 
+## 0. If you do not want to build at all
+
+Every tagged release carries a merged image built from that tag, so the whole section below
+is optional:
+
+```bash
+# espflash (Rust, any OS)
+espflash write-bin --chip esp32s3 --flash-size 16mb 0x0 esp32-agent-vX.Y.Z.bin
+
+# or the Python tooling
+esptool.py --chip esp32s3 write_flash 0x0 esp32-agent-vX.Y.Z.bin
+```
+
+Then jump to section 4: the board raises the `esp32-agent-setup` access point when it has no
+credentials, and provisioning is the same either way.
+
+The image is the project's own build (`firmware/partitions.csv`, application partition
+`factory`), produced by `.github/workflows/release.yml` on every tag. If you are on a
+different flash size, or want a chip other than the esp32s3, build it yourself — the rest of
+this page is that path.
+
 ## 1. Toolchain
+
+The `scripts/` helpers are PowerShell, so they are the Windows path. The toolchain itself is
+not Windows-specific; on macOS or Linux the three commands below are the same, and the only
+difference is the file `espup` writes for you to source:
+
+```bash
+cargo install espup espflash ldproxy
+espup install
+. $HOME/export-esp.sh        # macOS/Linux; on Windows it is export-esp.ps1
+```
+
+With that environment sourced, the build is plain cargo:
+
+```bash
+cd firmware
+cargo build --release --target xtensa-esp32s3-espidf
+espflash flash --chip esp32s3 --flash-size 16mb \
+  --partition-table partitions.csv --target-app-partition factory \
+  target/xtensa-esp32s3-espidf/release/esp32-agent
+```
+
+The PowerShell script does exactly that, plus the two workarounds documented in section 8
+(`LIBCLANG_PATH`, and the short output path esp-idf-sys insists on) — worth reading even
+when you are not on Windows, because the second one bites on any path with a long name.
+
+
 
 ```bash
 cargo install espup espflash ldproxy
