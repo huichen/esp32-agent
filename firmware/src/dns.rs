@@ -9,6 +9,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use esp_idf_svc::sys;
+
 pub struct MiniDns {
     stop: Arc<AtomicBool>,
 }
@@ -21,10 +23,24 @@ impl MiniDns {
         socket.set_read_timeout(Some(Duration::from_millis(500)))?;
         let stop = Arc::new(AtomicBool::new(false));
         let stop_thread = stop.clone();
-        std::thread::Builder::new()
-            .name("dns".into())
-            .stack_size(4 * 1024)
-            .spawn(move || {
+        // The DNS responder asks for a PSRAM stack unconditionally, and the reason is
+        // narrow: its whole body is `recvfrom`, an A-record reply and `send_to`, so it can
+        // never be running while the flash cache is off. That is IDF's condition for an
+        // external stack — with the cache off, PSRAM is not addressable, and a thread that
+        // commits to NVS with its stack there asserts in
+        // `esp_task_stack_is_sane_cache_disabled` and reboots the board (`nvs_writer.rs`
+        // is the fix for the thread that did exactly that). Every other thread here can
+        // reach flash somewhere (config, manifest, transcript, provisioning), which is why
+        // their stacks stay internal — the agent thread is the one exception, and it asks
+        // for internal RAM first and only falls back to PSRAM when 16 KB is not there.
+        //
+        // `esp_pthread_set_cfg` is read by `pthread_create` from the *calling* thread, so
+        // `runner::with_stack_caps` sets it around this one spawn and puts it back: the
+        // HTTP listener is created from here later, and a PSRAM stack for that one would
+        // be a crash waiting for the next config save.
+        let caps = sys::MALLOC_CAP_SPIRAM | sys::MALLOC_CAP_8BIT;
+        let spawned = crate::runner::with_stack_caps(caps, || {
+            std::thread::Builder::new().name("dns".into()).stack_size(4 * 1024).spawn(move || {
                 let mut buf = [0u8; 512];
                 while !stop_thread.load(Ordering::SeqCst) {
                     let Ok((n, peer)) = socket.recv_from(&mut buf) else { continue };
@@ -32,7 +48,11 @@ impl MiniDns {
                         let _ = socket.send_to(&reply, peer);
                     }
                 }
-            })?;
+            })
+        });
+        // A `JoinHandle` for a thread that never returns is a handle to nowhere: dropping
+        // it detaches, which is what this thread is.
+        drop(spawned?);
         Ok(Self { stop })
     }
 
