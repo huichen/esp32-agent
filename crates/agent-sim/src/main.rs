@@ -5,7 +5,7 @@
 //! ESP-IDF. This is how the project is developed and tested without a board on the
 //! desk, and how a contributor can try a driver before flashing anything.
 
-use esp32_agent_core::app::{drive_agent, make_handler, App, FwMeta, Shared};
+use esp32_agent_core::app::{drive_agent, make_routes, App, FwMeta, Shared};
 use esp32_agent_core::config::clamp_tick_ms;
 use esp32_agent_core::http::Server;
 use esp32_agent_core::logbuf::LogBuf;
@@ -82,7 +82,7 @@ fn main() {
     let app: Shared = Arc::new(Mutex::new(App::new(Box::new(board), Box::new(store), log.clone(), firmware)));
 
     let addr = format!("{}:{}", args.host, args.port);
-    let server = match Server::start(&addr, make_handler(app.clone()), log.clone()) {
+    let server = match Server::start(&addr, make_routes(app.clone()), log.clone()) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("could not listen on {addr}: {e}");
