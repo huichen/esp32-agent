@@ -3656,6 +3656,7 @@ impl App {
             "shell_sha256sum" => self.shell_hash(inner, true),
             "shell_md5sum" => self.shell_hash(inner, false),
             "shell_system_prompt" => self.shell_system_prompt(inner),
+            "shell_jq" => self.shell_jq(inner),
             "shell_wc" => self.shell_wc(inner),
             "shell_head" => self.shell_head(inner),
             "shell_cut" => self.shell_cut(inner),
@@ -4466,6 +4467,28 @@ impl App {
     }
 
     /// `du`: the workspace, file by file, biggest first.
+    /// `jq [query] <path>`, or a query over a pipe's input.
+    ///
+    /// `-r` prints strings without their quotes, which is what a `for` loop or a `grep`
+    /// downstream wants.
+    fn shell_jq(&mut self, args: &Value) -> std::result::Result<String, String> {
+        let raw = args.get("r").and_then(|v| v.as_bool()).unwrap_or(false);
+        let query = args
+            .get("positional")
+            .and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(|v| v.as_str()).map(|s| s.to_string()).collect::<Vec<_>>())
+            .unwrap_or_default();
+        // `jq .` reads the file; `jq .hits[]` with a pipe reads stdin. The query is what does
+        // not exist as a file, so it is decided by looking at the first word.
+        let (query_text, _) = match query.len() {
+            0 => (".".to_string(), ()),
+            1 => (query[0].clone(), ()),
+            _ => (query[0].clone(), ()),
+        };
+        let (_path, text) = self.shell_input(args, "jq")?;
+        crate::tools::shell::jq(&text, &query_text, raw)
+    }
+
     fn shell_du(&self) -> String {
         let json = self.workspace.to_json();
         let mut files: Vec<(String, usize)> = json["files"]
@@ -4922,6 +4945,11 @@ fn pipe_text(op: &str, answer: &Value) -> std::result::Result<String, String> {
         "date" => text("utc"),
         "uptime" => text("uptime"),
         "echo" => text("stdout"),
+        // A fetch hands its body down the pipe: that is the whole point of `curl api | jq`.
+        // `-f raw` keeps the document; otherwise the same HTML-to-text reduction `curl`
+        // applies to its own answer applies here, so `| grep` sees words rather than tags.
+        "curl" => text("body"),
+        "wget" => text("body"),
         other => return Err(format!("`{other}` has no line form to hand down a pipe")),
     })
 }
