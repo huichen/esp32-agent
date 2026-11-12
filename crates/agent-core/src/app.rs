@@ -544,8 +544,9 @@ impl App {
     fn extra_mcp_specs(&self) -> Vec<Value> {
         let mut out = Vec::new();
         for group in [
-            fs_tools::specs(),
-            net_tools::specs(),
+            // One `shell` instead of the twelve fs_*/net_* tools: same handlers, one
+            // schema, one name to remember.
+            json!([crate::tools::shell::openai_spec()]),
             board_tools::script_specs(),
             board_tools::agent_extra_specs(),
         ] {
@@ -612,8 +613,9 @@ impl App {
         // HTTP client), so they never appeared here — which is why the portal could show
         // 40 tools while the model had 49 and `script` looked missing.
         for group in [
-            fs_tools::specs(),
-            net_tools::specs(),
+            // One `shell` instead of the twelve fs_*/net_* tools: same handlers, one
+            // schema, one name to remember.
+            json!([crate::tools::shell::openai_spec()]),
             board_tools::script_specs(),
             board_tools::agent_extra_specs(),
         ] {
@@ -1032,6 +1034,12 @@ impl App {
         // only see a `ToolCtx`.
         if name == "script" {
             return self.run_script(args);
+        }
+        // `shell` is a router in front of the fs_*/net_* handlers, so it has to be reached
+        // from both entry points: the model's tool host and the MCP `tools/call`.
+        if name == "shell" {
+            let text = self.run_shell(args).map_err(McpError::invalid_params)?;
+            return Ok(serde_json::from_str(&text).unwrap_or_else(|_| json!({ "text": text })));
         }
         // `image_read` asks the model about an attachment, which means it needs the model
         // config and the transport — neither of which a `ToolCtx` carries.
@@ -2816,8 +2824,9 @@ impl ToolHost for App {
         // File, HTTP and script tools gate on nothing the hardware must provide, so they
         // are not MCP tools; the model still gets them, in the same sorted list.
         for group in [
-            fs_tools::specs(),
-            net_tools::specs(),
+            // One `shell` instead of the twelve fs_*/net_* tools: same handlers, one
+            // schema, one name to remember.
+            json!([crate::tools::shell::openai_spec()]),
             board_tools::script_specs(),
             board_tools::agent_extra_specs(),
         ] {
@@ -2850,28 +2859,26 @@ impl ToolHost for App {
     }
 
     fn call_tool(&mut self, name: &str, arguments: &Value) -> std::result::Result<String, String> {
+        self.fs_or_net_call(name, arguments)
+    }
+}
+
+impl App {
+    /// The `fs_*` and `net_*` handlers by name, shared by the tool host and `shell`.
+    fn fs_or_net_call(&mut self, name: &str, arguments: &Value) -> std::result::Result<String, String> {
         if name.starts_with("fs_") {
             let result = fs_tools::call(&mut self.workspace, name, arguments)
                 .ok_or_else(|| format!("`{name}` starts with fs_ but no such file tool exists"))?;
             let text = result?;
-            // Only the mutating tools dirty the stored blob.
             if matches!(name, "fs_write" | "fs_edit" | "fs_rm" | "fs_cp" | "fs_mv") {
                 self.persist_workspace();
             }
             return Ok(text);
         }
         if name.starts_with("net_") {
-            // A request to the board's own server cannot go out over a socket while this
-            // call is holding the thread that would answer it: the accept loop is inside
-            // this very tool. Answer it in process instead — the model gets the same JSON
-            // a socket would have carried, in microseconds, and the board cannot deadlock
-            // against itself.
             if let Some((method, path, body)) = self.self_target(arguments) {
                 return self.serve_self(&method, &path, body);
             }
-            // The turn's own client is elsewhere, so this one is free to be used from
-            // inside a tool call — which is what lets the agent reach the network
-            // mid-run instead of only between turns.
             let mut transport = self.tool_transport.take();
             let result = match transport.as_mut() {
                 Some(t) => net_tools::call(t.as_mut(), name, arguments),
@@ -2888,6 +2895,91 @@ impl ToolHost for App {
             Ok(v) => Ok(tool_text(&v)),
             Err(e) => Err(e.message),
         }
+    }
+}
+
+impl App {
+    /// `shell {op, …}`: pick the command, hand the rest of the arguments to the handler.
+    fn run_shell(&mut self, args: &Value) -> std::result::Result<String, String> {
+        let op = args.get("op").and_then(|v| v.as_str()).unwrap_or("").trim().to_ascii_lowercase();
+        let tool = crate::tools::shell::route(&op)
+            .ok_or_else(|| format!("`{op}` is not a shell command; try ls, cat, get, dns, zip…"))?;
+        // The command's own arguments are the same object minus `op`.
+        let mut inner = args.clone();
+        if let Some(map) = inner.as_object_mut() {
+            map.remove("op");
+        }
+        match tool {
+            "shell_zip" => self.shell_zip(&inner),
+            "shell_unzip" => self.shell_unzip(&inner),
+            other => self.fs_or_net_call(other, &inner),
+        }
+    }
+
+    /// Pack `{name: text}` entries into an archive and return it as base64.
+    ///
+    /// Base64 rather than a file in the workspace: the workspace holds text and totals 8 kB,
+    /// and a tool result is capped at 2 KB anyway. An external agent can decode the string
+    /// and write a real `.zip`; the board itself only needs to hand it over.
+    fn shell_zip(&mut self, args: &Value) -> std::result::Result<String, String> {
+        let name = args.get("name").and_then(|v| v.as_str()).unwrap_or("archive.zip");
+        let mut entries: Vec<(String, Vec<u8>)> = Vec::new();
+        if let Some(files) = args.get("files").and_then(|v| v.as_object()) {
+            for (path, text) in files {
+                entries.push((path.clone(), text.as_str().unwrap_or("").as_bytes().to_vec()));
+            }
+        }
+        // `paths` packs files that are already in the workspace.
+        if let Some(paths) = args.get("paths").and_then(|v| v.as_array()) {
+            for path in paths.iter().filter_map(|p| p.as_str()) {
+                match fs_tools::Workspace::read(&self.workspace, path) {
+                    Ok(text) => entries.push((path.trim_start_matches('/').to_string(), text.into_bytes())),
+                    Err(_) => return Err(format!("`{path}` is not in the workspace")),
+                }
+            }
+        }
+        if entries.is_empty() {
+            return Err("nothing to pack: give `files` {name: text} or `paths` [..]".into());
+        }
+        let archive = crate::zip::write(&entries)?;
+        if archive.len() > 1400 {
+            return Err(format!(
+                "the archive would be {} bytes; a tool result is limited to about 1.4 kB of base64",
+                archive.len()
+            ));
+        }
+        Ok(json!({
+            "name": name,
+            "bytes": archive.len(),
+            "entries": entries.iter().map(|(n, _)| n.clone()).collect::<Vec<_>>(),
+            "stored": true,
+            "archive_b64": crate::util::b64_encode(&archive),
+        })
+        .to_string())
+    }
+
+    fn shell_unzip(&mut self, args: &Value) -> std::result::Result<String, String> {
+        let encoded = args.get("archive_b64").and_then(|v| v.as_str()).unwrap_or("");
+        if encoded.is_empty() {
+            return Err("`archive_b64` is required".into());
+        }
+        let mut bytes = Vec::new();
+        crate::util::b64_decode(encoded, &mut bytes).map_err(|e| format!("base64: {}", e.message))?;
+        let entries = crate::zip::read(&bytes)?;
+        let mut out = Vec::new();
+        let mut budget = 1800usize;
+        for (name, data) in entries {
+            let text = String::from_utf8_lossy(&data).to_string();
+            let clipped = text.chars().take(budget.min(600)).collect::<String>();
+            budget = budget.saturating_sub(clipped.len());
+            out.push(json!({
+                "name": name,
+                "bytes": data.len(),
+                "text": clipped,
+                "binary": !data.iter().all(|b| *b == b'\t' || *b == b'\n' || *b == b'\r' || (32..127).contains(b)),
+            }));
+        }
+        Ok(json!({ "entries": out, "count": out.len() }).to_string())
     }
 }
 
@@ -3852,7 +3944,7 @@ mod tests {
             .iter()
             .map(|t| t["function"]["name"].as_str().unwrap_or("").to_string())
             .collect();
-        for kept in ["fs_read", "fs_write", "net_get", "script"] {
+        for kept in ["shell", "script"] {
             assert!(names.iter().any(|n| n == kept), "{kept} must survive the minimal profile");
         }
 
@@ -4465,8 +4557,7 @@ mod tests {
         assert!(tools.iter().all(|t| t["type"] == "function" && t["function"]["parameters"].is_object()));
         assert!(names.contains(&"board_status"), "got {names:?}");
         assert!(names.contains(&"oled_text"));
-        assert!(names.contains(&"fs_read"), "the file tools are missing: {names:?}");
-        assert!(names.contains(&"net_get"), "the http tools are missing: {names:?}");
+        assert!(names.contains(&"shell"), "the file and network commands are missing: {names:?}");
         // A tool whose hardware is absent is not offered, exactly as in tools/list.
         assert!(!names.contains(&"mpu6050_read"));
     }
@@ -4818,7 +4909,7 @@ mod tests {
             .filter_map(|t| t["function"]["name"].as_str())
             .collect();
         assert!(names.contains(&"board_status"), "got {names:?}");
-        assert!(names.contains(&"fs_read"), "got {names:?}");
+        assert!(names.contains(&"shell"), "got {names:?}");
         assert_eq!(body1["model"], "stub");
 
         // The second request carries the board's answer back as a `tool` message.
@@ -4928,41 +5019,43 @@ mod tests {
     fn the_file_and_network_tools_are_in_the_mcp_list_and_callable() {
         let mut app = test_app();
         let names = tool_names(&mut app);
-        for needle in
-            ["fs_ls", "fs_read", "fs_write", "fs_rm", "fs_cp", "fs_mv", "fs_grep", "net_get", "net_post"]
-        {
+        for needle in ["shell", "script", "image_read"] {
             assert!(names.contains(&needle.to_string()), "{needle} is missing from tools/list: {names:?}");
         }
 
         // The schema is the same object the model gets, in the MCP field name.
         let list = app.handle_rpc(r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#, None).unwrap();
-        let fs_read = list["result"]["tools"]
+        let shell = list["result"]["tools"]
             .as_array()
             .unwrap()
             .iter()
-            .find(|t| t["name"] == "fs_read")
-            .expect("fs_read in the list");
-        assert!(fs_read["inputSchema"]["properties"]["path"].is_object(), "{fs_read}");
+            .find(|t| t["name"] == "shell")
+            .expect("shell in the list");
+        assert!(shell["inputSchema"]["properties"]["op"].is_object(), "{shell}");
 
-        // And a call goes through the same code the agent uses.
+        // And the commands go through the same code the agent uses, over MCP.
         let write = app
             .handle_rpc(
-                r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"fs_write","arguments":{"path":"/notes/a.txt","text":"from mcp"}}}"#,
+                r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"shell","arguments":{"op":"write","path":"/notes/a.txt","text":"from mcp"}}}"#,
                 None,
             )
             .unwrap();
         assert_eq!(write["result"]["isError"], json!(false), "{write}");
         let read = app
             .handle_rpc(
-                r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"fs_read","arguments":{"path":"/notes/a.txt"}}}"#,
+                r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"shell","arguments":{"op":"cat","path":"/notes/a.txt"}}}"#,
                 None,
             )
             .unwrap();
         assert_eq!(read["result"]["structuredContent"]["text"], json!("from mcp"), "{read}");
 
-        // `mcp.disabled_tools` hides them like any other tool.
-        app.cfg.mcp.disabled_tools = vec!["fs_rm".into()];
-        assert!(!tool_names(&mut app).contains(&"fs_rm".to_string()), "disabled_tools did not hide fs_rm");
+        // `mcp.disabled_tools` hides a tool like any other; the commands inside `shell`
+        // are not separate tools, which is the point of the consolidation.
+        app.cfg.mcp.disabled_tools = vec!["image_read".into()];
+        assert!(
+            !tool_names(&mut app).contains(&"image_read".to_string()),
+            "disabled_tools did not hide image_read"
+        );
     }
 
     #[test]
@@ -5252,7 +5345,7 @@ mod tests {
         sorted.sort_unstable();
         assert_eq!(names, sorted, "the tool list is not alphabetical: {names:?}");
 
-        for needle in ["board_status", "manifest_apply", "fs_read", "net_get", "script"] {
+        for needle in ["board_status", "manifest_apply", "shell", "script", "image_read"] {
             assert!(names.contains(&needle), "{needle} is missing: {names:?}");
         }
         // A manifest tool sorts among the rest — `aaa_manifest` is first, not last.
@@ -5300,7 +5393,7 @@ mod tests {
         let tools = body["tools"].as_array().expect("tools");
         let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().expect("a name")).collect();
 
-        for needle in ["script", "fs_read", "fs_write", "net_get", "board_status"] {
+        for needle in ["script", "shell", "image_read", "board_status"] {
             assert!(names.contains(&needle), "{needle} is missing from the portal: {names:?}");
         }
         let mut sorted = names.clone();
@@ -5424,7 +5517,7 @@ mod tests {
             assert!(!names.contains(&absent.to_string()), "{absent} is back in the tool list: {names:?}");
         }
         // The file tools that do reach them are still there.
-        for present in ["fs_ls", "fs_read", "fs_write"] {
+        for present in ["shell"] {
             assert!(names.contains(&present.to_string()), "{present} is missing: {names:?}");
         }
 
