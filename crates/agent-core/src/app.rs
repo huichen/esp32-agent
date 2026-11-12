@@ -1265,8 +1265,12 @@ impl App {
     /// microseconds. `None` means nothing was queued.
     pub fn agent_begin(&mut self) -> Option<AgentStep> {
         let max_steps = self.llm.max_steps;
+        let (context_tokens, max_output_tokens) = (self.llm.context_tokens, self.llm.max_output_tokens);
         self.turn_source = self.pending_source();
-        self.with_agent(move |agent, host| agent.begin(host, now_ms, max_steps))
+        self.with_agent(move |agent, host| {
+            agent.set_budget(context_tokens, max_output_tokens);
+            agent.begin(host, now_ms, max_steps)
+        })
     }
 
     /// Phase 2: fold one model reply back in (journal, tool calls, transcript) and say
@@ -3502,6 +3506,8 @@ fn llm_json(cfg: &LlmConfig, with_key: bool) -> Value {
         "reasoning": cfg.reasoning,
         "vision": cfg.vision,
         "protocol": cfg.protocol,
+        "context_tokens": cfg.context_tokens,
+        "max_output_tokens": cfg.max_output_tokens,
     });
     if with_key {
         v["api_key"] = json!(cfg.api_key);
@@ -3549,6 +3555,15 @@ fn llm_apply_json(cfg: &mut LlmConfig, v: &Value) {
     }
     if let Some(p) = v.get("protocol").and_then(|x| x.as_str()) {
         cfg.protocol = crate::llm::Protocol::parse(p).as_str().to_string();
+    }
+    // The two budgets: clamped rather than rejected, because a page that sends 0 or a
+    // negative number means "I did not fill this in", and a 400 there would lose the
+    // rest of the patch.
+    if let Some(n) = v.get("context_tokens").and_then(|x| x.as_u64()) {
+        cfg.context_tokens = n.clamp(512, 2_000_000) as u32;
+    }
+    if let Some(n) = v.get("max_output_tokens").and_then(|x| x.as_u64()) {
+        cfg.max_output_tokens = n.clamp(64, 128_000) as u32;
     }
 }
 
