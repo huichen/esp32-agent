@@ -12,9 +12,7 @@ herramientas y responde con ellas; se puede declarar un sensor nuevo en JSON con
 marcha.
 
 > El bucle de agente sigue a [FutureOS](https://github.com/futuregene/future-os): transcripción,
-> diario de herramientas, eventos de flujo, adaptadores de protocolo, índice de memoria. Donde
-> el firmware se aparta (kilobytes en lugar de gigabytes de RAM, sin resúmenes escritos por el
-> modelo) el código dice por qué.
+> diario de herramientas, eventos de flujo, adaptadores de protocolo, índice de memoria.
 
 | Qué | En detalle |
 |---|---|
@@ -53,6 +51,53 @@ arranque; los navegadores avisan, así que conviene comparar la huella. El puert
 abierto, así que un certificado malo cuesta una URL y no la placa. `GET /agent.json` es toda la
 interfaz como datos: 40 rutas con método, cuerpo, retorno y autenticación, más cada ajuste
 escribible con su tipo y su valor por defecto.
+
+## Dale un modelo
+
+El modelo es un ajuste, no una compilación:
+
+```bash
+curl -sS -X POST http://<board>/api/agent/config -H 'Content-Type: application/json' \
+  -d '{"base_url":"https://your-provider/v1/chat/completions","model":"…","api_key":"…"}'
+curl -sS -X POST http://<board>/api/agent/message -H 'Content-Type: application/json' \
+  -d '{"text":"escribe HELLO en el OLED y pon el LED en azul"}'
+```
+
+Tres protocolos (`chat`, `responses`, `anthropic`), un nivel de razonamiento, una ventana de
+contexto y un tope de salida, en el panel Agent de la consola o con el mismo `POST`. Sin clave,
+apunta `base_url` a `http://127.0.0.1/selftest/chat/completions` y el bucle funciona igual.
+[Model](docs/model.md) tiene la lista de campos y los tres protocolos en paralelo.
+
+## Uso
+
+| Desde | Qué obtienes |
+|---|---|
+| `http://<board>/` en el móvil | hablar con el modelo, ver dispositivos y herramientas, cambiarlo todo |
+| `POST /mcp` desde un cliente MCP | las mismas herramientas que usa el agente de la placa |
+| `POST /api/script`, `POST /api/sched` | ejecutar un script ahora, o programarlo |
+| `GET /agent.json` | toda la interfaz como datos: rutas, ajustes, límites |
+
+```bash
+curl -sS -X POST http://<board>/mcp -H 'Content-Type: application/json' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/call",
+       "params":{"name":"shell","arguments":{"command":"ls /"}}}'
+```
+
+El agente de la placa también puede añadirse hardware (`manifest_apply`), memoria
+(`write /memory/…`) y shell: las mismas llamadas, el mismo PIN.
+
+## Notas de seguridad
+
+- **Las credenciales se quedan en la placa.** El WiFi va a NVS por `provision`, nunca a la
+  imagen; `api_key` es de solo escritura y se relee como `__set__`.
+- **Pon un PIN antes de que la placa salga de tu mesa.** `auth.portal_pin` protege todas las
+  escrituras y las lecturas que exponen el transcript, el prompt, la configuración y los registros.
+- **Compara el certificado.** El de la placa es autofirmado; su huella está en `GET /api/tls`.
+  El puerto 80 sigue abierto a propósito: un certificado malo cuesta una URL, no la placa.
+- **`shell`, `script` y las herramientas del manifiesto mueven pines.** Ese es el objetivo de la
+  placa; el PIN separa al agente haciendo su trabajo de un transeúnte haciéndolo.
+
+[Security](docs/security.md) dice qué no se defiende a propósito.
 
 ## Estructura del repositorio
 

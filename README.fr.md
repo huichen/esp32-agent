@@ -11,9 +11,7 @@ périphérique qui répond devient des outils MCP. L’agent de la carte voit ce
 répond avec eux ; un nouveau capteur peut être déclaré en JSON pendant que la carte tourne.
 
 > La boucle d’agent suit [FutureOS](https://github.com/futuregene/future-os) : transcription,
-> journal des outils, événements de flux, adaptateurs de protocole, index de mémoire. Là où le
-> firmware diffère (des kilooctets de RAM au lieu de gigaoctets, pas de résumés écrits par le
-> modèle), le code dit pourquoi.
+> journal des outils, événements de flux, adaptateurs de protocole, index de mémoire.
 
 | Quoi | En détail |
 |---|---|
@@ -52,6 +50,54 @@ navigateurs avertissent, comparez donc l’empreinte. Le port 80 reste ouvert, d
 certificat coûte une URL plutôt que la carte. `GET /agent.json` est toute l’interface sous forme
 de données : 40 routes avec méthode, corps, retour et authentification, plus chaque réglage
 modifiable avec son type et sa valeur par défaut.
+
+## Donnez-lui un modèle
+
+Le modèle est un réglage, pas une compilation :
+
+```bash
+curl -sS -X POST http://<board>/api/agent/config -H 'Content-Type: application/json' \
+  -d '{"base_url":"https://your-provider/v1/chat/completions","model":"…","api_key":"…"}'
+curl -sS -X POST http://<board>/api/agent/message -H 'Content-Type: application/json' \
+  -d '{"text":"écris HELLO sur l’OLED et mets la LED en bleu"}'
+```
+
+Trois protocoles (`chat`, `responses`, `anthropic`), un niveau de réflexion, une fenêtre de
+contexte et un plafond de sortie, dans le panneau Agent de la console ou par le même `POST`.
+Sans clé, pointez `base_url` sur `http://127.0.0.1/selftest/chat/completions` : la boucle tourne
+quand même. [Model](docs/model.md) donne la liste des champs et les trois protocoles côte à côte.
+
+## Utilisation
+
+| Depuis | Ce que vous obtenez |
+|---|---|
+| `http://<board>/` sur un téléphone | discuter avec le modèle, voir les appareils et les outils, tout modifier |
+| `POST /mcp` depuis un client MCP | les mêmes outils que l’agent de la carte |
+| `POST /api/script`, `POST /api/sched` | exécuter un script maintenant, ou le faire tourner sur un minuteur |
+| `GET /agent.json` | toute l’interface sous forme de données : routes, réglages, limites |
+
+```bash
+curl -sS -X POST http://<board>/mcp -H 'Content-Type: application/json' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/call",
+       "params":{"name":"shell","arguments":{"command":"ls /"}}}'
+```
+
+L’agent de la carte peut aussi s’ajouter du matériel (`manifest_apply`), une mémoire
+(`write /memory/…`) et un accès shell : mêmes appels, même PIN.
+
+## Notes de sécurité
+
+- **Les identifiants restent sur la carte.** Le WiFi passe en NVS par `provision`, jamais dans
+  l’image ; `api_key` est en écriture seule et se relit `__set__`.
+- **Définissez un PIN avant que la carte ne quitte votre bureau.** `auth.portal_pin` protège
+  toutes les écritures et les lectures qui exposent le transcript, le prompt, la configuration
+  et les journaux.
+- **Comparez le certificat.** Celui de la carte est auto-signé ; son empreinte est sur
+  `GET /api/tls`. Le port 80 reste ouvert exprès : un mauvais certificat coûte une URL, pas la carte.
+- **`shell`, `script` et les outils du manifeste bougent des broches.** C’est le but de la carte ;
+  le PIN sépare l’agent qui fait son travail d’un passant qui le ferait.
+
+[Security](docs/security.md) dit ce qui n’est délibérément pas défendu.
 
 ## Organisation du dépôt
 
