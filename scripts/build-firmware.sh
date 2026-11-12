@@ -12,7 +12,13 @@
 #
 # Flags mirror the .ps1 parameters: --mcpu, --target, --flash, --port, --debug
 # (the .ps1 defaults to -Release; -Release:$false is --debug here), --target-dir.
-set -u
+set -
+
+# Which commit this image came from, and when, so "did the flash take" is a string
+# comparison in /api/status rather than a guess.
+ESP32_AGENT_COMMIT="$(git -C "$repo" rev-parse --short HEAD 2>/dev/null || echo unknown)"
+ESP32_AGENT_BUILT_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+export ESP32_AGENT_COMMIT ESP32_AGENT_BUILT_ATu
 
 mcpu=esp32s3
 target=xtensa-esp32s3-espidf
