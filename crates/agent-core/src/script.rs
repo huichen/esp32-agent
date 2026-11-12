@@ -1359,8 +1359,6 @@ mod tests {
         assert!(out.steps > 200_000, "{}", out.steps);
     }
 
-    use super::*;
-
     struct Stub {
         calls: Vec<(String, Value)>,
         reply: Value,
