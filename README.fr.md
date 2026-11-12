@@ -21,7 +21,7 @@ répond avec eux ; un nouveau capteur peut être déclaré en JSON pendant que
 | Un seul jeu d’outils, deux appelants | Le point de terminaison MCP et l’agent embarqué voient les mêmes outils, à partir d’une seule description. [API HTTP et MCP](docs/http-api.md) |
 | Une console en HTTPS | Discutez avec le modèle et configurez les périphériques, outils, planification, journaux, WiFi et modèle depuis un téléphone ; la carte émet son propre certificat. [Console web](docs/web-console.md) |
 | Il agit sans surveillance | Prompts à heure fixe et règles de capteur qui en déclenchent une invite quand un relevé franchit un seuil. [Planification](docs/scheduling.md) |
-| Un shell et un langage de script | `shell` avec 55 commandes nommées comme dans NuttX, et un interpréteur pour boucler sur des appels d’outils. [Shell](docs/shell.md) · [Script](docs/scripting.md) |
+| Un shell et un langage de script | `shell` avec 57 commandes nommées comme dans NuttX, et un interpréteur pour boucler sur des appels d’outils. [Shell](docs/shell.md) · [Script](docs/scripting.md) |
 | Il retient ce qu'on lui a dit | Consignes permanentes, `/AGENTS.md`, un index `/MEMORY.md` et des compétences, assemblés dans le prompt à chaque tour. [Ce que le modèle voit à chaque tour](docs/context.md) |
 | Il arrive avec des compétences | Trois procédures embarquées — écrire une compétence, relever le câblage, récupérer une carte qui semble cassée — installées dans `/skills` au premier démarrage ; une modification reste à vous. [Skills](docs/agent-skills.md) |
 | La carte est le serveur | HTTPS servi par la carte, un certificat qu’elle génère, un seul PIN pour trois appelants. [Authentification](docs/security.md) |
@@ -87,7 +87,7 @@ pour chaque carte qu'il peut joindre. Sans aucune clé, `base_url` sur
 
 | Partie | État |
 |---|---|
-| `agent-core` | 427 tests unitaires et 14 tests d’intégration passent ; `scripts/smoke.ps1` passe de bout en bout |
+| `agent-core` | 677 tests unitaires et 14 tests d’intégration passent ; `scripts/smoke.ps1` passe de bout en bout |
 | Simulateur | console, MCP et la boucle d’agent fonctionnent de bout en bout |
 | Firmware | flashé sur un ESP32-S3-DevKitC-1 N16R8 (IDF v5.5.2) : 42 outils, OLED 128×32, micro et ampli I²S, WS2812, console TLS, tours de modèle en HTTPS |
 | Non implémenté | OTA, carte SD, DHT11/22, caméra. Voir `ROADMAP.md` |
