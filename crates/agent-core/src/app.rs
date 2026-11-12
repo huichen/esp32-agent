@@ -4945,6 +4945,11 @@ fn pipe_text(op: &str, answer: &Value) -> std::result::Result<String, String> {
         "date" => text("utc"),
         "uptime" => text("uptime"),
         "echo" => text("stdout"),
+        // A fetch hands its body down the pipe: that is the whole point of `curl api | jq`.
+        // `-f raw` keeps the document; otherwise the same HTML-to-text reduction `curl`
+        // applies to its own answer applies here, so `| grep` sees words rather than tags.
+        "curl" => text("body"),
+        "wget" => text("body"),
         other => return Err(format!("`{other}` has no line form to hand down a pipe")),
     })
 }
