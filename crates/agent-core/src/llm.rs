@@ -85,6 +85,15 @@ pub struct LlmConfig {
     pub temperature: f32,
     /// Default 45. Used by the transport, not by `chat`.
     pub timeout_s: u32,
+    /// How hard the model should think: `off`, `low`, `medium`, `high`, or empty for
+    /// "whatever the provider does by default". Sent as `reasoning_effort`, and only when
+    /// set — a provider that does not know the field rejects the whole request, and the
+    /// board cannot tell which ones know it.
+    pub reasoning: String,
+    /// Whether image attachments may be sent as content parts. The board cannot know
+    /// that from the model name, so it is a setting: on for a multimodal model, off for
+    /// a text-only one, which would reject the request outright.
+    pub vision: bool,
 }
 
 impl Default for LlmConfig {
@@ -96,6 +105,8 @@ impl Default for LlmConfig {
             max_steps: 0,
             temperature: 1.0,
             timeout_s: 45,
+            reasoning: String::new(),
+            vision: true,
         }
     }
 }
@@ -152,14 +163,20 @@ pub fn chat(
     // A NaN/inf temperature serialises to `null`, which some servers reject.
     let temperature =
         if cfg.temperature.is_finite() { cfg.temperature } else { LlmConfig::default().temperature };
-    let body = json!({
+    let mut body = json!({
         "model": cfg.model.trim(),
         "messages": messages,
         "tools": tools,
         "tool_choice": "auto",
         "temperature": temperature,
-    })
-    .to_string();
+    });
+    // Only when asked: `reasoning_effort` is an OpenAI extension, and an endpoint that
+    // does not define it answers 400 rather than ignoring it.
+    let reasoning = cfg.reasoning.trim();
+    if !reasoning.is_empty() {
+        body["reasoning_effort"] = json!(reasoning);
+    }
+    let body = body.to_string();
 
     let auth = format!("Bearer {}", cfg.api_key.trim());
     let mut headers: Vec<(&str, &str)> = vec![("Content-Type", "application/json")];

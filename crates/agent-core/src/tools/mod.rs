@@ -37,6 +37,24 @@ fn now_ms(ctx: &mut ToolCtx) -> u64 {
 pub fn board_tools() -> Vec<ToolDef> {
     vec![
         ToolDef::new(
+            "chip_temp",
+            "Read the chip's own temperature sensor, in degrees Celsius. Different from a board thermometer: this is the die, which runs warmer than the room",
+        )
+        .title("Chip temperature")
+        .category("board")
+        .bind(|ctx, _args| {
+            let celsius = ctx.hw.chip_temp_c();
+            Ok(json!({
+                "celsius": celsius,
+                "available": celsius.is_some(),
+                "note": if celsius.is_some() {
+                    "the die temperature, not the ambient one"
+                } else {
+                    "this part has no on-die sensor, or the driver did not start"
+                },
+            }))
+        }),
+        ToolDef::new(
             "board_status",
             "Board status: chip, firmware, uptime, temperature, heap, WiFi, detected device count, tool counters",
         )

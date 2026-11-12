@@ -43,6 +43,18 @@ const MODEL: &[Field] = &[
     f("max_steps", "integer", "0", "model calls per run; 0 means no limit, capped at 200"),
     f("temperature", "number", "1.0", "0.0 to 2.0"),
     f("timeout_s", "integer", "45", "5 to 180 seconds per model call"),
+    f(
+        "reasoning",
+        "string",
+        "\"\"",
+        "off | low | medium | high; empty sends nothing and leaves it to the provider (sent as `reasoning_effort`)",
+    ),
+    f(
+        "vision",
+        "boolean",
+        "true",
+        "send attached images as content parts; false names them in the text instead, for a text-only model",
+    ),
 ];
 
 const BOARD: &[Field] = &[
