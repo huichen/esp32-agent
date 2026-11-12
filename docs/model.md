@@ -44,8 +44,14 @@ The error names the layer, because the three failures look identical from a dist
 - `sending the request over TLS failed` — usually the clock (SNTP has not synced, so a
   certificate looks not-yet-valid) or internal RAM for the handshake. The message carries
   `time.synced`, the clock and the two heap numbers for that reason.
-- `reading the reply over TLS failed … times out after 45 s` — the model took longer than
-  `timeout_s`; raise it before raising the history budget.
+- `reading the reply over TLS failed … (code -0x7200: MBEDTLS_ERR_SSL_INVALID_RECORD)` —
+  the peer sent a TLS record larger than `CONFIG_MBEDTLS_SSL_IN_CONTENT_LEN`. This board had
+  4096 there (to save internal RAM), so every model reply longer than one 4 KB record failed
+  while short ones passed; the buffer is 16384 now. mbedTLS only accepts a record up to that
+  size and does not ask the other end to split — the length is the peer's choice.
+- `reading the reply over TLS failed … (code -0x6800: MBEDTLS_ERR_SSL_TIMEOUT)` — a real
+  timeout: nothing arrived within `timeout_s`. The message says how long the request had
+  been open, which is the difference between that and a peer that reset the connection.
 
 ## Without a provider
 
