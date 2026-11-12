@@ -20,7 +20,7 @@ sensor can be declared in JSON while the board runs.
 | It finds its own hardware | I2C, 1-Wire and declared pins are probed at boot; only what answers gets tools. [Capabilities](docs/capabilities.md) |
 | One tool set, two callers | The MCP endpoint and the on-board agent see the same tools, from one description. [HTTP and MCP API](docs/http-api.md) |
 | A console over HTTPS | Chat and configure devices, tools, schedule, logs, WiFi and the model from a phone; the board issues its own certificate. [Web console](#web-console) |
-| It acts unattended | Timed prompts and sensor rules that fire one when a threshold crosses. [Scheduled work](#scheduled-work) |
+| It acts unattended | Timed prompts and sensor rules that fire one when a reading crosses a threshold. [Scheduled work](#scheduled-work) |
 | A shell and a script language | `shell` with 26 NuttX-named commands, and an interpreter for loops over tool calls. [Shell](#shell) · [Script](#script) |
 | Standing orders | 2 KB in the system prompt for what this board is for, writable from the console, `shell` and HTTP. [Standing orders](#standing-orders) |
 | No cloud in the path | HTTPS from the board, a certificate it generates, one PIN for three callers. [Authentication](#authentication) |
