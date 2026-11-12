@@ -175,8 +175,19 @@ impl ChatTransport for EspHttpTransport {
 /// Both arms expose the same three operations, so [`read_response`] 鈥?the part with
 /// the framing rules in it 鈥?is written once and cannot drift between the two schemes.
 enum Conn {
-    Plain(TcpStream),
-    Tls(Box<EspTls<InternalSocket>>),
+    Plain { stream: TcpStream, opened: Instant },
+    Tls { tls: Box<EspTls<InternalSocket>>, opened: Instant },
+}
+
+impl Conn {
+    /// How long this connection has been open. A read failure quotes it because the
+    /// number is the difference between "the peer reset us" and "we waited out the
+    /// socket timeout", and the error text used to claim the second unconditionally.
+    fn opened_for(&self) -> Duration {
+        match self {
+            Conn::Plain { opened, .. } | Conn::Tls { opened, .. } => opened.elapsed(),
+        }
+    }
 }
 
 impl Conn {
@@ -189,7 +200,7 @@ impl Conn {
         // One request per connection and no interactive traffic: Nagle would only
         // add latency to the header/body split.
         let _ = stream.set_nodelay(true);
-        Ok(Conn::Plain(stream))
+        Ok(Conn::Plain { stream, opened: Instant::now() })
     }
 
     /// A TLS session verified against the certificate bundle in the image.
@@ -225,16 +236,16 @@ impl Conn {
                 } / 1024
             )
         })?;
-        Ok(Conn::Tls(Box::new(tls)))
+        Ok(Conn::Tls { tls: Box::new(tls), opened: Instant::now() })
     }
 
     fn write_all(&mut self, data: &[u8]) -> Result<(), String> {
         match self {
-            Conn::Plain(stream) => stream
+            Conn::Plain { stream, .. } => stream
                 .write_all(data)
                 .and_then(|()| stream.flush())
                 .map_err(|e| format!("sending the request failed: {e}")),
-            Conn::Tls(tls) => tls.write_all(data).map_err(|e| {
+            Conn::Tls { tls, .. } => tls.write_all(data).map_err(|e| {
                 // A bare ESP_FAIL here says nothing: the request is routinely 20-30 kB
                 // (51 tool definitions plus the tool results), and the board has a few kB
                 // of internal RAM to spare. Report the size and the heap at the moment of
@@ -260,20 +271,48 @@ impl Conn {
     /// contract the plain socket has.
     fn read(&mut self, buf: &mut [u8], timeout: Duration) -> Result<usize, String> {
         match self {
-            Conn::Plain(stream) => loop {
+            Conn::Plain { stream, .. } => loop {
                 match stream.read(buf) {
                     Ok(n) => return Ok(n),
                     Err(e) if e.kind() == ErrorKind::Interrupted => continue,
                     Err(e) => return Err(read_error(&e, timeout)),
                 }
             },
-            Conn::Tls(tls) => tls.read(buf).map_err(|e| {
+            Conn::Tls { tls, .. } => tls.read(buf).map_err(|e| {
+                let opened = self.opened_for();
                 format!(
-                    "reading the reply over TLS failed: {e} (the session times out after {} s)",
-                    timeout.as_secs()
+                    "reading the reply over TLS failed: {e} (code {code}: {meaning}; the request \
+                     had been open for {:.1} s, socket timeout {} s)",
+                    opened.as_secs_f32(),
+                    timeout.as_secs(),
+                    code = e.code(),
+                    meaning = tls_code_meaning(e.code()),
                 )
             }),
         }
+    }
+}
+
+/// What a TLS-layer return code means.
+///
+/// mbedTLS reports failures as negative values that are **not** `esp_err_t` codes, so
+/// `EspError`'s `Display` — which is `esp_err_to_name` — answers a flat `ERROR` for every
+/// one of them. That is how a reset, a record too large for the inbound buffer and a real
+/// timeout all arrived on this board as the same sentence with "the session times out
+/// after 45 s" appended, a cause that was guessed rather than read.
+fn tls_code_meaning(code: i32) -> &'static str {
+    match code {
+        -0x6800 => "MBEDTLS_ERR_SSL_TIMEOUT — nothing arrived within the socket timeout",
+        -0x7280 => {
+            "MBEDTLS_ERR_SSL_BUFFER_TOO_SMALL — a TLS record larger than CONFIG_MBEDTLS_SSL_IN_CONTENT_LEN"
+        }
+        -0x7880 => "MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY — the peer closed the session",
+        -0x7100 => "MBEDTLS_ERR_SSL_BAD_INPUT_DATA — the stream no longer parses",
+        -0x0044 => "MBEDTLS_ERR_NET_CONN_RESET — the peer reset the connection",
+        -0x004c => "MBEDTLS_ERR_NET_RECV_FAILED — the socket read failed",
+        -0x0050 => "MBEDTLS_ERR_NET_SEND_FAILED — the socket write failed",
+        -0x0058 => "MBEDTLS_ERR_NET_CONN_RESET/closed — the socket is gone",
+        _ => "not a code this firmware knows; the number is the fact to go on",
     }
 }
 
