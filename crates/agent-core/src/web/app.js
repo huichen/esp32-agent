@@ -15,7 +15,13 @@ const $$ = (sel, root = document) => Array.from(root.querySelectorAll(sel));
 const S = {
   token: localStorage.getItem("esp32-agent.token") || "",
   attach: null, // {name, mime, data_b64, kb} — one per message, downscaled here
-  lastSeq: 0,
+  // Two counters that are not the same number space: the transcript is indexed by
+  // message, the event journal by event. Feeding the transcript's index to
+  // `?after=` skipped every event of the run — which is exactly what "no streaming"
+  // looked like.
+  lastMsg: 0,
+  lastEvent: 0,
+  rendered: 0,
   stream: null,
   busy: false,
   panel: "status",
@@ -317,7 +323,8 @@ async function loadHistory() {
       return;
     }
     for (const turn of groupTurns(msgs)) renderTurn(turn);
-    for (const m of msgs) S.lastSeq = Math.max(S.lastSeq, m.seq || 0);
+    S.rendered = msgs.length;
+    for (const m of msgs) S.lastMsg = Math.max(S.lastMsg, m.seq || 0);
     scrollToEnd();
   } catch (e) {
     if (String(e.message).includes("PIN")) return;
@@ -442,7 +449,7 @@ function ensureLiveBubble() {
 }
 
 function handleEvent(name, data) {
-  S.lastSeq = Math.max(S.lastSeq, data.seq || 0);
+  S.lastEvent = Math.max(S.lastEvent, data.seq || 0);
   switch (name) {
     case "message_start":
       S.busy = true;
@@ -526,7 +533,7 @@ const EVENT_KINDS = [
 
 function connectStream() {
   if (S.stream) return;
-  const es = new EventSource("/api/agent/stream?after=" + S.lastSeq);
+  const es = new EventSource("/api/agent/stream?after=" + S.lastEvent);
   S.stream = es;
   for (const kind of EVENT_KINDS) {
     es.addEventListener(kind, (ev) => {
@@ -805,7 +812,22 @@ function init() {
 
   // One image per message. It is downscaled in the browser, because what crosses the LAN
   // has to fit the request the board can send and the heap it can spare.
-  $("#attach").onclick = () => $("#attach-input").click();
+  // A run can start without this page — a schedule, a goal, another client — and the event
+// stream only follows the run this page asked for. So look every 20 s, and only redraw
+// when the transcript actually changed: a phone should not spend its battery on a page
+// that has nothing new to say.
+setInterval(async () => {
+  if (S.busy || S.stream) return;
+  try {
+    const data = await api("/api/agent/history");
+    const count = ((data && data.messages) || []).length;
+    if (count !== S.rendered) loadHistory();
+  } catch {
+    /* offline or locked: the next tick tries again */
+  }
+}, 20000);
+
+$("#attach").onclick = () => $("#attach-input").click();
   $("#attach-input").onchange = async (ev) => {
     const file = ev.target.files && ev.target.files[0];
     ev.target.value = "";
