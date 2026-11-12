@@ -84,7 +84,7 @@ works for every board it can reach. Without a key at all, `base_url` set to
 
 | Part | State |
 |---|---|
-| `agent-core` | 734 unit tests and 4 integration tests pass; `scripts/smoke.ps1` passes end to end |
+| `agent-core` | 734 unit tests and 5 integration tests pass; `scripts/smoke.ps1` passes end to end |
 | Simulator | console, MCP and the agent loop run end to end |
 | Firmware | flashed on an ESP32-S3-DevKitC-1 N16R8 (IDF v5.5.2): 42 tools, OLED 128×32, I²S mic and amp, WS2812, TLS console, model turns over HTTPS |
 | Not implemented | OTA, SD card, DHT11/22, camera. See `ROADMAP.md` |
