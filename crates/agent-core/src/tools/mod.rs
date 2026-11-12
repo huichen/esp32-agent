@@ -377,7 +377,7 @@ pub fn system_tools() -> Vec<ToolDef> {
         }),
         ToolDef::new(
             "schedule",
-            "Manage the board's own schedule. action=list shows every task; add creates one that re-runs a prompt on an interval (`every_s`) or at a daily time (`at_hhmm`); remove/disable/enable take an `id`. A task fires into the same queue a user message uses, so the board works on its own",
+            "Manage the board's own schedule: `action` is list, add, remove, enable or disable. A task re-runs a prompt every `every_s` seconds or daily at `at_hhmm`, and fires into the same queue a user message uses — the board works on its own",
         )
         .title("Schedule")
         .category("system")
@@ -386,10 +386,10 @@ pub fn system_tools() -> Vec<ToolDef> {
         .schema(object_schema(
             &[
                 ("action", enumeration(&["list", "add", "remove", "enable", "disable"], "what to do")),
-                ("id", string("task id, for remove/enable/disable")),
-                ("prompt", string("what to ask the agent when it fires")),
-                ("every_s", integer(0, 86_400, "repeat every N seconds; 0 = use at_hhmm")),
-                ("at_hhmm", string("daily time as \"07:30\" (UTC)")),
+                ("id", string("task id (remove/enable/disable)")),
+                ("prompt", string("what to ask when it fires")),
+                ("every_s", integer(0, 86_400, "repeat every N s; 0 = use at_hhmm")),
+                ("at_hhmm", string("daily \"07:30\" (UTC)")),
                 ("enabled", boolean("default true")),
             ],
             &["action"],
@@ -578,7 +578,7 @@ pub fn script_specs() -> Value {
         "type": "function",
         "function": {
             "name": "script",
-            "description": "Run a small script on the board — the way to write a loop or a condition the fixed tools cannot express. Syntax: `let x = 1`, `x = 2`, `l[0] = 9`, `if c { } else { }`, `while c { }` with `break`, values are numbers, strings, bools, nil, lists `[1,2]` and maps `{a: 1}`; operators `+ - * / %`, `== != < <= > >=`, `and or not`; builtins `len str num type log` and `tool(name, args)` which calls any other board tool; `#` starts a comment; the last expression is the result. Send {\"lint\": true} with `source` to check it without running, {\"help\": true} (or {\"section\": \"overview\"|\"builtins\"|\"examples\"}) for the full reference. Bounded by wall clock (30 s) and, as a backstop, 5 000 000 steps; `tool(\"script\")` is refused.",
+            "description": "Run a small script on the board — the way to write a loop or a condition the fixed tools cannot express: `let`, assignment, `if`/`else`, `while` with `break`, numbers, strings, bools, nil, lists, maps, and `tool(name, args)` to call any other board tool. `{\"help\": true}` (or `section`: overview|builtins|examples) returns the syntax reference; `{\"lint\": true}` checks `source` without running it. Bounded by 30 s and 5 000 000 steps.",
             "parameters": {
                 "type": "object",
                 "properties": {

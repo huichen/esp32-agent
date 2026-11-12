@@ -1059,35 +1059,21 @@ pub fn route(op: &str) -> Option<&'static str> {
 pub fn spec() -> ToolDef {
     ToolDef::new(
         "shell",
-        "Run a command on the board, as on any unix shell: one `command` string.\n\
-         ls [path] · rm <path> --confirm · cp <from> <to> · mv <from> <to> --confirm · grep <pattern> [path]\n\
-         curl <url> [-d body] [-f text|raw] · wget <url> [-o path] · nslookup <host> · nc <host> [-p port] · ping <host> [-c n] · ifconfig\n\
-         zip <archive> <path...> · unzip <archive_b64> · hexdump <path> [-w n] · od <path> (octal) · base64 <path> [-d] [-o out]\n\
-         cat [path] · wc [-l|-w|-c] <path> · head/tail [-n n] <path> · cut -d c -f n <path> · sort [-r] [-u] <path> · uniq <path> · tr <from> <to> <path> · tee <path> [-i text] · echo <text>\n\
-         touch <path> · du · strings <path> · sleep <s> · usleep <ms> · jot <count> [start [step]] · crc32 <path>\n\
-         hostname [name] · whoami · id · env · setenv <k> <v> · unsetenv <k> · netstat · route · arp · type <name> · which <name>\n\
-         df · free · uptime · date · uname · ps · help\n\
-         Pipes and redirection work on one line: `ls / | grep txt`, `cat < /a > /b`, `echo hi >> /log` — up to 5 stages.\n\
-         No `&&`, no `;`, no `$(...)`, no subshell, no background job, no variable expansion.\n\
-         `curl` reduces an HTML page to its text unless -f raw. A wrong command answers with its usage; `shell help` lists everything.",
+        // The index of 57 commands used to sit here, in every request. It is the same text
+        // `{\"help\": true}` returns on demand, so the declaration keeps the part a model
+        // needs before it decides to call: what kind of thing this is, and how a line is
+        // written.
+        "Run a command on the board, as on a unix shell: one `command` string. Pipes (`|`), \
+         redirection (`>` `<` `>>`) and up to 5 stages work on one line; no `&&`, no `;`, no \
+         `$( )`, no variable expansion, no background job. `{\"help\": true}` prints the command \
+         index with a usage line for each, and `help <command>` prints one.",
     )
     .title("Shell")
     .category("system")
     .schema(object_schema(
         &[
-            ("command", string("the command line, e.g. `ls /notes`, `curl https://example.com/`, `ping -c 3 1.1.1.1`")),
-            ("path", string("file or directory, for ls/rm/grep/hexdump/base64")),
-            ("decode", json!({ "type": "boolean", "description": "for base64: decode instead of encode" })),
-            ("out", string("for base64: where to write the result, default is the return value")),
-            ("width", json!({ "type": "integer", "minimum": 4, "maximum": 32, "description": "for hexdump: bytes per line, default 16" })),
-            ("from", string("source path, for cp/mv")),
-            ("to", string("destination path, for cp/mv")),
-            ("confirm", json!({ "type": "boolean", "description": "must be true for rm and mv" })),
-            ("pattern", string("literal substring, for grep")),
-            ("name", string("archive name, for zip")),
-            ("files", json!({ "type": "object", "description": "for zip: {name: text} entries to pack" })),
-            ("archive_b64", string("for unzip: the archive, base64")),
-            ("help", json!({ "type": "boolean", "description": "return the usage lines instead of running anything" })),
+            ("command", string("the command line, e.g. `ls /notes`, `curl https://example.com/ | head -n 5`")),
+            ("help", json!({ "type": "boolean", "description": "return the command index instead of running anything" })),
         ],
         &[],
     ))
