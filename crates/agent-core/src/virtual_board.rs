@@ -307,6 +307,14 @@ impl Hardware for VirtualBoard {
         Some(41.5)
     }
 
+    fn tasks(&mut self) -> Vec<serde_json::Value> {
+        vec![
+            json!({"name": "main", "state": "running", "priority": 1, "stack_free_words": 2048}),
+            json!({"name": "httpd", "state": "blocked", "priority": 5, "stack_free_words": 1024}),
+            json!({"name": "agent", "state": "blocked", "priority": 4, "stack_free_words": 1536}),
+        ]
+    }
+
     /// The virtual board answers for every host it is asked about: there is no stack
     /// underneath it to be unreachable.
     fn ping(&mut self, host: &str, count: u32) -> crate::error::Result<serde_json::Value> {

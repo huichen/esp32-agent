@@ -2966,6 +2966,14 @@ impl App {
         let result = match tool {
             "shell_zip" => self.shell_zip(&inner),
             "shell_unzip" => self.shell_unzip(&inner),
+            "shell_df" => Ok(self.shell_df()),
+            "shell_free" => Ok(self.shell_free()),
+            "shell_uptime" => Ok(self.shell_uptime()),
+            "shell_date" => Ok(self.shell_date()),
+            "shell_uname" => Ok(self.shell_uname()),
+            "shell_ps" => self.shell_ps(),
+            "shell_hexdump" => self.shell_hexdump(&inner),
+            "shell_base64" => self.shell_base64(&inner),
             other => self.fs_or_net_call(other, &inner),
         };
         result.map_err(|e| {
@@ -3010,7 +3018,7 @@ impl App {
             let tail = url.rsplit('/').next().unwrap_or("index");
             format!("/downloads/{host}-{tail}")
         });
-        let text = crate::llm::truncate_bytes(&body, fs_tools::MAX_FILE_BYTES);
+        let text = crate::llm::truncate_bytes(&body, crate::tools::fs::MAX_FILE_BYTES);
         let truncated = text.len() < body.len();
         fs_tools::Workspace::write(&mut self.workspace, &path, &text)
             .map_err(|e| format!("could not save `{path}`: {e}"))?;
@@ -3025,6 +3033,137 @@ impl App {
             out["note"] = json!("the file holds the first 2048 bytes of the response");
         }
         Ok(out.to_string())
+    }
+
+    /// `df`: how much of the workspace is used.
+    fn shell_df(&self) -> String {
+        let json = self.workspace.to_json();
+        let files = json["files"].as_object();
+        let count = files.map(|f| f.len()).unwrap_or(0);
+        let bytes: usize =
+            files.map(|f| f.values().filter_map(|v| v.as_str()).map(|v| v.len()).sum()).unwrap_or(0);
+        serde_json::json!({
+            "files": count,
+            "bytes": bytes,
+            "file_limit_bytes": crate::tools::fs::MAX_FILE_BYTES,
+            "workspace_limit_bytes": WORKSPACE_TOTAL_MAX,
+            "free_bytes": WORKSPACE_TOTAL_MAX.saturating_sub(bytes),
+        })
+        .to_string()
+    }
+
+    /// `free`: heap, split the way this board actually splits it.
+    fn shell_free(&mut self) -> String {
+        let info = self.hw.board_info();
+        serde_json::json!({
+            "heap_free_kb": info.free_heap_kb,
+            "heap_min_kb": info.min_free_heap_kb,
+            "note": "free_kb includes PSRAM; internal_kb in /api/status is the number that matters for sockets and TLS",
+        })
+        .to_string()
+    }
+
+    fn shell_uptime(&mut self) -> String {
+        let up = self.runtime.uptime_s(now_ms());
+        serde_json::json!({
+            "uptime_s": up,
+            "uptime": format!("{}h {:02}m {:02}s", up / 3600, (up % 3600) / 60, up % 60),
+            "runs": self.agent.runs,
+        })
+        .to_string()
+    }
+
+    fn shell_date(&mut self) -> String {
+        let ms = now_ms();
+        serde_json::json!({
+            "unix_s": ms / 1000,
+            "synced": ms > 1_700_000_000_000,
+            "utc": utc_string(ms / 1000),
+            "note": "before SNTP syncs this is time since boot, and https certificates read as not yet valid",
+        })
+        .to_string()
+    }
+
+    fn shell_uname(&mut self) -> String {
+        let info = self.hw.board_info();
+        serde_json::json!({
+            "firmware": format!("esp32-agent {}", self.firmware.version),
+            "build": self.firmware.build,
+            "soc": info.soc,
+            "cores": info.cores,
+            "revision": info.revision,
+            "flash_mb": info.flash_mb,
+            "psram_kb": info.psram_kb,
+            "idf": info.idf_version,
+            "mac": info.mac,
+            "board": self.profile.id,
+        })
+        .to_string()
+    }
+
+    /// `ps`: tasks with their state and remaining stack.
+    fn shell_ps(&mut self) -> std::result::Result<String, String> {
+        let tasks = self.hw.tasks();
+        if tasks.is_empty() {
+            return Err("this platform cannot enumerate tasks".into());
+        }
+        Ok(serde_json::json!({ "count": tasks.len(), "tasks": tasks }).to_string())
+    }
+
+    fn shell_hexdump(&mut self, args: &Value) -> std::result::Result<String, String> {
+        let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("").trim();
+        if path.is_empty() {
+            return Err("`path` is required".into());
+        }
+        let width = args.get("width").and_then(|v| v.as_u64()).unwrap_or(16).clamp(4, 32) as usize;
+        let data = fs_tools::Workspace::read(&self.workspace, path)?.into_bytes();
+        // A tool result is 2 KB; four columns per byte would eat 70 bytes per line, so dump
+        // as much as arrives whole and say what was left out.
+        let lines_that_fit = 1800 / (width * 5 + 12);
+        let mut out = String::new();
+        for (row, chunk) in data.chunks(width).enumerate() {
+            if row >= lines_that_fit {
+                out.push_str(&format!("… {} more bytes\n", data.len() - row * width));
+                break;
+            }
+            out.push_str(&format!("{:04x}  ", row * width));
+            for byte in chunk {
+                out.push_str(&format!("{byte:02x} "));
+            }
+            out.push_str(" |");
+            for byte in chunk {
+                out.push(if (32..127).contains(byte) { *byte as char } else { '.' });
+            }
+            out.push_str("|\n");
+        }
+        Ok(serde_json::json!({ "path": path, "bytes": data.len(), "hexdump": out }).to_string())
+    }
+
+    /// `base64`: encode a file to base64, or decode base64 back into one.
+    fn shell_base64(&mut self, args: &Value) -> std::result::Result<String, String> {
+        let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("").trim();
+        if path.is_empty() {
+            return Err("`path` is required".into());
+        }
+        let decode = args.get("decode").and_then(|v| v.as_bool()).unwrap_or(false);
+        let out_path = args.get("out").and_then(|v| v.as_str()).map(|s| s.to_string());
+        let text = fs_tools::Workspace::read(&self.workspace, path)?;
+        if decode {
+            let mut bytes = Vec::new();
+            crate::util::b64_decode(text.trim(), &mut bytes).map_err(|e| e.message)?;
+            let decoded = String::from_utf8_lossy(&bytes).to_string();
+            let target = out_path.unwrap_or_else(|| format!("{path}.decoded"));
+            fs_tools::Workspace::write(&mut self.workspace, &target, &decoded)?;
+            self.persist_workspace();
+            return Ok(serde_json::json!({ "path": target, "bytes": bytes.len() }).to_string());
+        }
+        let encoded = crate::util::b64_encode(text.as_bytes());
+        if let Some(target) = out_path {
+            fs_tools::Workspace::write(&mut self.workspace, &target, &encoded)?;
+            self.persist_workspace();
+            return Ok(serde_json::json!({ "path": target, "bytes": encoded.len() }).to_string());
+        }
+        Ok(serde_json::json!({ "path": path, "base64": encoded }).to_string())
     }
 
     /// `ifconfig`: what the board thinks its network is, including the overrides.
@@ -3112,6 +3251,26 @@ impl App {
         }
         Ok(json!({ "entries": out, "count": out.len() }).to_string())
     }
+}
+
+/// `YYYY-MM-DD HH:MM:SS` in UTC, from a unix time. No library: the board only needs this
+/// for `date`, and a civil-time conversion is twenty lines.
+fn utc_string(unix: u64) -> String {
+    let days = (unix / 86_400) as i64;
+    let secs = unix % 86_400;
+    let (hour, minute, second) = (secs / 3600, (secs % 3600) / 60, secs % 60);
+    // Days since 1970-01-01 to a civil date (Howard Hinnant's algorithm).
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = if m <= 2 { y + 1 } else { y };
+    format!("{year:04}-{m:02}-{d:02} {hour:02}:{minute:02}:{second:02}")
 }
 
 /// Put the command's usage line under an error, once.
