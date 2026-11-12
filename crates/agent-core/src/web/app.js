@@ -100,7 +100,79 @@ function toast(text) {
 const escapeHtml = (s) =>
   s.replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 
-/** A small Markdown subset: the four things a model actually emits on a 2 KB budget. */
+/** Inline spans, applied to text that has already been HTML-escaped. */
+function inline(text) {
+  return text
+    .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
+    .replace(/(^|[^*])\*([^*\n]+)\*/g, "$1<em>$2</em>")
+    .replace(/`([^`]+)`/g, "<code>$1</code>")
+    .replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
+}
+
+/** One table row's cells. `\|` is a pipe in the text, not a separator. */
+function tableRow(line) {
+  let s = line.trim();
+  if (s.startsWith("|")) s = s.slice(1);
+  if (s.endsWith("|")) s = s.slice(0, -1);
+  const cells = [];
+  let cur = "";
+  for (let i = 0; i < s.length; i += 1) {
+    if (s[i] === "\\" && s[i + 1] === "|") {
+      cur += "|";
+      i += 1;
+      continue;
+    }
+    if (s[i] === "|") {
+      cells.push(cur.trim());
+      cur = "";
+      continue;
+    }
+    cur += s[i];
+  }
+  cells.push(cur.trim());
+  return cells;
+}
+
+/** A GFM table: `| a | b |`, then `|---|---|`, then the rows.
+ *
+ * The model emits tables — a device list is four columns and that is the shape it reaches
+ * for — and a phone is where raw pipes look worst: the columns run together into one
+ * paragraph of `|` and `---`. The wrapper scrolls sideways rather than letting a wide table
+ * push the bubble off its row. */
+function tableFrom(lines, at) {
+  const head = lines[at];
+  const sep = lines[at + 1];
+  if (!head.includes("|") || sep === undefined || !sep.includes("|") || !/^\s*\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)*\|?\s*$/.test(sep)) {
+    return null;
+  }
+  const header = tableRow(head);
+  if (header.length < 2) return null;
+  const align = tableRow(sep).map((c) =>
+    c.startsWith(":") && c.endsWith(":") ? "center" : c.endsWith(":") ? "right" : c.startsWith(":") ? "left" : ""
+  );
+  const rows = [];
+  let i = at + 2;
+  while (i < lines.length && lines[i].includes("|") && lines[i].trim() !== "") {
+    rows.push(tableRow(lines[i]));
+    i += 1;
+  }
+  const cell = (tag, text, column) => {
+    const a = align[column];
+    return "<" + tag + (a ? ' style="text-align:' + a + '"' : "") + ">" + inline(text || "") + "</" + tag + ">";
+  };
+  const body = rows
+    .map((r) => "<tr>" + header.map((_, c) => cell("td", r[c], c)).join("") + "</tr>")
+    .join("");
+  const html =
+    '<div class="table-wrap"><table><thead><tr>' +
+    header.map((t, c) => cell("th", t, c)).join("") +
+    "</tr></thead>" +
+    (body ? "<tbody>" + body + "</tbody>" : "") +
+    "</table></div>";
+  return { html, next: i };
+}
+
+/** A small Markdown subset: what a model actually emits on a 2 KB budget. */
 function markdown(text) {
   const blocks = [];
   let src = escapeHtml(text || "").replace(/```([\s\S]*?)```/g, (_, code) => {
@@ -108,16 +180,33 @@ function markdown(text) {
     return "\u0000BLOCK" + (blocks.length - 1) + "\u0000";
   });
 
+  // Tables come out before the inline rules: a row is a block, and the paragraph wrapper
+  // below would make it one <p> of pipes.
+  const tables = [];
+  {
+    const lines = src.split("\n");
+    const out = [];
+    for (let i = 0; i < lines.length; ) {
+      const table = tableFrom(lines, i);
+      if (table) {
+        tables.push(table.html);
+        out.push("\u0000TABLE" + (tables.length - 1) + "\u0000");
+        i = table.next;
+        continue;
+      }
+      out.push(lines[i]);
+      i += 1;
+    }
+    src = out.join("\n");
+  }
+
   src = src
     .replace(/^### (.*)$/gm, "<h3>$1</h3>")
     .replace(/^## (.*)$/gm, "<h2>$1</h2>")
     .replace(/^# (.*)$/gm, "<h1>$1</h1>")
     .replace(/^&gt; (.*)$/gm, "<blockquote>$1</blockquote>")
-    .replace(/^[-*] (.*)$/gm, "<li>$1</li>")
-    .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
-    .replace(/(^|[^*])\*([^*\n]+)\*/g, "$1<em>$2</em>")
-    .replace(/`([^`]+)`/g, "<code>$1</code>")
-    .replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
+    .replace(/^[-*] (.*)$/gm, "<li>$1</li>");
+  src = inline(src);
 
   // Wrap runs of list items, then paragraphs.
   src = src.replace(/(?:<li>.*<\/li>\n?)+/g, (m) => "<ul>" + m.replace(/\n/g, "") + "</ul>");
@@ -126,11 +215,13 @@ function markdown(text) {
     .map((chunk) => {
       const t = chunk.trim();
       if (!t) return "";
-      if (/^<(h\d|ul|blockquote|pre|p|\u0000BLOCK)/.test(t)) return t;
+      if (/^(?:<(?:h\d|ul|blockquote|pre|p)\b|\u0000(?:BLOCK|TABLE))/.test(t)) return t;
       return "<p>" + t.replace(/\n/g, "<br>") + "</p>";
     })
     .join("");
-  return html.replace(/\u0000BLOCK(\d+)\u0000/g, (_, i) => "<pre><code>" + blocks[Number(i)] + "</code></pre>");
+  return html
+    .replace(/\u0000BLOCK(\d+)\u0000/g, (_, i) => "<pre><code>" + blocks[Number(i)] + "</code></pre>")
+    .replace(/\u0000TABLE(\d+)\u0000/g, (_, i) => tables[Number(i)]);
 }
 
 // ---------------------------------------------------------------- chat view
