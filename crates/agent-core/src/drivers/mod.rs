@@ -11,9 +11,12 @@
 
 pub mod actuator;
 pub mod ads1115;
+pub mod aht20;
 pub mod audio;
 pub mod bdc_motor;
+pub mod bh1750;
 pub mod bme280;
+pub mod bme680;
 pub mod encoder;
 pub mod expander;
 pub mod hx711;
@@ -24,10 +27,12 @@ pub mod onewire;
 pub mod pir;
 pub mod ranging;
 pub mod rc522;
+pub mod rtc;
 pub mod sht3x;
 pub mod ssd1306;
 pub mod stepper;
 pub mod tm1637;
+pub mod vl53l0x;
 
 use crate::boards::BoardProfile;
 use crate::config::Config;
@@ -177,8 +182,8 @@ pub static CATALOG: &[CatalogEntry] = &[
     CatalogEntry {
         kind: "vl53l0x",
         name: "VL53L0X time-of-flight distance",
-        detection: "not implemented yet",
-        status: "planned",
+        detection: "I2C 0x29: model id register 0xC0 reads 0xEE",
+        status: "implemented",
         caps: &["vl53l0x"],
         docs: "docs/adding-a-device.md",
     },
@@ -217,24 +222,24 @@ pub static CATALOG: &[CatalogEntry] = &[
     CatalogEntry {
         kind: "bme680",
         name: "BME680 temperature / humidity / pressure / gas",
-        detection: "not implemented yet: same I2C probe as the BME280 plus the gas heater ramp",
-        status: "planned",
+        detection: "I2C 0x76/0x77: chip id 0xD0 reads 0x61",
+        status: "implemented",
         caps: &["bme680"],
         docs: "ROADMAP.md",
     },
     CatalogEntry {
         kind: "aht20",
         name: "AHT20 / AHT10 temperature + humidity",
-        detection: "not implemented yet: 0x38, read the status word after a conversion command",
-        status: "planned",
+        detection: "I2C 0x38: the status byte after a convert reports calibrated and busy",
+        status: "implemented",
         caps: &["aht20"],
         docs: "ROADMAP.md",
     },
     CatalogEntry {
         kind: "bh1750",
         name: "BH1750 ambient light",
-        detection: "not implemented yet: 0x23/0x5C, a one-byte command returns lux as 16 bits",
-        status: "planned",
+        detection: "I2C 0x23/0x5C: a one-byte command, 16 bits of lux back in continuous mode",
+        status: "implemented",
         caps: &["bh1750"],
         docs: "ROADMAP.md",
     },
@@ -249,8 +254,8 @@ pub static CATALOG: &[CatalogEntry] = &[
     CatalogEntry {
         kind: "ds3231",
         name: "DS3231 real-time clock",
-        detection: "not implemented yet: 0x68, BCD registers; SNTP covers the clock today",
-        status: "planned",
+        detection: "I2C 0x68: no id register; a plausible BCD time and a valid status byte",
+        status: "implemented",
         caps: &["rtc"],
         docs: "ROADMAP.md",
     },
@@ -361,6 +366,11 @@ const DECLARABLE: &[&str] = &[
     "tm1637",
     "max7219",
     "rc522",
+    "bme680",
+    "aht20",
+    "bh1750",
+    "ds3231",
+    "vl53l0x",
 ];
 
 /// Probe every configured bus and every declared pin.
@@ -749,6 +759,11 @@ pub fn instantiate(spec: &crate::manifest::DeviceSpec, hw: &mut dyn Hardware) ->
             Box::new(ssd1306::Ssd1306::probe(hw, bus, needs_addr(addr)?, height, controller, 1)?)
         }
         "bme280" => Box::new(bme280::Bme280::probe(hw, bus, needs_addr(addr)?, 1)?),
+        "bme680" => Box::new(bme680::Bme680::probe(hw, bus, needs_addr(addr)?, 1)?),
+        "aht20" => Box::new(aht20::Aht20::probe(hw, bus, needs_addr(addr)?, 1)?),
+        "bh1750" => Box::new(bh1750::Bh1750::probe(hw, bus, needs_addr(addr)?, 1)?),
+        "ds3231" => Box::new(rtc::Ds3231::probe(hw, bus, needs_addr(addr)?, 1)?),
+        "vl53l0x" => Box::new(vl53l0x::Vl53l0x::probe(hw, bus, needs_addr(addr)?, 1)?),
         "sht3x" => Box::new(sht3x::Sht3x::probe(hw, bus, needs_addr(addr)?, 1)?),
         "ina219" => {
             let shunt = opt("shunt_mohm").and_then(|s| s.parse().ok()).unwrap_or(100u32);
