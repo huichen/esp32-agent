@@ -355,10 +355,23 @@ terminator, `nvs.h`), and those names are 16, 18 and 19. `ESP_ERR_NVS_KEY_TOO_LO
 `0x1109` = 4361. Nothing was ever stored, so the transcript and the run-in-flight marker
 existed only in RAM: a power cut lost the conversation, and no reboot could ever find a
 turn to resume. The names are now `transcript` (10), `transcript.N` (12) and
-`run_in_flight` (13), `every_key_the_board_stores_fits_nvs` in `app.rs` checks every key
-and every chunk the plans can produce, and `StoreQueue` refuses an over-long key with that
-same code before it reaches a backend, so the next one costs a log line instead of a flash
-round trip.
+`run_in_flight` (13), and `StoreQueue` refuses an over-long key with that same code before
+it reaches a backend, so the next one costs a log line instead of a flash round trip.
+
+**Nothing to migrate, on purpose.** No build ever put a byte under `agent.transcript` or
+`agent.run_in_flight` — NVS refused the value before writing any of it — so there is no old
+value on flash, no migration step, and no code that reads the old names. If a later
+investigation expects one, this paragraph is the answer. A simulator state file is the only
+place an old name can still exist, and that is scratch state rather than the board's.
+
+Every key name now lives in one table, `crates/agent-core/src/keys.rs`: the seven base
+names plus `keys::chunk(base, index)`, which is the only place a chunked key is assembled
+(both the workspace and the transcript go through it). `keys::all()` enumerates the shapes
+that assembly can produce — indices `0..=99`, deliberately wider than any plan — and
+`every_key_the_board_can_generate_fits_nvs` asserts each is within the ceiling. It fails on
+a longer prefix (`agent.transcript` → red), on a longer separator (`::chunk` → red) and on
+a wider index; `the_blob_plans_stay_inside_the_key_table` in `app.rs` keeps the two plans
+inside what the table enumerated.
 
 What the other codes mean, since they need different fixes:
 
