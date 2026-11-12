@@ -22,7 +22,7 @@
 | 一个 shell 和一门脚本语言 | `shell` 有 55 个按 NuttX 命名的命令，还有一个对工具调用做循环的解释器。[Shell](docs/shell.md) · [脚本](docs/scripting.md) |
 | 它会记住告诉过它的事 | 常驻指令、`/AGENTS.md`、`/MEMORY.md` 索引与技能，每轮组装进提示词。[模型每轮都能看到什么](docs/context.md) |
 | 自带技能 | 固件里带三个流程——写技能、摸清接线、救回一块看起来坏了的板——首次启动就落在 `/skills`；你改过的那份会一直是你的。[技能](docs/agent-skills.md) |
-| 路径中没有云端 | 由板子提供 HTTPS，证书由它生成，三类调用方一个 PIN。[认证](docs/security.md) |
+| 板子自己就是服务器 | 由板子提供 HTTPS，证书由它生成，三类调用方一个 PIN。[认证](docs/security.md) |
 | 无需硬件即可测试 | 模拟器把同一份 `agent-core` 跑在虚拟板上。[模拟器](docs/simulator.md) |
 
 ## 烧录与连接
