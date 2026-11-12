@@ -135,6 +135,9 @@
         <h3>Add</h3>
         <label for="sched-prompt">Prompt</label>
         <textarea id="sched-prompt" class="field" placeholder="what to ask when it fires"></textarea>
+        <label for="sched-script">Script (runs without a model call)</label>
+        <textarea id="sched-script" class="field" placeholder='tool("led_set", {"color": "#00ff00"})'></textarea>
+        <p class="hint">Fill one: a prompt queues a turn for the model, a script runs by itself. If both are filled the script wins.</p>
         <label for="sched-every">Every N seconds (0 = daily time)</label>
         <input id="sched-every" type="number" min="0" step="1">
         <label for="sched-at">Daily time, UTC (07:30)</label>
