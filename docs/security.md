@@ -21,13 +21,18 @@ Tokens live in RAM: a reboot revokes every one of them.
 ## TLS
 
 Port 443 serves the same routes with a certificate the board generates on first boot (EC
-P-256, self-signed, 2020–2035 so a 1970 clock still verifies). The fingerprint is at
+P-256, self-signed, 2020-2035 so a 1970 clock still verifies). The fingerprint is at
 `GET /api/tls` and inside `/agent.json` — compare it with the one the browser shows before
-clicking through. Port 80 stays open on purpose: a bad certificate should cost a URL, not the
-board.
+clicking through.
 
-Outbound TLS (model calls, `curl https://…`) verifies the server certificate against the
-ESP-IDF bundle; there is no "skip verification" switch and there will not be one.
+Port 80 stays open **by default**: a bad certificate should cost a URL, not the board.
+`mcp.plain_http: false` (a checkbox in Settings, or `POST /api/config`) closes it and leaves
+only https. Two consequences, both deliberate:
+
+- the board refuses the setting when it has no certificate and says so in the log — a device
+  that answers on no port is not more secure, only unreachable;
+- with http off, the ways back in are the USB cable (`provision` over USB-Serial-JTAG) and a
+  factory reset. Nothing on the network will get you in if the certificate stops working.
 
 ## What is deliberately not defended
 

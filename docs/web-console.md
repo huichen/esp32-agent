@@ -8,8 +8,9 @@ One page, served by the board, no build step and nothing fetched from the intern
 | `http://<board>/` | the console, and `/mcp` on the same port |
 | `https://<board>/` | the same routes over TLS, certificate generated on the board |
 
-Both stay open. Port 80 is the way back in when a certificate is wrong, so a TLS
-misconfiguration costs a URL and not the board.
+Both stay open by default. Port 80 is the way back in when a certificate is wrong, so a TLS
+misconfiguration costs a URL and not the board. \mcp.plain_http: false\ closes it (see
+[security](security.md)); with it off, only \https://<board>/\ answers.
 
 ## Panels
 
