@@ -921,6 +921,22 @@ impl App {
         self.tools.iter().filter(|d| self.is_visible(&d.spec.name)).map(|d| d.spec.name.clone()).collect()
     }
 
+    /// How many tools the model is offered, without building the list.
+    ///
+    /// `/api/status` needs this number on every poll, and `tool_specs()` answers with a deep
+    /// clone of the whole array — an 18 KB `Value`, which is a fresh allocation for every
+    /// string, object and array in it, in PSRAM, for a `filter().count()`. The predicate is
+    /// the same one `tool_specs_uncached` uses, so the two cannot disagree; the test that
+    /// compares `/api/status` with `ToolHost::tool_specs` would fail if they did.
+    fn visible_tool_count(&self) -> usize {
+        let registry = self.tools.iter().filter(|d| self.is_visible(&d.spec.name)).count();
+        let extras = Self::extra_entries()
+            .into_iter()
+            .filter(|entry| self.extra_why_hidden(entry["function"]["name"].as_str().unwrap_or("")).is_none())
+            .count();
+        registry + extras
+    }
+
     /// Every tool that exists but is not offered, with the reason — registry entries first,
     /// then the out-of-registry ones, each in name order.
     ///
@@ -1128,8 +1144,8 @@ impl App {
                 // What the model actually receives, not the registry count: the out-of-
                 // registry tools (`shell`, `script`, `read`/`write`/`edit`) are tools the
                 // model can call, and leaving them out made this number disagree with
-                // `/api/tools` by six.
-                "tools_visible": self.tool_specs().as_array().map(|a| a.len()).unwrap_or(0),
+                // `/api/tools` by six. Counted rather than cloned: see `visible_tool_count`.
+                "tools_visible": self.visible_tool_count(),
                 "tools_hidden": self.hidden_tools(),
                 "sessions": self.runtime.sessions.len(),
                 "auth_required": !self.cfg.auth.mcp_token.is_empty(),
