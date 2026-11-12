@@ -108,7 +108,7 @@ the HTML so a browser can cache them; everything else the page needs is inside t
 | Method | Path | Purpose |
 |---|---|---|
 | POST | `/api/agent/message` | `{text}` — queue a user message; answers `202` with the queued count |
-| GET | `/api/agent/history?after=<n>` | Transcript entries after `n`, plus `usage` |
+| GET | `/api/agent/history?after=<n>` | Transcript entries after `n`, plus `usage`. Each tool call carries its `arguments`; past 1024 bytes they arrive as a string with `arguments_elided_bytes`, so a client can say what it is not showing |
 | POST | `/api/agent/reset` | Clear the conversation |
 | GET | `/api/agent/config` | Model connection, `tick_ms`, `last_run`/`total` usage |
 | POST | `/api/agent/config` | Update `base_url` / `model` / `api_key` / `tick_ms` |

@@ -412,6 +412,10 @@ function renderTrace(thinking, steps) {
     // string, which printed raw is one unreadable line.
     const args = document.createElement("pre");
     args.textContent = "arguments: " + pretty(typeof call.arguments === "string" ? call.arguments : JSON.stringify(call.arguments || {}));
+    if (call.arguments_elided_bytes) {
+      // Said rather than hidden: a cut document that looks whole is worse than none.
+      args.textContent += "\n... " + call.arguments_elided_bytes + " more bytes not kept";
+    }
     d.appendChild(args);
     if (step.result) {
       const res = document.createElement("pre");
@@ -659,7 +663,14 @@ function handleEvent(name, data) {
       const box = ensureLiveTrace();
       liveCalls += 1;
       updateLiveSummary();
-      const wrap = chip(box, (data.name || "tool") + "()", [["arguments", data.text || "{}"]]);
+      // The summary carries the arguments, as the restored transcript's does: `script()`
+      // with empty parens reads as "called with nothing", and that is how a call with a
+      // long source was being shown.
+      let shown = data.text || "{}";
+      try { shown = JSON.stringify(JSON.parse(shown)); } catch (e) { /* keep it as sent */ }
+      const wrap = chip(box, (data.name || "tool") + "(" + previewArgs(shown) + ")", [
+        ["arguments", data.text || "{}"],
+      ]);
       wrap.dataset.id = data.tool_call_id || "";
       break;
     }
