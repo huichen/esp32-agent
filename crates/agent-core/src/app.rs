@@ -8979,7 +8979,13 @@ mod tests {
 
         let rec = app.call_tool("mic_record", &json!({ "samples": 64 })).unwrap();
         assert_eq!(rec["samples"], json!(64), "{rec}");
-        assert!(rec["pcm_b64"].as_str().unwrap().len() <= 2048, "a tool result is capped at 2 KB");
+        // The board records WAV: the result says so, and the payload is header + samples.
+        assert_eq!(rec["format"], json!("wav"), "a recording states its format: {rec}");
+        assert_eq!(rec["wav_bytes"], json!(44 + 64 * 2), "44-byte header, 16-bit mono: {rec}");
+        let mut wave = Vec::new();
+        crate::util::b64_decode(rec["wav_b64"].as_str().unwrap(), &mut wave).expect("the payload is base64");
+        assert_eq!(&wave[0..4], b"RIFF", "the header travels with the samples");
+        assert!(rec["wav_b64"].as_str().unwrap().len() <= 2048, "a tool result is capped at 2 KB");
 
         let tone = app.call_tool("speaker_tone", &json!({ "freq_hz": 440, "ms": 50 })).unwrap();
         assert_eq!(tone["ok"], json!(true), "{tone}");
