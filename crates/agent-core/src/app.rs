@@ -329,6 +329,12 @@ pub struct App {
     /// loop failed to start still answers the portal, MCP and every tool, so the only
     /// honest place to see the failure is here.
     agent_thread: AgentThread,
+    /// The writes this `App` has asked for and nobody has performed yet. `store` is a
+    /// [`store::QueuedStore`] over this, so no code path in here can reach flash from
+    /// whatever thread happens to be running.
+    store_queue: store::StoreQueue,
+    /// What the platform says about the task that drains the queue.
+    store_writer: StoreWriter,
 }
 
 /// Whether the thread that runs the agent loop is up.
@@ -365,9 +371,40 @@ impl AgentThread {
     }
 }
 
+/// The task that performs the queued store writes, as the platform reports it.
+///
+/// It exists because the write is a flash operation with both caches disabled, which
+/// makes *which task does it* a correctness question rather than a detail: a task whose
+/// stack is in PSRAM cannot do it at all (the board asserts and reboots). The platform
+/// therefore names its writer and says whether that task's stack turned out to be in
+/// internal RAM; `/api/status.store` shows both, so "the queue is being drained by the
+/// right task" is something a person can check instead of assume.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct StoreWriter {
+    /// The task's name, empty until a platform attaches one.
+    pub name: String,
+    /// Whether the writer's stack is in internal RAM. `None` until it has said so;
+    /// `Some(false)` is a bug that must not be silent.
+    pub internal_stack: Option<bool>,
+}
+
+impl StoreWriter {
+    pub fn as_json(&self) -> Value {
+        json!({
+            "task": self.name,
+            "internal_stack": self.internal_stack,
+        })
+    }
+}
+
 impl App {
     pub fn new(hw: Box<dyn Hardware>, store: Box<dyn KvStore>, log: Arc<LogBuf>, firmware: FwMeta) -> Self {
         let now = now_ms();
+        // Every write below this line is a request: `store` is the queue, and the platform's
+        // writer task is what turns a request into an `spi_flash` call. Reads pass straight
+        // through (after checking the queue), which is why boot is unchanged.
+        let queue = store::StoreQueue::new(store);
+        let store: Box<dyn KvStore> = Box::new(store::QueuedStore::new(queue.clone()));
         let cfg = store
             .get(crate::config::NVS_KEY_CONFIG)
             .and_then(|s| Config::from_json_str(&s))
@@ -434,6 +471,8 @@ impl App {
             shared: Weak::new(),
             session_counter: 0,
             agent_thread: AgentThread::NotStarted,
+            store_queue: queue,
+            store_writer: StoreWriter::default(),
         };
         app.log.info(
             "boot",
@@ -487,6 +526,74 @@ impl App {
     /// What `/api/status` reports as `agent.thread`, for tests and for the portal.
     pub fn agent_thread(&self) -> &AgentThread {
         &self.agent_thread
+    }
+
+    /// The queue handle a platform's writer task drains.
+    ///
+    /// Handing it out is the whole mechanism: the writer keeps this and calls
+    /// [`App::flush_store`] under the app lock, and nothing else in the firmware touches
+    /// NVS after boot.
+    pub fn store_queue(&self) -> store::StoreQueue {
+        self.store_queue.clone()
+    }
+
+    /// Report the task that performs the queued writes, and whether its stack turned out
+    /// to be in internal RAM.
+    pub fn attach_store_writer(&mut self, name: impl Into<String>, internal_stack: bool) {
+        let name = name.into();
+        if internal_stack {
+            self.log.info(
+                "store",
+                format!(
+                    "store writer is `{name}`, stack in internal RAM: it is the only task that writes NVS"
+                ),
+            );
+        } else {
+            self.log.error(
+                "store",
+                format!(
+                    "store writer `{name}` is on a stack outside internal RAM; it must not write NVS (spi_flash runs with the caches off), so the queue is left queued"
+                ),
+            );
+        }
+        self.store_writer = StoreWriter { name, internal_stack: Some(internal_stack) };
+    }
+
+    /// What `/api/status` reports as `store`.
+    pub fn store_writer(&self) -> &StoreWriter {
+        &self.store_writer
+    }
+
+    /// Perform every write this `App` has queued.
+    ///
+    /// **Only a task whose stack is in internal RAM may call this.** An NVS write is an
+    /// `spi_flash` operation with both caches disabled, so a task whose stack lives in
+    /// PSRAM cannot survive one: the board asserts in
+    /// `spi_flash_disable_interrupts_caches_and_other_cpu (esp_task_stack_is_sane_cache_disabled())`
+    /// and reboots (measured 2026-11-12, a due scheduled task, ~8 s per reboot). The
+    /// firmware checks the calling task's stack before every call
+    /// (`firmware/src/nvs_writer.rs`); the host tests call this directly, where there is
+    /// no such thing as a flash window.
+    pub fn flush_store(&self, who: &str) -> store::FlushReport {
+        let report = self.store_queue.flush();
+        if report.failed > 0 {
+            self.log.error(
+                "store",
+                format!(
+                    "{} of {} store write(s) were refused by flash: {}",
+                    report.failed,
+                    report.failed + report.written,
+                    report.keys.join(", ")
+                ),
+            );
+        }
+        if report.written > 0 {
+            self.log.info(
+                "store",
+                format!("wrote {} store value(s) from `{who}`: {}", report.written, report.keys.join(", ")),
+            );
+        }
+        report
     }
 
     /// Re-run board resolution, manifest device instantiation, detection and the
@@ -1154,6 +1261,14 @@ impl App {
                 "enabled_tasks": self.tasks.iter().filter(|t| t.enabled).count(),
                 "enabled_rules": self.rules.iter().filter(|r| r.enabled).count(),
             },
+            // What is queued and who drains it. A growing `pending` means the writer task
+            // is not running; `internal_stack: false` means it must not write at all.
+            "store": {
+                "pending": self.store_queue.pending(),
+                "written": self.store_queue.written(),
+                "failed": self.store_queue.failed(),
+                "writer": self.store_writer.as_json(),
+            },
             "pins": self.cfg.pins,
         })
     }
@@ -1653,12 +1768,20 @@ impl App {
         out
     }
 
+    /// Queue the config for the store writer.
+    ///
+    /// Every `persist_*` in this file works this way: the state is serialised here, queued
+    /// in [`store::StoreQueue`], and written by the platform's writer task. `set` is true
+    /// when the write was accepted *into the queue*; whether flash took it is reported by
+    /// the writer (`/api/status.store.failed` and the `store` log line), because the caller
+    /// here is very often the agent thread, which cannot touch flash at all — see
+    /// [`App::flush_store`].
     fn persist_config(&mut self) {
         let json = self.cfg.to_json_string();
         if self.store.set(crate::config::NVS_KEY_CONFIG, &json) {
             self.log.info("config", "saved");
         } else {
-            self.log.error("config", "could not write the config");
+            self.log.error("config", "the config could not even be queued for saving");
         }
         self.runtime.config_dirty = false;
     }
@@ -1669,7 +1792,7 @@ impl App {
             self.runtime.manifest_rev += 1;
             self.log.info("manifest", format!("saved, revision {}", self.runtime.manifest_rev));
         } else {
-            self.log.error("manifest", "could not write the manifest");
+            self.log.error("manifest", "the manifest could not even be queued for saving");
         }
     }
 
@@ -2183,12 +2306,18 @@ impl App {
         }
     }
 
-    /// Store the workspace, or say why it could not be stored.
+    /// Queue the workspace, or say why it cannot be stored at all.
     ///
-    /// The return value is the point: a write that cannot be made durable must reach the
-    /// caller as an error, because the caller is the one about to answer `ok: true` to a
-    /// model or a person. `Err` carries the size and the ceiling, and the change that could
-    /// not be stored is undone by [`App::workspace_edit`].
+    /// The return value is the point: a blob that cannot fit the storage plan has to reach
+    /// the caller as an error, because the caller is the one about to answer `ok: true` to
+    /// a model or a person, and [`App::workspace_edit`] undoes the change on `Err`. What is
+    /// checked here is therefore everything that is knowable before flash is touched —
+    /// the chunk count, the per-value ceiling, the UTF-8 boundaries; NVS refusing a write
+    /// it has room for is left to the writer task, which counts it in
+    /// `/api/status.store.failed` and logs the keys.
+    ///
+    /// The write itself is a request (see [`App::flush_store`]): this runs on whatever
+    /// thread made the change, and on this board only the store writer may touch flash.
     fn persist_workspace(&mut self) -> std::result::Result<(), String> {
         let text = self.workspace.to_json().to_string();
         match store::write_blob(self.store.as_mut(), NVS_KEY_WORKSPACE, &text, WORKSPACE_PLAN) {
@@ -6530,11 +6659,23 @@ mod tests {
     /// exactly the property that a new `App` and an old one disagree about, and a store
     /// per `App` could not express it.
     #[derive(Clone, Debug, Default)]
-    struct SharedStore(Arc<Mutex<std::collections::BTreeMap<String, String>>>);
+    struct SharedStore(
+        Arc<Mutex<std::collections::BTreeMap<String, String>>>,
+        // Writes that actually reached this store, as opposed to being queued for it.
+        Arc<std::sync::atomic::AtomicU32>,
+    );
 
     impl SharedStore {
         fn new() -> Self {
             Self::default()
+        }
+
+        /// How many `set`/`remove` calls this store has taken. The store writer is the only
+        /// thing on a board that makes these calls, so a test that reads this without
+        /// flushing first is asking "did the app write flash itself?" — the question this
+        /// whole layer exists to answer with "never".
+        fn writes(&self) -> u32 {
+            self.1.load(std::sync::atomic::Ordering::Relaxed)
         }
 
         /// Every key currently stored, in order: the transcript spans several of them.
@@ -6552,6 +6693,7 @@ mod tests {
             match self.0.lock() {
                 Ok(mut m) => {
                     m.insert(key.to_string(), value.to_string());
+                    self.1.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     true
                 }
                 Err(_) => false,
@@ -6560,7 +6702,10 @@ mod tests {
 
         fn remove(&mut self, key: &str) -> bool {
             match self.0.lock() {
-                Ok(mut m) => m.remove(key).is_some(),
+                Ok(mut m) => {
+                    self.1.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    m.remove(key).is_some()
+                }
                 Err(_) => false,
             }
         }
@@ -6581,6 +6726,14 @@ mod tests {
 
     fn app_with(store: &SharedStore) -> App {
         app_with_log(store).0
+    }
+
+    /// The store writer's job, done at a point a test chooses: these tests read the
+    /// *backing* store, and on a board only the writer task ever writes there. Calling it
+    /// where a test says "it reached flash" is the point - a write that is merely queued
+    /// has not reached anything yet.
+    fn drain_store(app: &mut App) {
+        app.flush_store("test-writer");
     }
 
     /// The model endpoint is a stub, and the stub is the transport: only the URL has to
@@ -6662,6 +6815,8 @@ mod tests {
             shared.lock().unwrap().agent.push_user(&format!("question {turn}"), "http", turn);
             assert_eq!(run_turn(&shared, &mut model), format!("turn {turn} done"));
         }
+        // The writer flushes what the turns queued, and only then does the power go out.
+        shared.lock().unwrap().flush_store("test-writer");
         let before = { shared.lock().unwrap().agent.history.clone() };
         drop(shared);
 
@@ -6711,6 +6866,7 @@ mod tests {
             ));
         }
         assert!(app.persist_transcript());
+        drain_store(&mut app);
 
         // The board's NVS takes no value above ~4 KB, so the blob is stored as a run of
         // keys rather than one that would be silently refused on the bench.
@@ -6764,6 +6920,7 @@ mod tests {
         writer.agent.history.push(crate::agent::Message::user("before the outage", "http", 1));
         writer.agent.history.push(crate::agent::Message::assistant("and before", Vec::new(), 2));
         assert!(writer.persist_transcript());
+        writer.flush_store("test-writer");
         let good = store.get(NVS_KEY_TRANSCRIPT).expect("stored");
         let mut writer = store.clone();
         assert!(writer.set(NVS_KEY_TRANSCRIPT, &good[..good.len() - 20]));
@@ -6783,12 +6940,14 @@ mod tests {
         let mut model = Scripted::new(vec![Scripted::answer("noted")]);
         shared.lock().unwrap().agent.push_user("remember this", "http", 1);
         assert_eq!(run_turn(&shared, &mut model), "noted");
+        shared.lock().unwrap().flush_store("test-writer");
         assert!(store.get(NVS_KEY_TRANSCRIPT).is_some(), "the turn reached flash");
 
         // `forget` through the same route an external agent uses.
         let resp = shared.lock().unwrap().route(&post("/api/agent/forget", "{}"));
         assert_eq!(resp.status, 200);
         assert_eq!(body_json(&resp)["removed"], json!(2));
+        shared.lock().unwrap().flush_store("test-writer");
         assert!(
             store.get(NVS_KEY_TRANSCRIPT).is_none(),
             "the stored copy survived a forget, so it would come back at the next boot"
@@ -6805,6 +6964,7 @@ mod tests {
         app.agent.history.push(crate::agent::Message::assistant("at all", Vec::new(), 2));
         assert!(app.persist_transcript());
         assert_eq!(app.route(&post("/api/agent/reset", "{}")).status, 200);
+        drain_store(&mut app);
         assert!(store.get(NVS_KEY_TRANSCRIPT).is_none());
     }
 
@@ -6858,6 +7018,7 @@ mod tests {
             let mut app = shared.lock().unwrap();
             app.agent.push_user("turn the pump on for two seconds", "http", 2);
             assert!(matches!(app.agent_begin(), Some(AgentStep::Ask { .. })));
+            drain_store(&mut app);
             assert!(store.get(NVS_KEY_RUN_IN_FLIGHT).is_some(), "a running turn is marked");
             let reply = llm::ModelReply {
                 tool_calls: vec![llm::ToolCall {
@@ -6868,6 +7029,7 @@ mod tests {
                 ..Default::default()
             };
             assert!(matches!(app.agent_reply(Ok(reply)), AgentStep::Ask { .. }));
+            drain_store(&mut app);
             assert!(
                 store.get(NVS_KEY_RUN_IN_FLIGHT).is_some(),
                 "a turn that is still asking is still in flight"
@@ -6878,7 +7040,9 @@ mod tests {
 
         let (mut app, log) = app_with_log(&store);
         point_at_the_stub(&mut app);
-        // The marker is consumed at boot, so a second reboot does not ask a third time.
+        // The marker is consumed at boot, so a second reboot does not ask a third time. The
+        // removal is queued like every other write, so the writer is what makes it stick.
+        drain_store(&mut app);
         assert!(store.get(NVS_KEY_RUN_IN_FLIGHT).is_none(), "the marker outlived the boot that read it");
         let queued = app.agent.pending.clone().expect("the interrupted turn is queued again");
         assert_eq!(queued.source, RESUME_SOURCE);
@@ -7064,6 +7228,109 @@ mod tests {
         let job = app.scripts.iter().find(|j| j.state == "done").expect("a finished job");
         assert_eq!(job.result, json!(2));
         assert!(app.agent.pending.is_some(), "the prompt task still queues a message");
+    }
+
+    // ------------------------------------------- who is allowed to touch flash
+
+    /// A due task runs on the agent thread, and that thread's stack is not guaranteed to
+    /// be in internal RAM — measured on the bench 2026-11-12: stack in PSRAM, a due task,
+    /// `persist_sched` -> `nvs_erase_key`, `esp_task_stack_is_sane_cache_disabled()`, reboot
+    /// every ~8 s, forever, because the task was still due after the reboot.
+    ///
+    /// So this is the constraint as an assertion rather than a comment: the tick may ask
+    /// for the write, and the store must not see one. Reverting `QueuedStore` to write
+    /// straight through makes `writes()` 1 here and this test fail.
+    #[test]
+    fn a_due_task_queues_its_write_and_the_tick_never_touches_flash() {
+        let store = SharedStore::new();
+        let mut app = app_with(&store);
+        // Let the writer catch up with what boot queued (the seeded skills), so the counts
+        // below are about the scheduled task and nothing else.
+        app.flush_store("test-writer");
+        let writes_before = store.writes();
+        let resp = app.route(&post(
+            "/api/sched",
+            r#"{"kind":"task","op":"add","task":{"id":"t1","prompt":"say hi","every_s":60}}"#,
+        ));
+        assert_eq!(resp.status, 200, "{:?}", body_json(&resp));
+        assert_eq!(store.writes(), writes_before, "accepting a task must not write flash either");
+
+        // One interval later, exactly what the agent thread's tick does on the board.
+        let now = 60_000;
+        let fired = app.sched_tick(now, 0);
+        assert_eq!(fired, vec!["schedule:t1".to_string()]);
+        assert_eq!(
+            store.writes(),
+            writes_before,
+            "the scheduler tick runs on the agent thread; a write from there is the reboot loop"
+        );
+        // Read-your-writes: the queued schedule already says the task ran, so a second tick
+        // cannot fire it twice while the writer has not caught up.
+        let queued = app.store.get(NVS_KEY_SCHED).expect("the tick queued the schedule");
+        assert!(queued.contains("\"t1\""), "{queued}");
+        assert_eq!(app.store_queue().pending(), 1, "one key, however many ticks queued it");
+
+        // The writer is what makes it durable, and it is the only thing that does.
+        let report = app.flush_store("test-writer");
+        assert_eq!(report.written, 1);
+        assert_eq!(report.failed, 0);
+        assert_eq!(report.keys, vec![NVS_KEY_SCHED.to_string()]);
+        assert_eq!(store.writes(), writes_before + 1);
+        assert!(store.get(NVS_KEY_SCHED).expect("stored").contains("\"t1\""));
+        assert_eq!(app.store_queue().pending(), 0);
+        // And the next tick is not due: only true because the write was applied.
+        assert!(app.sched_tick(now + 1_000, 0).is_empty());
+    }
+
+    /// The same rule for every other durable change, driven through the routes and tools a
+    /// person or a model actually uses: config, file workspace and transcript.
+    #[test]
+    fn no_edit_writes_flash_where_it_was_made() {
+        let store = SharedStore::new();
+        let mut app = app_with(&store);
+        // Boot queues what it has to rewrite (the seeded skills), and writes nothing.
+        assert_eq!(store.writes(), 0, "boot must not write flash from the thread that runs it");
+
+        assert_eq!(app.route(&post("/api/config", r#"{"device_name":"bench"}"#)).status, 200);
+        ToolHost::call_tool(&mut app, "fs_write", &json!({ "path": "/a.txt", "text": "hello" }))
+            .expect("fs_write");
+        app.agent.history.push(crate::agent::Message::user("question", "http", 1));
+        assert!(app.persist_transcript());
+        assert_eq!(store.writes(), 0, "an edit must not reach flash from the thread that made it");
+
+        let report = app.flush_store("test-writer");
+        assert_eq!(report.failed, 0, "{:?}", report.keys);
+        assert!(report.written >= 3, "{:?}", report.keys);
+        for key in [crate::config::NVS_KEY_CONFIG, NVS_KEY_WORKSPACE, NVS_KEY_TRANSCRIPT] {
+            assert!(
+                report.keys.iter().any(|queued| queued == key),
+                "`{key}` was never queued: {:?}",
+                report.keys
+            );
+        }
+        assert!(store.get(crate::config::NVS_KEY_CONFIG).expect("stored").contains("bench"));
+        assert_eq!(app.store_queue().pending(), 0);
+        // The counters `/api/status.store` shows agree with what happened.
+        let status = body_json(&app.route(&get("/api/status")));
+        assert_eq!(status["store"]["written"], json!(report.written));
+        assert_eq!(status["store"]["failed"], json!(0));
+        assert_eq!(status["store"]["pending"], json!(0));
+    }
+
+    /// What `/api/status.store` says about the writer: a board whose writer is on the wrong
+    /// kind of stack has to be visible from outside, not only in a log line.
+    #[test]
+    fn the_status_names_the_task_that_writes_and_whether_its_stack_is_safe() {
+        let store = SharedStore::new();
+        let mut app = app_with(&store);
+        assert_eq!(
+            body_json(&app.route(&get("/api/status")))["store"]["writer"]["internal_stack"],
+            Value::Null
+        );
+        app.attach_store_writer("nvs-writer", true);
+        let status = body_json(&app.route(&get("/api/status")));
+        assert_eq!(status["store"]["writer"]["task"], json!("nvs-writer"));
+        assert_eq!(status["store"]["writer"]["internal_stack"], json!(true));
     }
 
     /// The map is only worth reading if it is true.
@@ -9472,6 +9739,8 @@ mod tests {
             ToolHost::call_tool(&mut app, "fs_write", &json!({ "path": path, "text": text }))
                 .unwrap_or_else(|e| panic!("fs_write {path}: {e}"));
         }
+        // What the writer task would have done before the reboot.
+        drain_store(&mut app);
 
         // The blob is past the 4000-byte single-value ceiling: the size that used to be
         // written nowhere while the tool answered ok.
@@ -9529,13 +9798,15 @@ mod tests {
         .to_string();
         assert!(store.clone().set(NVS_KEY_WORKSPACE, &old));
 
-        let (app, log) = app_with_log(&store);
+        let (mut app, log) = app_with_log(&store);
         assert_eq!(
             fs_tools::Workspace::read(&app.workspace, "/memory/pins.md").unwrap(),
             "# pins\nGPIO18 is the WS2812 strip, active high.\n",
             "every file the old value held is still there"
         );
         assert!(fs_tools::Workspace::read(&app.workspace, "/MEMORY.md").unwrap().contains("pins"));
+        // The migration is queued like every other write; the writer makes it durable.
+        drain_store(&mut app);
         // The same boot wrote it back in the chunked format, and said so.
         assert!(store.get("ws").unwrap().starts_with("ws1 "), "{:?}", store.get("ws"));
         assert!(
@@ -9567,6 +9838,7 @@ mod tests {
             ToolHost::call_tool(&mut app, "fs_write", &json!({ "path": path, "text": text })).unwrap();
         }
         assert!(fs_tools::Workspace::read(&app.workspace, "/notes/a.md").unwrap().len() > 1000);
+        drain_store(&mut app);
         assert!(store.get("ws.2").is_some(), "the blob has to span two values for this test");
 
         // A power cut in the middle of a save leaves a chunk that does not match the header.
@@ -10595,6 +10867,9 @@ mod tests {
                 &json!({ "path": "/skills/recover-board/SKILL.md", "confirm": true }),
             )
             .expect("and deletes another");
+            // The owner's edits are queued; the writer flushes them, and then the power
+            // goes out.
+            drain_store(&mut app);
         }
 
         // The power goes out, and comes back to a new App over the same flash.
