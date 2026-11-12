@@ -26,7 +26,8 @@ use serde_json::{json, Map, Value};
 use std::collections::BTreeMap;
 
 pub const MANIFEST_VERSION: u32 = 1;
-pub const NVS_KEY_MANIFEST: &str = "manifest";
+/// The name lives in `keys.rs` with every other NVS key: one place, one 15-byte check.
+pub const NVS_KEY_MANIFEST: &str = crate::keys::MANIFEST;
 pub const MAX_TOOLS: usize = 48;
 pub const MAX_STEPS: usize = 8;
 pub const MAX_TOTAL_DELAY_MS: u32 = 5_000;

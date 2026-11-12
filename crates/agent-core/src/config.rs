@@ -24,7 +24,8 @@ fn default_discovery() -> String {
 fn default_profile() -> String {
     "full".to_string()
 }
-pub const NVS_KEY_CONFIG: &str = "config";
+/// The name lives in `keys.rs` with every other NVS key: one place, one 15-byte check.
+pub const NVS_KEY_CONFIG: &str = crate::keys::CONFIG;
 pub const DEFAULT_PORT: u16 = 80;
 pub const DEFAULT_PATH: &str = "/mcp";
 
