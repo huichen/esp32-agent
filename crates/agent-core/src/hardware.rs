@@ -95,6 +95,23 @@ pub trait Hardware: Send {
         Err(McpError::unsupported("I2C is not available on this board"))
     }
 
+    /// SPI: transfer `data` and return the same number of bytes shifted back.
+    ///
+    /// Full duplex; chip select is the caller's job (drivers drive it with
+    /// `gpio_write`, so the pin is visible to a manifest too). Defaulted, so a
+    /// board without SPI still compiles and a driver reports one clear error
+    /// instead of carrying an unreachable branch.
+    fn spi_transfer(&mut self, _bus: u8, _data: &[u8]) -> Result<Vec<u8>> {
+        Err(McpError::unsupported("SPI is not available on this board"))
+    }
+
+    /// Camera: capture one frame as packed RGB888 (three bytes per pixel, row
+    /// major). `opts` carries the pins and geometry declared by the manifest or
+    /// the board profile. Defaulted for the same reason as `spi_transfer`.
+    fn dvp_capture(&mut self, _opts: &serde_json::Value) -> Result<Vec<u8>> {
+        Err(McpError::unsupported("a camera is not available on this board"))
+    }
+
     fn gpio_config(&mut self, _pin: i32, _mode: PinMode) -> Result<()> {
         Err(McpError::unsupported("GPIO is not available on this board"))
     }
