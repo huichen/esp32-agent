@@ -30,7 +30,7 @@ pub const AGENTS_MD: &str = "/AGENTS.md";
 /// Where skills live.
 pub const SKILLS_DIR: &str = "/skills";
 /// The memory index the agent writes and the prompt reads.
-pub const MEMORY_MD: &str = "/memory.md";
+pub const MEMORY_MD: &str = "/MEMORY.md";
 /// Where the memories themselves live, one file per topic.
 pub const MEMORY_DIR: &str = "/memory";
 

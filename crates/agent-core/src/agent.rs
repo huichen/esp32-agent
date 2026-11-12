@@ -303,7 +303,7 @@ pub trait ToolHost {
         Vec::new()
     }
 
-    /// The memory index: `/memory.md`, already bounded by the host.
+    /// The memory index: `/MEMORY.md`, already bounded by the host.
     ///
     /// Memories live on the file workspace like everything else the agent can edit — the
     /// index is what makes them reachable without a tool of their own. `None` means the
@@ -1009,11 +1009,11 @@ impl Agent {
         // memory is opened with `fs_read` like any other file, so nothing is loaded twice
         // and nothing is spent on a topic this turn does not need.
         text.push_str(
-            "\n\n## Memory (/memory.md)\n\
+            "\n\n## Memory (/MEMORY.md)\n\
              This is what you wrote down in earlier sessions, as an index. Open a topic with \
              fs_read before relying on it; a fresh board has none.\n\
              To remember something: write the fact to `/memory/<topic>.md` (2 KB is the file \
-             limit) and add **one line** to `/memory.md` — `- [topic](path) — hook`. The line is a \
+             limit) and add **one line** to `/MEMORY.md` — `- [topic](path) — hook`. The line is a \
              pointer, never the memory itself, and the index is kept under 24 lines; replace an \
              outdated entry instead of appending.\n",
         );
@@ -2102,7 +2102,7 @@ mod tests {
         }
         let agent = Agent::new();
         let prompt = agent.system_message(&mut Remembering);
-        assert!(prompt.contains("## Memory (/memory.md)"), "{prompt}");
+        assert!(prompt.contains("## Memory (/MEMORY.md)"), "{prompt}");
         assert!(prompt.contains("memory/pins.md"), "{prompt}");
 
         let prompt = agent.system_message(&mut StubHost::returning("{}"));

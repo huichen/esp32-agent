@@ -20,7 +20,7 @@
 | 通过 HTTPS 的控制台 | 在手机上对话，并配置设备、工具、定时、日志、WiFi 与模型；证书由板子自己签发。[网页控制台](docs/web-console.md) |
 | 无人值守也会动作 | 定时提示，以及读数越过阈值时触发提示的传感器规则。[定时任务](docs/scheduling.md) |
 | 一个 shell 和一门脚本语言 | `shell` 有 26 个按 NuttX 命名的命令，还有一个对工具调用做循环的解释器。[Shell](docs/shell.md) · [脚本](docs/scripting.md) |
-| 它会记住告诉过它的事 | 常驻指令、`/AGENTS.md`、`/memory.md` 索引与技能，每轮组装进提示词。[模型每轮都能看到什么](docs/context.md) |
+| 它会记住告诉过它的事 | 常驻指令、`/AGENTS.md`、`/MEMORY.md` 索引与技能，每轮组装进提示词。[模型每轮都能看到什么](docs/context.md) |
 | 路径中没有云端 | 由板子提供 HTTPS，证书由它生成，三类调用方一个 PIN。[认证](docs/security.md) |
 | 无需硬件即可测试 | 模拟器把同一份 `agent-core` 跑在虚拟板上。[模拟器](docs/simulator.md) |
 
