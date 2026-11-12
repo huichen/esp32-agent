@@ -3681,6 +3681,8 @@ impl App {
             "shell_sort" => self.shell_sort(inner),
             "shell_uniq" => self.shell_uniq(inner),
             "shell_tr" => self.shell_tr(inner),
+            "shell_sed" => self.shell_sed(inner),
+            "shell_awk" => self.shell_awk(inner),
             "shell_tee" => self.shell_tee(inner),
             "shell_touch" => self.shell_touch(inner),
             "shell_du" => Ok(self.shell_du()),
@@ -4365,6 +4367,69 @@ impl App {
             "lines": lines.len(),
             "duplicates_removed": before - lines.len(),
             "text": lines.join("\n"),
+        })
+        .to_string())
+    }
+
+    /// `sed 's/from/to/[g]' [path]`: one substitution, applied line by line.
+    fn shell_sed(&mut self, args: &Value) -> std::result::Result<String, String> {
+        let script = args.get("script").and_then(|v| v.as_str()).unwrap_or("");
+        let (from, to, global) = crate::tools::shell::parse_substitute(script)?;
+        let (path, text) = self.shell_input(args, "sed")?;
+        let mut lines: Vec<String> = Vec::with_capacity(text.lines().count());
+        let mut changed = 0usize;
+        let mut replacements = 0usize;
+        for line in text.lines() {
+            let hits = line.matches(from.as_str()).count();
+            if hits > 0 {
+                changed += 1;
+                replacements += if global { hits } else { 1 };
+            }
+            lines.push(if global {
+                line.replace(from.as_str(), &to)
+            } else {
+                line.replacen(from.as_str(), &to, 1)
+            });
+        }
+        Ok(json!({
+            "path": path,
+            "lines": lines.len(),
+            "changed_lines": changed,
+            "replacements": replacements,
+            "text": lines.join("\n"),
+        })
+        .to_string())
+    }
+
+    /// `awk '{print $1, $NF}' [path]`: the field-printing subset.
+    ///
+    /// Fields are whitespace-separated unless `-F` gives a separator. Nothing else is
+    /// implemented — no patterns, no arithmetic, no `BEGIN` — because the board has `script`
+    /// for that, and a half-`awk` would be the worse tool of the two.
+    fn shell_awk(&mut self, args: &Value) -> std::result::Result<String, String> {
+        use crate::tools::shell::PrintItem;
+        let program = args.get("program").and_then(|v| v.as_str()).unwrap_or("");
+        let items = crate::tools::shell::parse_print_program(program)?;
+        let sep = args.get("sep").and_then(|v| v.as_str()).unwrap_or("");
+        let (path, text) = self.shell_input(args, "awk")?;
+        let mut out: Vec<String> = Vec::with_capacity(text.lines().count());
+        for line in text.lines() {
+            let cols: Vec<&str> =
+                if sep.is_empty() { line.split_whitespace().collect() } else { line.split(sep).collect() };
+            let mut parts: Vec<&str> = Vec::with_capacity(items.len());
+            for item in &items {
+                parts.push(match item {
+                    PrintItem::Line => line,
+                    PrintItem::Last => cols.last().copied().unwrap_or(""),
+                    PrintItem::Field(n) => cols.get(n - 1).copied().unwrap_or(""),
+                });
+            }
+            out.push(if sep.is_empty() { parts.join(" ") } else { parts.join(sep) });
+        }
+        Ok(json!({
+            "path": path,
+            "lines": out.len(),
+            "text": out.join("\n"),
         })
         .to_string())
     }
@@ -7094,6 +7159,80 @@ mod tests {
         assert_eq!(upper["text"], json!("XYZ\n"));
         // A range would be three characters here, and the answer says so rather than lying.
         assert!(upper["note"].as_str().unwrap().contains("not a range"), "{upper}");
+    }
+
+    /// `sed`: one substitution per line, and a script that is not one is refused rather
+    /// than guessed at.
+    #[test]
+    fn sed_replaces_one_expression_per_line() {
+        let mut app = test_app();
+        write_file(&mut app, "/s.txt", "error: one\nerror: two\nfine\n");
+        let first = sh(&mut app, "sed s/error/ERR/ /s.txt");
+        assert_eq!(first["text"], json!("ERR: one\nERR: two\nfine"), "{first}");
+        assert_eq!(first["changed_lines"], json!(2));
+        assert_eq!(first["replacements"], json!(2));
+
+        // `g` takes every match on a line; without it, only the first.
+        write_file(&mut app, "/g.txt", "a a a\n");
+        assert_eq!(sh(&mut app, "sed s/a/b/g /g.txt")["text"], json!("b b b"));
+        assert_eq!(sh(&mut app, "sed s/a/b/ /g.txt")["text"], json!("b a a"));
+
+        // A delimiter that is not `/` works, and a literal one can be escaped. (`|` cannot:
+        // the shell splits the command line on it before `sed` ever sees the script.)
+        write_file(&mut app, "/p.txt", "a/b\n");
+        assert_eq!(sh(&mut app, "sed s,/,:, /p.txt")["text"], json!("a:b"), "comma delimiter");
+
+        // The refusals are the interesting part: each names what is not implemented.
+        for (script, needle) in [
+            ("s/a", "both sides"),
+            ("s//b/", "empty `from`"),
+            ("s/a/b/x", "not a flag"),
+            ("d", "not a substitution"),
+        ] {
+            let err =
+                ToolHost::call_tool(&mut app, "shell", &json!({"command": format!("sed {script} /s.txt")}))
+                    .unwrap_err();
+            assert!(err.contains(needle), "`{script}` gave: {err}");
+        }
+    }
+
+    /// `awk`: `$0`, `$N` and `$NF`, whitespace or `-F`; anything else is refused with the
+    /// reason, because a half-`awk` that quietly returns nothing is worse than an error.
+    #[test]
+    fn awk_prints_fields_and_refuses_the_rest_of_the_language() {
+        let mut app = test_app();
+        write_file(&mut app, "/log.txt", "12:01 up 3 days\n12:02 up 3 days\n");
+        let second = sh(&mut app, "awk '{print $2}' /log.txt");
+        assert_eq!(second["text"], json!("up\nup"), "{second}");
+        assert_eq!(second["lines"], json!(2));
+
+        // Two fields, the last one, and the whole line.
+        assert_eq!(sh(&mut app, "awk '{print $1, $NF}' /log.txt")["text"], json!("12:01 days\n12:02 days"));
+        assert_eq!(sh(&mut app, "awk '{print $NF, $1}' /log.txt")["text"], json!("days 12:01\ndays 12:02"));
+        assert_eq!(
+            sh(&mut app, "awk '{print $0}' /log.txt")["text"],
+            json!("12:01 up 3 days\n12:02 up 3 days")
+        );
+
+        // A separator, as `--sep ,`.
+        write_file(&mut app, "/csv.txt", "a,1\nb,2\n");
+        assert_eq!(sh(&mut app, "awk '{print $2}' --sep , /csv.txt")["text"], json!("1\n2"));
+
+        // Out of range prints an empty field, as awk does, rather than dropping the line.
+        write_file(&mut app, "/short.txt", "only\n");
+        assert_eq!(sh(&mut app, "awk '{print $3}' /short.txt")["text"], json!(""));
+
+        for (program, needle) in
+            [("{print 1}", "not a field"), ("$1", "`{print ...}`"), ("{sum += $1}", "only `print`")]
+        {
+            let err = ToolHost::call_tool(
+                &mut app,
+                "shell",
+                &json!({"command": format!("awk '{program}' /log.txt")}),
+            )
+            .unwrap_err();
+            assert!(err.contains(needle), "`{program}` gave: {err}");
+        }
     }
 
     #[test]
