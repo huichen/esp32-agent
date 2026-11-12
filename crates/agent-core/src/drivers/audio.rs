@@ -204,7 +204,7 @@ impl crate::device::Device for Speaker {
             }),
             ToolDef::new(
                 "speaker_play",
-                "Play base64 PCM on the amplifier (16-bit mono, 24 kHz), at most 2048 bytes of audio",
+                "Play base64 PCM on the amplifier (16-bit mono, 24 kHz), at most 2048 bytes of audio — 43 ms. A tool result cannot carry a song: stream a longer one into `POST /audio/pcm` instead (docs/audio.md §6)",
             )
             .title("Play samples")
             .category("audio")
