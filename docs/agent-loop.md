@@ -29,7 +29,7 @@ endpoint over HTTP or HTTPS, using the board's own tools as its tool set:
   heap for the session, which is why the board has PSRAM and why one run still happens
   at a time. Inbound traffic — the portal and `/mcp` on port 8080 — stays HTTP;
   see `SECURITY.md` for why that is a reverse-proxy decision, not an oversight.
-- **Bounded everything.** History ring (<= 48 messages / <= 24 KB), tool result
+- **Bounded everything.** History ring (<= 256 messages / <= 512 KB), tool result
   <= 2 KB (truncated with a marker), model reply <= 8 KB, `max_steps` default 4.
 - **No new ESP-IDF components.** The workspace for the file tools is an in-RAM
   map persisted as one JSON blob in NVS (`esp32mcp` namespace, key `ws`), files
@@ -136,7 +136,7 @@ impl Agent {
 
 Rules: system prompt is generated once per run and is not stored in history;
 history trimming keeps the system prompt implicit and drops oldest user/assistant
-pairs beyond 48 messages; every tool result text is truncated to 2048 bytes with
+pairs beyond 256 messages; every tool result text is truncated to 2048 bytes with
 `"…(truncated)"`; `run_pending` with no pending message is `Ok(String::new())`.
 
 ### 3.2a The order of the tool list is part of the contract
@@ -230,6 +230,34 @@ Both functions must be pure (no clock access) — the caller passes time in.
 - Routes (all under the existing pin/token gate where they mutate):
   - `POST /api/agent/message {"text"}` -> `202 {"queued":true,"seq":n}`
   - `GET /api/agent/history?after=N` -> transcript JSON
+
+## Surviving a power cut
+
+Two mechanisms, one storage: `config.agent.persist_transcript` (default on) and the
+`agent.run_in_flight` marker.
+
+The transcript is written as JSON Lines behind a header under `agent.transcript`,
+`agent.transcript.1`, ... Each chunk is 3500 bytes with an FNV-1a checksum in its header,
+because ESP-IDF refuses a string value above about 4000 bytes and the firmware's NVS
+adapter reads through a fixed 4096-byte buffer. A single 16 KB key would pass every host
+test and persist nothing on the board.
+
+The stored copy is lossy on purpose: text over 300 bytes, reasoning over 200 and tool
+arguments over 256 are cut with the truncation marker, images are not stored at all, and
+only the newest messages that fit 16 KB are kept (`dropped: N` in the header, repeated in
+the prompt as "Recovered after a reboot"). A blob with a bad checksum, an unknown version,
+an edited body or an orphan tool result at the tail is discarded whole and logged, so a
+torn write loses the transcript rather than half-adopting it.
+
+Resume works at step granularity. The marker is written before a run and removed when it
+ends, before the final save, so a crash can lose a reply but never repeat one. At boot a
+marker that survived is consumed and the transcript's last user message is queued again
+with `source: "resume"`; the request then carries the tool call and the result that already
+landed, so the model answers instead of re-issuing the call.
+
+What a power cut still costs: the model output in flight (the turn is re-asked and paid for
+again), a queue entry that never started, and a cut inside the window between clearing the
+marker and the final save (one turn lost, never duplicated).
   - `POST /api/agent/reset` -> `{"reset":true}`
   - `GET /api/agent/config` / `POST /api/agent/config` (api_key never echoed)
   - `GET /api/sched` / `POST /api/sched` (add/update/delete one task or rule by id)
