@@ -1070,15 +1070,7 @@ impl App {
             return Ok(self.ifconfig_json());
         }
         if name == "ping" {
-            let host = args.get("host").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
-            if host.is_empty() {
-                return Err(McpError::invalid_params("`host` is required"));
-            }
-            let count = args.get("count").and_then(|v| v.as_u64()).unwrap_or(3).clamp(1, 5) as u32;
-            return match self.hw.ping(&host, count) {
-                Ok(v) => Ok(v),
-                Err(e) => Err(McpError::unsupported(with_usage("ping", format!("ping: {}", e.message)))),
-            };
+            return self.run_ping(args).map_err(McpError::invalid_params);
         }
         // `image_read` asks the model about an attachment, which means it needs the model
         // config and the transport — neither of which a `ToolCtx` carries.
@@ -2940,7 +2932,24 @@ impl App {
 impl App {
     /// `shell {op, …}`: pick the command, hand the rest of the arguments to the handler.
     fn run_shell(&mut self, args: &Value) -> std::result::Result<String, String> {
+        // Two ways in: a command line (`{"command":"ls -la /notes"}`), which is what a
+        // shell is, and the JSON form (`{"op":"ls","path":"/notes"}`), which is what a
+        // script or a client that builds objects prefers. The command line is parsed and
+        // then becomes the JSON form, so both reach the same handler with the same values.
+        if let Some(line) = args.get("command").and_then(|v| v.as_str()) {
+            let parsed = crate::tools::shell::parse(line)?;
+            let mut derived = crate::tools::shell::arguments(&parsed)?;
+            if args.get("help").and_then(|v| v.as_bool()).unwrap_or(false) {
+                derived["help"] = json!(true);
+            }
+            let mut object = derived.as_object().cloned().unwrap_or_default();
+            object.insert("op".into(), json!(parsed.name));
+            return self.run_shell(&Value::Object(object));
+        }
         let op = args.get("op").and_then(|v| v.as_str()).unwrap_or("").trim().to_ascii_lowercase();
+        if op.is_empty() {
+            return Err(format!("`command` (or `op`) is required.\n\n{}", crate::tools::shell::help_text()));
+        }
         // `shell help`, `shell {"op":"rm","help":true}` and a bare unknown op all answer
         // with the usage lines: a model that guessed the flags should not have to guess
         // again to find out what they are.
@@ -2966,6 +2975,10 @@ impl App {
         let result = match tool {
             "shell_zip" => self.shell_zip(&inner),
             "shell_unzip" => self.shell_unzip(&inner),
+            "shell_curl" => self.run_curl("curl", &inner),
+            "shell_wget" => self.run_curl("wget", &inner),
+            "shell_ping" => self.run_ping(&inner).map(|v| v.to_string()),
+            "shell_ifconfig" => Ok(self.ifconfig_json().to_string()),
             "shell_df" => Ok(self.shell_df()),
             "shell_free" => Ok(self.shell_free()),
             "shell_uptime" => Ok(self.shell_uptime()),
@@ -2983,6 +2996,22 @@ impl App {
                 format!("{e}\n\nusage: {usage}")
             }
         })
+    }
+
+    fn run_ping(&mut self, args: &Value) -> std::result::Result<Value, String> {
+        let host = args.get("host").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+        if host.is_empty() {
+            return Err(with_usage("ping", "`host` is required".to_string()));
+        }
+        let count = args
+            .get("count")
+            .and_then(|v| v.as_u64().or_else(|| v.as_str().and_then(|s| s.parse().ok())))
+            .unwrap_or(3)
+            .clamp(1, 5) as u32;
+        match self.hw.ping(&host, count) {
+            Ok(v) => Ok(v),
+            Err(e) => Err(with_usage("ping", format!("ping: {}", e.message))),
+        }
     }
 
     /// `curl`: GET (with HTML reduced to text) or POST when `data` is given.
@@ -4437,7 +4466,7 @@ mod tests {
 
         // `help` answers without doing anything.
         let help: Value = serde_json::from_str(&queued(&mut app, json!({"op":"help"})).unwrap()).unwrap();
-        assert!(help["help"].as_str().unwrap().contains("unzip --archive_b64"), "{help}");
+        assert!(help["help"].as_str().unwrap().contains("unzip <archive_b64>"), "{help}");
         let one: Value =
             serde_json::from_str(&queued(&mut app, json!({"op":"cp","help":true})).unwrap()).unwrap();
         assert!(one["help"].as_str().unwrap().starts_with("usage: cp <from> <to>"), "{one}");
@@ -4446,7 +4475,7 @@ mod tests {
         let err = app.call_tool("read", &json!({"path":"/nope.txt"})).unwrap_err();
         assert!(err.message.contains("usage: read <path>"), "{}", err.message);
         let help = app.call_tool("ping", &json!({"help":true})).unwrap();
-        assert_eq!(help["help"], json!("usage: ping <host> [--count n]"));
+        assert_eq!(help["help"], json!("usage: ping <host> [-c <count>]"));
     }
 
     // ---- the live journal stream (docs/agent-stream.md §1) ----
@@ -5361,7 +5390,7 @@ mod tests {
             .iter()
             .find(|t| t["name"] == "shell")
             .expect("shell in the list");
-        assert!(shell["inputSchema"]["properties"]["op"].is_object(), "{shell}");
+        assert!(shell["inputSchema"]["properties"]["command"].is_object(), "{shell}");
 
         // And the commands go through the same code the agent uses, over MCP.
         let write = app

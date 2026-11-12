@@ -499,6 +499,9 @@ pub fn system_tools() -> Vec<ToolDef> {
 /// `nslookup`, `nc`, `ifconfig`, `ping` — because a model knows those and a description it
 /// has to read for every one of them is a description in every request.
 pub fn agent_extra_specs() -> Value {
+    // Reading, writing and editing a file are the three operations frequent enough to be
+    // their own tools; everything else the shell does is behind `shell`, with one command
+    // line as its argument.
     json!([
         {
             "type": "function",
@@ -508,8 +511,8 @@ pub fn agent_extra_specs() -> Value {
                 "parameters": {
                     "type": "object",
                     "properties": {
-                    "help": { "type": "boolean", "description": "return the usage line instead of running" },
                         "path": { "type": "string", "description": "file path, e.g. `/notes/a.txt`" },
+                        "help": { "type": "boolean", "description": "return the usage line instead of running" },
                     },
                     "required": ["path"],
                 },
@@ -523,9 +526,9 @@ pub fn agent_extra_specs() -> Value {
                 "parameters": {
                     "type": "object",
                     "properties": {
-                    "help": { "type": "boolean", "description": "return the usage line instead of running" },
                         "path": { "type": "string", "description": "file path to write" },
                         "text": { "type": "string", "description": "complete new contents" },
+                        "help": { "type": "boolean", "description": "return the usage line instead of running" },
                     },
                     "required": ["path", "text"],
                 },
@@ -539,10 +542,10 @@ pub fn agent_extra_specs() -> Value {
                 "parameters": {
                     "type": "object",
                     "properties": {
-                    "help": { "type": "boolean", "description": "return the usage line instead of running" },
                         "path": { "type": "string", "description": "file path to edit" },
                         "find": { "type": "string", "description": "literal text, must occur exactly once" },
                         "replace": { "type": "string", "description": "replacement text" },
+                        "help": { "type": "boolean", "description": "return the usage line instead of running" },
                     },
                     "required": ["path", "find", "replace"],
                 },
@@ -551,109 +554,19 @@ pub fn agent_extra_specs() -> Value {
         {
             "type": "function",
             "function": {
-                "name": "curl",
-                "description": "Fetch a URL. GET by default; an HTML page is reduced to its text unless format=raw; send `data` to POST it. Returns up to 2048 bytes.",
+                "name": "image_read",
+                "description": "Read an image the user attached to their message, by asking a vision model about it. Give a `prompt` (\"transcribe the text\" for OCR, \"describe\" for a caption) and optionally `name` when more than one is attached. This costs a second model call.",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                    "help": { "type": "boolean", "description": "return the usage line instead of running" },
-                        "url": { "type": "string", "description": "http:// or https:// URL" },
-                        "data": { "type": "string", "description": "body to POST; omit for GET" },
-                        "format": { "type": "string", "enum": ["text", "raw"], "description": "text (default) reduces an HTML page to its words" },
+                        "prompt": { "type": "string", "description": "what to ask about the image; the default is a full transcription plus a description" },
+                        "name": { "type": "string", "description": "which attachment, when the message carried more than one" },
                     },
-                    "required": ["url"],
+                    "required": [],
                 },
             },
         },
-        {
-            "type": "function",
-            "function": {
-                "name": "wget",
-                "description": "Download a URL into the workspace as a file. Text is stored as it arrives; anything else is stored base64-encoded with `encoding: base64` in the result.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                    "help": { "type": "boolean", "description": "return the usage line instead of running" },
-                        "url": { "type": "string", "description": "http:// or https:// URL" },
-                        "path": { "type": "string", "description": "where to save it, default `/downloads/<host><path>`" },
-                        "format": { "type": "string", "enum": ["text", "raw"], "description": "for HTML: text (default) saves the words, raw saves the document" },
-                    },
-                    "required": ["url"],
-                },
-            },
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "nslookup",
-                "description": "Resolve a hostname with the board's resolver. Use it when curl fails: name, route and TLS failures look identical from curl's error.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                    "help": { "type": "boolean", "description": "return the usage line instead of running" },
-                        "host": { "type": "string", "description": "name to resolve, e.g. example.com" },
-                        "port": { "type": "integer", "minimum": 1, "maximum": 65535, "description": "port for the lookup, default 443" },
-                    },
-                    "required": ["host"],
-                },
-            },
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "nc",
-                "description": "Open a TCP connection to host:port and close it. Tells \"host up, service down\" apart from \"nothing there\".",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                    "help": { "type": "boolean", "description": "return the usage line instead of running" },
-                        "host": { "type": "string", "description": "name or address" },
-                        "port": { "type": "integer", "minimum": 1, "maximum": 65535, "description": "port to try, default 80" },
-                        "timeout_ms": { "type": "integer", "minimum": 100, "maximum": 20000, "description": "give up after this, default 3000" },
-                    },
-                    "required": ["host"],
-                },
-            },
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "ping",
-                "description": "Send ICMP echo requests and report the replies: the one check that says whether a host is reachable at all, before any name or TLS question.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                    "help": { "type": "boolean", "description": "return the usage line instead of running" },
-                        "host": { "type": "string", "description": "name or address" },
-                        "count": { "type": "integer", "minimum": 1, "maximum": 5, "description": "echo requests to send, default 3" },
-                    },
-                    "required": ["host"],
-                },
-            },
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "ifconfig",
-                "description": "The board's own network state: address, netmask, gateway, DNS servers, SSID, RSSI and MAC. Answers \"is the gateway I set actually in effect\".",
-                "parameters": { "type": "object", "properties": {
-                    "help": { "type": "boolean", "description": "return the usage line instead of running" },}, "required": [] },
-            },
-        },{
-        "type": "function",
-        "function": {
-            "name": "image_read",
-            "description": "Read an image the user attached to their message, by asking a vision model about it. Give a `prompt` (\"transcribe the text\" for OCR, \"describe\" for a caption) and optionally `name` when more than one is attached. This costs a second model call.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "prompt": { "type": "string", "description": "what to ask about the image; the default is a full transcription plus a description" },
-                    "name": { "type": "string", "description": "which attachment, when the message carried more than one" },
-                },
-                "required": [],
-            },
-        },
-    }])
+    ])
 }
 
 pub fn script_specs() -> Value {

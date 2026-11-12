@@ -11,6 +11,20 @@ answers; a new sensor can be declared with a JSON manifest while the board runs.
 > tool journal, stream events, protocol adapters, memory index. Where the firmware differs
 > (kilobytes instead of gigabytes of RAM, no model-written summaries) the code says why.
 
+## Features
+
+| # | Feature |
+|---|---|
+| 1 | **A model runs on the board.** Agent loop, tools, memory and transcript are in the firmware; the model can be any OpenAI-compatible or Anthropic endpoint. |
+| 2 | **The tool surface is a document.** `manifest_apply` validates a JSON manifest, compiles it into tools and takes effect in the same turn — no restart, no reflash. |
+| 3 | **It finds its own hardware.** Drivers probe I2C, 1-Wire and configured pins at boot; only what answers gets tools. |
+| 4 | **One tool set, two callers.** The MCP endpoint and the on-board agent see the same tools: 48 today, with the shell among them. |
+| 5 | **A web console over HTTPS.** Chat with the model, and change devices, tools, manifest, schedule, logs, WiFi and model settings from a phone. |
+| 6 | **It works while nobody watches.** Timed prompts, sensor rules, and an objective it iterates on across runs. |
+| 7 | **A shell and a scripting language.** 22 shell commands (files, network, diagnostics) and a small interpreter for loops and conditions over tool calls. |
+| 8 | **Self-contained on the LAN.** HTTP and HTTPS from the board, a certificate it generates itself, a PIN and a token for the three callers. |
+| 9 | **Testable without hardware.** The simulator runs the same core against a virtual board. |
+
 ## Flash and connect
 
 ```bash
@@ -93,26 +107,29 @@ read   {"path":"/notes/a.txt"}
 write  {"path":"/notes/a.txt","text":"..."}
 edit   {"path":"/notes/a.txt","find":"old","replace":"new"}
 
-shell  {"op":"ls","path":"/notes"}
-shell  {"op":"cp","from":"/a.txt","to":"/b.txt"}
-shell  {"op":"mv","from":"/a.txt","to":"/b.txt","confirm":true}
-shell  {"op":"rm","path":"/a.txt","confirm":true}
-shell  {"op":"grep","pattern":"GPIO","path":"/"}
-shell  {"op":"zip","name":"t.zip","files":{"a.txt":"hello"}}
-shell  {"op":"unzip","archive_b64":"UEsDB..."}
+shell  {"command": "ls /notes"}
+shell  {"command": "cp /a.txt /b.txt"}
+shell  {"command": "grep GPIO /"}
+shell  {"command": "rm /a.txt --confirm"}
+shell  {"command": "zip t.zip /a.txt /notes/b.md"}
+shell  {"command": "unzip UEsDB..."}
 ```
+
+`shell` takes one command line and parses it, the way a shell does: words, quotes, and
+`-f`/`--flag` options. `{"op":"ls","path":"/notes"}` still works when a client would rather
+build an object than a string.
 
 The commands a shell has for looking at itself, as NuttX's `nsh` does:
 
 ```text
-shell  {"op":"df"}                                   # workspace usage against its 8 KB
-shell  {"op":"free"}                                 # heap, free and minimum
-shell  {"op":"uptime"}                               # uptime and model runs
-shell  {"op":"date"}                                 # clock, and whether SNTP has synced
-shell  {"op":"uname"}                                # soc, cores, flash, PSRAM, IDF, MAC
-shell  {"op":"ps"}                                   # tasks with state and stack headroom
-shell  {"op":"hexdump","path":"/dl/img.bin"}
-shell  {"op":"base64","path":"/notes/a.txt"}          # or --decode / --out <path>
+shell  {"command": "df"}          # workspace usage against its 8 KB
+shell  {"command": "free"}        # heap, free and minimum
+shell  {"command": "uptime"}      # uptime and model runs
+shell  {"command": "date"}        # clock, and whether SNTP has synced
+shell  {"command": "uname"}       # soc, cores, flash, PSRAM, IDF, MAC
+shell  {"command": "ps"}          # tasks with state and stack headroom
+shell  {"command": "hexdump /dl/img.bin"}
+shell  {"command": "base64 /notes/a.txt"}   # -d to decode, -o to write elsewhere
 ```
 
 `edit` refuses when `find` occurs zero or several times, so an ambiguous edit cannot rewrite
@@ -123,14 +140,14 @@ deflated entries and checks each CRC.
 Network commands use the names they have everywhere else:
 
 ```text
-curl     {"url":"https://example.com/"}                       # GET, HTML reduced to text
-curl     {"url":"...","data":"{\"a\":1}"}                    # POST
-curl     {"url":"...","format":"raw"}                         # the document as it arrived
-wget     {"url":"https://example.com/","path":"/dl/page.txt"} # save the body
-nslookup {"host":"example.com"}
-nc       {"host":"example.com","port":443}
-ping     {"host":"192.168.3.1","count":3}
-ifconfig {}                                                   # ip, gateway, DNS, SSID, RSSI, MAC
+shell  {"command": "curl https://example.com/"}                # GET, HTML reduced to text
+shell  {"command": "curl -d {\"a\":1} https://example.com/"}    # POST
+shell  {"command": "curl -f raw https://example.com/"}         # the document as it arrived
+shell  {"command": "wget -o /dl/page.txt https://example.com/"} # save the body
+shell  {"command": "nslookup example.com"}
+shell  {"command": "nc -p 443 example.com"}
+shell  {"command": "ping -c 3 192.168.3.1"}
+shell  {"command": "ifconfig"}                                 # ip, gateway, DNS, SSID, RSSI, MAC
 ```
 
 `ifconfig` reports the configured gateway and DNS rather than the lease, which answers
@@ -183,6 +200,35 @@ limit is what protects it.
 A full run on the bench, from a prompt asking for π to twenty decimal places: doubles reach
 15 digits, so the model wrote a fixed-point big-number loop over lists and returned
 `3.141592653589793238462648…` in 22 000 steps.
+
+## Scheduled work
+
+Two ways to give the board something to do on its own; both feed the same queue a chat
+message uses, so a task and a person cannot start two runs at once.
+
+```bash
+# every five minutes, ask the model something
+curl -sS -X POST http://<board>/api/sched -H 'Content-Type: application/json' -d '{
+  "tasks": [{"id":"t1","prompt":"read the BME280 and say the temperature in one line",
+             "every_s": 300, "enabled": true}]
+}'
+
+# or at a wall-clock time, UTC
+curl -sS -X POST http://<board>/api/sched -H 'Content-Type: application/json' -d '{
+  "tasks": [{"id":"t2","prompt":"summarise the last day and draw it on the OLED",
+             "at_hhmm": "07:30"}]
+}'
+
+# a sensor rule: run the prompt when a reading crosses a threshold
+curl -sS -X POST http://<board>/api/sched -H 'Content-Type: application/json' -d '{
+  "rules": [{"id":"r1","tool":"bme280_read","path":"temperature_c",
+             "op":"gt","value":30,"prompt":"it is hot, check the enclosure"}]
+}'
+```
+
+The agent can also schedule itself: `schedule {"action":"add","prompt":"…","every_s":300}`
+lists, adds, removes, enables and disables the same tasks. Tasks survive a reboot; the
+answer of each run lands in the transcript with `source: "schedule:t1"`.
 
 ## Manifest
 
@@ -252,13 +298,25 @@ chip.
 `crates/` is everything that builds and is tested on a host. `firmware/` is the ESP-IDF
 backend.
 
+**Why `agent-sim` and `agent-core` are two crates.** `agent-core` is the board: protocol,
+manifest, drivers, HTTP server, agent loop, all of it, behind one `Hardware` trait. It has
+no chip-specific code and no dependency on ESP-IDF, so `cargo test` runs it on a laptop.
+`agent-sim` is a 200-line binary that implements that trait against a register file and
+serves the result on a real port; it exists so the same code can be exercised without a
+board. Merging the two would put the simulator inside every firmware image and the
+firmware's dependencies inside every test.
+
+**Why `firmware/` is not in the workspace.** It builds for `xtensa-esp32s3-espidf` with a
+different toolchain (`cargo +esp`, `-Zbuild-std`) and needs ESP-IDF checked out; a root
+`cargo test` must not try to compile any of that.
+
 ```
 crates/agent-core/          no chip needed, host-tested
   hardware.rs               the trait firmware implements
   drivers/                  one module per chip
   manifest.rs               validation, compilation into tools, merge, safety
   agent.rs, llm.rs          the loop and the model client (three protocols)
-  goal.rs, sched.rs         objectives across runs; timed prompts and sensor rules
+  sched.rs                  timed prompts and sensor rules
   tools/                    board, manifest, shell, script, image, knowledge
   http.rs                   HTTP/1.1: keep-alive, chunked, 100-continue, SSE
   app.rs                    state, JSON-RPC dispatch, /mcp and console routes
@@ -278,9 +336,9 @@ firmware/
 
 | Part | State |
 |---|---|
-| `agent-core` | 318 unit tests and 14 integration tests pass; `scripts/smoke.ps1` passes end to end |
+| `agent-core` | 319 unit tests and 14 integration tests pass; `scripts/smoke.ps1` passes end to end |
 | Simulator | console, MCP and the agent loop run end to end |
-| Firmware | built and flashed on an ESP32-S3-DevKitC-1 N16R8 (IDF v5.5.2): 45 tools, OLED 128×32, I²S mic and amplifier, WS2812, TLS portal, model turns over HTTPS |
+| Firmware | built and flashed on an ESP32-S3-DevKitC-1 N16R8 (IDF v5.5.2): 48 tools, OLED 128×32, I²S mic and amplifier, WS2812, TLS portal, model turns over HTTPS |
 | Not implemented | OTA, SD card, DHT/RC522/VL53L0X drivers; video decoding. See `ROADMAP.md` |
 
 Bench measurements: a four-tool model turn in 13.7 s; portal page 7 535 B in 0.55 s over
@@ -301,7 +359,6 @@ design.
 - [Instructions and skills](docs/agent-skills.md)
 - [Memory, compression and forgetting](docs/agent-memory.md)
 - [Manual discovery and scripting](docs/scripting.md)
-- [Goal mode](docs/agent-goal.md)
 
 ## Contributing
 

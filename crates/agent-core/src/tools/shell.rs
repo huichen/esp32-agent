@@ -28,6 +28,12 @@ pub const OPS: &[(&str, &str)] = &[
     ("unzip", "shell_unzip"),
     // The commands a shell has for looking at itself. NuttX's `nsh` has all of these and
     // they cost nothing here: the numbers are already in the app.
+    ("curl", "shell_curl"),
+    ("wget", "shell_wget"),
+    ("nslookup", "net_dns"),
+    ("nc", "net_tcp"),
+    ("ping", "shell_ping"),
+    ("ifconfig", "shell_ifconfig"),
     ("df", "shell_df"),
     ("free", "shell_free"),
     ("uptime", "shell_uptime"),
@@ -37,6 +43,154 @@ pub const OPS: &[(&str, &str)] = &[
     ("hexdump", "shell_hexdump"),
     ("base64", "shell_base64"),
 ];
+
+/// One command line, split the way a shell splits it: words, with quotes respected.
+pub struct Parsed {
+    pub name: String,
+    pub args: Vec<String>,
+    /// `--flag`, `-f value` and `--flag=value` both land here.
+    pub flags: std::collections::BTreeMap<String, String>,
+}
+
+/// Split a command line into a name, positional arguments and flags.
+///
+/// The grammar is the one everybody already types — `ls -la /notes`, `curl -f raw URL`,
+/// `ping -c 3 1.1.1.1` — because the point of a shell is that the model does not have to
+/// learn a new calling convention to use it. Quotes group a word; a backslash escapes the
+/// next character.
+pub fn parse(line: &str) -> Result<Parsed, String> {
+    let mut words: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    for ch in line.trim().chars() {
+        if escaped {
+            current.push(ch);
+            escaped = false;
+            continue;
+        }
+        match ch {
+            '\\' => escaped = true,
+            '"' | '\'' => match quote {
+                Some(open) if open == ch => quote = None,
+                Some(_) => current.push(ch),
+                None => quote = Some(ch),
+            },
+            c if c.is_whitespace() && quote.is_none() => {
+                if !current.is_empty() {
+                    words.push(std::mem::take(&mut current));
+                }
+            }
+            c => current.push(c),
+        }
+    }
+    if quote.is_some() {
+        return Err("unbalanced quote in the command".into());
+    }
+    if !current.is_empty() {
+        words.push(current);
+    }
+    let mut it = words.into_iter();
+    let name = it.next().ok_or("empty command")?.to_ascii_lowercase();
+    let rest: Vec<String> = it.collect();
+
+    let mut args = Vec::new();
+    let mut flags = std::collections::BTreeMap::new();
+    let mut index = 0;
+    while index < rest.len() {
+        let word = &rest[index];
+        if let Some(stripped) = word.strip_prefix("--") {
+            match stripped.split_once('=') {
+                Some((key, value)) => {
+                    flags.insert(key.to_ascii_lowercase(), value.to_string());
+                }
+                None => {
+                    let key = stripped.to_ascii_lowercase();
+                    // A flag takes the next word as its value unless that word is another flag.
+                    if let Some(next) = rest.get(index + 1) {
+                        if !next.starts_with('-') {
+                            flags.insert(key, next.clone());
+                            index += 1;
+                        } else {
+                            flags.insert(key, "true".into());
+                        }
+                    } else {
+                        flags.insert(key, "true".into());
+                    }
+                }
+            }
+        } else if word.len() > 1 && word.starts_with('-') && word != "-" {
+            // Short flags: `-d`, and `-o value` for the ones that take one.
+            let key = word[1..].to_ascii_lowercase();
+            let takes_value = matches!(key.as_str(), "o" | "p" | "c" | "w" | "f");
+            if takes_value {
+                if let Some(next) = rest.get(index + 1) {
+                    flags.insert(key, next.clone());
+                    index += 1;
+                }
+            } else {
+                flags.insert(key, "true".into());
+            }
+        } else {
+            args.push(word.clone());
+        }
+        index += 1;
+    }
+    Ok(Parsed { name, args, flags })
+}
+
+/// Turn a parsed line into the argument object the handler for that command takes.
+///
+/// One place, so the command line and the JSON form cannot mean different things.
+pub fn arguments(parsed: &Parsed) -> Result<serde_json::Value, String> {
+    use serde_json::json;
+    let arg = |n: usize| parsed.args.get(n).cloned();
+    let need = |n: usize, what: &str| -> Result<String, String> {
+        arg(n).ok_or_else(|| format!("{}: missing {what}", parsed.name))
+    };
+    let flag = |long: &str, short: &str| parsed.flags.get(long).or_else(|| parsed.flags.get(short)).cloned();
+    let flag_bool = |long: &str, short: &str| flag(long, short).map(|v| v == "true").unwrap_or(false);
+
+    Ok(match parsed.name.as_str() {
+        "ls" => json!({ "path": arg(0).unwrap_or_else(|| "/".into()) }),
+        "rm" => {
+            json!({ "path": need(0, "<path>")?, "confirm": flag_bool("confirm", "y") || flag_bool("force", "f") })
+        }
+        "cp" => json!({ "from": need(0, "<from>")?, "to": need(1, "<to>")? }),
+        "mv" => {
+            json!({ "from": need(0, "<from>")?, "to": need(1, "<to>")?, "confirm": flag_bool("confirm", "y") })
+        }
+        "grep" => json!({ "pattern": need(0, "<pattern>")?, "path": arg(1).unwrap_or_else(|| "/".into()) }),
+        "zip" => {
+            let name = need(0, "<archive>")?;
+            let mut files = serde_json::Map::new();
+            for path in parsed.args.iter().skip(1) {
+                files.insert(path.trim_start_matches('/').to_string(), json!(""));
+            }
+            json!({ "name": name, "paths": parsed.args.iter().skip(1).collect::<Vec<_>>(), "files": files })
+        }
+        "unzip" => json!({ "archive_b64": need(0, "<archive_b64>")? }),
+        "hexdump" => json!({ "path": need(0, "<path>")?, "width": flag("width", "w") }),
+        "base64" => json!({
+            "path": need(0, "<path>")?,
+            "decode": flag_bool("decode", "d"),
+            "out": flag("out", "o"),
+        }),
+        "curl" => json!({
+            "url": need(0, "<url>")?,
+            "data": flag("data", "d"),
+            "format": flag("format", "f"),
+        }),
+        "wget" => json!({ "url": need(0, "<url>")?, "path": flag("output", "o") }),
+        "nslookup" => json!({ "host": need(0, "<host>")?, "port": flag("port", "p") }),
+        "nc" => {
+            json!({ "host": need(0, "<host>")?, "port": flag("port", "p"), "timeout_ms": flag("timeout", "t") })
+        }
+        "ping" => json!({ "host": need(0, "<host>")?, "count": flag("count", "c") }),
+        "ifconfig" | "df" | "free" | "uptime" | "date" | "uname" | "ps" | "help" => json!({}),
+        other => return Err(format!("`{other}` is not a shell command")),
+    })
+}
 
 /// How each command is written, in the order it takes its arguments.
 ///
@@ -50,26 +204,26 @@ pub fn usage(op: &str) -> Option<&'static str> {
         "cp" => "cp <from> <to>",
         "mv" => "mv <from> <to> --confirm",
         "grep" => "grep <pattern> [path]",
-        "zip" => "zip --name <archive> [--files {name: text}] [--paths [path]]",
-        "unzip" => "unzip --archive_b64 <base64>",
+        "zip" => "zip <archive> <path...>",
+        "unzip" => "unzip <archive_b64>",
         "df" => "df",
         "free" => "free",
         "uptime" => "uptime",
         "date" => "date",
         "uname" => "uname",
         "ps" => "ps",
-        "hexdump" => "hexdump <path> [--width 16]",
-        "base64" => "base64 --path <path> [--decode] [--out <path>]",
+        "hexdump" => "hexdump <path> [-w <bytes per line>]",
+        "base64" => "base64 <path> [-d] [-o <out>]",
         // The commands that are tools of their own. They share the table so `--help` and
         // the error suffix say the same thing wherever the model reaches them.
         "read" => "read <path>",
         "write" => "write <path> <text>",
         "edit" => "edit <path> <find> <replace>",
-        "curl" => "curl <url> [--data <body>] [--format text|raw]",
-        "wget" => "wget <url> [--path <path>] [--format text|raw]",
-        "nslookup" => "nslookup <host> [--port n]",
-        "nc" => "nc <host> [--port n] [--timeout_ms n]",
-        "ping" => "ping <host> [--count n]",
+        "curl" => "curl <url> [-d <body>] [-f text|raw]",
+        "wget" => "wget <url> [-o <path>] [-f text|raw]",
+        "nslookup" => "nslookup <host> [-p <port>]",
+        "nc" => "nc <host> [-p <port>] [-t <ms>]",
+        "ping" => "ping <host> [-c <count>]",
         "ifconfig" => "ifconfig",
         _ => return None,
     })
@@ -77,7 +231,7 @@ pub fn usage(op: &str) -> Option<&'static str> {
 
 /// Every command with its usage, for `shell {"op":"help"}`.
 pub fn help_text() -> String {
-    let mut out = String::from("shell commands (op + arguments):\n");
+    let mut out = String::from("shell commands:\n");
     for (op, _) in OPS {
         if let Some(line) = usage(op) {
             out.push_str("  ");
@@ -85,11 +239,7 @@ pub fn help_text() -> String {
             out.push('\n');
         }
     }
-    out.push_str(
-        "Separate tools with their own names: read <path> · write <path> <text> · edit <path> <find> <replace> · \
-         curl <url> [--data <body>] [--format text|raw] · wget <url> [--path <path>] · nslookup <host> [--port n] · \
-         nc <host> [--port n] [--timeout_ms n] · ping <host> [--count n] · ifconfig",
-    );
+    out.push_str("\nSeparate tools: read <path> · write <path> <text> · edit <path> <find> <replace>");
     out
 }
 
@@ -103,15 +253,18 @@ pub fn route(op: &str) -> Option<&'static str> {
 pub fn spec() -> ToolDef {
     ToolDef::new(
         "shell",
-        "Workspace commands that have no tool of their own. `op` picks the command and the other fields are its arguments:\n\
-         ls{path} · rm{path,confirm} · cp{from,to} · mv{from,to,confirm} · grep{pattern,path} · zip{name,files} · unzip{archive_b64}\n\
-         Read, write and edit a file with the `read`, `write` and `edit` tools; fetch a URL with `curl` or `wget`. `zip` writes a stored archive and returns it as base64; `unzip` reads stored or deflated archives.",
+        "Run a command on the board, as on any unix shell: one `command` string.\n\
+         ls [path] · rm <path> --confirm · cp <from> <to> · mv <from> <to> --confirm · grep <pattern> [path]\n\
+         curl <url> [-d body] [-f text|raw] · wget <url> [-o path] · nslookup <host> · nc <host> [-p port] · ping <host> [-c n] · ifconfig\n\
+         zip <archive> <path...> · unzip <archive_b64> · hexdump <path> [-w n] · base64 <path> [-d] [-o out]\n\
+         df · free · uptime · date · uname · ps · help\n\
+         `curl` reduces an HTML page to its text unless -f raw. A wrong command answers with its usage; `shell help` lists everything.",
     )
     .title("Shell")
     .category("system")
     .schema(object_schema(
         &[
-            ("op", string("the command: ls, rm, cp, mv, grep, zip, unzip, df, free, uptime, date, uname, ps, hexdump, base64")),
+            ("command", string("the command line, e.g. `ls /notes`, `curl https://example.com/`, `ping -c 3 1.1.1.1`")),
             ("path", string("file or directory, for ls/rm/grep/hexdump/base64")),
             ("decode", json!({ "type": "boolean", "description": "for base64: decode instead of encode" })),
             ("out", string("for base64: where to write the result, default is the return value")),
@@ -125,7 +278,7 @@ pub fn spec() -> ToolDef {
             ("archive_b64", string("for unzip: the archive, base64")),
             ("help", json!({ "type": "boolean", "description": "return the usage lines instead of running anything" })),
         ],
-        &["op"],
+        &[],
     ))
 }
 
@@ -156,6 +309,6 @@ mod tests {
         assert_eq!(route("sudo"), None);
         let spec = spec();
         assert_eq!(spec.spec.name, "shell");
-        assert!(spec.spec.input_schema["properties"]["op"].is_object());
+        assert!(spec.spec.input_schema["properties"]["command"].is_object());
     }
 }

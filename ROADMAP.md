@@ -49,7 +49,39 @@ what is not done or not verified.
 7. ~~**I2S audio**: INMP441 microphone + MAX98357A amplifier → `mic_level`, `speaker_tone`,
    `mic_record`.~~ Done and measured on the bench: 16 kHz/32-bit/left mic, 24 kHz/16-bit
    amplifier, -65 dBFS floor and a 1 kHz tone at -25 dBFS through the microphone.
-8. **More drivers**: DHT11/22, RC522, VL53L0X, BH1750, BME680, SD card, stepper motor.
+8. **More drivers.** The catalogue in `drivers/mod.rs` marks what is planned and what is
+   not; these are the ones worth writing next, ordered by how often they appear on an
+   ESP32 bench, with the upstream component that already exists for each so nobody starts
+   from a datasheet alone:
+
+   | Driver | Bus | Probe | Upstream reference |
+   |---|---|---|---|
+   | Camera OV2640 / OV3660 | DVP + I2C (SCCB) | SCCB id register 0x0A/0x0B | `esp32-camera` (registry), `esp_video` |
+   | BME680 (T/RH/P/gas) | I2C 0x76/0x77 | chip id 0x61 | `bme680`, `esp_bme680` |
+   | AHT20 / AHT10 | I2C 0x38 | status word after a convert | `aht20`, `esp_ahtxx` |
+   | BH1750 light | I2C 0x23/0x5C | one-byte command, 16-bit lux | `bh1750` in several ports |
+   | VL53L0X / VL53L1X ToF | I2C 0x29 | model id 0xEE | `vl53l0x`, `vl53l1x_uld_esp_wrapper` |
+   | HX711 load cell | 2 GPIO, bit-banged | presence by a stable 24-bit read | `hx711` |
+   | MFRC522 RFID | SPI | version register 0x37 | `rc522` |
+   | DS3231 RTC | I2C 0x68 | registers are BCD, no id — declare it | — |
+   | Brushed motor L298N / TB6612 / DRV8833 | 2 PWM + 1 GPIO | not probeable, declare it | `bdc_motor`, `bdc_driver` |
+   | Stepper A4988 / DRV8825 / TMC2208 | STEP/DIR + PWM | not probeable, declare it | `stepper_driver`, `tmc2208`, `soldered-drv8825-esp-idf-component` |
+   | Rotary encoder | 2 GPIO | not probeable; needs a quadrature decoder | — |
+   | PIR HC-SR501 | 1 GPIO | not probeable | — |
+   | TM1637 7-segment | 2 GPIO | not I2C: its own clock/data protocol | — |
+   | MAX7219 matrix | SPI | not probeable, declare it | — |
+   | DHT11 / DHT22 | 1 GPIO, strict timing | not probeable | — |
+   | SD card | SPI or SDMMC | mount attempt | `esp-idf` sdspi |
+
+   A camera is the largest of these: it needs DMA frame buffers in PSRAM, a mode and
+   frame-size negotiation over SCCB, and a result path that does not go through the 2 KB
+   tool result limit — the frame has to land in the workspace or go out as a stream.
+   That makes it a feature, not a driver, and it should land after the storage question
+   (below) is answered.
+
+   Two of the entries above are honest about not being probeable at all (motors, PIR,
+   encoders). For those the manifest is the interface and the driver is only needed when
+   timing or decoding demands it — a brushed motor over two PWM pins is a manifest today.
 9. **Manifest template library**: grow `examples/manifests/` into a set of device recipes
    that the console can import in one click.
 10. **Capability registry**: make the table in `docs/capabilities.md` the single source a
