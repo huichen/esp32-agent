@@ -126,13 +126,6 @@ impl Drop for EventStreamSlot {
 // (mbedTLS), which runs on this thread too when the board serves https — a second thread
 // for it does not fit in internal RAM alongside the agent.
 const ACCEPT_STACK: usize = 20 * 1024;
-/// One request at a time may run per thread, and only this many threads at once: the stack
-/// comes from internal SRAM, which is the scarcest thing on this board.
-#[cfg(target_os = "espidf")]
-const REQUEST_STACK: usize = 12 * 1024;
-#[cfg(not(target_os = "espidf"))]
-const REQUEST_STACK: usize = 128 * 1024;
-const MAX_REQUEST_THREADS: usize = 3;
 #[cfg(not(target_os = "espidf"))]
 const ACCEPT_STACK: usize = 256 * 1024;
 
@@ -873,53 +866,17 @@ fn accept_loop(
                 Ready::Data(prefix) => {
                     let (stream, peer, _, _) = pending.remove(index);
                     stream.set_nonblocking(false).ok();
-                    // A request is served on its own thread, never here. Serving it inline is
-                    // what wedged the board: one slow handler - a model call, a 64 KB fetch -
-                    // held the accept loop, and every other client got a connection reset
-                    // with nothing in the log to say why. The board now answers or resets,
-                    // but it always keeps accepting.
-                    //
-                    // The cost is the stack, so it is bounded twice: a request thread only
-                    // starts while fewer than MAX_REQUEST_THREADS are running, and a refused
-                    // spawn drops that one connection instead of falling back to inline.
-                    if active.load(Ordering::SeqCst) >= MAX_REQUEST_THREADS {
-                        log.warn(
-                            "http",
-                            format!("{peer}: {MAX_REQUEST_THREADS} requests in flight, dropping"),
-                        );
-                        index += 1;
-                        continue;
-                    }
-                    let handler2 = handler.clone();
-                    let log2 = log.clone();
-                    let active2 = active.clone();
-                    let peer2 = peer.clone();
-                    let spawned = std::thread::Builder::new()
-                        .name("http-req".into())
-                        .stack_size(REQUEST_STACK)
-                        .spawn(move || {
-                            active2.fetch_add(1, Ordering::SeqCst);
-                            match serve_until_stream(stream, prefix, &peer2, "http", true, &handler2, &log2) {
-                                // Keep-alive ends with the thread: the browser reconnects, and
-                                // a parked socket is not worth an unbounded table here.
-                                Serve::KeepAlive(stream, rest) => {
-                                    // Keep-alive ends with the thread: the socket is
-                                    // closed rather than parked, so a browser reconnects and
-                                    // the table stays bounded.
-                                    drop((stream, rest));
-                                }
-                                Serve::Done | Serve::Failed => {}
-                                Serve::Stream(conn, resp, body, head_only) => {
-                                    spawn_stream(conn, resp, body, head_only, &log2, &active2);
-                                }
+                    match serve_until_stream(stream, prefix, &peer, "http", true, &handler, &log) {
+                        Serve::Done | Serve::Failed => {}
+                        Serve::KeepAlive(stream, rest) => {
+                            if stream.set_nonblocking(true).is_ok() {
+                                pending.push((stream, peer, std::time::Instant::now(), rest));
                             }
-                            active2.fetch_sub(1, Ordering::SeqCst);
-                        });
-                    if spawned.is_err() {
-                        log.warn("http", format!("{peer}: no stack for a request thread, dropping"));
+                        }
+                        Serve::Stream(conn, resp, body, head_only) => {
+                            spawn_stream(conn, resp, body, head_only, &log, &active);
+                        }
                     }
-                    index += 1;
-                    continue;
                 }
                 Ready::Closed => {
                     pending.remove(index);
