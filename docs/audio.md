@@ -20,7 +20,7 @@ disagree with, a `[measured]` number is not.
 | PSRAM free at runtime | ~6.5 MB (6,593 kB at 507 KB of history) | `[measured]`, `docs/troubleshooting.md` |
 | Thread stacks | come from **internal SRAM**, not PSRAM | `docs/troubleshooting.md` ("could not spawn connection thread") |
 | Microphone | 16 kHz, 32-bit slots, left channel, 24 bits used | `[measured]`, `crates/agent-core/src/drivers/audio.rs` |
-| One tool result | 2048 B, truncated with a marker past that | `agent::MAX_TOOL_RESULT_BYTES` |
+| One tool result | 8,192 B (`agent::MAX_TOOL_RESULT_BYTES`), truncated with a marker past that; `mic_record` keeps itself under 2 KB on purpose | `crates/agent-core/src/agent.rs` |
 
 The 5–6 kB is not a soft number. TLS already lives close to the edge of it: with ~15 kB free
 the hardware-AES path fails to get a DMA-capable buffer and every record dies with
@@ -144,7 +144,9 @@ host. It is **not implemented** — this document proposes it, it does not claim
    run it.
 3. Play a song by streaming PCM into `POST /audio/pcm` (§6), which reads the body as it
    arrives. Do not grow `speaker_play`: its 2 KB is the tool-result cap, not an oversight.
-4. Revisit if a board arrives with ~40–50 kB of free internal SRAM *and* a PSRAM-capable task
+4. Play a **tune** as a score (`notes`, §7) when the caller is a model that would otherwise
+   have to produce the samples: a few hundred bytes of `{hz, ms}` against 240 KB of PCM.
+5. Revisit if a board arrives with ~40–50 kB of free internal SRAM *and* a PSRAM-capable task
    stack (ESP32-P4 class, or DMA that reaches PSRAM): the flash arithmetic above already says
    the code would fit there.
 
@@ -197,8 +199,87 @@ What this does **not** do: change the sample rate (the I2S TX clock is the const
 `AMP_RATE_HZ`, so `?rate=` accepts 24000 only), and hold two uploads at once. Both need a
 `i2s_open_tx(rate)` and a second thread, i.e. RAM this board does not have; they are
 `ROADMAP.md` items, not promises.
+## 7. Playing a melody: send the score, not the samples
 
-## 7. How to check these numbers again
+§6 streams PCM, and for audio a host already holds that is the right answer. A melody is the
+other case: the bytes do not exist until the *caller* writes them, and here the caller is a
+model. Five seconds at 24 kHz is 240,000 bytes — 320,000 as base64, twice the request body
+and some 80,000 tokens of base64 to get wrong. A tune is therefore something the caller can
+*describe*, not something it can carry.
+
+| Form | What the caller sends | Audio it plays |
+|---|---|---|
+| `pcm_b64` | 2,732 B of base64 | 2048 B = 1024 samples = **43 ms** |
+| `notes` | ~25 B per note — a few hundred bytes for a tune | as long as the notes add up to, at most **6 s** |
+| `POST /audio/pcm` (§6) | 48,000 B for every second of audio | up to **30 s**, but the caller must already have the bytes |
+
+So the score is not a way around the body cap — §6 already has that — it is a way around
+having to produce the audio at all. `{hz, ms}` is ~25 bytes of JSON, so a fourteen-note tune
+is a few hundred bytes, and the board synthesizes it into **one contiguous buffer** which
+reaches I2S in **one write**. Nothing crosses the network between two notes, so there is
+nothing to be heard there.
+
+```json
+{"notes": [{"hz": 523, "ms": 400}, {"hz": 523, "ms": 400}, {"hz": 784, "ms": 400}], "volume": 30}
+```
+
+### The limits, and where they come from
+
+| Limit | Value | Why |
+|---|---|---|
+| Notes per call | 64 | a 64-note score is still under a kilobyte of JSON |
+| One note | 20–2000 ms, 0–8000 Hz | 20 ms keeps the 2 ms articulation ramp from swallowing the note; 8000 Hz is `speaker_tone`'s ceiling |
+| Whole melody | 6000 ms | 144,000 samples = 288,000 B of mono PCM |
+| Handed to the DMA | 288,000 stereo slots = 576,000 B | the driver duplicates each sample into both slots (see §1 of `drivers/audio.rs`) |
+| Peak heap while playing | ~864,000 B (~844 KiB) | mono buffer + the stereo copy, both in PSRAM. `[estimate]`: the arithmetic, not measured |
+| Arguments on the wire | a few hundred bytes | this is the point |
+| Binary write needed? | **no** | the score is JSON; nothing has to be stored as a file |
+
+`hz: 0` is a rest — the same envelope over silence — so a melody can hold a beat. Each note
+starts and ends at exactly zero amplitude and the ramp is 2 ms at a note boundary, 5 ms at
+the melody's ends: a note at a new frequency that starts at a non-zero value is a step, and
+a step is a click. That ramp is a **dip in the envelope, not a gap in the stream** — no
+samples are inserted or skipped, and the buffer is exactly the sum of the note lengths.
+
+### The text workspace
+
+This workspace stores text: `write` writes text files, so a rendered `.wav` cannot be kept
+here, and "render a file, then play the file" is not a path this repository has (a `.wav`
+is also 240,000 bytes for five seconds, twice the `pcm_b64` cap before base64 makes it
+worse). The score form needs no file at all — the melody lives in the tool call and dies
+with it. A host that *does* hold bytes still has `pcm_b64` for the 43 ms it is good for.
+
+### What it costs elsewhere
+
+The write blocks until every sample is queued, so a tool call occupies the board for the
+length of the melody: `/api/status` and every other tool wait for up to 6 s behind it. §6
+takes the lock once per ~21 ms piece instead of once per tune; this takes it for the whole
+melody, which is the price of the single write and the reason the cap is 6 s rather than
+"as long as you like".
+
+The tool result carries `synth_ms` and `write_ms` so the split is measured rather than
+guessed. `[measured]` on this board, repeated runs within a few ms:
+
+| Melody | Samples | `synth_ms` | `write_ms` | Wall clock of the call |
+|---|---|---|---|---|
+| 1 note, 1.2 s | 28,800 | 40 | 1,193 | 1,275 ms |
+| 4 notes, 2.4 s | 57,600 | 81 | 2,399 | 2,527 ms |
+| 14 notes, 4.8 s (Twinkle Twinkle) | 115,200 | 163 | 4,817 | 5,038 ms |
+
+Two things are worth reading off that table:
+
+- **`write_ms` is the audio's own length**, to within one DMA ring (16.7 ms). The write
+  therefore never stalls: nothing was dropped for want of room and nothing was inserted
+  waiting for it. That is what "no gap between the notes" means here — not that the gaps
+  are short, but that the stream is never interrupted.
+- The first version of this used `f32::sin` per sample and `synth_ms` was **1,915** for the
+  same 14 notes, so the call took 6,779 ms to play 4,800 ms of music: the board spent 40%
+  of the tune on float maths and answered nothing while it did. The table oscillator is
+  11× cheaper, which is why it is there rather than for elegance. It costs 4 KB of flash
+  (1,025 `f32` entries); the app partition went from 87.08% to 87.24% of 3 MiB with it.
+  `[measured]`: `espflash` prints `App/part. size` on every flash.
+
+## 8. How to check these numbers again
 
 - Flash: `espflash flash --partition-table firmware/partitions.csv --target-app-partition
   factory <elf>` prints `App size … (N%)`; compare N with 86%.
@@ -207,7 +288,12 @@ What this does **not** do: change the sample rate (the I2S TX clock is the const
 - The WAV itself: call `mic_record` over `/mcp`, write `wav_b64` to a file after
   base64-decoding it, then `soxi`/`ffprobe` should say `16000 Hz, 1 channels, 16-bit` with the
   sample count the tool reported.
-- The stream route: `sox` a known 10 s clip to raw PCM16 mono at 24 kHz, `POST` it to
+- The stream route (§6): `sox` a known 10 s clip to raw PCM16 mono at 24 kHz, `POST` it to
   `/audio/pcm` with `Transfer-Encoding: chunked`, and compare the answer's `ms` with 10000 —
   then watch `/api/status`'s `free_heap_kb` before and after, which must not have moved. A
   `samples` count short of `bytes / 2` means a piece was cut; `ok: false` names why.
+- The melody route (§7): call `speaker_play` with `notes` over `/mcp` and time the call. Its
+  `ms` field and the wall clock should agree to within a few tens of milliseconds (the last
+  16.7 ms of audio is still in the DMA ring when the call returns, so the call ends slightly
+  *early*, never late), and `write_ms` should equal `ms` — a write that took longer than the
+  audio means the stream ran dry and was refilled.
