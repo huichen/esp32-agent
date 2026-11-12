@@ -169,10 +169,10 @@ pub static CATALOG: &[CatalogEntry] = &[
     CatalogEntry {
         kind: "dht11",
         name: "DHT11 / DHT22 temperature + humidity",
-        detection: "not implemented yet",
+        detection: "declared pin: a bit-banged 40-bit frame, checked against its own checksum",
         status: "implemented",
         caps: &["dht"],
-        docs: "docs/adding-a-device.md",
+        docs: "crates/agent-core/src/drivers/dht.rs",
     },
     CatalogEntry {
         kind: "rc522",
@@ -193,10 +193,10 @@ pub static CATALOG: &[CatalogEntry] = &[
     CatalogEntry {
         kind: "sdcard",
         name: "SD card over SPI",
-        detection: "not implemented yet",
+        detection: "declared chip select: CMD0/CMD8/ACMD41/CMD58 handshake, raw 512-byte blocks",
         status: "implemented",
         caps: &["sdcard"],
-        docs: "docs/adding-a-device.md",
+        docs: "crates/agent-core/src/drivers/sdcard.rs",
     },
     CatalogEntry {
         kind: "mic",
@@ -1075,6 +1075,8 @@ mod cap_tests {
             ("bh1750", serde_json::json!({"address": 35}), &[]),
             ("ds3231", serde_json::json!({"address": 104}), &[]),
             ("vl53l0x", serde_json::json!({"address": 41}), &[]),
+            ("dht11", serde_json::json!({"out": 4}), &[("kind", "dht22")]),
+            ("sdcard", serde_json::json!({"cs": 5}), &[]),
             // A DVP camera: twelve pins and a geometry, because the frame comes from the
             // platform and the driver has to be told where the bus is wired.
             (
@@ -1132,10 +1134,14 @@ mod cap_tests {
                         "{kind} is in the catalogue but instantiate does not know it: {}",
                         e.message
                     );
+                    // The board may also simply lack the bus the part sits on: there is no
+                    // SPI on the virtual board, so a declared SD card is refused with "SPI is
+                    // not available", which names the missing thing just as well.
                     assert!(
                         e.message.contains("GPIO")
                             || e.message.contains("no ")
-                            || e.message.contains("did not"),
+                            || e.message.contains("did not")
+                            || e.message.contains("not available"),
                         "{kind} failed without saying what was missing: {}",
                         e.message
                     );
