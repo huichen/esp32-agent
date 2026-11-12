@@ -304,9 +304,13 @@ What that says:
    The panic was not captured because nothing was holding the serial port. That capture is the
    next step, and until it exists 512 KB is the highest figure with evidence behind it.
 
-The one failure in the first ladder was not memory: it was
-`reading the reply over TLS failed: ERROR (the session times out after 45 s)` on a deliberately
-long reply. Raise `llm.timeout_s` before raising the history cap.
+The one failure in the first ladder was not memory, and the message it printed named the
+wrong cause: `reading the reply over TLS failed: ERROR (the session times out after 45 s)` on
+a deliberately long reply. `ERROR` was `esp_err_to_name` of `-0x7200`, and `-0x7200` is
+`MBEDTLS_ERR_SSL_INVALID_RECORD`: the reply arrived in a TLS record bigger than the 4 KB
+inbound buffer this board was configured with, which mbedTLS rejects. It is fixed in
+`firmware/sdkconfig.defaults` (16 KB inbound, the protocol maximum) — raising `timeout_s`
+never had anything to do with it.
 
 ## Performance and stability
 
