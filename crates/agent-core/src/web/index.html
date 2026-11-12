@@ -27,6 +27,9 @@
 </main>
 
 <form id="composer" class="composer" autocomplete="off">
+  <div id="attach-chip" class="attach-chip" hidden></div>
+  <input id="attach-input" type="file" accept="image/*" hidden>
+  <button id="attach" class="attach" type="button" aria-label="Attach an image">+</button>
   <textarea id="input" rows="1" placeholder="Ask the board&hellip;" enterkeyhint="send"></textarea>
   <button id="send" class="send" type="submit" aria-label="Send">&#8593;</button>
 </form>
@@ -89,6 +92,25 @@
         <input id="agent-steps" type="number" min="0" max="200" step="1">
         <label for="agent-temperature">Temperature</label>
         <input id="agent-temperature" type="number" min="0" max="2" step="0.1">
+        <label for="agent-protocol">Protocol</label>
+        <select id="agent-protocol">
+          <option value="chat">OpenAI chat completions</option>
+          <option value="responses">OpenAI Responses API</option>
+          <option value="anthropic">Anthropic Messages</option>
+        </select>
+        <label for="agent-reasoning">Thinking (empty = the provider's default)</label>
+        <select id="agent-reasoning">
+          <option value="">default</option>
+          <option value="off">off</option>
+          <option value="low">low</option>
+          <option value="medium">medium</option>
+          <option value="high">high</option>
+        </select>
+        <label for="agent-vision">Images</label>
+        <select id="agent-vision">
+          <option value="true">send to the model (multimodal)</option>
+          <option value="false">name only (text-only model)</option>
+        </select>
         <div class="buttons"><button id="agent-save" class="btn primary">Save</button></div>
       </div>
       <div class="card">
@@ -133,6 +155,10 @@
         <input id="wifi-ssid" type="text" autocomplete="off">
         <label for="wifi-password">Password</label>
         <input id="wifi-password" type="password" autocomplete="new-password">
+        <label for="wifi-gateway">Gateway (empty = from DHCP)</label>
+        <input id="wifi-gateway" type="text" inputmode="decimal" placeholder="192.168.3.232">
+        <label for="wifi-dns">DNS (empty = from DHCP)</label>
+        <input id="wifi-dns" type="text" inputmode="decimal" placeholder="192.168.3.232">
         <div class="buttons">
           <button id="wifi-connect" class="btn primary">Save and join</button>
           <button id="wifi-scan" class="btn ghost">Scan</button>

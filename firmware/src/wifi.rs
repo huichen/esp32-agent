@@ -16,6 +16,7 @@ use esp_idf_svc::eventloop::EspSystemEventLoop;
 use esp_idf_svc::hal::modem::Modem;
 use esp_idf_svc::ipv4;
 use esp_idf_svc::netif::{EspNetif, NetifConfiguration};
+use esp_idf_svc::sys;
 use esp_idf_svc::nvs::EspDefaultNvsPartition;
 use esp_idf_svc::wifi::{AccessPointConfiguration, AuthMethod, ClientConfiguration, Configuration, EspWifi};
 use std::sync::mpsc::{channel, Sender};
@@ -213,6 +214,7 @@ fn run(
 
     let mut last_state = String::new();
     let mut reconnect_ticks = 0u32;
+    let mut overrides_due = 0u32;
     loop {
         match rx.recv_timeout(Duration::from_millis(1000)) {
             Ok(WifiCmd::Connect { ssid: new_ssid, password }) => {
@@ -258,6 +260,7 @@ fn run(
             (false, false) => "disconnected",
         }
         .to_string();
+        let state_first = state.clone();
         publish(|s| {
             s.state = state.clone();
             s.ip = sta_ip.map(|ip| ip.to_string()).unwrap_or_default();
@@ -271,14 +274,30 @@ fn run(
         // The console needs this line as much as the in-RAM log: a board whose
         // portal never appears is debugged over the serial port, and this is the
         // only place that says whether the radio actually moved.
-        if state != last_state {
+        if state_first != last_state {
             log::info!(
                 "wifi state: {state}, station ip {:?}, ap ip {:?}",
                 sta_ip.map(|ip| ip.to_string()),
                 ap_ip.map(|ip| ip.to_string())
             );
-            last_state = state;
+            last_state = state_first;
         }
+        // Re-applied every 30 s from the live config: a gateway typed into the portal
+        // should take effect without a reboot, and lwIP's DHCP client rewrites the DNS
+        // servers from the lease on renewal, which would otherwise undo the setting.
+        if sta_connected && overrides_due == 0 {
+            let (gw, dns, dns2) = {
+                let guard = app.lock().map_err(|_| anyhow::anyhow!("app lock poisoned"))?;
+                (
+                    guard.cfg.wifi.gateway.trim().to_string(),
+                    guard.cfg.wifi.dns.trim().to_string(),
+                    guard.cfg.wifi.dns2.trim().to_string(),
+                )
+            };
+            apply_network_overrides(&gw, &dns, &dns2, wifi.sta_netif(), &log);
+        }
+        overrides_due = (overrides_due + 1) % 30;
+
         // `esp_wifi` only tries once per `connect()`; without this a router that
         // reboots leaves the board off the network until somebody reboots it too.
         if auto_reconnect && !ssid.is_empty() && !sta_connected {
@@ -295,6 +314,76 @@ fn run(
         }
     }
     Ok(())
+}
+
+/// Point the station's traffic at a chosen gateway and resolver.
+///
+/// Both are empty by default, in which case the DHCP lease decides and this does nothing.
+/// A gateway here is how a board is put behind a box that tunnels traffic: the lease still
+/// supplies the address, and the default route is moved afterwards.
+///
+/// Re-applied periodically because lwIP's DHCP client writes the lease's DNS servers back
+/// into the resolver list on renewal — a one-shot override would survive until the next
+/// lease and then quietly stop being true.
+fn apply_network_overrides(
+    gateway: &str,
+    dns: &str,
+    dns2: &str,
+    netif: &EspNetif,
+    log: &Arc<LogBuf>,
+) {
+    // `RawHandle::handle` is the only way to the underlying esp_netif_t in this version.
+    let raw = esp_idf_svc::handle::RawHandle::handle(netif);
+    unsafe {
+        let lwip = sys::esp_netif_get_netif_impl(raw) as *mut sys::netif;
+        if lwip.is_null() {
+            return;
+        }
+        if let Some(ip) = parse_v4(gateway) {
+            let addr = sys::ip4_addr_t { addr: ip };
+            sys::netif_set_gw(lwip, &addr);
+            sys::netif_set_default(lwip);
+        }
+        for (index, text) in [(0u8, dns), (1u8, dns2)] {
+            if let Some(ip) = parse_v4(text) {
+                let mut info = sys::esp_netif_dns_info_t::default();
+                info.ip.u_addr.ip4.addr = ip;
+                let rc = sys::esp_netif_set_dns_info(
+                    raw,
+                    sys::esp_netif_dns_type_t_ESP_NETIF_DNS_MAIN + index as u32,
+                    &mut info,
+                );
+                if rc != 0 {
+                    log.warn("wifi", format!("dns {index} {text}: esp_netif_set_dns_info returned {rc}"));
+                }
+            }
+        }
+        if !gateway.is_empty() || !dns.is_empty() || !dns2.is_empty() {
+            log.info(
+                "wifi",
+                format!(
+                    "network overrides applied: gateway {} dns {} backup {}",
+                    if gateway.is_empty() { "(lease)" } else { gateway },
+                    if dns.is_empty() { "(lease)" } else { dns },
+                    if dns2.is_empty() { "(lease)" } else { dns2 },
+                ),
+            );
+        }
+    }
+}
+
+/// `a.b.c.d` to the network-order u32 lwIP wants. Anything else is "unset", not an error:
+/// a typo in the portal should leave the lease in charge, not take the board off the LAN.
+fn parse_v4(text: &str) -> Option<u32> {
+    let mut parts = text.trim().split('.');
+    let mut octets = [0u8; 4];
+    for slot in octets.iter_mut() {
+        *slot = parts.next()?.parse().ok()?;
+    }
+    if parts.next().is_some() {
+        return None;
+    }
+    Some(u32::from_be_bytes(octets).to_be())
 }
 
 /// The setup access point's own netif: ESP-IDF's documented 192.168.4.0/24, with

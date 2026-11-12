@@ -37,6 +37,9 @@ pub struct EspHw {
     mac: String,
     bus_pins: HashMap<u8, (i32, i32, u32)>,
     /// I2S channel handles; null until `i2s_setup` brings them up.
+    /// The chip's own temperature sensor, installed once. Null when the part has none
+    /// (ESP32-C3) or the driver refused, which is why the reading is an `Option`.
+    tsens: sys::temperature_sensor_handle_t,
     i2s_rx: sys::i2s_chan_handle_t,
     i2s_tx: sys::i2s_chan_handle_t,
 }
@@ -60,6 +63,7 @@ impl EspHw {
             boot_us: unsafe { sys::esp_timer_get_time() },
             mac: read_mac(),
             bus_pins: HashMap::new(),
+            tsens: std::ptr::null_mut(),
             i2s_rx: std::ptr::null_mut(),
             i2s_tx: std::ptr::null_mut(),
         };
@@ -68,7 +72,48 @@ impl EspHw {
                 log::warn!("i2c bus {bus} (SDA {sda}, SCL {scl}) failed: {}", e.message);
             }
         }
+        // The on-die temperature sensor: one install, enabled for the life of the board.
+        // `board_status` used to report `temperature_c: null` on a part that has one,
+        // which reads as "the firmware is broken" rather than "nothing asked the driver".
+        match hw.install_temp_sensor() {
+            Ok(()) => log::info!("chip temperature sensor installed"),
+            Err(e) => log::warn!("chip temperature sensor: {e}"),
+        }
         Ok(hw)
+    }
+
+    fn install_temp_sensor(&mut self) -> anyhow::Result<()> {
+        unsafe {
+            // The range is the driver's expected span, not a measurement; -10..80 covers a
+            // room, a bench and a warm enclosure.
+            let cfg = sys::temperature_sensor_config_t {
+                range_min: -10,
+                range_max: 80,
+                clk_src: sys::soc_periph_temperature_sensor_clk_src_t_TEMPERATURE_SENSOR_CLK_SRC_RC_FAST,
+                flags: sys::temperature_sensor_config_t__bindgen_ty_1 { allow_pd: 0 },
+            };
+            let mut handle: sys::temperature_sensor_handle_t = std::ptr::null_mut();
+            esp_idf_svc::sys::esp!(sys::temperature_sensor_install(&cfg, &mut handle))
+                .map_err(|e| anyhow::anyhow!("temperature_sensor_install: {e}"))?;
+            esp_idf_svc::sys::esp!(sys::temperature_sensor_enable(handle))
+                .map_err(|e| anyhow::anyhow!("temperature_sensor_enable: {e}"))?;
+            self.tsens = handle;
+        }
+        Ok(())
+    }
+
+    /// One reading, or `None` when the driver is not there or the read fails.
+    fn chip_temperature(&mut self) -> Option<f32> {
+        if self.tsens.is_null() {
+            return None;
+        }
+        let mut celsius: f32 = 0.0;
+        let rc = unsafe { sys::temperature_sensor_get_celsius(self.tsens, &mut celsius) };
+        if rc == 0 {
+            Some(celsius)
+        } else {
+            None
+        }
     }
 
     fn open_bus(&mut self, bus: u8, sda: i32, scl: i32, freq: u32) -> Result<()> {
@@ -189,6 +234,10 @@ fn read_mac() -> String {
 }
 
 impl Hardware for EspHw {
+    fn chip_temp_c(&mut self) -> Option<f32> {
+        self.chip_temperature()
+    }
+
     fn board_info(&mut self) -> BoardInfo {
         // `esp_chip_info` is not in the generated bindings, so the SoC comes from
         // the build (MCU is set in .cargo/config.toml) and the rest from the
@@ -213,7 +262,7 @@ impl Hardware for EspHw {
                 unsafe { std::ffi::CStr::from_ptr(sys::esp_get_idf_version()) }.to_bytes(),
             )
             .to_string(),
-            temp_c: None,
+            temp_c: self.chip_temperature(),
             firmware: env!("CARGO_PKG_VERSION").into(),
             build: "idf".into(),
         }
