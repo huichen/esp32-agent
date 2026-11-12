@@ -176,6 +176,9 @@ impl ToolDef {
             "mutating": self.spec.mutating,
             "core": self.spec.core,
             "visible": visible,
+            // The declaration as the model sees it: without this the portal can say a
+            // tool exists but not what it takes, which is the first question anyone asks.
+            "input_schema": self.spec.input_schema,
         })
     }
 }

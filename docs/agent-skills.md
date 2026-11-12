@@ -106,7 +106,7 @@ named `Deploy Notes` is invisible, because the name has a space. Keep names to
 From an MCP client, the same call, since these paths are ordinary files:
 
 ```bash
-curl -sS -X POST http://<board>:8080/mcp -H 'Content-Type: application/json' -d \
+curl -sS -X POST http://<board>:80/mcp -H 'Content-Type: application/json' -d \
   '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"fs_write","arguments":
     {"path":"/skills/deploy.md",
      "text":"# deploy\ndescription: roll the portal forward\n1. snapshot\n2. flash\n"}}}'

@@ -81,6 +81,15 @@ pub const ROUTES: &[Route] = &[
     ),
     r(
         "GET",
+        "/api/tls",
+        "status",
+        Auth::Open,
+        "The certificate this board made for itself: fingerprint, https port, or why https is off",
+        "",
+        "{enabled, port, fingerprint, error}",
+    ),
+    r(
+        "GET",
         "/api/status",
         "status",
         Auth::Open,

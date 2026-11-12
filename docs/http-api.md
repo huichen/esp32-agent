@@ -1,7 +1,18 @@
 # HTTP and MCP interfaces
 
-One port serves both the web console and the MCP endpoint (default `8080`, changeable
+One port serves both the web console and the MCP endpoint (default `80`, changeable
 through `config.mcp.port`).
+
+Port **443** serves the same routes over TLS, with a certificate the board generated for
+itself on first boot (EC P-256, stored in NVS, fingerprint at `GET /api/tls`). Both ports
+share **one accept thread**, so a TLS client is served while plaintext clients wait in the
+listen backlog for the duration of one request — a deliberate trade: a thread per TLS
+connection does not fit in this board's internal RAM alongside the agent, and the failure
+arrives as `ERR_CONNECTION_RESET` in a browser. TLS connections are not kept alive, for
+the same reason.
+
+`/agent.json` reports the scheme that answered: fetched over https its `base_url` and the
+MCP `initialize` instructions both say `https://…:443`, not the plaintext port.
 
 ## 0. Read this first: `GET /agent.json`
 
@@ -11,7 +22,7 @@ PIN, plus the MCP surface (transport, session header, methods, resources, a work
 example), the error shape, and the limits that apply to a caller.
 
 ```bash
-curl -sS http://<ip>:8080/agent.json | jq '.endpoints[] | "\(.method) \(.path) — \(.summary)"'
+curl -sS http://<ip>:80/agent.json | jq '.endpoints[] | "\(.method) \(.path) — \(.summary)"'
 ```
 
 `GET /sitemap.json` is an alias. The document is generated from the same table the router
@@ -26,12 +37,12 @@ the running board, so the same document is correct on every unit.
 
 ```bash
 # list tools
-curl -sS -X POST http://<ip>:8080/mcp \
+curl -sS -X POST http://<ip>:80/mcp \
   -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' \
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
 
 # call a tool
-curl -sS -X POST http://<ip>:8080/mcp -H 'Content-Type: application/json' \
+curl -sS -X POST http://<ip>:80/mcp -H 'Content-Type: application/json' \
   -d '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"board_status","arguments":{}}}'
 ```
 
@@ -61,6 +72,7 @@ CORS is on by default (`mcp.cors`), so a browser MCP client can connect directly
 | GET | `/healthz` | `{ok, uptime_s, devices}` |
 | GET | `/agent.json` | The map for an external agent: every route, the MCP surface, conventions and limits (`/sitemap.json` is an alias) |
 | GET | `/api/status` | Board, memory, WiFi, MCP, device count, counters |
+| GET | `/api/tls` | The board's own certificate: `{enabled, port, fingerprint, error}` |
 | GET | `/api/config` | Configuration (secrets shown as `__set__`) |
 | POST | `/api/config` | Partial update (JSON of the same shape) |
 | GET | `/api/devices` | Device table + unidentified addresses + buses |
@@ -130,6 +142,6 @@ error. Only protocol errors (unknown method, malformed JSON) use the `error` obj
 ## 5. Connecting a client
 
 - **Claude Desktop / Cursor and anything else that speaks HTTP**:
-  `{"mcpServers":{"esp32-agent":{"type":"http","url":"http://<ip>:8080/mcp"}}}`
+  `{"mcpServers":{"esp32-agent":{"type":"http","url":"http://<ip>:80/mcp"}}}`
 - **stdio-only clients**: use a bridge such as `mcp-remote` or `mcp2serial`.
 - **Your own script**: see the curl above; `/api/clients` returns a ready-made command.

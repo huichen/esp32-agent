@@ -105,6 +105,35 @@ pub struct FwMeta {
     pub build: String,
 }
 
+/// HTTPS on this board: the port it listens on and the SHA-256 fingerprint of the
+/// certificate it made for itself. Empty `fingerprint` means no https.
+#[derive(Debug, Clone, Default)]
+pub struct TlsInfo {
+    pub port: u16,
+    /// Lower-case hex, colon-separated, as `openssl x509 -fingerprint -sha256` prints it.
+    pub fingerprint: String,
+    /// Why https is not up, when it is not. Shown on the portal so "no https" is a
+    /// statement rather than a mystery.
+    pub error: String,
+}
+
+impl TlsInfo {
+    pub fn enabled(&self) -> bool {
+        self.port != 0 && !self.fingerprint.is_empty()
+    }
+
+    pub fn json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "enabled": self.enabled(),
+            "port": self.port,
+            "fingerprint": self.fingerprint,
+            "error": self.error,
+            "how_to_check": "compare this with the certificate the browser shows; it is \
+                             SHA-256 over the DER certificate",
+        })
+    }
+}
+
 impl Default for FwMeta {
     fn default() -> Self {
         Self {
@@ -131,6 +160,10 @@ pub struct App {
     pub firmware: FwMeta,
     /// Set by the platform layer once the HTTP server is up.
     pub lan_url: String,
+    /// The board's own certificate, when it serves https on a second port. The
+    /// fingerprint is what a person compares against the browser's warning page —
+    /// it is the only proof that this board, and not something on the path, answered.
+    pub tls: TlsInfo,
     /// The on-board agent: transcript, the one-slot queue and the last error.
     pub agent: Agent,
     /// Where the model lives and how far one run may go. `api_key` is kept in
@@ -220,6 +253,7 @@ impl App {
             profile_exact: true,
             firmware,
             lan_url: String::new(),
+            tls: TlsInfo::default(),
             agent: Agent::new(),
             llm: LlmConfig::default(),
             tasks: Vec::new(),
@@ -294,12 +328,33 @@ impl App {
             if spec.driver.is_none() {
                 continue;
             }
-            let already = self
-                .devices
-                .infos()
-                .iter()
-                .any(|i| i.kind == spec.kind || spec.driver.as_deref() == Some(i.kind.as_str()));
-            if already && spec.address.is_none() && spec.pins.is_empty() {
+            // The manifest may declare what the probe has already adopted — that is the
+            // normal case once `discovery` is `auto` and someone leaves an earlier
+            // declaration in place. Declaring it again must not produce a second device:
+            // on the bench that showed up as eight devices, two of everything, with the
+            // copies renamed `led_set_2`. Same kind *and* same identity is the same
+            // device; a genuinely second sensor at another address still gets added.
+            let driver = spec.driver.as_deref().unwrap_or("");
+            // Compare pins as sets: a declaration written from a candidate template says
+            // `{out: 48, p0: 48}` where the probe reports `[48]`, and a raw list compare
+            // then declares a second LED on the same pin. A subset is enough — declaring
+            // part of what is already live cannot mean "another device".
+            let pins: std::collections::BTreeSet<i32> = spec.pins.values().copied().collect();
+            let already = self.devices.infos().iter().any(|i| {
+                if i.kind != spec.kind && i.kind != driver {
+                    return false;
+                }
+                match spec.address {
+                    Some(a) => i.address == Some(a),
+                    None if pins.is_empty() => true,
+                    None => pins.iter().all(|p| i.pins.contains(p)),
+                }
+            });
+            if already {
+                self.log.info(
+                    "manifest",
+                    format!("`{}` is already live from the probe; the declaration is a no-op", spec.id),
+                );
                 continue;
             }
             match drivers::instantiate(spec, &mut *self.hw) {
@@ -464,11 +519,12 @@ impl App {
     fn tools_list_json(&self) -> Value {
         let mut tools: Vec<Value> =
             self.tools.iter().filter(|d| self.is_visible(&d.spec.name)).map(|d| d.mcp_json()).collect();
-        tools.sort_by_key(|t| t["name"].as_str().unwrap_or("").to_string());
-        // `fs_*` and `net_*` are not registry entries (their handlers need the workspace
-        // and an HTTP client), but an MCP client should be able to reach them, so they are
-        // appended in module order rather than sorted in.
+        // `fs_*`, `net_*` and `script` are not registry entries (their handlers need the
+        // workspace and an HTTP client), but an MCP client can reach them, so they belong
+        // in the same list — and in the same order: one alphabetical run, matching what
+        // the model gets. Two views of the same set should not disagree about its shape.
         tools.extend(self.extra_mcp_specs());
+        tools.sort_by_key(|t| t["name"].as_str().unwrap_or("").to_string());
         json!({ "tools": tools })
     }
 
@@ -503,7 +559,7 @@ impl App {
             .unwrap_or_else(|| format!("<board>:{}", self.cfg.mcp.port));
         let tool_count = self.tool_specs().as_array().map(|a| a.len()).unwrap_or(0);
         crate::sitemap::document(json!({
-            "base_url": format!("http://{host}"),
+            "base_url": format!("{}://{host}", req.scheme),
             "firmware": { "name": "esp32-agent", "version": crate::VERSION },
             "board": { "profile": self.cfg.board, "devices": self.devices.len() },
             "mcp": crate::sitemap::mcp_json(
@@ -516,6 +572,7 @@ impl App {
                 "mcp_token_set": !self.cfg.auth.mcp_token.is_empty(),
                 "note": "with neither set, every route above is open on the local network",
             },
+            "tls": self.tls.json(),
             "model": {
                 "configured": !self.llm.base_url.is_empty() && !self.llm.model.is_empty(),
                 "endpoint": self.llm.base_url,
@@ -537,11 +594,32 @@ impl App {
                 v
             })
             .collect();
-        tools.sort_by(|a, b| {
-            let ka = (a["category"].as_str().unwrap_or(""), a["name"].as_str().unwrap_or(""));
-            let kb = (b["category"].as_str().unwrap_or(""), b["name"].as_str().unwrap_or(""));
-            ka.cmp(&kb)
-        });
+        // The agent's own tools are not in the registry (they need the workspace and the
+        // HTTP client), so they never appeared here — which is why the portal could show
+        // 40 tools while the model had 49 and `script` looked missing.
+        for group in [fs_tools::specs(), net_tools::specs(), board_tools::script_specs()] {
+            for entry in group.as_array().into_iter().flatten() {
+                let f = &entry["function"];
+                let name = f["name"].as_str().unwrap_or("");
+                // The read-only ones, by name: the specs are OpenAI-shaped and carry no
+                // `mutating` flag, and a made-up one would be worse than this list.
+                let read_only = matches!(name, "fs_ls" | "fs_read" | "fs_grep" | "net_get");
+                tools.push(json!({
+                    "name": name,
+                    "title": name,
+                    "description": f["description"],
+                    "category": "agent",
+                    "requires": [],
+                    "mutating": !read_only,
+                    "core": false,
+                    "visible": true,
+                    "mcp": true,
+                    "input_schema": f["parameters"],
+                }));
+            }
+        }
+        // Alphabetical, one list: the order the model gets, and the order a reader expects.
+        tools.sort_by_key(|t| t["name"].as_str().unwrap_or("").to_string());
         let visible = tools.iter().filter(|t| t["visible"] == json!(true)).count();
         json!({
             "tools": tools,
@@ -669,7 +747,14 @@ impl App {
     }
 
     pub fn mcp_url(&mut self) -> String {
-        if !self.lan_url.is_empty() {
+        self.mcp_url_with("http")
+    }
+
+    /// The MCP endpoint as seen by a client that reached us over `scheme`. A board
+    /// answering TLS that advertises `http://` sends the next agent down a dead path —
+    /// and so does one that keeps the plaintext port in the URL.
+    pub fn mcp_url_with(&mut self, scheme: &str) -> String {
+        if scheme == "http" && !self.lan_url.is_empty() {
             return format!("{}{}", self.lan_url.trim_end_matches('/'), self.cfg.mcp.path);
         }
         let wifi = self.hw.wifi_status();
@@ -680,19 +765,20 @@ impl App {
         } else {
             "<board-ip>".into()
         };
-        format!("http://{host}:{}{}", self.cfg.mcp.port, self.cfg.mcp.path)
+        let port = if scheme == "https" && self.tls.port != 0 { self.tls.port } else { self.cfg.mcp.port };
+        format!("{scheme}://{host}:{port}{}", self.cfg.mcp.path)
     }
 
     /// The text shown to the model at `initialize`, generated from what is really
     /// attached so it never promises hardware that is not there.
-    fn instructions(&mut self) -> String {
+    fn instructions(&mut self, scheme: &str) -> String {
         let mut names: Vec<String> = self.devices.infos().iter().map(|d| d.name.clone()).collect();
         if names.is_empty() {
             names.push("no peripherals detected".into());
         }
         let tools = self.visible_tool_names();
         let setup = self.setup_needed();
-        let url = self.mcp_url();
+        let url = self.mcp_url_with(scheme);
         let soc = self.hw.board_info().soc;
         let board = self.profile.name.to_string();
         format!(
@@ -837,6 +923,9 @@ impl App {
             headers: Default::default(),
             body: body.into_bytes(),
             peer: "self".to_string(),
+            // An in-process call has no listener; it is the caller's own view of the
+            // board, and http is what the self-call path represents.
+            scheme: "http",
         };
         let resp = self.route(&req);
         let text = String::from_utf8_lossy(&resp.body).to_string();
@@ -1697,6 +1786,12 @@ impl App {
     // ---------------------------------------------------------------- RPC
 
     pub fn handle_rpc(&mut self, body: &str, session: Option<&str>) -> Option<Value> {
+        self.handle_rpc_with(body, session, "http")
+    }
+
+    /// As [`Self::handle_rpc`], but knowing which listener answered. `initialize` quotes
+    /// an endpoint, and quoting the wrong scheme sends the next agent to a dead port.
+    pub fn handle_rpc_with(&mut self, body: &str, session: Option<&str>, scheme: &str) -> Option<Value> {
         let messages = match protocol::parse(body) {
             Ok(m) => m,
             Err((id, code_n, message)) => {
@@ -1707,7 +1802,7 @@ impl App {
         let single = messages.len() == 1;
         let mut out = Vec::new();
         for msg in messages {
-            if let Some(v) = self.handle_one(msg, session) {
+            if let Some(v) = self.handle_one(msg, session, scheme) {
                 out.push(v);
             }
         }
@@ -1721,7 +1816,7 @@ impl App {
         }
     }
 
-    fn handle_one(&mut self, msg: RpcIn, session: Option<&str>) -> Option<Value> {
+    fn handle_one(&mut self, msg: RpcIn, session: Option<&str>, scheme: &str) -> Option<Value> {
         let id = msg.id.clone();
         if msg.is_notification {
             self.runtime.counters.notifications += 1;
@@ -1736,7 +1831,7 @@ impl App {
         }
         self.runtime.counters.requests += 1;
         let result = match msg.method.as_str() {
-            "initialize" => Ok(self.on_initialize(&msg.params, session)),
+            "initialize" => Ok(self.on_initialize(&msg.params, session, scheme)),
             "ping" => Ok(json!({})),
             "tools/list" => {
                 if self.cfg.mcp.reprobe_on_list {
@@ -1765,7 +1860,7 @@ impl App {
         }
     }
 
-    fn on_initialize(&mut self, params: &Value, session: Option<&str>) -> Value {
+    fn on_initialize(&mut self, params: &Value, session: Option<&str>, scheme: &str) -> Value {
         let client = params
             .get("clientInfo")
             .and_then(|c| c.get("name"))
@@ -1781,7 +1876,7 @@ impl App {
             let idx = self.runtime.touch_session(s, now_ms(), &client);
             self.runtime.sessions[idx].protocol = protocol_version;
         }
-        let instructions = self.instructions();
+        let instructions = self.instructions(scheme);
         protocol::initialize_result(&self.firmware.name, &self.firmware.version, &instructions, true)
     }
 
@@ -1911,33 +2006,28 @@ impl App {
         if self.cfg.mcp.reprobe_on_list {
             self.rebuild();
         }
-        let mut names: Vec<&str> =
-            self.tools.iter().map(|d| d.spec.name.as_str()).filter(|n| self.is_visible(n)).collect();
-        names.sort_unstable();
+        // One list, sorted by name across both sources, byte for byte what
+        // `tools_list_json` returns. The two paths exist because one avoids building a
+        // Value tree on a board with a few kB of heap; they must not disagree about order,
+        // or the same client sees a different list depending on the transport.
+        let mut entries: Vec<Value> =
+            self.tools.iter().filter(|d| self.is_visible(&d.spec.name)).map(|d| d.mcp_json()).collect();
+        entries.extend(self.extra_mcp_specs());
+        entries.sort_by_key(|t| t["name"].as_str().unwrap_or("").to_string());
 
         let id = serde_json::to_string(&msg.id.unwrap_or(Value::Null)).ok()?;
         // Same shape `protocol::ok` produces (serde_json orders object keys).
-        let mut out = String::with_capacity(512 + names.len() * 640);
+        let mut out = String::with_capacity(512 + entries.len() * 640);
         out.push_str("{\"id\":");
         out.push_str(&id);
         out.push_str(",\"jsonrpc\":\"2.0\",\"result\":{\"tools\":[");
         let mut first = true;
-        for name in names {
-            let def = self.tools.get(name)?;
+        for entry in entries {
             if !first {
                 out.push(',');
             }
             first = false;
-            out.push_str(&serde_json::to_string(&def.mcp_json()).ok()?);
-        }
-        // The registry tools are sorted; the extras follow in module order, exactly as
-        // in `tools_list_json`.
-        for spec in self.extra_mcp_specs() {
-            if !first {
-                out.push(',');
-            }
-            first = false;
-            out.push_str(&serde_json::to_string(&spec).ok()?);
+            out.push_str(&serde_json::to_string(&entry).ok()?);
         }
         out.push_str("]}}");
         Some(out)
@@ -1995,6 +2085,7 @@ impl App {
             // The map an external agent reads before it touches anything. Two paths so a
             // client that guesses either name finds it.
             ("GET", "/agent.json") | ("GET", "/sitemap.json") => Response::json(&self.sitemap_json(req)),
+            ("GET", "/api/tls") => Response::json(&self.tls.json()),
             ("GET", "/api/status") => {
                 let v = self.status_json();
                 Response::json(&v)
@@ -2385,7 +2476,7 @@ impl App {
             return resp;
         }
 
-        let reply = self.handle_rpc(&body, Some(&session_id));
+        let reply = self.handle_rpc_with(&body, Some(&session_id), req.scheme);
         let mut resp = match reply {
             None => Response::empty(202),
             Some(v) => Response::json(&v),
@@ -2546,32 +2637,20 @@ impl ToolHost for App {
             })
         };
 
-        // Order is part of the contract, because a provider caches the request by its
-        // prefix: one reordered entry and every token after it is reprocessed. So the
-        // blocks run from least to most volatile, and each block is ordered by name.
-        //
-        //   1. the board's own tools — they change with the hardware or the firmware
-        //   2. fs_* and net_*         — fixed for a given build
-        //   3. manifest tools         — they change whenever the model rewrites one
-        //
-        // Alphabetical within a block, so two boards with the same hardware produce the
-        // same bytes however the probe happened to enumerate them.
-        let mut board: Vec<Value> =
-            visible.iter().filter(|d| !d.spec.from_manifest).map(|d| load(d)).collect();
-        board.sort_by_key(|t| t["function"]["name"].as_str().unwrap_or("").to_string());
-
-        let mut volatile: Vec<Value> =
-            visible.iter().filter(|d| d.spec.from_manifest).map(|d| load(d)).collect();
-        volatile.sort_by_key(|t| t["function"]["name"].as_str().unwrap_or("").to_string());
-
-        let mut tools = board;
-        // File and HTTP tools gate on nothing the hardware must provide, so they are not
-        // MCP tools; they are appended after the board's own list, and they come before
-        // the manifest block because they never change at runtime.
+        // Order is part of the contract: a provider caches the request by its prefix, so
+        // one reordered entry and every token after it is reprocessed. The list is
+        // therefore sorted by name across every source — board tools, manifest tools and
+        // the agent-only fs_*/net_*/script group — which is both stable for a given board
+        // and the order a person expects to read. A manifest edit now moves the entries it
+        // touches instead of everything after them, because the manifest tools are no
+        // longer kept in a block at the end.
+        let mut tools: Vec<Value> = visible.iter().map(|d| load(d)).collect();
+        // File, HTTP and script tools gate on nothing the hardware must provide, so they
+        // are not MCP tools; the model still gets them, in the same sorted list.
         for group in [fs_tools::specs(), net_tools::specs(), board_tools::script_specs()] {
             tools.extend(openai_tools(&group));
         }
-        tools.extend(volatile);
+        tools.sort_by_key(|t| t["function"]["name"].as_str().unwrap_or("").to_string());
         Value::Array(tools)
     }
 
@@ -3352,6 +3431,48 @@ mod tests {
         assert!(endpoints.iter().any(|e| e["path"] == "/agent.json"));
     }
 
+    /// The map is a promise about where to send the next request. Over TLS it has to
+    /// say https, or an external agent connects to a port that is not answering that way.
+    #[test]
+    fn the_discovery_document_follows_the_listener_that_answered() {
+        let mut app = test_app();
+        // What the firmware sets once the 443 listener is up.
+        app.tls = TlsInfo { port: 443, fingerprint: "aa:bb".into(), error: String::new() };
+        let mut req = get("/agent.json");
+        req.headers.insert("host".into(), "192.168.3.7".into());
+        req.scheme = "https";
+        let doc: Value = serde_json::from_slice(&app.route(&req).body).expect("parses");
+        assert_eq!(doc["dynamic"]["base_url"], "https://192.168.3.7");
+
+        // The MCP `initialize` response quotes the same endpoint, by the same rule.
+        let mut init = Request {
+            method: "POST".into(),
+            path: "/mcp".into(),
+            query: Default::default(),
+            headers: Default::default(),
+            body: br#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"t","version":"1"}}}"#.to_vec(),
+            peer: "test".into(),
+            scheme: "https",
+        };
+        init.headers.insert("content-type".into(), "application/json".into());
+        let reply: Value = serde_json::from_slice(&app.route(&init).body).expect("json");
+        let text = reply["result"]["instructions"].as_str().expect("instructions");
+        assert!(text.contains("https://"), "the endpoint told the client: {text}");
+        assert!(!text.contains("Endpoint: http://"), "the endpoint told the client: {text}");
+        // And the port that answers *that* scheme — 443, not the plaintext 80.
+        assert!(
+            text.contains("https://") && text.contains(":443/mcp"),
+            "the endpoint told the client: {text}"
+        );
+
+        // Over plain http the same board keeps naming port 80.
+        let mut plain = init.clone();
+        plain.scheme = "http";
+        let reply: Value = serde_json::from_slice(&app.route(&plain).body).expect("json");
+        let text = reply["result"]["instructions"].as_str().expect("instructions");
+        assert!(text.contains("http://") && text.contains(":80/mcp"), "the endpoint told the client: {text}");
+    }
+
     /// A GET request; the query string is split off into `query` the way the
     /// server does it, so `?after=2` reaches the handler.
     fn get(url: &str) -> Request {
@@ -3379,6 +3500,7 @@ mod tests {
             headers: Default::default(),
             body: body.as_bytes().to_vec(),
             peer: "test".into(),
+            scheme: "http",
         }
     }
 
@@ -3482,6 +3604,20 @@ mod tests {
     /// A script is how the model writes the loop the tool vocabulary cannot express — and
     /// `tool()` inside it goes through the same dispatcher, so it cannot reach further than
     /// the caller.
+    /// Opening the sheet always lands on Devices, whatever was open last time.
+    #[test]
+    fn the_board_sheet_opens_on_devices() {
+        assert!(
+            crate::web::INDEX_HTML.contains("data-panel=\"devices\" aria-selected=\"true\""),
+            "devices is the selected tab in the markup"
+        );
+        assert!(
+            crate::web::APP_JS.contains("showPanel(\"devices\")"),
+            "opening the sheet selects devices, it does not remember"
+        );
+        assert!(!crate::web::APP_JS.contains("showPanel(S.panel)"), "no restore of the last tab");
+    }
+
     /// `minimal` is the answer to "why are there still 27 tools on an empty board": it
     /// hides the nine that are conveniences, and keeps everything an empty board needs to
     /// rebuild itself.
@@ -3594,7 +3730,8 @@ mod tests {
         let mut app = test_app();
         let started = std::time::Instant::now();
         // The path MCP and the on-board agent both take for `net_*` is `ToolHost`.
-        let out = ToolHost::call_tool(&mut app, "net_get", &json!({"url": "http://127.0.0.1:8080/healthz"}))
+        let url = format!("http://127.0.0.1:{}/healthz", app.cfg.mcp.port);
+        let out = ToolHost::call_tool(&mut app, "net_get", &json!({"url": url}))
             .expect("a self request is answered");
         let body: Value = serde_json::from_str(&out).expect("json");
         let took = started.elapsed();
@@ -4285,7 +4422,10 @@ mod tests {
     fn a_joined_board_does_not_claim_it_is_in_setup_mode() {
         let mut app = test_app();
         assert!(app.setup_needed(), "a board with no SSID is in setup mode");
-        assert!(app.instructions().contains("setup mode"), "with no credentials the instructions say so");
+        assert!(
+            app.instructions("http").contains("setup mode"),
+            "with no credentials the instructions say so"
+        );
 
         let resp = app.route(&post("/api/config", r#"{"wifi":{"ssid":"home"}}"#));
         assert_eq!(resp.status, 200, "the config write must be accepted");
@@ -4298,7 +4438,7 @@ mod tests {
             "/api/status must agree with the instruction text"
         );
         assert!(
-            !app.instructions().contains("setup mode"),
+            !app.instructions("http").contains("setup mode"),
             "a joined board must not be described to a model as unprovisioned"
         );
     }
@@ -4829,8 +4969,8 @@ mod tests {
     /// One array, one shape, no source tag: the `category`/`core`/`mutating` fields
     /// exist for the portal and for `tools/list`, and are never sent. What differs is
     /// only the *position* — the board's tools (driver, system and manifest alike) are
-    /// one alphabetical block, and `fs_*` then `net_*` follow, because those are not
-    /// MCP tools and are appended by `tool_specs` rather than registered.
+    /// one alphabetical list with everything else, because the model's view is built from
+    /// three sources (registry, agent-only tools, manifest) and a reader expects one order.
     #[test]
     fn every_tool_reaches_the_model_in_one_shape_and_a_predictable_order() {
         let mut app = test_app();
@@ -4862,29 +5002,84 @@ mod tests {
             assert!(tool["function"]["parameters"].is_object(), "{tool}");
         }
 
-        // The board's own tools are one alphabetical block, manifest tools excluded.
-        let split = names.iter().position(|n| n.starts_with("fs_")).expect("fs tools");
-        let board = &names[..split];
-        let mut sorted = board.to_vec();
+        // One list, sorted by name, whatever produced the entry: the board's own tools,
+        // the agent-only fs_*/net_*/script group, and the manifest-compiled tools all sit
+        // in the same alphabetical run. Stable for a given board (the next test checks the
+        // bytes), and the order a reader expects.
+        let mut sorted = names.clone();
         sorted.sort_unstable();
-        assert_eq!(board, sorted.as_slice(), "the board tools are not one alphabetical block");
-        for needle in ["board_status", "manifest_apply"] {
-            assert!(board.contains(&needle), "{needle} is not in the board block: {board:?}");
+        assert_eq!(names, sorted, "the tool list is not alphabetical: {names:?}");
+
+        for needle in ["board_status", "manifest_apply", "fs_read", "net_get", "script"] {
+            assert!(names.contains(&needle), "{needle} is missing: {names:?}");
         }
-        assert!(!board.contains(&"aaa_manifest"), "a manifest tool is not in the board block: {board:?}");
+        // A manifest tool sorts among the rest — `aaa_manifest` is first, not last.
+        assert_eq!(names.first(), Some(&"aaa_manifest"), "manifest tools are not in the same list");
+    }
 
-        // ... then the tools outside the registry — file, network, script — in module order ...
-        assert_eq!(
-            &names[split..split + 11],
-            &[
-                "fs_ls", "fs_read", "fs_write", "fs_edit", "fs_rm", "fs_cp", "fs_mv", "fs_grep", "net_get",
-                "net_post", "script"
-            ],
-            "the file, network and script tools are not the trailing block: {names:?}"
-        );
+    /// With `discovery = auto` the probe adopts what it finds, and an older manifest may
+    /// still declare the same sensor. Declaring it again must not add a second device —
+    /// on the bench that produced eight devices, two of everything, with copies renamed
+    /// `led_set_2`.
+    #[test]
+    fn a_declaration_the_probe_already_adopted_is_a_no_op() {
+        let mut app = test_app();
+        let before = app.devices.infos().len();
+        let declared: Vec<Value> = app
+            .devices
+            .infos()
+            .iter()
+            .filter(|i| i.address.is_some() || !i.pins.is_empty())
+            .map(|i| {
+                json!({
+                    "id": format!("again_{}", i.id),
+                    "kind": i.kind,
+                    "driver": i.kind,
+                    "bus": 0,
+                    "address": i.address,
+                    "pins": {},
+                })
+            })
+            .collect();
+        if declared.is_empty() {
+            return; // a board with no addressable devices has nothing to duplicate
+        }
+        app.call_tool("manifest_apply", &json!({ "manifest": { "devices": declared } })).expect("applied");
+        assert_eq!(app.devices.infos().len(), before, "a device declared twice became two devices");
+    }
 
-        // ... and the manifest block last, because it is the one the model rewrites.
-        assert_eq!(&names[split + 11..], &["aaa_manifest"], "{names:?}");
+    /// The portal's tool page is the only place a person can see what exists. It used to
+    /// list the registry only, so the agent's own tools — and `script` in particular —
+    /// looked missing while the model had them all along.
+    #[test]
+    fn the_portal_lists_every_tool_the_model_has() {
+        let mut app = test_app();
+        let body = body_json(&app.route(&get("/api/tools")));
+        let tools = body["tools"].as_array().expect("tools");
+        let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().expect("a name")).collect();
+
+        for needle in ["script", "fs_read", "fs_write", "net_get", "board_status"] {
+            assert!(names.contains(&needle), "{needle} is missing from the portal: {names:?}");
+        }
+        let mut sorted = names.clone();
+        sorted.sort_unstable();
+        assert_eq!(names, sorted, "the portal list is not alphabetical: {names:?}");
+
+        // The model has exactly this set: no tool is portal-only or model-only.
+        let model: Vec<String> = ToolHost::tool_specs(&app)
+            .as_array()
+            .expect("array")
+            .iter()
+            .map(|t| t["function"]["name"].as_str().expect("name").to_string())
+            .collect();
+        // Every model tool is in the portal list ...
+        for name in &model {
+            assert!(names.contains(&name.as_str()), "{name} reaches the model but not the portal");
+        }
+        // ... and the portal adds nothing the model cannot call.
+        for name in &names {
+            assert!(model.iter().any(|m| m == name), "{name} is in the portal but not in the model's list");
+        }
     }
 
     /// The same board has to produce the same bytes, or the provider's prompt cache
@@ -5473,6 +5668,7 @@ mod tests {
             headers: Default::default(),
             body: br#"{"device_name":"bench","mcp":{"tools_mode":"auto"}}"#.to_vec(),
             peer: "test".into(),
+            scheme: "http",
         };
         let resp = app.route(&req);
         assert_eq!(resp.status, 200);
@@ -5492,6 +5688,7 @@ mod tests {
             headers: Default::default(),
             body: br#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#.to_vec(),
             peer: "test".into(),
+            scheme: "http",
         };
         assert_eq!(app.route(&req).status, 401);
         req.headers.insert("authorization".into(), "Bearer tok".into());
@@ -5511,6 +5708,7 @@ mod tests {
             headers: Default::default(),
             body: br#"{"device_name":"x"}"#.to_vec(),
             peer: "t".into(),
+            scheme: "http",
         };
         assert_eq!(app.route(&write).status, 401);
         let read = Request { method: "GET".into(), path: "/api/status".into(), ..write.clone() };
@@ -5527,6 +5725,7 @@ mod tests {
             headers: Default::default(),
             body: br#"{"mode":"generic"}"#.to_vec(),
             peer: "t".into(),
+            scheme: "http",
         };
         assert_eq!(app.route(&req).status, 200);
         assert_eq!(app.cfg.mcp.tools_mode, "generic");

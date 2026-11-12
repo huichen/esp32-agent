@@ -10,7 +10,7 @@
 
 use crate::logbuf::LogBuf;
 use std::collections::BTreeMap;
-use std::io::{Read, Write};
+use std::io::Read;
 use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -122,8 +122,10 @@ impl Drop for EventStreamSlot {
 // Requests are served on the accept thread — one stack instead of one per connection — so
 // this stack carries the heaviest handler. `/api/tools` serialises 41 tool descriptors and
 // overflowed a 6 kB stack with a `***ERROR*** A stack overflow in task pthread` and a
-// reboot; 16 kB is what it takes with room to spare.
-const ACCEPT_STACK: usize = 16 * 1024;
+// reboot; 16 kB is what it takes with room to spare. The extra 4 kB is the TLS handshake
+// (mbedTLS), which runs on this thread too when the board serves https — a second thread
+// for it does not fit in internal RAM alongside the agent.
+const ACCEPT_STACK: usize = 20 * 1024;
 #[cfg(not(target_os = "espidf"))]
 const ACCEPT_STACK: usize = 256 * 1024;
 
@@ -135,6 +137,10 @@ const CONN_STACK: usize = 6 * 1024;
 #[cfg(not(target_os = "espidf"))]
 const CONN_STACK: usize = 512 * 1024;
 
+/// How long a client may take to finish its handshake. Short, because the loop is
+/// serialised: one silent socket must not hold every other client.
+const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+
 #[derive(Debug, Clone)]
 pub struct Request {
     pub method: String,
@@ -145,6 +151,9 @@ pub struct Request {
     pub headers: BTreeMap<String, String>,
     pub body: Vec<u8>,
     pub peer: String,
+    /// `http` or `https` — set by the listener, not by the client. A self-describing
+    /// board that answers over TLS must not tell an agent to use `http://`.
+    pub scheme: &'static str,
 }
 
 impl Request {
@@ -239,15 +248,19 @@ impl Response {
     }
 
     pub fn html(body: impl Into<Vec<u8>>) -> Self {
-        Self::new(200, "text/html; charset=utf-8", body)
+        // No caching: the console's HTML and its two assets change together in a firmware
+        // build, and a browser that keeps the old script against the new document renders a
+        // blank page. That looks exactly like "the site is down" and costs a flash cycle to
+        // disprove, so the three files are always revalidated.
+        Self::new(200, "text/html; charset=utf-8", body).with_header("Cache-Control", "no-store")
     }
 
     pub fn js(body: impl Into<Vec<u8>>) -> Self {
-        Self::new(200, "application/javascript; charset=utf-8", body)
+        Self::new(200, "application/javascript; charset=utf-8", body).with_header("Cache-Control", "no-store")
     }
 
     pub fn css(body: impl Into<Vec<u8>>) -> Self {
-        Self::new(200, "text/css; charset=utf-8", body)
+        Self::new(200, "text/css; charset=utf-8", body).with_header("Cache-Control", "no-store")
     }
 
     pub fn empty(status: u16) -> Self {
@@ -298,16 +311,51 @@ impl Response {
 
 pub type Handler = Arc<dyn Fn(&Request) -> Response + Send + Sync>;
 
-struct BufferedReader {
-    stream: TcpStream,
+/// Anything that can carry an HTTP connection.
+///
+/// The server does not care whether the bytes travel over a plain socket or a TLS session:
+/// it reads a request, writes a response, and sets two timeouts. Keeping that in a trait is
+/// what lets HTTPS be a second listener rather than a second server.
+pub trait Stream: std::io::Read + std::io::Write + Send {
+    fn set_read_timeout(&self, d: Option<Duration>) -> std::io::Result<()>;
+    fn set_write_timeout(&self, d: Option<Duration>) -> std::io::Result<()>;
+    fn set_nodelay(&self, on: bool) -> std::io::Result<()>;
+}
+
+impl Stream for TcpStream {
+    fn set_read_timeout(&self, d: Option<Duration>) -> std::io::Result<()> {
+        TcpStream::set_read_timeout(self, d)
+    }
+    fn set_write_timeout(&self, d: Option<Duration>) -> std::io::Result<()> {
+        TcpStream::set_write_timeout(self, d)
+    }
+    fn set_nodelay(&self, on: bool) -> std::io::Result<()> {
+        TcpStream::set_nodelay(self, on)
+    }
+}
+
+impl Stream for Box<dyn Stream> {
+    fn set_read_timeout(&self, d: Option<Duration>) -> std::io::Result<()> {
+        (**self).set_read_timeout(d)
+    }
+    fn set_write_timeout(&self, d: Option<Duration>) -> std::io::Result<()> {
+        (**self).set_write_timeout(d)
+    }
+    fn set_nodelay(&self, on: bool) -> std::io::Result<()> {
+        (**self).set_nodelay(on)
+    }
+}
+
+struct BufferedReader<S> {
+    stream: S,
     buf: Vec<u8>,
     pos: usize,
 }
 
-impl BufferedReader {
+impl<S: Stream> BufferedReader<S> {
     /// A reader that already holds the bytes read while the socket was still in the
     /// waiting list.
-    fn with_prefix(stream: TcpStream, prefix: Vec<u8>) -> std::io::Result<Self> {
+    fn with_prefix(stream: S, prefix: Vec<u8>) -> std::io::Result<Self> {
         stream.set_read_timeout(Some(IDLE_TIMEOUT))?;
         stream.set_write_timeout(Some(IDLE_TIMEOUT))?;
         stream.set_nodelay(true).ok();
@@ -388,7 +436,11 @@ fn find_crlf(hay: &[u8]) -> Option<usize> {
     hay.windows(2).position(|w| w == b"\r\n")
 }
 
-fn parse_request(conn: &mut BufferedReader, peer: &str) -> std::io::Result<Option<Request>> {
+fn parse_request<S: Stream>(
+    conn: &mut BufferedReader<S>,
+    peer: &str,
+    scheme: &'static str,
+) -> std::io::Result<Option<Request>> {
     let request_line = match conn.line(MAX_HEADER_BYTES)? {
         Some(l) => l,
         None => return Ok(None),
@@ -396,18 +448,19 @@ fn parse_request(conn: &mut BufferedReader, peer: &str) -> std::io::Result<Optio
     if request_line.is_empty() {
         // A stray CRLF between keep-alive requests.
         return match conn.line(MAX_HEADER_BYTES)? {
-            Some(l) if !l.is_empty() => parse_with_line(conn, peer, &l),
+            Some(l) if !l.is_empty() => parse_with_line(conn, peer, &l, scheme),
             Some(_) => Ok(None),
             None => Ok(None),
         };
     }
-    parse_with_line(conn, peer, &request_line)
+    parse_with_line(conn, peer, &request_line, scheme)
 }
 
-fn parse_with_line(
-    conn: &mut BufferedReader,
+fn parse_with_line<S: Stream>(
+    conn: &mut BufferedReader<S>,
     peer: &str,
     request_line: &str,
+    scheme: &'static str,
 ) -> std::io::Result<Option<Request>> {
     let mut parts = request_line.split_whitespace();
     let method = parts.next().unwrap_or("").to_ascii_uppercase();
@@ -456,7 +509,7 @@ fn parse_with_line(
         }
     };
 
-    Ok(Some(Request { method, path, query, headers, body, peer: peer.to_string() }))
+    Ok(Some(Request { method, path, query, headers, body, peer: peer.to_string(), scheme }))
 }
 
 fn split_target(target: &str) -> (String, BTreeMap<String, String>) {
@@ -514,8 +567,8 @@ fn url_decode(s: &str) -> String {
     String::from_utf8_lossy(&out).to_string()
 }
 
-fn write_response(
-    stream: &mut TcpStream,
+fn write_response<S: std::io::Write>(
+    stream: &mut S,
     resp: &Response,
     keep_alive: bool,
     head_only: bool,
@@ -548,11 +601,11 @@ fn write_response(
 }
 
 /// A socket as an [`EventSink`]: every `send` becomes one chunk.
-struct ChunkedSink<'a> {
-    stream: &'a mut TcpStream,
+struct ChunkedSink<'a, S: std::io::Write> {
+    stream: &'a mut S,
 }
 
-impl EventSink for ChunkedSink<'_> {
+impl<S: std::io::Write> EventSink for ChunkedSink<'_, S> {
     fn send(&mut self, bytes: &[u8]) -> std::io::Result<()> {
         if bytes.is_empty() {
             return Ok(());
@@ -573,8 +626,8 @@ impl EventSink for ChunkedSink<'_> {
 /// to, so the body is chunked and the connection closed afterwards. `EventSource`
 /// reconnects on its own with `after=<last id>`; that is the contract's design, not
 /// a failure mode.
-fn write_stream_response(
-    stream: &mut TcpStream,
+fn write_stream_response<S: std::io::Write>(
+    stream: &mut S,
     resp: &Response,
     body: StreamBody,
     head_only: bool,
@@ -605,27 +658,85 @@ fn write_stream_response(
 }
 
 /// A running server. Dropping it stops the accept loop.
+/// What to do with a freshly accepted TCP connection on the TLS listener.
+///
+/// The platform owns the handshake: on the board it is esp-tls, on the host a rustls
+/// server. `None` means the handshake failed and the socket is dropped — a stranger
+/// speaking the wrong protocol must never reach the request parser.
+pub type Handshake = Arc<dyn Fn(TcpStream) -> Option<Box<dyn Stream>> + Send + Sync>;
+
 pub struct Server {
     stop: Arc<AtomicBool>,
     addr: SocketAddr,
+    scheme: &'static str,
     join: Option<JoinHandle<()>>,
     log: Arc<LogBuf>,
 }
 
 impl Server {
+    /// Plain http only.
     pub fn start(addr: &str, handler: Handler, log: Arc<LogBuf>) -> std::io::Result<Self> {
-        let listener = bind(addr)?;
-        let local = listener.local_addr()?;
-        listener.set_nonblocking(true)?;
+        let http = bind(addr)?;
+        let local = http.local_addr()?;
+        http.set_nonblocking(true)?;
+        Self::spawn(vec![http], handler, log, "http", local)
+    }
+
+    /// http and https on two ports, served by **one** accept thread.
+    ///
+    /// That is not a shortcut, it is the only shape that fits. A TLS connection needs a
+    /// stack before its handshake can start; six of those at once (what a browser asks
+    /// for) do not fit in this board's internal RAM, and the failure arrives as
+    /// ERR_CONNECTION_RESET. One listener thread that does the handshake inline costs a
+    /// single stack and nothing per connection. The consequence is honest and bounded:
+    /// while one TLS client is being served, another waits in the listen backlog for the
+    /// duration of one request.
+    pub fn start_with_tls(
+        http_addr: &str,
+        tls_addr: &str,
+        handler: Handler,
+        log: Arc<LogBuf>,
+        handshake: Handshake,
+    ) -> std::io::Result<Self> {
+        let http = bind(http_addr)?;
+        let local = http.local_addr()?;
+        http.set_nonblocking(true)?;
+        let tls = bind(tls_addr)?;
+        tls.set_nonblocking(true)?;
+        log.info("http", format!("listening on https://{}/", tls.local_addr()?));
+        let mut listeners = vec![(http, None), (tls, Some(handshake))];
+        // Keep the plaintext listener first: it is the one that must never starve.
+        listeners.sort_by_key(|(_, tls)| tls.is_some());
+        Self::spawn_with(listeners, handler, log, "http", local)
+    }
+
+    fn spawn(
+        listeners: Vec<TcpListener>,
+        handler: Handler,
+        log: Arc<LogBuf>,
+        scheme: &'static str,
+        local: SocketAddr,
+    ) -> std::io::Result<Self> {
+        let listeners = listeners.into_iter().map(|l| (l, None)).collect();
+        Self::spawn_with(listeners, handler, log, scheme, local)
+    }
+
+    fn spawn_with(
+        listeners: Vec<(TcpListener, Option<Handshake>)>,
+        handler: Handler,
+        log: Arc<LogBuf>,
+        scheme: &'static str,
+        local: SocketAddr,
+    ) -> std::io::Result<Self> {
         let stop = Arc::new(AtomicBool::new(false));
         let stop_thread = stop.clone();
         let log_thread = log.clone();
         let join = std::thread::Builder::new()
             .name("httpd".into())
             .stack_size(ACCEPT_STACK)
-            .spawn(move || accept_loop(listener, handler, stop_thread, log_thread))?;
-        log.info("http", format!("listening on http://{local}/"));
-        Ok(Self { stop, addr: local, join: Some(join), log })
+            .spawn(move || accept_loop(listeners, handler, stop_thread, log_thread))?;
+        log.info("http", format!("listening on {scheme}://{local}/"));
+        Ok(Self { stop, addr: local, scheme, join: Some(join), log })
     }
 
     pub fn local_addr(&self) -> SocketAddr {
@@ -633,7 +744,7 @@ impl Server {
     }
 
     pub fn url(&self) -> String {
-        format!("http://{}", self.addr)
+        format!("{}://{}", self.scheme, self.addr)
     }
 
     pub fn stop(&mut self) {
@@ -667,7 +778,12 @@ fn bind(addr: &str) -> std::io::Result<TcpListener> {
     Err(last.unwrap_or_else(|| std::io::Error::new(std::io::ErrorKind::AddrNotAvailable, "no address")))
 }
 
-fn accept_loop(listener: TcpListener, handler: Handler, stop: Arc<AtomicBool>, log: Arc<LogBuf>) {
+fn accept_loop(
+    listeners: Vec<(TcpListener, Option<Handshake>)>,
+    handler: Handler,
+    stop: Arc<AtomicBool>,
+    log: Arc<LogBuf>,
+) {
     let active = Arc::new(AtomicUsize::new(0));
     // Requests are answered on this thread — one stack instead of one per connection — but
     // only once a socket actually has something to say. A browser opens idle sockets to
@@ -677,23 +793,30 @@ fn accept_loop(listener: TcpListener, handler: Handler, stop: Arc<AtomicBool>, l
     // list until `peek` reports data.
     let mut pending: Vec<(TcpStream, String, std::time::Instant, Vec<u8>)> = Vec::new();
     while !stop.load(Ordering::SeqCst) {
-        loop {
-            match listener.accept() {
-                Ok((stream, peer)) => {
-                    if stream.set_nonblocking(true).is_err() {
-                        continue;
+        for (listener, tls) in &listeners {
+            loop {
+                match listener.accept() {
+                    Ok((stream, peer)) => match tls {
+                        // A TLS socket cannot be probed for readiness without speaking
+                        // TLS, so it is served here and now.
+                        Some(handshake) => serve_tls(stream, peer, handshake, &handler, &log, &active),
+                        None => {
+                            if stream.set_nonblocking(true).is_err() {
+                                continue;
+                            }
+                            if pending.len() >= MAX_PENDING {
+                                log.warn("http", format!("{peer}: {MAX_PENDING} sockets waiting, dropping"));
+                                continue;
+                            }
+                            pending.push((stream, peer.to_string(), std::time::Instant::now(), Vec::new()));
+                        }
+                    },
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(e) => {
+                        log.warn("http", format!("accept failed: {e}"));
+                        std::thread::sleep(Duration::from_millis(50));
+                        break;
                     }
-                    if pending.len() >= MAX_PENDING {
-                        log.warn("http", format!("{}: {MAX_PENDING} sockets waiting, dropping", peer));
-                        continue;
-                    }
-                    pending.push((stream, peer.to_string(), std::time::Instant::now(), Vec::new()));
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-                Err(e) => {
-                    log.warn("http", format!("accept failed: {e}"));
-                    std::thread::sleep(Duration::from_millis(50));
-                    break;
                 }
             }
         }
@@ -723,7 +846,7 @@ fn accept_loop(listener: TcpListener, handler: Handler, stop: Arc<AtomicBool>, l
                 Ready::Data(prefix) => {
                     let (stream, peer, _, _) = pending.remove(index);
                     stream.set_nonblocking(false).ok();
-                    match serve_until_stream(stream, prefix, &peer, &handler, &log) {
+                    match serve_until_stream(stream, prefix, &peer, "http", true, &handler, &log) {
                         Serve::Done | Serve::Failed => {}
                         Serve::KeepAlive(stream, rest) => {
                             if stream.set_nonblocking(true).is_ok() {
@@ -731,26 +854,7 @@ fn accept_loop(listener: TcpListener, handler: Handler, stop: Arc<AtomicBool>, l
                             }
                         }
                         Serve::Stream(conn, resp, body, head_only) => {
-                            if active.load(Ordering::SeqCst) >= MAX_CONNECTIONS {
-                                log.warn("http", format!("{peer}: too many streams, dropping"));
-                                continue;
-                            }
-                            active.fetch_add(1, Ordering::SeqCst);
-                            let log_conn = log.clone();
-                            let active_conn = active.clone();
-                            let spawned = std::thread::Builder::new()
-                                .name("http-stream".into())
-                                .stack_size(CONN_STACK)
-                                .spawn(move || {
-                                    let mut conn = conn;
-                                    let _ = write_stream_response(&mut conn.stream, &resp, body, head_only);
-                                    drop(log_conn);
-                                    active_conn.fetch_sub(1, Ordering::SeqCst);
-                                });
-                            if spawned.is_err() {
-                                active.fetch_sub(1, Ordering::SeqCst);
-                                log.error("http", "could not spawn stream thread");
-                            }
+                            spawn_stream(conn, resp, body, head_only, &log, &active);
                         }
                     }
                 }
@@ -770,6 +874,84 @@ fn accept_loop(listener: TcpListener, handler: Handler, stop: Arc<AtomicBool>, l
     }
 }
 
+/// Hand a streaming response to a thread of its own, so the listener can accept again.
+fn spawn_stream<S: Stream + 'static>(
+    mut conn: BufferedReader<S>,
+    resp: Response,
+    body: StreamBody,
+    head_only: bool,
+    log: &Arc<LogBuf>,
+    active: &Arc<AtomicUsize>,
+) {
+    if active.load(Ordering::SeqCst) >= MAX_CONNECTIONS {
+        log.warn("http", "too many streams, dropping");
+        return;
+    }
+    active.fetch_add(1, Ordering::SeqCst);
+    let log_conn = log.clone();
+    let active_conn = active.clone();
+    let spawned =
+        std::thread::Builder::new().name("http-stream".into()).stack_size(CONN_STACK).spawn(move || {
+            let _ = write_stream_response(&mut conn.stream, &resp, body, head_only);
+            drop(log_conn);
+            active_conn.fetch_sub(1, Ordering::SeqCst);
+        });
+    if spawned.is_err() {
+        active.fetch_sub(1, Ordering::SeqCst);
+        log.error("http", "could not spawn stream thread");
+    }
+}
+
+/// Serve one TLS connection on the accept thread: handshake, one request, close.
+fn serve_tls(
+    stream: TcpStream,
+    peer: std::net::SocketAddr,
+    handshake: &Handshake,
+    handler: &Handler,
+    log: &Arc<LogBuf>,
+    active: &Arc<AtomicUsize>,
+) {
+    // Blocking mode is what a handshake wants. The read timeout is short because this
+    // thread is also the plaintext listener: a client that connects and says nothing must
+    // not hold everybody else for the full idle timeout.
+    stream.set_nonblocking(false).ok();
+    stream.set_read_timeout(Some(TLS_HANDSHAKE_TIMEOUT)).ok();
+    stream.set_write_timeout(Some(IDLE_TIMEOUT)).ok();
+    stream.set_nodelay(true).ok();
+    let conn = match handshake(stream) {
+        Some(c) => c,
+        None => {
+            // A browser opens speculative TLS connections and drops the ones it does not
+            // need; a phone on the LAN does the same when a page is refreshed. Logging
+            // each one at warn fills the ring with the same line and buries the failures
+            // that matter. Count them, say it the first few times, then once a minute.
+            let n = TLS_FAILS.fetch_add(1, Ordering::Relaxed) + 1;
+            let now = (crate::app::now_ms() / 1000) as u32;
+            let last = TLS_FAIL_AT_S.load(Ordering::Relaxed);
+            if n <= 3 || now.saturating_sub(last) > 60 {
+                TLS_FAIL_AT_S.store(now, Ordering::Relaxed);
+                log.warn("http", format!("{peer}: tls handshake failed ({n} since boot)"));
+            }
+            return;
+        }
+    };
+    let peer = peer.to_string();
+    // No keep-alive: one request per TLS connection, because each one occupies the
+    // listener while it lasts.
+    match serve_until_stream(conn, Vec::new(), &peer, "https", false, handler, log) {
+        Serve::Done | Serve::Failed | Serve::KeepAlive(..) => {}
+        Serve::Stream(conn, resp, body, head_only) => {
+            spawn_stream(conn, resp, body, head_only, log, active);
+        }
+    }
+}
+
+/// Handshake failures since boot, and when the last one was logged. A busy client can
+/// produce dozens of them per page load; see `serve_tls`.
+static TLS_FAILS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+// Seconds, not milliseconds: the xtensa target has no 64-bit atomics.
+static TLS_FAIL_AT_S: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
 /// Whether an accepted socket has anything for us yet.
 enum Ready {
     Data(Vec<u8>),
@@ -778,45 +960,51 @@ enum Ready {
 }
 
 /// What serving one connection came to.
-enum Serve {
+enum Serve<S> {
     /// Every request was answered; the socket is closed.
     Done,
     /// The socket died mid-request.
     Failed,
     /// The response streams, so the socket moves to a thread of its own.
-    Stream(BufferedReader, Response, StreamBody, bool),
+    Stream(BufferedReader<S>, Response, StreamBody, bool),
     /// One request answered, the client may send another: hand the socket back to the
     /// waiting list instead of parking the accept thread in a second read. Chrome keeps
     /// six warm connections open and would otherwise hold the whole server.
-    KeepAlive(TcpStream, Vec<u8>),
+    KeepAlive(S, Vec<u8>),
 }
 
-impl BufferedReader {
+impl<S: Stream> BufferedReader<S> {
     /// The stream plus any bytes already read past the request that was just answered.
-    fn into_parts(mut self) -> (TcpStream, Vec<u8>) {
+    fn into_parts(mut self) -> (S, Vec<u8>) {
         let rest = self.buf.split_off(self.pos.min(self.buf.len()));
         (self.stream, rest)
     }
 }
 
 /// Serve **one** request. The caller decides what happens to the socket afterwards.
-fn serve_until_stream(
-    stream: TcpStream,
+fn serve_until_stream<S: Stream>(
+    stream: S,
     prefix: Vec<u8>,
     peer: &str,
+    scheme: &'static str,
+    allow_keep_alive: bool,
     handler: &Handler,
     log: &Arc<LogBuf>,
-) -> Serve {
+) -> Serve<S> {
     let mut conn = match BufferedReader::with_prefix(stream, prefix) {
         Ok(c) => c,
         Err(_) => return Serve::Failed,
     };
-    match parse_request(&mut conn, peer) {
+    match parse_request(&mut conn, peer, scheme) {
         Ok(Some(req)) => {
-            let keep_alive = match req.header("connection") {
-                Some(v) => !v.eq_ignore_ascii_case("close"),
-                None => true,
-            };
+            // A listener may refuse keep-alive outright. TLS does: its connections own
+            // a stack each, and holding one open for an idle browser socket costs internal
+            // RAM that the next handshake needs.
+            let keep_alive = allow_keep_alive
+                && match req.header("connection") {
+                    Some(v) => !v.eq_ignore_ascii_case("close"),
+                    None => true,
+                };
             let head_only = req.method == "HEAD";
             let started = std::time::Instant::now();
             let mut resp = handler(&req);
@@ -854,7 +1042,7 @@ fn serve_until_stream(
 #[allow(dead_code)]
 fn serve_connection(stream: TcpStream, peer: String, handler: Handler, log: Arc<LogBuf>) {
     if let Serve::Stream(mut conn, resp, body, head_only) =
-        serve_until_stream(stream, Vec::new(), &peer, &handler, &log)
+        serve_until_stream(stream, Vec::new(), &peer, "http", true, &handler, &log)
     {
         let _ = write_stream_response(&mut conn.stream, &resp, body, head_only);
     }
@@ -863,6 +1051,18 @@ fn serve_connection(stream: TcpStream, peer: String, handler: Handler, log: Arc<
 #[cfg(test)]
 mod tests {
     use super::*;
+    // The tests write raw requests; the library itself only needs `Read`.
+    use std::io::Write;
+
+    /// The portal's three files must not be cached: an HTML that changed and a script that
+    /// did not is a blank page, which reads as "the site is down".
+    #[test]
+    fn the_portal_assets_are_never_cached() {
+        for resp in [Response::html("x"), Response::js("x"), Response::css("x")] {
+            let cache = resp.headers.iter().find(|(k, _)| k == "Cache-Control");
+            assert_eq!(cache.map(|(_, v)| v.as_str()), Some("no-store"), "{resp:?}");
+        }
+    }
 
     #[test]
     fn query_strings_are_decoded() {
