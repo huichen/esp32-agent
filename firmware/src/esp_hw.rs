@@ -732,10 +732,14 @@ fn i2s_channel(
         chan.id = if port == 0 { sys::i2s_port_t_I2S_NUM_0 } else { sys::i2s_port_t_I2S_NUM_1 };
         chan.role = sys::i2s_role_t_I2S_ROLE_MASTER;
         // The bench firmware that works on this hardware uses 8 descriptors of 512 frames;
-        // matching it removes one variable. (`auto_clear` lives in an anonymous union in
-        // these bindings and only affects TX callbacks, so it stays at its default.)
-        chan.dma_desc_num = 2;
-        chan.dma_frame_num = 200;
+        // matching it removes one variable. It matters on transmit: a stream is written in
+        // one call per socket read, and anything else on the board (an OLED frame on the I2C
+        // bus, the App lock) runs between those calls. With 2 x 200 frames the ring holds
+        // 16.7 ms, which is less than one 128x32 frame takes to draw, so the ring runs dry
+        // and the last descriptor replays: the music repeats fragments instead of pausing.
+        // 4 x 512 frames is 85 ms of slack for 8 KB of internal RAM.
+        chan.dma_desc_num = if rx { 2 } else { 4 };
+        chan.dma_frame_num = if rx { 200 } else { 512 };
         // A DMA descriptor keeps being replayed, so a tone whose writer went away loops
         // forever — the amplifier screams until someone sends silence. Clearing the TX
         // buffer after each send makes an interrupted tone decay to silence instead.
