@@ -7,7 +7,7 @@
 //! loop itself never reads a clock and stays testable on the host.
 //!
 //! Bounds, because the board has ~300 KB of usable heap and this history is
-//! persisted to NVS:
+//! transcript lives on the heap, not in NVS: a reboot starts a new conversation
 //!
 //! * at most [`MAX_HISTORY_MESSAGES`] messages and [`MAX_HISTORY_BYTES`] of text;
 //! * a user message is cut to [`MAX_USER_BYTES`];
@@ -19,9 +19,21 @@ use crate::llm::{self, ChatTransport, LlmConfig, ToolCall};
 use serde_json::{json, Value};
 
 /// Oldest messages are dropped above this count.
-pub const MAX_HISTORY_MESSAGES: usize = 48;
+pub const MAX_HISTORY_MESSAGES: usize = 256;
 /// Oldest messages are dropped above this much text.
-pub const MAX_HISTORY_BYTES: usize = 24 * 1024;
+///
+/// Not a physical limit of the chip: the transcript and the request built from it live
+/// in PSRAM (8 MB here), and the two ceilings that used to bind, the internal-RAM
+/// allocations and the mbedTLS buffers, were both moved off it. What this bounds is the
+/// *request body*: tools (about 18 KB of JSON), the system prompt, and this text all go
+/// out in one POST, and the board has to build and send that body while its internal
+/// SRAM is down to a few kilobytes after TLS.
+///
+/// Measured on the bench, and then measured again at a larger size (see
+/// `docs/troubleshooting.md`): 507 KB of transcript still served turns, and the board
+/// rebooted somewhere below 1 MB with the cause not yet captured. 512 KB is therefore the
+/// highest size with a measurement behind it, not a wish.
+pub const MAX_HISTORY_BYTES: usize = 512 * 1024;
 /// How many question-and-answer exchanges survive compression verbatim.
 ///
 /// Four is enough to keep the thread of a task (what was asked, what the last tools did)
@@ -40,6 +52,60 @@ pub const MAX_USER_BYTES: usize = 4096;
 /// Reasoning is shown in the portal but never sent back as answer text, so it gets a
 /// tighter cap than the reply itself.
 pub const MAX_REASONING_BYTES: usize = 4096;
+
+/// When compaction fires, as a fraction of the declared context window.
+///
+/// Same ratio as the host agent's `trigger_tokens` (four fifths of the window): the
+/// remaining fifth is what a reply and the tool schemas get to use.
+pub fn trigger_tokens(context_tokens: u32) -> u32 {
+    let window = context_tokens.max(1) as u64;
+    ((window * 4) / 5).max(1) as u32
+}
+
+/// How much of the tail survives compression verbatim, in tokens.
+///
+/// The host computes `min(RECENT_HISTORY, trigger / 4)`; the board has no 8000-token
+/// history budget to spend, so its cap is a quarter of the trigger and never more than
+/// what is left after the reply reserve. One exchange is always kept.
+pub fn keep_recent_tokens(context_tokens: u32, max_output_tokens: u32) -> u32 {
+    let trigger = trigger_tokens(context_tokens);
+    let room = trigger.saturating_sub(max_output_tokens.min(trigger.saturating_sub(1)));
+    (trigger / 4).min(room).max(1)
+}
+
+/// Whether `c` falls in a CJK range whose characters tokenise to about one token each,
+/// rather than the ~4 characters per token of ASCII. Ported from the host agent so both
+/// sides estimate the same text the same way.
+fn is_cjk(c: char) -> bool {
+    matches!(
+        c as u32,
+        0x4E00..=0x9FFF     // CJK Unified Ideographs
+        | 0x3400..=0x4DBF   // CJK Extension A
+        | 0x3040..=0x30FF   // Hiragana + Katakana
+        | 0xAC00..=0xD7AF   // Hangul Syllables
+        | 0xF900..=0xFAFF   // CJK Compatibility Ideographs
+        | 0x20000..=0x2A6DF // CJK Extension B
+    )
+}
+
+/// Quarters of a token per character: CJK 1.5, ASCII 0.25, everything else 0.5.
+/// Rounded up by [`estimate_tokens`], so the estimate errs high and compaction fires
+/// early rather than at the provider's 400.
+fn char_quarters(c: char) -> u64 {
+    if is_cjk(c) {
+        6
+    } else if c.is_ascii() {
+        1
+    } else {
+        2
+    }
+}
+
+/// Estimate the tokens in a piece of text, the same way the host agent does.
+pub fn estimate_tokens(text: &str) -> u32 {
+    let quarters = text.chars().fold(0_u64, |n, c| n.saturating_add(char_quarters(c)));
+    quarters.saturating_add(3).div_euclid(4).min(u32::MAX as u64) as u32
+}
 
 /// The run journal is a ring: enough to render one run in the portal, small enough to
 /// live in RAM next to the transcript on a board with a few hundred KB of internal heap.
@@ -234,10 +300,17 @@ pub enum AgentStep {
 /// The transcript plus the queue. Lives behind the app mutex.
 pub struct Agent {
     pub history: Vec<Message>,
-    /// A deterministic index of what compression dropped: one line per exchange, taken
-    /// from the messages themselves. It is **not** a model-written summary — nothing here
-    /// costs a model call, and it survives as long as the transcript does.
+    /// The deterministic index of dropped exchanges: one line per message, taken from the
+    /// messages themselves. It is **not** a model-written summary — nothing here costs a
+    /// model call, and it survives as long as the transcript does.
+    ///
+    /// Two asymmetries follow the host agent's deterministic projection: a user question
+    /// is kept in full (it is the statement of what was wanted), while an answer is
+    /// reduced to its first line — and the count of those reductions is stated in the
+    /// prompt rather than hidden.
     pub archive: Vec<String>,
+    /// How many earlier answers were reduced to a line, so the prompt can say so.
+    pub demoted_answers: usize,
     /// Depth-1 queue: a trigger while a run is in flight coalesces into this.
     pub pending: Option<Message>,
     pub last_error: String,
@@ -256,6 +329,12 @@ pub struct Agent {
     /// text-only endpoint rejects the multimodal shape, and the board cannot tell from a
     /// model name which kind it is talking to.
     pub vision: bool,
+    /// The transcript budget, in tokens: `llm.context_tokens`, mirrored here so `trim`
+    /// can run without the config in hand. `set_budget` refreshes it on every run, so a
+    /// setting changed in the portal takes effect on the next turn.
+    context_tokens: u32,
+    /// The reply reserve, in tokens: `llm.max_output_tokens`, same reason.
+    max_output_tokens: u32,
 }
 
 impl Default for Agent {
@@ -263,6 +342,7 @@ impl Default for Agent {
         Self {
             history: Vec::new(),
             archive: Vec::new(),
+            demoted_answers: 0,
             pending: None,
             last_error: String::new(),
             runs: 0,
@@ -276,6 +356,8 @@ impl Default for Agent {
             // On by default: the model this board ships configured for is multimodal, and
             // an image the user attached going nowhere would be the surprising outcome.
             vision: true,
+            context_tokens: LlmConfig::default().context_tokens,
+            max_output_tokens: LlmConfig::default().max_output_tokens,
         }
     }
 }
@@ -430,6 +512,21 @@ impl Agent {
     /// `Ask` carries everything a model call needs and nothing that borrows the agent,
     /// which is the whole point: the caller can drop its lock, make the call, and come
     /// back with [`Agent::apply`].
+    /// Set the transcript budget from the model configuration.
+    ///
+    /// Separate from `begin` so existing callers keep working with the defaults, and
+    /// called before every run so a change made in the portal applies to the next turn
+    /// rather than at the next reboot.
+    pub fn set_budget(&mut self, context_tokens: u32, max_output_tokens: u32) {
+        self.context_tokens = context_tokens.max(1);
+        self.max_output_tokens = max_output_tokens.max(1);
+    }
+
+    /// The budget in force: `(context_tokens, max_output_tokens)`.
+    pub fn budget(&self) -> (u32, u32) {
+        (self.context_tokens, self.max_output_tokens)
+    }
+
     pub fn begin(
         &mut self,
         host: &mut dyn ToolHost,
@@ -649,7 +746,10 @@ impl Agent {
     /// The dropped part is not lost silently: :func:`compress` turns it into a
     /// deterministic index first, so the model still knows what it already tried.
     fn trim(&mut self) {
-        self.compress(COMPACT_KEEP_TURNS);
+        if self.needs_compaction() {
+            let keep = self.turns_within(keep_recent_tokens(self.context_tokens, self.max_output_tokens));
+            self.compress(keep);
+        }
         while self.history.len() > MAX_HISTORY_MESSAGES {
             self.history.remove(0);
         }
@@ -674,9 +774,6 @@ impl Agent {
     /// what a model needs to avoid repeating itself — which tool ran with which arguments
     /// and what came back — not prose about how the conversation felt.
     pub fn compress(&mut self, keep_turns: usize) {
-        if self.history_bytes() <= MAX_HISTORY_BYTES && self.history.len() <= MAX_HISTORY_MESSAGES {
-            return;
-        }
         let cut = turn_start(&self.history, keep_turns.min(self.history.len()));
         if cut == 0 {
             return;
@@ -690,9 +787,17 @@ impl Agent {
     /// One line for the archive, bounded so the index itself cannot grow without limit.
     fn archive_message(&mut self, message: &Message) {
         let line = match message.role {
-            Role::User => format!("user: {}", head(&message.text, 90)),
+            // A question is the one thing compression must not paraphrase: it is the
+            // statement of what was wanted, and a clipped version of it is what makes a
+            // model re-ask something it was already told. The host agent protects user
+            // text the same way (its `protected_text` never demotes a user block), so the
+            // whole line is kept here, bounded only by what one message may carry.
+            Role::User => format!("user: {}", head(&message.text, MAX_USER_BYTES)),
             Role::Assistant => {
                 if message.tool_calls.is_empty() {
+                    // Answers are demoted, and the demotion is counted rather than silent:
+                    // `retention_note` states how many were reduced to a line.
+                    self.demoted_answers += 1;
                     format!("answer: {}", head(&message.text, 90))
                 } else {
                     let calls: Vec<String> = message
@@ -726,9 +831,63 @@ impl Agent {
         let cut = turn_start(&self.history, keep_turns.min(self.history.len()));
         let removed = self.history.drain(..cut).count();
         self.archive.clear();
+        self.demoted_answers = 0;
         self.pending = None;
         self.last_error.clear();
         (removed, self.history.len())
+    }
+
+    /// Whether the transcript has outgrown its budget and compaction should run.
+    ///
+    /// Public because it is the whole answer to "when does this fire": the three bounds
+    /// are the token budget from the configured window, the hard byte ceiling that keeps
+    /// the ring buffer inside the board's RAM, and the message count.
+    pub fn needs_compaction(&self) -> bool {
+        self.history_tokens() > trigger_tokens(self.context_tokens)
+            || self.history_bytes() > MAX_HISTORY_BYTES
+            || self.history.len() > MAX_HISTORY_MESSAGES
+    }
+
+    /// Estimated tokens in the transcript, by the same classifier the host uses.
+    ///
+    /// Tool arguments count too: a `write` of two kilobytes is the largest thing a single
+    /// message can carry, and leaving it out would let a run of them look free.
+    pub fn history_tokens(&self) -> u32 {
+        self.history
+            .iter()
+            .map(|m| {
+                let calls: u32 = m
+                    .tool_calls
+                    .iter()
+                    .map(|c| {
+                        estimate_tokens(&c.name)
+                            .saturating_add(estimate_tokens(&llm::arguments_request_json(c).to_string()))
+                    })
+                    .sum();
+                estimate_tokens(&m.text).saturating_add(calls)
+            })
+            .fold(0u32, |a, b| a.saturating_add(b))
+    }
+
+    /// How many trailing exchanges fit in `budget` tokens; at least one, so a single
+    /// oversized exchange still survives compression rather than emptying the thread.
+    fn turns_within(&self, budget: u32) -> usize {
+        let mut kept = 0usize;
+        for turn in 1..=self.history.len().max(1) {
+            let start = turn_start(&self.history, turn);
+            let cost: u32 = self.history[start..]
+                .iter()
+                .map(|m| estimate_tokens(&m.text))
+                .fold(0u32, |a, b| a.saturating_add(b));
+            if cost > budget && kept > 0 {
+                break;
+            }
+            kept = turn;
+            if cost >= budget {
+                break;
+            }
+        }
+        kept.max(1)
     }
 
     fn history_bytes(&self) -> usize {
@@ -821,6 +980,13 @@ impl Agent {
             );
             for line in &self.archive {
                 text.push_str(&format!("- {line}\n"));
+            }
+            if self.demoted_answers > 0 {
+                text.push_str(&format!(
+                    "- ({count} earlier answer(s) are reduced to their first line; the questions \
+                     above are kept in full)\n",
+                    count = self.demoted_answers
+                ));
             }
         }
         text
@@ -1476,6 +1642,187 @@ mod tests {
         let prompt = agent.system_message(&mut host);
         assert!(prompt.contains("Earlier in this conversation"), "{prompt}");
         assert!(prompt.contains("board_status"), "{prompt}");
+    }
+
+    #[test]
+    fn the_trigger_follows_the_configured_window_and_the_script_it_is_written_in() {
+        // A window of 8192 fires at 80% of it, as the host agent's trigger_tokens does.
+        assert_eq!(trigger_tokens(8192), 6553);
+        assert_eq!(trigger_tokens(1), 1, "a degenerate window still has a trigger");
+        assert_eq!(trigger_tokens(0), 1, "and a zero window does not divide by zero");
+
+        // Same character count, different scripts: Chinese costs six quarters a character
+        // against one for ASCII, so a mixed board compacts earlier than an ASCII one.
+        assert_eq!(estimate_tokens(&"a".repeat(400)), 100, "four ASCII characters to a token");
+        assert_eq!(estimate_tokens(&"\u{5de5}\u{5177}".repeat(200)), 600, "1.5 tokens a character");
+
+        // A budget set through set_budget is what trim uses, not the constants.
+        let mut agent = Agent::new();
+        agent.set_budget(4096, 512);
+        assert_eq!(agent.budget(), (4096, 512));
+        assert_eq!(agent.budget(), (agent.budget().0.max(1), agent.budget().1.max(1)));
+        let small = keep_recent_tokens(4096, 512);
+        let large = keep_recent_tokens(65536, 512);
+        assert!(large >= small, "a bigger window keeps at least as much: {small} vs {large}");
+        assert!(small >= 1, "one exchange always survives");
+    }
+
+    #[test]
+    fn compaction_fires_on_the_token_budget_and_not_before_it() {
+        // A window small enough that a handful of replies crosses 80% of it.
+        let mut agent = Agent::new();
+        agent.set_budget(600, 64);
+
+        // Under the trigger: three short exchanges must not be compressed.
+        for i in 0..3 {
+            agent.history.push(Message::user(&format!("q{i}"), "http", 10 * i));
+            agent.history.push(Message::assistant("a", Vec::new(), 10 * i + 1));
+        }
+        let before = agent.history.len();
+        assert!(agent.history_tokens() < trigger_tokens(600), "{} tokens", agent.history_tokens());
+        assert!(!agent.needs_compaction(), "under 80% of the window nothing fires");
+        agent.trim();
+        assert_eq!(agent.history.len(), before, "nothing to compress yet");
+
+        // Over the trigger: the same history with one long reply does compress, and what
+        // survives is the tail, priced in tokens rather than in messages.
+        agent.history.push(Message::user("long", "http", 99));
+        agent.history.push(Message::assistant(&"x".repeat(2400), Vec::new(), 100));
+        assert!(agent.history_tokens() > trigger_tokens(600));
+        assert!(agent.needs_compaction(), "over the window the trigger is armed");
+        agent.trim();
+        assert!(
+            agent.history.len() < 8,
+            "the oldest exchanges are gone: {:?}",
+            agent.history.iter().map(|m| m.text.len()).collect::<Vec<_>>()
+        );
+        assert!(agent.archive.iter().any(|l| l.starts_with("user: q0")), "{:?}", agent.archive);
+        assert_eq!(
+            agent.history.last().map(|m| m.text.len()),
+            Some(2400),
+            "the exchange in flight is never the one compressed away"
+        );
+    }
+
+    #[test]
+    fn compression_never_orphans_a_tool_result_and_the_run_resumes() {
+        // Two exchanges of work, then a third mid-flight: the assistant asked for a tool
+        // and the result is in. Compressing here must not cut between the two, or the next
+        // request carries a `tool_call_id` with no message and every provider rejects it.
+        let mut agent = Agent::new();
+        for i in 0..2 {
+            agent.history.push(Message::user(&format!("task {i}"), "http", 10 * i));
+            let call = ToolCall { id: format!("c{i}"), name: "board_status".into(), arguments: json!({}) };
+            agent.history.push(Message::assistant("checking", vec![call], 10 * i + 1));
+            agent.history.push(Message::tool(&format!("c{i}"), "{}", 10 * i + 2));
+        }
+        agent.history.push(Message::user("task 2", "http", 30));
+        let call = ToolCall { id: "c2".into(), name: "i2c_scan".into(), arguments: json!({}) };
+        agent.history.push(Message::assistant("scanning", vec![call], 31));
+        agent.history.push(Message::tool("c2", "{\"addresses\":[\"0x3C\"]}", 32));
+
+        agent.compress(1);
+
+        assert_eq!(agent.history[0].role, Role::User, "compression never starts on a tool result");
+        let mut open: Vec<String> = Vec::new();
+        for message in &agent.history {
+            match message.role {
+                Role::Assistant => open.extend(message.tool_calls.iter().map(|c| c.id.clone())),
+                Role::Tool => {
+                    let id = message.tool_call_id.clone().unwrap_or_default();
+                    let at = open.iter().position(|o| *o == id).expect("a result for an opened call");
+                    open.remove(at);
+                }
+                _ => {}
+            }
+        }
+        assert!(open.is_empty(), "every tool call kept its result: {open:?}");
+
+        // And the run continues with the index in the prompt.
+        let mut host = StubHost::returning("{}");
+        let prompt = agent.system_message(&mut host);
+        assert!(prompt.contains("Earlier in this conversation"), "the index is carried");
+        assert!(agent.history_tokens() > 0);
+    }
+
+    #[test]
+    fn a_long_conversation_compacts_mid_run_and_the_next_turn_still_goes_out() {
+        // The whole loop, four turns deep, with a window small enough that a later turn
+        // crosses it. This is the "does it resume" question: compaction happens between
+        // turns, and the request built afterwards has to be one a provider will accept.
+        let mut agent = Agent::new();
+        agent.set_budget(900, 128);
+        let mut host = StubHost::returning("{\"ok\":true}");
+
+        for turn in 0..6u64 {
+            assert!(agent.push_user(&format!("turn {turn}"), "portal", 10 * turn));
+            let step = agent.begin(&mut host, || 0, 0).expect("a pending message starts a run");
+            assert!(matches!(step, AgentStep::Ask { .. }), "turn {turn} asks the model");
+            // A long reply with no tool call: it ends the turn and grows the transcript.
+            let reply = llm::ModelReply { content: "y".repeat(600), ..Default::default() };
+            agent.apply(&mut host, Ok(reply), || 0);
+        }
+
+        assert!(!agent.archive.is_empty(), "the conversation outgrew the window and compacted");
+        assert_eq!(agent.history[0].role, Role::User, "the tail still starts with a question");
+
+        // A fifth turn is accepted and produces a request: the run resumed rather than
+        // wedging on a transcript the model would reject.
+        assert!(agent.push_user("turn 4", "portal", 99));
+        let step = agent.begin(&mut host, || 0, 0).expect("the run resumes");
+        let messages = match step {
+            AgentStep::Ask { messages, .. } => messages,
+            _ => panic!("expected a request, not a finished run"),
+        };
+        assert!(messages.as_array().map(|m| !m.is_empty()).unwrap_or(false), "the request carries messages");
+        assert!(agent.last_error.is_empty(), "{}", agent.last_error);
+    }
+
+    #[test]
+    fn a_question_survives_compression_verbatim_and_a_demoted_answer_is_counted() {
+        // The host agent's deterministic projection protects user text and demotes
+        // assistant text, counting the demotions. This is that behaviour, and the reason
+        // it matters: a model that reads a clipped question re-asks what it was told.
+        let mut agent = Agent::new();
+        let question = "rewire the pump relay to GPIO12 and keep the pulse under 2 s, \
+                        the old pin is shorted to ground so do not touch it";
+        agent.history.push(Message::user(question, "portal", 1));
+        agent.history.push(Message::assistant("ok, moving it", Vec::new(), 2));
+        for i in 0..3 {
+            agent.history.push(Message::user(&format!("q{i}"), "portal", 10 + i));
+            agent.history.push(Message::assistant(
+                &format!("a{i} that is a long answer {}", "x".repeat(200)),
+                Vec::new(),
+                20 + i,
+            ));
+        }
+
+        agent.compress(1);
+
+        let user_line = agent
+            .archive
+            .iter()
+            .find(|l| l.starts_with("user: rewire"))
+            .expect("the question is in the index");
+        assert_eq!(
+            user_line.trim_start_matches("user: "),
+            question,
+            "a question is kept whole, not clipped to its first line"
+        );
+        assert!(
+            agent.archive.iter().any(|l| l.starts_with("answer: ok, moving it")),
+            "an answer is reduced: {:?}",
+            agent.archive
+        );
+        assert_eq!(agent.demoted_answers, 3, "every dropped answer is counted");
+
+        let mut host = StubHost::returning("{}");
+        let prompt = agent.system_message(&mut host);
+        assert!(
+            prompt.contains("earlier answer(s) are reduced to their first line"),
+            "the prompt states the demotion instead of hiding it: {prompt}"
+        );
+        assert!(prompt.contains("the old pin is shorted to ground"), "the whole question is carried");
     }
 
     #[test]

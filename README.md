@@ -1,30 +1,30 @@
 # esp32-agent
 
+**English** · [简体中文](README.zh.md) · [Français](README.fr.md) · [Español](README.es.md) · [Русский](README.ru.md) · [العربية](README.ar.md)
+
 Firmware for an ESP32 that runs its own agent loop and serves an MCP endpoint, so one model
 can drive the board directly and any external agent can use the same tools over HTTP.
 
-Flash it, join WiFi, and it probes the buses and pins it has drivers for. Each device that
-answers becomes MCP tools. The agent on the board sees those same tools, calls them, and
-answers; a new sensor can be declared with a JSON manifest while the board runs.
+Flash it, join WiFi, and it probes the buses it has drivers for. Each device that answers
+becomes MCP tools. The agent on the board sees those same tools and answers with them; a new
+sensor can be declared in JSON while the board runs.
 
 > The agent loop follows [FutureOS](https://github.com/futuregene/future-os): transcript,
 > tool journal, stream events, protocol adapters, memory index. Where the firmware differs
 > (kilobytes instead of gigabytes of RAM, no model-written summaries) the code says why.
 
-## Features
-
 | What | In detail |
 |---|---|
-| A model runs on the board | The agent loop, tools, memory and transcript live in the firmware; the model is any OpenAI-compatible or Anthropic endpoint. [Give it a model](#give-it-a-model) |
-| The tool surface is a document | `manifest_apply` validates a JSON manifest, compiles it into tools and takes effect in the same turn — no restart, no reflash. [Manifest](#manifest) |
-| It finds its own hardware | Drivers probe I2C, 1-Wire and configured pins at boot; only what answers gets tools. Unrecognised addresses are reported, so a chip without a driver is still visible. [Capabilities](docs/capabilities.md) |
-| One tool set, two callers | The MCP endpoint and the on-board agent see the same 48 tools. A manifest edit moves both at once, because there is one description. [HTTP and MCP API](docs/http-api.md) |
-| A web console over HTTPS | Chat with the model and change devices, tools, manifest, schedule, logs, WiFi and the model settings from a phone; the board generates its own certificate. [Web console](#web-console) |
-| It works while nobody watches | Timed prompts (`every_s`, `at_hhmm`), sensor rules that fire a prompt on a threshold, and an objective it iterates on across runs. [Scheduled work](#scheduled-work) |
-| A shell and a scripting language | `shell` with 26 commands named as NuttX names them — files, network, hashing, inspection — and a small interpreter for loops and conditions over tool calls. [Shell](#shell) · [Script](#script) |
-| Standing orders | A 2 KB slot in the system prompt for what this board is for, writable from the portal, from `shell` and from HTTP. [Standing orders](#standing-orders) |
-| Self-contained on a LAN | HTTP and HTTPS from the board, a certificate it generates itself, a PIN and a token for the three callers, no cloud in the path. [Authentication](#authentication) |
-| Testable without hardware | The simulator runs the same `agent-core` against a virtual board on a real port. [Simulator](#simulator) |
+| A model runs on the board | Loop, tools, memory and transcript are firmware; the model is any OpenAI-compatible or Anthropic endpoint. [Give it a model](#give-it-a-model) |
+| The tool set is a document | `manifest_apply` validates a JSON manifest, compiles it into tools, live in the same turn. [Manifest](#manifest) |
+| It finds its own hardware | I2C, 1-Wire and declared pins are probed at boot; only what answers gets tools. [Capabilities](docs/capabilities.md) |
+| One tool set, two callers | The MCP endpoint and the on-board agent see the same tools, from one description. [HTTP and MCP API](docs/http-api.md) |
+| A console over HTTPS | Chat with the model and configure devices, tools, schedule, logs, WiFi and the model, from a phone; the board issues its own certificate. [Web console](#web-console) |
+| It acts unattended | Timed prompts, and sensor rules that fire a prompt when a reading crosses a threshold. [Scheduled work](#scheduled-work) |
+| A shell and a script language | `shell` with 26 NuttX-named commands, and an interpreter for loops over tool calls. [Shell](#shell) · [Script](#script) |
+| It remembers what it was told | Standing orders, `/AGENTS.md`, a `/memory.md` index and skills, assembled into the prompt on every turn. [What the model always sees](#what-the-model-always-sees) |
+| No cloud in the path | HTTPS from the board, a certificate it generates, one PIN for three callers. [Authentication](#authentication) |
+| Testable without hardware | The simulator runs the same `agent-core` against a virtual board. [Simulator](#simulator) |
 
 ## Flash and connect
 
@@ -34,18 +34,9 @@ espup install
 powershell scripts/build-firmware.ps1 -Flash -Port COM3
 ```
 
-With no stored credentials the board raises its own access point:
-
-```text
-wifi: radio up: access point `esp32-agent-setup` on http://192.168.4.1/
-http: listening on 0.0.0.0:80
-```
-
-Join it from a phone and open `http://192.168.4.1/`, or send
-`provision <ssid> <password>` over the USB cable. WiFi credentials are kept in NVS, not
-compiled in.
-
-Check the board:
+With no stored credentials the board raises its own access point. Join it from a phone and
+open `http://192.168.4.1/`, or send `provision <ssid> <password>` over USB. Credentials go
+to NVS, never into the image.
 
 ```bash
 curl -sS http://<board>/agent.json | jq '.endpoints | length'
@@ -54,278 +45,167 @@ curl -sS -X POST http://<board>/mcp -H 'Content-Type: application/json' \
 curl -k -sS https://<board>/api/tls | jq -r .fingerprint
 ```
 
-Port 443 serves the same routes over TLS with a certificate the board generates on first
-boot. Browsers warn about it; compare the fingerprint in `/api/tls` with the one the
-browser shows. Port 80 stays open, so a TLS misconfiguration costs a URL and not the board.
-
-`GET /agent.json` is the whole interface as data: 40 routes with method, body, return and
-auth, the MCP surface, error shape, limits, and a `settings` table listing every writable
-field with its type and default.
+Port 443 serves the same routes over TLS with a certificate generated on first boot; browsers
+warn, so compare the fingerprint. Port 80 stays open, so a bad certificate costs a URL rather
+than the board. `GET /agent.json` is the whole interface as data: 40 routes with method, body,
+return and auth, plus every writable setting with its type and default.
 
 ## Web console
 
-```
-http://<board>/        the console, and /mcp on the same port
-https://<board>/       the same routes over TLS, certificate generated on the board
-```
-
 | Where | What you do there |
 |---|---|
-| Chat (the page itself) | talk to the model; each turn shows the answer, and the tool calls and reasoning that produced it fold into one line you can open |
-| Devices | what the probe found, its pins and address, `Probe devices`, the candidates waiting to be adopted |
+| Chat (the page) | talk to the model; tool calls and reasoning fold into one line per turn |
+| Devices | what the probe found, pins, addresses, `Probe devices`, adoptable candidates |
 | Tools | every tool with its input schema, and why one is hidden |
-| Agent | endpoint, model, key, protocol, thinking level, temperature, max steps, images |
+| Agent | endpoint, model, key, protocol, thinking level, temperature, context and output size |
 | Schedule | timed prompts and sensor rules |
-| Logs | the board's ring buffer, newest first |
-| Settings | WiFi with gateway and DNS overrides, the portal PIN, reboot, factory reset |
+| Logs, Settings | the ring buffer; WiFi with gateway/DNS overrides, the PIN, reboot |
 
-The page needs no build step and loads nothing from the internet: about 58 KB of HTML, CSS
-and JavaScript compiled into the firmware and served from the board, with
-`Cache-Control: no-store` so a reflash is visible on the next reload.
+No build step and nothing loaded from the internet: about 58 KB of HTML, CSS and JavaScript
+compiled in and served with `Cache-Control: no-store`, so a reflash shows on the next reload.
 
 ## Give it a model
 
 ```bash
-curl -sS -X POST http://<board>/api/agent/config \
-  -H 'Content-Type: application/json' \
+curl -sS -X POST http://<board>/api/agent/config -H 'Content-Type: application/json' \
   -d '{"base_url":"https://future-os.cn/api/v1/chat/completions",
        "model":"deepseek-flash","api_key":"<key>"}'
-
-curl -sS -X POST http://<board>/api/agent/message \
-  -H 'Content-Type: application/json' \
-  -d '{"text":"clear the screen, write HELLO on line 0, set the on-board LED blue, then scan I2C"}'
+curl -sS -X POST http://<board>/api/agent/message -H 'Content-Type: application/json' \
+  -d '{"text":"write HELLO on the OLED, set the LED blue, then scan I2C"}'
 ```
 
-The model client speaks three protocols: `chat` (OpenAI chat completions), `responses`
-(OpenAI Responses API) and `anthropic` (Messages API). Images attached in the portal are
-sent as content parts. `reasoning` selects the thinking level (`off`/`low`/`medium`/`high`);
-`max_steps` caps model calls per turn and is unlimited by default.
+Three protocols: `chat` (OpenAI chat completions), `responses` (OpenAI Responses API) and
+`anthropic` (Messages API). Images from the console go out as content
+parts. `reasoning` sets the thinking level, `max_steps` caps model calls per turn (0 = no
+cap), `context_tokens` and `max_output_tokens` set the window and the reply reserve, and the
+transcript compacts at 80% of the window. Without a key, point `base_url` at the board's own
+`/selftest/chat/completions` and the loop still runs.
 
-Without a key, point `base_url` at the board's own `/selftest/chat/completions` and the loop
-still runs.
+## What the model always sees
 
-## Standing orders
+Four layers go into the system prompt, in this order, on **every** turn: what an owner wrote
+once, and what the agent has learned since. None of it is in the transcript, so it costs the
+same whether the conversation is one message long or a thousand.
 
-The system prompt has a slot for what this board is *for*, which the owner writes and the
-model reads on every turn:
+| Layer | Where it lives | How much reaches the model | Written by |
+|---|---|---|---|
+| Standing orders | `agent.system_prompt` (NVS) | all of it, 2 KB cap | the owner, over HTTP or `shell` |
+| Project instructions | `/AGENTS.md` | the first 1 KB, then a marker saying the rest is there | the owner, by `fs_write` |
+| Long-term memory | `/memory.md`, an index pointing at `/memory/<topic>.md` | the index only, 24 lines / 2 KB | the agent itself, as it learns |
+| Skills | `/skills/<name>/SKILL.md` plus whatever sits beside it | one line each, name and description | either |
 
 ```bash
+# The owner's standing orders: why this board exists, and the rules that come first.
 curl -sS -X POST http://<board>/api/agent/prompt -H 'Content-Type: application/json' \
-  -d '{"action":"set","text":"The pump relay is on GPIO12 and waters the plants. Never run it for more than two minutes at a time."}'
+  -d '{"action":"set","text":"The pump relay is on GPIO12. Never run it past two minutes."}'
+
+# What the model will actually receive, layers and all — the only way to check this.
+curl -sS http://<board>/api/agent/prompt | jq -r .system
 ```
 
-`action` is `set`, `append` or `clear`; `GET /api/agent/prompt` shows the whole prompt the
-model will receive, custom part included. The agent can do the same with
-`shell {"command": "system_prompt set …"}`, and `system_prompt get` reads it back. The text is
-capped at 2 KB and stored in NVS, so it survives a reboot and costs one line in every
-request.
+`action` is `set`, `append` or `clear`; `system_prompt get` reads it back from the board and
+`system_prompt set …` writes it from the agent's side. Memory and skills are ordinary files:
+`fs_write /memory/wiring.md "GPIO18 = LED strip"` plus one line in `/memory.md` is all a
+memory is, and deleting the file forgets it. An edited file takes effect on the next turn —
+no restart, no reflash, no transcript rewrite.
 
-## What the board can do
-
-| Area | Tools |
-|---|---|
-| Hardware | GPIO, ADC, PWM, I2C, 1-Wire, WS2812, SSD1306, BME280, SHT3x, INA219/226, MPU6050, ADS1115, PCF8574, DS18B20, HC-SR04, servo, relay, I²S microphone and amplifier |
-| Discovery | `inventory`, `devices_list`, `i2c_scan`, `i2c_identify`, `devices_probe` |
-| Manifest | `manifest_get`, `manifest_describe`, `manifest_validate`, `manifest_apply`, `manifest_reset` |
-| Shell | `shell` with 26 commands: files, archives, network, hashing, inspection, and `system_prompt` |
-| Scheduling | `schedule` tool, `POST /api/sched` for timed prompts and sensor rules |
-| Configuration | `config_set`, `POST /api/config` (WiFi, buses, pins, MCP, auth, log, UI, discovery) |
-
-Tool results are capped at 2 KB and replies at 8 KB. The board has 8 MB of PSRAM and a few
-dozen kilobytes of internal SRAM; the limits exist because of the second number.
+The sizes are the reason the split exists. A board with kilobytes of internal SRAM cannot
+afford to carry the whole of what it knows in every request, so each layer is an index or a
+prefix, and the expensive part is fetched with `fs_read` when a turn actually needs it.
+[docs/agent-memory.md](docs/agent-memory.md) and [docs/agent-skills.md](docs/agent-skills.md)
+have the details, including how the index is bounded.
 
 ## Shell
 
-The board has one writable area, 8 KB of text in NVS, and two ways to use it: three tools
-for the common operations, and the NuttX-style `shell` for the rest.
+Every driver in the catalogue is documented in [docs/capabilities.md](docs/capabilities.md):
+GPIO, ADC, PWM, I2C, 1-Wire, WS2812, SSD1306, BME280, SHT3x, INA219/226, MPU6050, ADS1115,
+PCF8574, DS18B20, HC-SR04, servo, relay, I²S mic and amp.
+
+One writable area, 8 KB of text in NVS. `read`, `write` and `edit` cover the common cases;
+everything else is one `shell` command line, parsed with words, quotes and `--flags`. A tool
+result is capped at 2 KB and a reply at 8 KB: the board has 8 MB of PSRAM and a few kilobytes
+of internal SRAM, and the second number is the one that binds:
 
 ```text
-read   {"path":"/notes/a.txt"}
-write  {"path":"/notes/a.txt","text":"..."}
-edit   {"path":"/notes/a.txt","find":"old","replace":"new"}
-
-shell  {"command": "ls /notes"}
-shell  {"command": "cp /a.txt /b.txt"}
-shell  {"command": "grep GPIO /"}
-shell  {"command": "rm /a.txt --confirm"}
-shell  {"command": "zip t.zip /a.txt /notes/b.md"}
-shell  {"command": "unzip UEsDB..."}
+shell {"command":"ls /notes"}            shell {"command":"grep GPIO /"}
+shell {"command":"cp /a.txt /b.txt"}     shell {"command":"rm /a.txt --confirm"}
+shell {"command":"curl https://example.com/"}          # GET, HTML reduced to text
+shell {"command":"wget -o /dl/page.txt https://example.com/"}
+shell {"command":"ping -c 3 192.168.3.1"}   shell {"command":"nslookup example.com"}
+shell {"command":"ifconfig"}                # configured gateway and DNS, not the lease
+shell {"command":"df | free | uptime | date | uname | ps"}
+shell {"command":"sha256sum /notes/a.txt"}  shell {"command":"zip t.zip /a.txt"}
 ```
 
-`shell` takes one command line and parses it, the way a shell does: words, quotes, and
-`-f`/`--flag` options. There is no second calling convention; `shell {"command":"ls"}` is the
-only form.
-
-The commands a shell has for looking at itself, named as NuttX's shell names them:
-
-```text
-shell  {"command": "df"}          # workspace usage against its 8 KB
-shell  {"command": "free"}        # heap, free and minimum
-shell  {"command": "uptime"}      # uptime and model runs
-shell  {"command": "date"}        # clock, and whether SNTP has synced
-shell  {"command": "uname"}       # soc, cores, flash, PSRAM, IDF, MAC
-shell  {"command": "ps"}          # tasks with state and stack headroom
-shell  {"command": "hexdump /dl/img.bin"}
-shell  {"command": "base64 /notes/a.txt"}   # -d to decode, -o to write elsewhere
-```
-
-`edit` refuses when `find` occurs zero or several times, so an ambiguous edit cannot rewrite
-the wrong place. `rm` and `mv` need `confirm`. `zip` writes stored entries and returns the
-archive as base64, because a tool result is capped at 2 KB; `unzip` reads stored and
-deflated entries and checks each CRC.
-
-Network commands use the names they have everywhere else:
-
-```text
-shell  {"command": "curl https://example.com/"}                # GET, HTML reduced to text
-shell  {"command": "curl -d {\"a\":1} https://example.com/"}    # POST
-shell  {"command": "curl -f raw https://example.com/"}         # the document as it arrived
-shell  {"command": "wget -o /dl/page.txt https://example.com/"} # save the body
-shell  {"command": "nslookup example.com"}
-shell  {"command": "nc -p 443 example.com"}
-shell  {"command": "ping -c 3 192.168.3.1"}
-shell  {"command": "ifconfig"}                                 # ip, gateway, DNS, SSID, RSSI, MAC
-```
-
-`ifconfig` reports the configured gateway and DNS rather than the lease, which answers
-"did my override take effect". `ping` sends real ICMP echoes through ESP-IDF's ping session.
-
-The commands that came with the last batch:
-
-```text
-shell  {"command": "sha256sum /notes/a.txt"}   # also md5sum
-shell  {"command": "base64enc /notes/a.txt"}    # base64dec to go back
-shell  {"command": "system_prompt get"}         # the standing orders, see below
-```
-
-**When a command is wrong, the error says how to write it:**
-
-```text
-rm without confirm → "`confirm` must be true" ... usage: rm <path> --confirm
-unknown op         → "`sudo` is not a shell command" ... followed by every usage line
-{"op":"rm","help":true} → usage: rm <path> --confirm
-{"help":true} on curl, read, ping, … → the same one-line usage
-```
-
-`shell {"command":"help"}` lists every command. The usage lines come from one table, so the
-error suffix and the help output cannot disagree.
+`edit` refuses an ambiguous match rather than rewriting the wrong place; `rm` and `mv` need
+`confirm`. A wrong command answers with its usage line, taken from the same table the help
+text comes from, so the two cannot disagree: `rm` without `--confirm` returns
+`usage: rm <path> --confirm`. `shell {"command":"help"}` lists all 26.
 
 ## Script
 
-`script` is a small language for what the fixed tools cannot express: a loop over sensor
-readings, a condition on a result, a sequence that depends on the previous answer.
+For what fixed tools cannot express: a loop over readings, a branch on a result.
 
 ```text
 let scan = tool("i2c_scan", {})
-let n = len(scan.addresses)
 let i = 0
-while i < n {
-  log("address " + scan.addresses[i])
-  i = i + 1
-}
-if n > 0 { "found " + str(n) } else { "nothing" }
+while i < len(scan.addresses) { log(scan.addresses[i])  i = i + 1 }
+if i > 0 { "found " + str(i) } else { "nothing" }
 ```
 
-Values are numbers, strings, booleans, nil, lists `[1,2]` and maps `{a: 1}`. Statements are
-`let`, assignment (including `l[0] = 9` and `m.k = 1`), `if`/`else`, `while`, `break` and
-blocks. Operators are `+ - * / %`, `== != < <= > >=`, `and or not`. Built-ins are `len`,
-`str`, `num`, `type`, `log`, and `tool(name, args)`, which calls any board tool with the
-caller's own permissions.
-
-`tool` is the only way out, so a script can do exactly what the caller could do — and
-`tool("script")` is refused. `script {"lint": true, "source": …}` checks syntax and unknown
-function names with line and column, and never executes. `script {"help": true}` returns the
-reference in three sections, each small enough to arrive whole in a 2 KB result.
-
-Bounds: 30 seconds of wall clock, five million steps, 32 nested blocks, 4 KB strings, 64 log
-lines, 8 KB of source. The clock matters because the interpreter runs on the thread that
-answers the portal: a script that does not finish makes the board unreachable, so the time
-limit is what protects it.
-
-A full run on the bench, from a prompt asking for π to twenty decimal places: doubles reach
-15 digits, so the model wrote a fixed-point big-number loop over lists and returned
-`3.141592653589793238462648…` in 22 000 steps.
+Numbers, strings, booleans, nil, lists, maps; `let`, assignment, `if`/`else`, `while`,
+`break`; built-ins `len`, `str`, `num`, `type`, `log` and `tool(name, args)`, which calls any
+board tool with the caller's own permissions (`tool("script")` aside). `{"lint":true}` checks
+syntax and unknown names with line and column and never executes; `{"help":true}` returns the
+reference. Bounds: 30 s, five million steps, 32 nested blocks, 4 KB strings, 8 KB of source.
+The clock is the real bound: the interpreter runs on the thread that answers the console.
 
 ## Scheduled work
 
-Two ways to give the board something to do on its own; both feed the same queue a chat
-message uses, so a task and a person cannot start two runs at once.
-
 ```bash
-# every five minutes, ask the model something
 curl -sS -X POST http://<board>/api/sched -H 'Content-Type: application/json' -d '{
-  "tasks": [{"id":"t1","prompt":"read the BME280 and say the temperature in one line",
-             "every_s": 300, "enabled": true}]
-}'
-
-# or at a wall-clock time, UTC
-curl -sS -X POST http://<board>/api/sched -H 'Content-Type: application/json' -d '{
-  "tasks": [{"id":"t2","prompt":"summarise the last day and draw it on the OLED",
-             "at_hhmm": "07:30"}]
-}'
-
-# a sensor rule: run the prompt when a reading crosses a threshold
-curl -sS -X POST http://<board>/api/sched -H 'Content-Type: application/json' -d '{
-  "rules": [{"id":"r1","tool":"bme280_read","path":"temperature_c",
-             "op":"gt","value":30,"prompt":"it is hot, check the enclosure"}]
-}'
+  "tasks":[{"id":"t1","prompt":"read the BME280","every_s":300}],
+  "rules":[{"id":"r1","tool":"bme280_read","path":"temperature_c","op":"gt","value":30,"prompt":"it is hot"}]}'
 ```
 
-The agent can also schedule itself: `schedule {"action":"add","prompt":"…","every_s":300}`
-lists, adds, removes, enables and disables the same tasks. Tasks survive a reboot; the
-answer of each run lands in the transcript with `source: "schedule:t1"`.
+`at_hhmm` runs at a UTC wall-clock time instead, and every answer lands in the transcript
+tagged `source: "schedule:t1"`. The agent can schedule itself with
+`schedule {"action":"add", …}`. Tasks survive a reboot.
 
 ## Manifest
 
 A device that needs no timing or calibration is declared, not compiled:
 
 ```json
-{
-  "devices": [{ "id": "pump", "kind": "actuator", "pins": { "out": 12 }, "note": "active-low relay" }],
-  "tools": [{
-    "name": "pump_pulse",
-    "description": "Energise the pump relay for `ms` milliseconds",
-    "params": [{ "name": "ms", "type": "integer", "min": 10, "max": 5000, "required": true }],
-    "exec": { "type": "sequence", "steps": [
-      { "ms": 0, "exec": { "type": "gpio_write", "pin": 12, "level": 0 } },
-      { "ms": 0, "exec": { "type": "delay", "ms": { "param": "ms" } } },
-      { "ms": 0, "exec": { "type": "gpio_write", "pin": 12, "level": 1 } }]},
-    "safety": { "max_calls_per_min": 20, "confirm": true }
-  }]
-}
+{"devices":[{"id":"pump","kind":"actuator","pins":{"out":12},"note":"active-low relay"}],
+ "tools":[{"name":"pump_pulse","description":"Energise the relay for `ms` ms",
+   "params":[{"name":"ms","type":"integer","min":10,"max":5000,"required":true}],
+   "exec":{"type":"sequence","steps":[
+     {"ms":0,"exec":{"type":"gpio_write","pin":12,"level":0}},
+     {"ms":0,"exec":{"type":"delay","ms":{"param":"ms"}}},
+     {"ms":0,"exec":{"type":"gpio_write","pin":12,"level":1}}]},
+   "safety":{"max_calls_per_min":20,"confirm":true}}]}
 ```
 
-`manifest_apply` validates the document, rebuilds the tool list and takes effect in the same
-turn. Validation runs on the board: parameter ranges, `safety` limits and the per-minute cap
-are checked before a pin moves, and an out-of-range call returns the allowed range.
-
-Three paths add hardware:
-
-| Path | Use | Where |
-|---|---|---|
-| Manifest only | I2C or GPIO devices with no timing or state machine | `examples/manifests/*.json`, applies live |
-| Compiled driver | state machines, calibration, strict timing | `crates/agent-core/src/drivers/<chip>.rs` |
-| Board profile | facts that cannot be probed, such as which pins the LED and buttons use | `crates/agent-core/src/boards.rs` |
-
-Drivers are listed only when the probe finds the device, so a half-written driver cannot
-report hardware that is not there. [docs/adding-a-device.md](docs/adding-a-device.md) covers
-both paths. `drivers/` has one module per chip, and `CATALOG` is where a new driver
-announces itself.
+Three paths add hardware: a manifest (no timing or state machine, applies live), a compiled
+driver (`drivers/<chip>.rs`, for state machines and strict timing), or a board profile (facts
+that cannot be probed, such as which pins the LED and buttons use). A driver is listed only
+when the probe finds the device, so a half-written one cannot report hardware that is not
+there. Validation runs on the board: parameter ranges and a `safety` per-minute cap are checked
+before a pin moves, and an out-of-range call returns the range it would accept.
+[docs/adding-a-device.md](docs/adding-a-device.md) covers all three.
 
 ## Authentication
 
-The board is on a LAN, so the credential is local. One PIN covers three callers:
-
 | Caller | Credential |
 |---|---|
-| Portal | `POST /api/auth {"pin":"…"}` returns a bearer token the page keeps and retries with |
-| Script | `X-Portal-Pin: <pin>`, or the same bearer token |
-| MCP client | `Authorization: Bearer <mcp.token>`; a portal PIN is accepted when no MCP token is set |
+| Console | `POST /api/auth {"pin":"…"}` returns a bearer token the page keeps |
+| Script | `X-Portal-Pin: <pin>`, or the same token |
+| MCP client | `Authorization: Bearer <mcp.token>`; the PIN is accepted when no token is set |
 
-With `auth.portal_pin` set, writes and the reads that expose the transcript, prompt, config
-and logs require it. Status, devices, tools, schedule and `/agent.json` stay open. Tokens
-live in RAM, so a reboot revokes them. The default is no PIN; `/agent.json` reports that in
-its `security` block.
+With `auth.portal_pin` set, writes and the reads that expose transcript, prompt, config and
+logs need it; status, devices, tools and `/agent.json` stay open. Tokens live in RAM, so a
+reboot revokes them. The default is no PIN, and `/agent.json` says so in its `security` block.
 
 ## Simulator
 
@@ -333,83 +213,51 @@ its `security` block.
 cargo run -p esp32-agent-sim
 ```
 
-Runs the same `esp32-agent-core` against a virtual board (OLED, BME280, SHT3x, INA226)
-with a real HTTP port. Only the `Hardware` implementation differs, so the console, the MCP
-endpoint, the drivers, the manifest engine and the agent loop are the code that runs on the
-chip.
+The same `agent-core` against a virtual board on a real port. Only the `Hardware`
+implementation differs, so the console, the MCP endpoint, the drivers, the manifest engine and
+the agent loop are the code that runs on the chip.
 
 ## Repository layout
 
-`crates/` is everything that builds and is tested on a host. `firmware/` is the ESP-IDF
-backend.
-
-**Why `agent-sim` and `agent-core` are two crates.** `agent-core` is the board: protocol,
-manifest, drivers, HTTP server, agent loop, all of it, behind one `Hardware` trait. It has
-no chip-specific code and no dependency on ESP-IDF, so `cargo test` runs it on a laptop.
-`agent-sim` is a 200-line binary that implements that trait against a register file and
-serves the result on a real port; it exists so the same code can be exercised without a
-board. Merging the two would put the simulator inside every firmware image and the
-firmware's dependencies inside every test.
-
-**Why `firmware/` is not in the workspace.** It builds for `xtensa-esp32s3-espidf` with a
-different toolchain (`cargo +esp`, `-Zbuild-std`) and needs ESP-IDF checked out; a root
-`cargo test` must not try to compile any of that.
+`crates/` builds and is tested on a host; `firmware/` is the ESP-IDF backend. `agent-core` is
+the board behind one `Hardware` trait with no chip-specific code, so `cargo test` runs it on a
+laptop; `agent-sim` implements that trait against a register file. Merging them would put the
+simulator in every image and the firmware's dependencies in every test. `firmware/` opts out of
+the workspace because it needs `cargo +esp`, `-Zbuild-std` and a checked-out ESP-IDF.
 
 ```
-crates/agent-core/          no chip needed, host-tested
-  hardware.rs               the trait firmware implements
-  drivers/                  one module per chip
-  manifest.rs               validation, compilation into tools, merge, safety
-  agent.rs, llm.rs          the loop and the model client (three protocols)
-  sched.rs                  timed prompts and sensor rules
-  tools/                    board, manifest, shell, script, image, knowledge
-  http.rs                   HTTP/1.1: keep-alive, chunked, 100-continue, SSE
-  app.rs                    state, JSON-RPC dispatch, /mcp and console routes
-  sitemap.rs, settings.rs   the discovery document and the writable settings
-  virtual_board.rs          the same services on a fake chip
-crates/agent-sim/           host process: the virtual board behind an HTTP port
-firmware/
-  main.rs                   boot order: config → buses → radio → server → agent
-  runner.rs                 the agent thread and the TLS transport
-  esp_hw.rs                 Hardware over ESP-IDF: GPIO/I2C/PWM/ADC/RMT/I2S
-  console.rs                provisioning over USB-Serial-JTAG
-  wifi.rs, dns.rs           AP+STA, captive DNS, gateway and DNS overrides
-  nvs_store.rs              the NVS key-value store
+crates/agent-core/    hardware.rs (the trait) · drivers/ (one module per chip) · boards.rs ·
+                      manifest.rs · agent.rs + llm.rs · sched.rs · tools/ ·
+                      http.rs · app.rs · sitemap.rs + settings.rs · virtual_board.rs
+crates/agent-sim/     the virtual board behind an HTTP port
+firmware/             main.rs (boot order) · runner.rs (agent thread, TLS) ·
+                      esp_hw.rs (GPIO/I2C/PWM/ADC/RMT/I2S) · console.rs · wifi.rs
 ```
 
 ## Status
 
 | Part | State |
 |---|---|
-| `agent-core` | 319 unit tests and 14 integration tests pass; `scripts/smoke.ps1` passes end to end |
+| `agent-core` | 427 unit tests and 14 integration tests pass; `scripts/smoke.ps1` passes end to end |
 | Simulator | console, MCP and the agent loop run end to end |
-| Firmware | built and flashed on an ESP32-S3-DevKitC-1 N16R8 (IDF v5.5.2): 48 tools, OLED 128×32, I²S mic and amplifier, WS2812, TLS portal, model turns over HTTPS |
-| Not implemented | OTA, SD card, DHT/RC522/VL53L0X drivers; video decoding. See `ROADMAP.md` |
+| Firmware | flashed on an ESP32-S3-DevKitC-1 N16R8 (IDF v5.5.2): 42 tools, OLED 128×32, I²S mic and amp, WS2812, TLS console, model turns over HTTPS |
+| Not implemented | OTA, SD card, DHT11/22, camera. See `ROADMAP.md` |
 
-Bench measurements: a four-tool model turn in 13.7 s; portal page 7 535 B in 0.55 s over
-TLS; I²C scan stable across 8 runs; `net_get` of a web page reduced to 3 943 bytes of text.
-Internal SRAM after a TLS page is 5–6 kB free, which is the tightest constraint in the
-design.
+Bench numbers: a four-tool turn in 13.7 s; console over TLS in 0.55 s; I²C scan stable over
+8 runs; internal SRAM 5–6 kB free after a TLS page, the tightest constraint here.
 
 ## Documentation
 
-- [Architecture](docs/architecture.md)
-- [Manifest specification](docs/manifest.md)
-- [Capabilities and devices](docs/capabilities.md)
-- [HTTP / MCP API](docs/http-api.md)
-- [Adding a device](docs/adding-a-device.md)
-- [Flashing and first setup](docs/flashing.md)
-- [Troubleshooting](docs/troubleshooting.md)
-- [Agent loop](docs/agent-loop.md) and [agent stream](docs/agent-stream.md)
-- [Instructions and skills](docs/agent-skills.md)
-- [Memory, compression and forgetting](docs/agent-memory.md)
-- [Manual discovery and scripting](docs/scripting.md)
+[Architecture](docs/architecture.md) · [Manifest](docs/manifest.md) · [Capabilities](docs/capabilities.md) ·
+[HTTP and MCP](docs/http-api.md) · [Adding a device](docs/adding-a-device.md) · [Flashing](docs/flashing.md) ·
+[Troubleshooting](docs/troubleshooting.md) · [Agent loop](docs/agent-loop.md) · [Stream](docs/agent-stream.md) ·
+[Skills](docs/agent-skills.md) · [Memory](docs/agent-memory.md) · [Scripting](docs/scripting.md)
 
 ## Contributing
 
-A new peripheral starts as a manifest fragment under `examples/manifests/`. A Rust driver is
-needed only for timing, calibration or state. Both are welcome; `CATALOG` is where a driver
-is registered. Conventions are in [AGENTS.md](AGENTS.md) and [CONTRIBUTING.md](CONTRIBUTING.md).
+A new peripheral starts as a manifest fragment under `examples/manifests/`; a Rust driver is
+needed only for timing, calibration or state. `CATALOG` is where a driver registers itself.
+Conventions are in [AGENTS.md](AGENTS.md) and [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## License
 
