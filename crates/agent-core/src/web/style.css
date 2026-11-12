@@ -414,6 +414,67 @@ button.btn:active { transform: scale(0.98); }
   color: var(--text);
 }
 
+/* The work behind an answer: one line, opening into the steps.
+ *
+ * A chat that prints every tool call and every intermediate sentence is a log. The answer
+ * is what remains visible; the rest is one line that opens, so nothing is hidden but
+ * nothing competes with the reply either. */
+.row.trace { justify-content: flex-start; }
+.trace-box {
+  max-width: min(86%, 640px);
+  font-size: 12.5px;
+  color: var(--muted);
+}
+.trace-box > summary {
+  cursor: pointer;
+  list-style: none;
+  display: inline-flex;
+  gap: 6px;
+  align-items: center;
+  padding: 3px 9px;
+  border: 1px dashed var(--line);
+  border-radius: 999px;
+  font-size: 11.5px;
+  color: var(--muted);
+}
+.trace-box > summary::-webkit-details-marker { display: none; }
+.trace-box > summary::before {
+  content: "\25B8";
+  font-size: 9px;
+  transition: transform 0.15s;
+}
+.trace-box[open] > summary::before { transform: rotate(90deg); }
+.trace-box[open] > summary { border-style: solid; }
+.trace-box > *:not(summary) { margin-top: 8px; }
+/* Steps are not bubbles: a hairline on the left says "this produced the answer". */
+.trace-box details.think,
+.trace-box .step-text {
+  border-left: 2px solid var(--line);
+  padding-left: 10px;
+}
+.trace-box details.think > summary {
+  cursor: pointer;
+  list-style: none;
+  font-size: 11.5px;
+  color: var(--muted);
+}
+.trace-box details.think > summary::-webkit-details-marker { display: none; }
+.trace-box details.think > summary::before { content: "\25B8 "; }
+.trace-box details.think[open] > summary::before { content: "\25BE "; }
+.trace-box .think-text {
+  font-size: 12px;
+  color: var(--muted);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  max-height: 40vh;
+  overflow: auto;
+}
+.trace-box .think-text p { margin: 0 0 6px; }
+.trace-box .step-text { font-size: 12.5px; color: var(--muted); }
+.trace-box .step-text p { margin: 0 0 6px; }
+.trace-box details.tool { margin-top: 6px; }
+.trace-box.live > summary { border-color: var(--ok); color: var(--ok); }
+
 /* A tool call in the transcript: one collapsed line, arguments and result inside. */
 details.tool {
   font-family: ui-monospace, Menlo, Consolas, monospace;

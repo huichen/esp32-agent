@@ -139,16 +139,6 @@ function addRow(who) {
   return { row, bubble };
 }
 
-function addTools(row) {
-  let tools = row.querySelector(".tools");
-  if (!tools) {
-    tools = document.createElement("div");
-    tools.className = "tools";
-    row.appendChild(tools);
-  }
-  return tools;
-}
-
 function chip(tools, label, detail) {
   // A tool call reads as one compact line; the arguments and the result live behind the
   // disclosure triangle. A chat that shows every result inline is a log, not a chat.
@@ -177,25 +167,139 @@ function scrollToEnd() {
   chat.scrollTop = chat.scrollHeight;
 }
 
-function renderMessage(msg) {
-  if (msg.role === "tool") return;
-  const who = msg.role === "user" ? "user" : "agent";
-  const text = msg.text || "";
-  if (!text && !(msg.tool_calls && msg.tool_calls.length)) return;
-  const { row, bubble } = addRow(who);
-  bubble.innerHTML = markdown(text);
-  if (msg.tool_calls && msg.tool_calls.length) {
-    const tools = addTools(row);
-    for (const call of msg.tool_calls) {
-      const fn = call.function || call;
-      chip(tools, fn.name + "(…)", [["arguments", typeof fn.arguments === "string" ? fn.arguments : JSON.stringify(fn.arguments || {})]]);
+/** One turn: a user message and everything the board did while answering it.
+ *
+ * The transcript shows the answer. The work that produced it — tool calls, intermediate
+ * notes, the model's thinking — collapses into one line above it, the way a chat should
+ * read. Nothing is hidden: the line opens. */
+function groupTurns(msgs) {
+  const turns = [];
+  for (const m of msgs) {
+    if (m.role === "user") {
+      turns.push({ user: m, entries: [] });
+      continue;
+    }
+    if (!turns.length) turns.push({ user: null, entries: [] });
+    turns[turns.length - 1].entries.push(m);
+  }
+  return turns;
+}
+
+/** Split one turn into the answer plus the trace that led to it. */
+function splitTurn(entries) {
+  const results = new Map();
+  for (const m of entries) if (m.role === "tool") results.set(m.tool_call_id, m);
+
+  // The answer is the last thing the board said in words; everything before it is trace.
+  const spoken = entries.filter((m) => m.role !== "tool" && (m.text || "").trim());
+  const last = spoken.length ? spoken[spoken.length - 1] : null;
+
+  let thinking = "";
+  const steps = [];
+  for (const m of entries) {
+    if (m.role === "tool") continue;
+    if (m.reasoning) thinking += (thinking ? "\n\n" : "") + m.reasoning;
+    const text = (m.text || "").trim();
+    if (text && m !== last) steps.push({ kind: "say", text });
+    for (const call of m.tool_calls || []) {
+      steps.push({ kind: "call", call, result: results.get(call.id) });
     }
   }
-  if (who === "agent") {
-    const meta = document.createElement("div");
-    meta.className = "meta";
-    meta.textContent = new Date(msg.at_ms || Date.now()).toLocaleTimeString();
-    row.appendChild(meta);
+  return { thinking, steps, answer: last ? last.text : "" };
+}
+
+function previewArgs(args) {
+  let text = typeof args === "string" ? args : JSON.stringify(args || {});
+  if (!text || text === "{}") return "";
+  text = text.replace(/\s+/g, " ");
+  return text.length > 42 ? text.slice(0, 41) + "\u2026" : text;
+}
+
+function counter(n, one, many) {
+  return n + " " + (n === 1 ? one : many);
+}
+
+/** The collapsed line above an answer: how much work, and the work itself. */
+function renderTrace(thinking, steps) {
+  const row = document.createElement("div");
+  row.className = "row trace";
+  const box = document.createElement("details");
+  box.className = "trace-box";
+
+  // The summary is a glyph and a count per kind, the way FutureOS folds a step run:
+  // the line has to survive in a phone's margin, and the words live in the title.
+  const calls = steps.filter((s) => s.kind === "call").length;
+  const said = steps.length - calls;
+  const counts = [];
+  if (calls) counts.push("\u{1F527} " + calls);
+  if (said) counts.push("\u270E " + said);
+  if (thinking) counts.push("\u{1F9E0}");
+  const summary = document.createElement("summary");
+  summary.textContent = counts.join(" \u00b7 ") || "details";
+  summary.title = [
+    calls ? counter(calls, "tool call", "tool calls") : "",
+    said ? counter(said, "intermediate message", "intermediate messages") : "",
+    thinking ? "the model's thinking" : "",
+  ]
+    .filter(Boolean)
+    .join(" \u00b7 ");
+  box.appendChild(summary);
+
+  if (thinking) {
+    const inner = document.createElement("details");
+    inner.className = "think";
+    const s2 = document.createElement("summary");
+    s2.textContent = "thinking";
+    inner.appendChild(s2);
+    const body = document.createElement("div");
+    body.className = "think-text";
+    body.innerHTML = markdown(thinking);
+    inner.appendChild(body);
+    box.appendChild(inner);
+  }
+
+  for (const step of steps) {
+    if (step.kind === "say") {
+      const div = document.createElement("div");
+      div.className = "step-text";
+      div.innerHTML = markdown(step.text);
+      box.appendChild(div);
+      continue;
+    }
+    const call = step.call.function || step.call;
+    const d = document.createElement("details");
+    d.className = "tool";
+    const sum = document.createElement("summary");
+    sum.textContent = call.name + "(" + previewArgs(call.arguments) + ")";
+    d.appendChild(sum);
+    const args = document.createElement("pre");
+    args.textContent = "arguments: " + (typeof call.arguments === "string" ? call.arguments : JSON.stringify(call.arguments || {}));
+    d.appendChild(args);
+    if (step.result) {
+      const res = document.createElement("pre");
+      res.textContent = "result: " + (step.result.text || "");
+      d.appendChild(res);
+      if (step.result.is_error) d.classList.add("err");
+      else d.classList.add("ok");
+    }
+    box.appendChild(d);
+  }
+
+  row.appendChild(box);
+  $("#chat").appendChild(row);
+  scrollToEnd();
+}
+
+function renderTurn(turn) {
+  if (turn.user) {
+    const { bubble } = addRow("user");
+    bubble.innerHTML = markdown(turn.user.text || "");
+  }
+  const { thinking, steps, answer } = splitTurn(turn.entries);
+  if (thinking || steps.length) renderTrace(thinking, steps);
+  if (answer) {
+    const { bubble } = addRow("agent");
+    bubble.innerHTML = markdown(answer);
   }
 }
 
@@ -211,10 +315,9 @@ async function loadHistory() {
         "<p>This is the board's own agent. Ask it about the hardware, tell it to change something, or give it a job &mdash; it calls its tools by itself.</p>";
       return;
     }
-    for (const m of msgs) {
-      renderMessage(m);
-      S.lastSeq = Math.max(S.lastSeq, m.seq || 0);
-    }
+    for (const turn of groupTurns(msgs)) renderTurn(turn);
+    for (const m of msgs) S.lastSeq = Math.max(S.lastSeq, m.seq || 0);
+    scrollToEnd();
   } catch (e) {
     if (String(e.message).includes("PIN")) return;
     toast("history: " + e.message);
@@ -232,7 +335,9 @@ async function send(text) {
     await api("/api/agent/message", { method: "POST", body: { text: trimmed } });
     S.busy = true;
     $("#link").className = "dot busy";
-    pendingRow = null;
+    liveTrace = null;
+    liveBubble = null;
+    liveCalls = 0;
     connectStream();
   } catch (e) {
     toast(e.message);
@@ -241,14 +346,42 @@ async function send(text) {
 
 // ---------------------------------------------------------------- streaming
 
-let pendingRow = null;
+let liveTrace = null;
+let liveBubble = null;
+let liveCalls = 0;
 
-function ensurePending() {
-  if (pendingRow) return pendingRow;
-  const { row, bubble } = addRow("agent");
-  bubble.innerHTML = '<span class="typing"><i></i><i></i><i></i></span>';
-  pendingRow = row;
-  return row;
+/** The run in progress: a trace that grows, and a bubble for the text it streams. */
+function ensureLiveTrace() {
+  if (liveTrace) return liveTrace;
+  const row = document.createElement("div");
+  row.className = "row trace";
+  const box = document.createElement("details");
+  box.className = "trace-box live";
+  const summary = document.createElement("summary");
+  summary.textContent = "working\u2026";
+  box.appendChild(summary);
+  row.appendChild(box);
+  $("#chat").appendChild(row);
+  liveTrace = box;
+  scrollToEnd();
+  return box;
+}
+
+function updateLiveSummary() {
+  if (!liveTrace) return;
+  const summary = liveTrace.querySelector("summary");
+  if (!summary) return;
+  summary.textContent = liveCalls
+    ? counter(liveCalls, "tool call", "tool calls") + " \u00b7 running"
+    : "working\u2026";
+}
+
+function ensureLiveBubble() {
+  if (liveBubble) return liveBubble;
+  const { bubble } = addRow("agent");
+  bubble.dataset.raw = "";
+  liveBubble = bubble;
+  return bubble;
 }
 
 function handleEvent(name, data) {
@@ -256,29 +389,52 @@ function handleEvent(name, data) {
   switch (name) {
     case "message_start":
       S.busy = true;
+      liveTrace = null;
+      liveBubble = null;
+      liveCalls = 0;
       $("#link").className = "dot busy";
       break;
+    case "thinking_delta": {
+      const box = ensureLiveTrace();
+      let inner = box.querySelector("details.think");
+      if (!inner) {
+        inner = document.createElement("details");
+        inner.className = "think";
+        inner.open = true;
+        const sum = document.createElement("summary");
+        sum.textContent = "thinking";
+        inner.appendChild(sum);
+        const body = document.createElement("div");
+        body.className = "think-text";
+        inner.appendChild(body);
+        box.appendChild(inner);
+      }
+      const body = inner.querySelector(".think-text");
+      body.dataset.raw = (body.dataset.raw || "") + (data.text || "");
+      body.innerHTML = markdown(body.dataset.raw);
+      scrollToEnd();
+      break;
+    }
     case "text_delta": {
-      const row = ensurePending();
-      const bubble = row.querySelector(".bubble");
-      if (bubble.querySelector(".typing")) bubble.innerHTML = "";
+      const bubble = ensureLiveBubble();
       bubble.dataset.raw = (bubble.dataset.raw || "") + (data.text || "");
       bubble.innerHTML = markdown(bubble.dataset.raw);
       scrollToEnd();
       break;
     }
     case "tool_use": {
-      const row = pendingRow || ensurePending();
-      const args = data.text || "{}";
-      const wrap = chip(addTools(row), (data.name || "tool") + "()", [["arguments", args]]);
+      const box = ensureLiveTrace();
+      liveCalls += 1;
+      updateLiveSummary();
+      const wrap = chip(box, (data.name || "tool") + "()", [["arguments", data.text || "{}"]]);
       wrap.dataset.id = data.tool_call_id || "";
       break;
     }
     case "tool_result": {
-      const row = pendingRow;
-      if (!row) break;
-      const rows = Array.from(row.querySelectorAll("details.tool"));
-      const last = rows.filter((d) => !d.classList.contains("ok") && !d.classList.contains("err")).pop() || rows.pop();
+      if (!liveTrace) break;
+      const rows = Array.from(liveTrace.querySelectorAll("details.tool"));
+      const last =
+        rows.filter((d) => !d.classList.contains("ok") && !d.classList.contains("err")).pop() || rows.pop();
       if (last) {
         const pre = document.createElement("pre");
         pre.textContent = "result: " + (data.text || "");
@@ -292,12 +448,13 @@ function handleEvent(name, data) {
       break;
     case "run_end":
       S.busy = false;
-      if (pendingRow) {
-        const bubble = pendingRow.querySelector(".bubble");
-        if (bubble.querySelector(".typing")) bubble.innerHTML = "<p><em>no answer</em></p>";
-      }
-      pendingRow = null;
+      liveTrace = null;
+      liveBubble = null;
+      liveCalls = 0;
       $("#link").className = "dot live";
+      // Re-render from the board's own transcript: it is the authority on what belongs in
+      // the answer and what belongs in the collapsed trace.
+      loadHistory();
       // The run is over: give the board its 8 kB back.
       setTimeout(stopStream, 500);
       break;
@@ -373,9 +530,10 @@ async function loadStatus() {
     ]);
     // The model settings live in the Agent panel now; the header line is enough here.
     const model = await api("/api/agent/config");
+    // No IP in the header: the address bar already shows where we are, and on a phone
+    // that line is the most expensive space on the page.
     $("#sub").textContent =
-      (d.wifi.ip || d.wifi.ap_ip) + " · " + d.devices.count + " devices · " + d.mcp.tools_visible + " tools · " +
-      (model.model || "no model");
+      d.devices.count + " devices · " + d.mcp.tools_visible + " tools · " + (model.model || "no model");
     $("#title").textContent = d.device_name || "esp32-agent";
   } catch (e) {
     if (!String(e.message).includes("PIN")) $("#sub").textContent = "offline";
