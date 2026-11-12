@@ -17,9 +17,10 @@ mod dns;
 mod esp_hw;
 mod nvs_store;
 mod runner;
+mod tls_server;
 mod wifi;
 
-use esp32_agent_core::app::{make_handler, App, FwMeta, Shared};
+use esp32_agent_core::app::{make_handler, App, FwMeta, Shared, TlsInfo};
 use esp32_agent_core::config::Config;
 use esp32_agent_core::hardware::Hardware;
 use esp32_agent_core::http::Server;
@@ -238,6 +239,17 @@ fn run() -> anyhow::Result<()> {
     }
     let hw: Box<dyn esp32_agent_core::hardware::Hardware> = Box::new(hw);
 
+    // The certificate this board will serve https with. Generated here — before the
+    // radio and before the clock — because it carries fixed validity dates; see
+    // `tls_server::identity`. A failure is not fatal: http stays up either way.
+    let (tls_identity, tls_error) = match tls_server::identity(&mut store) {
+        Ok(id) => (Some(id), String::new()),
+        Err(e) => {
+            log.error("boot", format!("https: no certificate ({e}); http only"));
+            (None, e)
+        }
+    };
+
     let firmware = FwMeta {
         name: "esp32-agent".into(),
         version: esp32_agent_core::VERSION.into(),
@@ -276,7 +288,51 @@ fn run() -> anyhow::Result<()> {
     };
 
     let addr = format!("0.0.0.0:{port}");
-    let mut server = Server::start(&addr, make_handler(app.clone()), log.clone())?;
+    // One accept thread serves both ports. A second listener thread for TLS does not fit:
+    // with it the agent thread itself failed to start ("Not enough space"), which costs the
+    // whole board to gain a second URL.
+    let tls_bind = format!("0.0.0.0:{}", tls_server::TLS_PORT);
+    let mut server = match tls_identity {
+        Some(identity) => {
+            let fingerprint = identity.fingerprint.clone();
+            match Server::start_with_tls(
+                &addr,
+                &tls_bind,
+                make_handler(app.clone()),
+                log.clone(),
+                identity.handshake(),
+            ) {
+                Ok(s) => {
+                    if let Ok(mut guard) = app.lock() {
+                        guard.tls = TlsInfo {
+                            port: tls_server::TLS_PORT,
+                            fingerprint: fingerprint.clone(),
+                            error: String::new(),
+                        };
+                    }
+                    log::info!("https server listening on 0.0.0.0:{}", tls_server::TLS_PORT);
+                    log.info("boot", format!("https on port {} (certificate {fingerprint})", tls_server::TLS_PORT));
+                    s
+                }
+                Err(e) => {
+                    if let Ok(mut guard) = app.lock() {
+                        guard.tls = TlsInfo { port: 0, fingerprint: String::new(), error: format!("{e}") };
+                    }
+                    log.error("boot", format!("https: could not listen on {}: {e}; http only", tls_server::TLS_PORT));
+                    Server::start(&addr, make_handler(app.clone()), log.clone())?
+                }
+            }
+        }
+        None => {
+            let mut server = Server::start(&addr, make_handler(app.clone()), log.clone())?;
+            if !tls_error.is_empty() {
+                if let Ok(mut guard) = app.lock() {
+                    guard.tls = TlsInfo { port: 0, fingerprint: String::new(), error: tls_error.clone() };
+                }
+            }
+            server
+        }
+    };
     log.info("boot", format!("serving the portal and /mcp on port {port}"));
     // Serial as well: "the board serves" is the line a bench check looks for, and
     // the in-RAM log cannot be read until the server that carries it is up.
@@ -285,6 +341,7 @@ fn run() -> anyhow::Result<()> {
         let mut guard = app.lock().map_err(|_| anyhow::anyhow!("app lock poisoned"))?;
         guard.lan_url = String::new(); // resolved from the WiFi status at runtime
     }
+
 
     // The scheduler's `at_hhmm` tasks, every message timestamp and — less obviously —
     // every TLS handshake need a wall clock: the board's RTC starts at the epoch, and a
@@ -348,6 +405,17 @@ fn run() -> anyhow::Result<()> {
             server.stop();
             server = Server::start(&format!("0.0.0.0:{port_now}"), make_handler(app.clone()), log.clone())?;
             port = port_now;
+            // The https listener went down with the old server and is not rebuilt here.
+            // Say so instead of leaving `/api/tls` claiming a port that no longer answers.
+            if let Ok(mut guard) = app.lock() {
+                if guard.tls.enabled() {
+                    guard.tls = TlsInfo {
+                        port: 0,
+                        fingerprint: String::new(),
+                        error: "https stopped when the MCP port changed; reboot to restore it".into(),
+                    };
+                }
+            }
         }
     }
 }

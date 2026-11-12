@@ -659,12 +659,15 @@ fn tick(
         static LAST_WARN_S: AtomicU32 = AtomicU32::new(0);
         let now_s = (now / 1000) as u32;
         let last = LAST_WARN_S.load(Ordering::Relaxed);
-        if internal_kb < 24 && now_s.saturating_sub(last) > 60 {
+        // 20 kB is the normal steady state on this board (a TLS page costs ~11 kB of it
+        // once), so warning above 8 kB only taught people to ignore the log. Below 8 kB a
+        // stream thread (6 kB of stack) or a handshake really does start failing.
+        if internal_kb < 8 && now_s.saturating_sub(last) > 600 {
             LAST_WARN_S.store(now_s, Ordering::Relaxed);
             log.warn(
                 "agent",
                 format!(
-                    "internal free heap is {internal_kb} kB: the HTTP accept thread needs ~16 kB of it, so requests and streams start failing here"
+                    "internal free heap is only {internal_kb} kB: a stream thread needs 6 kB of stack, so new streams and TLS handshakes will start failing"
                 ),
             );
         }

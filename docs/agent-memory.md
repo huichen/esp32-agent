@@ -111,20 +111,20 @@ editing the conversation it is in the middle of).
 
 ```bash
 # write a memory through the normal file tools
-curl -sS -X POST http://<board>:8080/mcp -H 'Content-Type: application/json' \
+curl -sS -X POST http://<board>:80/mcp -H 'Content-Type: application/json' \
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{
        "name":"fs_write","arguments":{"path":"/memory/pins.md","text":"GPIO18 = strip"}}}'
 
 # the index line
-curl -sS -X POST http://<board>:8080/mcp -H 'Content-Type: application/json' \
+curl -sS -X POST http://<board>:80/mcp -H 'Content-Type: application/json' \
   -d '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{
        "name":"fs_write","arguments":{
          "path":"/memory.md","text":"- [pins](/memory/pins.md) — GPIO18 is the strip\n"}}}'
 
 # what the model will be told
-curl -sS http://<board>:8080/api/agent/prompt | jq -r .system | sed -n '/## Memory/,/^## /p'
+curl -sS http://<board>:80/api/agent/prompt | jq -r .system | sed -n '/## Memory/,/^## /p'
 
 # forgetting
-curl -sS -X POST http://<board>:8080/api/agent/forget \
+curl -sS -X POST http://<board>:80/api/agent/forget \
   -H 'Content-Type: application/json' -d '{"keep":1}'
 ```

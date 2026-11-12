@@ -39,7 +39,7 @@ is the glue between them.
 ## 2. The path of one request
 
 ```
-phone / model → TCP:8080
+phone / model → TCP:80
   http.rs        parse HTTP/1.1 (keep-alive, chunked, 100-continue)
   app.rs         route: /mcp or /api/*
     /mcp POST → auth (optional Bearer) → allocate or reuse Mcp-Session-Id

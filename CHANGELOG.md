@@ -7,6 +7,16 @@ version numbering follows semantic versioning.
 
 ### Added
 
+- **Inbound https on 443, with a certificate the board makes for itself.** On first boot it
+  generates an EC P-256 key and a self-signed X.509 certificate (mbedTLS, fixed
+  2020-2035 validity so a board with an unsynced clock still issues something usable),
+  stores both in NVS, and serves the same routes as port 80 through esp-tls. The
+  SHA-256 fingerprint is at `GET /api/tls` and in `/agent.json`; `/agent.json` and the MCP
+  `initialize` instructions report `https://…:443` when that is what answered. Port 80
+  keeps serving, so a fault on the TLS path costs a URL and never the board. Measured on
+  the bench: portal 7 535 B in 0.55 s over TLS, six consecutive requests, and a full agent
+  turn through the browser over https (5.2 s, one tool call).
+
 - **`board.auto_peripherals`**: the devkit's own RGB LED and BOOT button are no longer
   forced into the device list. With `false` the board comes up with the bus, GPIO and
   manifest tools (44 instead of 48 on an S3-DevKitC-1) and gets them back by declaring

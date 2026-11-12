@@ -145,20 +145,20 @@ disk nor the rollback. The differences are design decisions, not gaps to be fill
 ## 7. Verifying it without an API key
 
 The board serves a scripted model at `POST /selftest/chat/completions`. Point
-`agent.base_url` at `http://<board>:8080/selftest/chat/completions` (model
+`agent.base_url` at `http://<board>:80/selftest/chat/completions` (model
 `selftest`) and the whole loop runs with no credentials and no external service.
 
 ```bash
 # 1. start a goal: a real objective, a small cap so the run is short
-curl -sS -X POST http://<board>:8080/api/goal \
+curl -sS -X POST http://<board>:80/api/goal \
   -H 'Content-Type: application/json' \
   -d '{"objective":"confirm the board answers board_status","max_iterations":2}'
 
 # 2. watch it iterate: status, iteration, notes and failures move on their own
-curl -sS http://<board>:8080/api/goal
+curl -sS http://<board>:80/api/goal
 
 # 3. stop it, or let the cap do it
-curl -sS -X POST http://<board>:8080/api/goal/stop -d '{"reason":"enough"}' \
+curl -sS -X POST http://<board>:80/api/goal/stop -d '{"reason":"enough"}' \
   -H 'Content-Type: application/json'
 ```
 

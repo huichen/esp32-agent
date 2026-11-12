@@ -69,7 +69,7 @@ queue, and the "no lock across the model call" property
 
 1. `cargo test -p esp32-agent-core` (169 existing + new), clippy `-D warnings`, fmt,
    `scripts/smoke.ps1` green.
-2. On the board: `curl -N http://<board>:8080/api/agent/stream` shows the run's events
+2. On the board: `curl -N http://<board>:80/api/agent/stream` shows the run's events
    as they happen while a message is processed, and closes after the idle timeout.
 3. A third concurrent stream is refused with 503.
 4. Tick interval change is visible: set `tick_ms` 200, queue a message, and the
