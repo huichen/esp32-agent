@@ -53,6 +53,9 @@ pub const OPS: &[(&str, &str)] = &[
     ("base64enc", "shell_base64"),
     ("base64dec", "shell_base64"),
     ("sha256sum", "shell_sha256sum"),
+    // A JSON query, because `curl api | grep title` is what people actually do and it does
+    // not survive nested objects or escaping.
+    ("jq", "shell_jq"),
     ("md5sum", "shell_md5sum"),
     ("system_prompt", "shell_system_prompt"),
     // Reading and slicing text. `nsh` carries all of these and a person's fingers already
@@ -488,6 +491,112 @@ fn words_to_parsed(words: Vec<String>) -> Result<Parsed, String> {
     Ok(Parsed { name, args, flags })
 }
 
+/// `jq`, the subset this board needs: a path into a JSON document.
+///
+/// Queries are `.` (the document), `.name`, `.a.b`, `.[0]`, `.a[0].b`, and `[]` after any
+/// step to iterate (`.[]`, `.hits[]`, `.hits[].title`). `length` returns a count. Iterating
+/// prints one compact JSON value per line, which is what makes `jq .hits[].title | head`
+/// work; any other result prints one value, pretty-printed unless `raw` is set and the
+/// value is a string.
+///
+/// Not implemented, on purpose: pipes inside the query, functions, arithmetic, assignment.
+/// A query language inside a shell inside a tool would be a third grammar to learn, and the
+/// board has one job for this command — reach into a response.
+pub fn jq(input: &str, query: &str, raw: bool) -> Result<String, String> {
+    let doc: serde_json::Value =
+        serde_json::from_str(input).map_err(|e| format!("jq: the input is not JSON ({e})"))?;
+    let query = query.trim();
+    let query = if query.is_empty() { "." } else { query };
+    let mut current = doc;
+    let mut iterated = false;
+
+    // A leading `.` is the document; the rest is a sequence of names, `[n]` indices and `[]`
+    // iterations. Scanned rather than split on `.`, because `hits[0]` is one step with two
+    // parts and splitting there would lose the index.
+    let body = query.strip_prefix('.').ok_or("jq: a query starts with `.`")?;
+    let chars: Vec<char> = body.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        match chars[i] {
+            '.' => i += 1,
+            '[' => {
+                let mut j = i + 1;
+                while j < chars.len() && chars[j] != ']' {
+                    j += 1;
+                }
+                let inner: String = chars[i + 1..j.min(chars.len())].iter().collect();
+                if inner.trim().is_empty() {
+                    iterated = true;
+                } else {
+                    let n: usize =
+                        inner.trim().parse().map_err(|_| format!("jq: `{inner}` is not an index"))?;
+                    current = current.get(n).cloned().ok_or_else(|| format!("jq: no element {n}"))?;
+                }
+                i = (j + 1).min(chars.len());
+            }
+            _ => {
+                let mut j = i;
+                while j < chars.len() && chars[j] != '.' && chars[j] != '[' {
+                    j += 1;
+                }
+                let name: String = chars[i..j].iter().collect();
+                if name == "length" {
+                    let n = match &current {
+                        serde_json::Value::Array(a) => a.len(),
+                        serde_json::Value::Object(o) => o.len(),
+                        serde_json::Value::String(s) => s.chars().count(),
+                        _ => 0,
+                    };
+                    current = serde_json::json!(n);
+                } else if iterated {
+                    // After `[]` the value is an array and every further step applies to each
+                    // element: `.hits[].title` is a projection, not a lookup on the array.
+                    let items = match current {
+                        serde_json::Value::Array(items) => items,
+                        other => vec![other],
+                    };
+                    let mut out = Vec::new();
+                    for item in items {
+                        if let Some(found) = item.get(&name) {
+                            out.push(found.clone());
+                        }
+                    }
+                    current = serde_json::Value::Array(out);
+                } else {
+                    current = current.get(&name).cloned().ok_or_else(|| format!("jq: no field `{name}`"))?;
+                }
+                i = j;
+            }
+        }
+    }
+
+    if iterated {
+        // One line per element of the final array, which is what a following `grep` or
+        // `head` wants. A non-array under `[]` is one element, as in jq.
+        let items: Vec<serde_json::Value> = match current {
+            serde_json::Value::Array(a) => a,
+            other => vec![other],
+        };
+        let mut lines = Vec::new();
+        for item in items {
+            let line = match (&item, raw) {
+                (serde_json::Value::String(s), true) => s.clone(),
+                (serde_json::Value::Object(_), _) | (serde_json::Value::Array(_), _) => {
+                    serde_json::to_string(&item).unwrap_or_default()
+                }
+                _ => serde_json::to_string(&item).unwrap_or_default(),
+            };
+            lines.push(line);
+        }
+        return Ok(lines.join("\n"));
+    }
+
+    match (&current, raw) {
+        (serde_json::Value::String(s), true) => Ok(s.clone()),
+        _ => Ok(serde_json::to_string_pretty(&current).unwrap_or_default()),
+    }
+}
+
 /// Digits and dots: what a negative number looks like once its sign is off.
 fn looks_numeric(text: &str) -> bool {
     !text.is_empty()
@@ -653,6 +762,7 @@ pub fn usage(op: &str) -> Option<&'static str> {
         "base64enc" => "base64enc <path> [-o <out>]",
         "base64dec" => "base64dec <path> [-o <out>]",
         "sha256sum" => "sha256sum <path>",
+        "jq" => "jq [query] <path>   query: . .name .a.b .[0] .a[0].b .[] .length (-r for strings)",
         "md5sum" => "md5sum <path>",
         "system_prompt" => "system_prompt get | set <text> | append <text> | clear",
         // Reading and slicing text. Each takes its input as a path, or as the pipe a stage
@@ -915,6 +1025,26 @@ mod tests {
     }
 
     /// The bound is a decision, not an accident: five stages carry, six do not.
+    #[test]
+    fn jq_reaches_into_a_document() {
+        let doc = r#"{"hits":[{"title":"a","points":3},{"title":"b","points":9}],"total":2}"#;
+
+        assert!(jq(doc, ".", false).unwrap().contains("\"total\""));
+        assert_eq!(jq(doc, ".total", false).unwrap(), "2");
+        assert_eq!(jq(doc, ".hits[0].title", false).unwrap(), "\"a\"");
+        assert_eq!(jq(doc, ".hits[0].title", true).unwrap(), "a", "-r drops the quotes");
+        assert_eq!(jq(doc, ".hits.length", false).unwrap(), "2");
+
+        // Iteration is one value per line, which is what a `head` or `grep` downstream reads.
+        assert_eq!(jq(doc, ".hits[].title", true).unwrap(), "a\nb");
+
+        // A bad step is named, not turned into null.
+        assert!(jq(doc, ".missing", false).unwrap_err().contains("no field `missing`"));
+        assert!(jq(doc, ".hits[7]", false).unwrap_err().contains("no element 7"));
+        assert!(jq("not json", ".", false).unwrap_err().contains("not JSON"));
+        assert!(jq(doc, "hits", false).unwrap_err().contains("starts with"));
+    }
+
     #[test]
     fn a_pipeline_has_a_stage_limit_and_needs_both_ends() {
         let five = "echo a | cat | cat | cat | cat";
