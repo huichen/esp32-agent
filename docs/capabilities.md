@@ -140,5 +140,5 @@ authoritative when this table and a firmware disagree.
 | `logs_tail`, `reboot`, `factory_reset` | the ring log, a restart, and back to defaults |
 | `device_invoke` | one detected device's tool, by id — what `tools_mode: generic` collapses the device tools into |
 
-`manifest_apply` and its relatives are in [manifest](manifest.md); `shell`, `read`,
+The `manifest` tool and its five commands are in [manifest](manifest.md); `shell`, `read`,
 `write`, `edit` and `script` are in [shell](shell.md) and [scripting](scripting.md).

@@ -13,6 +13,7 @@ use crate::manifest::{
     Issue, Manifest, ValidateCtx, MANIFEST_VERSION, MAX_STEPS, MAX_TOOLS, MAX_TOTAL_DELAY_MS,
 };
 use crate::tool::{boolean, enumeration, integer, object_schema, ToolCtx, ToolDef};
+use crate::tools::family::Family;
 use serde_json::{json, Value};
 
 fn validate_ctx<'b>(ctx: &mut ToolCtx<'b>) -> ValidateCtx<'b> {
@@ -150,7 +151,12 @@ fn parse_manifest(value: &Value) -> std::result::Result<Manifest, McpError> {
     })
 }
 
-pub fn manifest_tools() -> Vec<ToolDef> {
+/// The five commands of the `manifest` family.
+///
+/// They stay tools of their own as well, so a script written before the family existed
+/// (`tool("manifest_apply", …)`) still reaches the same handler; the listing hides the
+/// old names and says where they went.
+pub fn manifest_commands() -> Vec<ToolDef> {
     vec![
         ToolDef::new(
             "manifest_get",
@@ -398,6 +404,13 @@ pub fn manifest_tools() -> Vec<ToolDef> {
             ctx.runtime.config_dirty = true;
             Ok(json!({ "ok": true, "note": "manifest cleared; built-in tools remain" }))
         }),
+    ]
+}
+
+/// The bus probe and the config reader: this module's other two responsibilities, which are
+/// not part of the manifest family.
+fn board_extra_tools() -> Vec<ToolDef> {
+    vec![
         ToolDef::new(
             "i2c_identify",
             "Identify what answers at an I2C address: reads the usual id registers and reports candidate drivers",
@@ -473,6 +486,31 @@ pub fn manifest_tools() -> Vec<ToolDef> {
             Ok(v)
         }),
     ]
+}
+
+/// The `manifest` family: one tool, five commands.
+pub fn manifest_family() -> ToolDef {
+    Family::new(
+        "manifest",
+        "Read, describe, validate and apply the device manifest; `command: help` lists what each command takes",
+        manifest_commands(),
+    )
+    .into_tool()
+}
+
+/// The names the family takes over, derived from the commands themselves so the family and
+/// its members cannot drift apart.
+pub fn manifest_members() -> Vec<String> {
+    manifest_commands().into_iter().map(|d| d.spec.name).collect()
+}
+
+/// What the registry gets from this module: the family first, then the five commands it
+/// groups, then the bus and config tools.
+pub fn manifest_tools() -> Vec<ToolDef> {
+    let mut out = vec![manifest_family()];
+    out.extend(manifest_commands());
+    out.extend(board_extra_tools());
+    out
 }
 
 fn manifest_schema() -> Value {

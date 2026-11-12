@@ -17,7 +17,7 @@ marcha.
 | Qué | En detalle |
 |---|---|
 | Un modelo se ejecuta en la placa | El bucle, las herramientas, la memoria y la transcripción son firmware; el modelo es cualquier endpoint compatible con OpenAI o de Anthropic. [Cómo darle un modelo](docs/model.md) |
-| El conjunto de herramientas es un documento | `manifest_apply` valida un manifiesto JSON, lo compila en herramientas y está activo en el mismo turno. [Manifiesto](docs/manifest.md) |
+| El conjunto de herramientas es un documento | `manifest` (`command: apply`) valida un manifiesto JSON, lo compila en herramientas y está activo en el mismo turno. [Manifiesto](docs/manifest.md) |
 | Encuentra su propio hardware | I2C, 1-Wire y los pines declarados se sondean al arrancar; solo lo que responde obtiene herramientas. [Capacidades](docs/capabilities.md) |
 | Un conjunto de herramientas, dos invocadores | El endpoint MCP y el agente de la placa ven las mismas herramientas, desde una sola descripción. [API HTTP y MCP](docs/http-api.md) |
 | Una consola sobre HTTPS | Hablar con el modelo y configurar dispositivos, herramientas, programación, registros, WiFi y el modelo desde un teléfono; la placa emite su propio certificado. [Consola web](docs/web-console.md) |

@@ -237,6 +237,12 @@ pub struct App {
     pub manifest: Manifest,
     pub devices: Devices,
     pub tools: ToolRegistry,
+    /// Tool names a family took over: `manifest_apply` -> `manifest apply`.
+    ///
+    /// The handlers stay in the registry so a script written before the family existed
+    /// keeps working; what changes is that the model is not shown five names where one
+    /// will do, and the listing explains where each old name went.
+    pub family_members: std::collections::BTreeMap<String, String>,
     pub hw: Box<dyn Hardware>,
     pub store: Box<dyn KvStore>,
     pub log: Arc<LogBuf>,
@@ -343,6 +349,7 @@ impl App {
             manifest,
             devices: Devices::new(),
             tools: ToolRegistry::new(),
+            family_members: std::collections::BTreeMap::new(),
             hw,
             store,
             log: log.clone(),
@@ -496,6 +503,17 @@ impl App {
         let mut tools = ToolRegistry::new();
         tools.register_all(board_tools::always_tools());
         tools.register_all(board_tools::manifest_tools());
+        // The manifest family is one tool with five commands; the five are still registered
+        // above, under their old names, so a stored script keeps calling the same handler.
+        // Remembering which is which is what lets the listing say "reachable as `manifest
+        // apply`" instead of silently dropping four names.
+        self.family_members = board_tools::manifest_members()
+            .into_iter()
+            .map(|name| {
+                let command = name.trim_start_matches("manifest_").to_string();
+                (name, format!("manifest {command}"))
+            })
+            .collect();
         tools.register_all(self.devices.tool_defs());
         // A manifest may not take a name the board already uses (validation refuses it),
         // but a manifest stored by an older build — or one applied before the hardware
@@ -589,8 +607,10 @@ impl App {
         "wifi_status",
         "reboot",
         "factory_reset",
-        "manifest_validate",
-        "manifest_reset",
+        // `manifest_validate` and `manifest_reset` used to sit here. They are not hidden by
+        // the profile any more: the `manifest` family owns them, and the family is what an
+        // empty board needs to rebuild itself — so it stays, and the profile has nothing
+        // left to say about them.
     ];
 
     /// May this tool appear in `tools/list` right now?
@@ -608,6 +628,11 @@ impl App {
         let def = self.tools.get(name)?;
         if self.cfg.mcp.disabled_tools.iter().any(|d| d == name) {
             return Some("switched off in `mcp.disabled_tools`".to_string());
+        }
+        // A family took this name over. The handler still answers, so the sentence says
+        // where to find it rather than pretending the ability is gone.
+        if let Some(reached) = self.family_members.get(name) {
+            return Some(format!("reachable as `{reached}`"));
         }
         // `minimal` hides conveniences, never capabilities: an HTTP route or a manifest can
         // do these, and a model rarely needs them. Discovery, manifest, GPIO and the file
@@ -1336,7 +1361,10 @@ impl App {
         if name == "image_read" {
             return self.image_read(args);
         }
-        if !self.is_visible(name) {
+        // A name a family took over still answers. It is hidden from the listing, not
+        // removed from the board, so a script or a person who learned `manifest_apply`
+        // before the family existed keeps working — and the listing says where it went.
+        if !self.is_visible(name) && !self.family_members.contains_key(name) {
             let missing =
                 self.tools.get(name).map(|d| self.caps.missing(&d.spec.requires)).unwrap_or_default();
             if missing.is_empty() {
@@ -3409,13 +3437,9 @@ impl App {
     /// shell hands arguments to a script. Positional arguments keep their order in `argv`
     /// including the flags, so a script can read either view.
     ///
-    /// The array built from scratch: one pass over the disabled names, not 51.
+    /// The array built from scratch: one pass over the registry, one predicate.
     fn tool_specs_uncached(&self) -> Value {
-        let disabled: std::collections::BTreeSet<&str> =
-            self.cfg.mcp.disabled_tools.iter().map(|d| d.as_str()).collect();
-        let generic = self.cfg.mcp.tools_mode == "generic";
-        let visible: Vec<&ToolDef> =
-            self.tools.iter().filter(|d| self.visible_given(&d.spec.name, &disabled, generic)).collect();
+        let visible: Vec<&ToolDef> = self.tools.iter().filter(|d| self.is_visible(&d.spec.name)).collect();
         let load = |def: &ToolDef| {
             json!({
                 "type": "function",
@@ -3440,24 +3464,6 @@ impl App {
         tools.extend(self.extra_specs());
         tools.sort_by_key(|t| t["function"]["name"].as_str().unwrap_or("").to_string());
         Value::Array(tools)
-    }
-
-    /// `is_visible` with the disabled set and the mode already resolved, for the one caller
-    /// that asks about every tool at once: same rules, one scan of the names.
-    fn visible_given(&self, name: &str, disabled: &std::collections::BTreeSet<&str>, generic: bool) -> bool {
-        let Some(def) = self.tools.get(name) else {
-            return false;
-        };
-        if disabled.contains(name) {
-            return false;
-        }
-        if self.cfg.mcp.profile == "minimal" && Self::MINIMAL_HIDDEN.contains(&name) {
-            return false;
-        }
-        if generic && def.spec.device_tool {
-            return false;
-        }
-        !def.spec.requires.iter().any(|cap| !self.caps.contains(cap))
     }
 
     /// The `fs_*` and `net_*` handlers by name, shared by the tool host and `shell`.
@@ -6400,15 +6406,7 @@ mod tests {
             assert!(!app.is_visible(hidden), "{hidden} should be hidden in minimal");
         }
         // The bootstrap survives: discovery, manifest, GPIO and the file tools.
-        for kept in [
-            "board_status",
-            "devices_list",
-            "devices_probe",
-            "i2c_scan",
-            "manifest_apply",
-            "manifest_describe",
-            "gpio_write",
-        ] {
+        for kept in ["board_status", "devices_list", "devices_probe", "i2c_scan", "manifest", "gpio_write"] {
             assert!(app.is_visible(kept), "{kept} must survive the minimal profile");
         }
         // `fs_*`, `net_*` and `script` live outside the registry, so they are checked in the
@@ -8176,6 +8174,49 @@ mod tests {
         );
     }
 
+    /// A family's three tables are one table: declared (the schema enum), helped (`command:
+    /// help`) and dispatchable (a call that is not "no command").
+    ///
+    /// This is the assertion the `jq` bug needed: a command that was documented in `help`
+    /// and absent from dispatch. It fails if a name is added to one list alone — which is
+    /// also why `help` costs at most a kilobyte here: past that, the saving the family made
+    /// leaks back out of the help text.
+    #[test]
+    fn a_family_declares_helps_and_dispatches_the_same_commands() {
+        let mut app = test_app();
+        let spec = ToolHost::tool_specs(&app)
+            .as_array()
+            .expect("array")
+            .iter()
+            .find(|t| t["function"]["name"] == "manifest")
+            .cloned()
+            .expect("the manifest family is offered");
+        let names = |v: &Value| -> Vec<String> {
+            v.as_array().unwrap().iter().map(|s| s.as_str().unwrap().to_string()).collect()
+        };
+        let mut declared = names(&spec["function"]["parameters"]["properties"]["command"]["enum"]);
+        declared.retain(|c| c != "help");
+
+        let help = app.call_tool("manifest", &json!({ "command": "help" })).unwrap();
+        let helped = names(&help["commands"]);
+        assert_eq!(declared, helped, "the schema and `help` disagree");
+
+        for command in helped.iter().chain(std::iter::once(&"help".to_string())) {
+            if let Err(e) = app.call_tool("manifest", &json!({ "command": command })) {
+                assert!(
+                    !e.message.contains("no command"),
+                    "`help` lists `{command}` but dispatch refuses it: {}",
+                    e.message
+                );
+            }
+        }
+        let err = app.call_tool("manifest", &json!({ "command": "frobnicate" })).unwrap_err();
+        assert!(err.message.contains("no command"), "an unknown command must be refused: {err:?}");
+
+        let bytes = serde_json::to_string(&help).unwrap().len();
+        assert!(bytes <= 1024, "manifest help is {bytes} bytes; that eats the saving");
+    }
+
     #[test]
     fn tools_list_only_shows_detected_hardware() {
         let mut app = test_app();
@@ -8595,7 +8636,7 @@ mod tests {
         sorted.sort_unstable();
         assert_eq!(names, sorted, "the tool list is not alphabetical: {names:?}");
 
-        for needle in ["board_status", "manifest_apply", "shell", "script", "read"] {
+        for needle in ["board_status", "manifest", "shell", "script", "read"] {
             assert!(names.contains(&needle), "{needle} is missing: {names:?}");
         }
         // A manifest tool sorts among the rest — `aaa_manifest` is first, not last.
@@ -9056,7 +9097,7 @@ mod tests {
             assert!(!app.is_visible(gone), "{gone} survived a minimal start");
         }
         assert!(app.is_visible("gpio_write"), "the primitives must stay");
-        assert!(app.is_visible("manifest_apply"), "self-configuration must stay");
+        assert!(app.is_visible("manifest"), "self-configuration must stay");
 
         // Declaring them in the manifest brings the tools back — the whole point.
         let v = app
@@ -9221,7 +9262,9 @@ mod tests {
         )
         .expect("a manifest");
         app.rebuild();
-        assert!(app.is_visible("manifest_apply"), "the built-in disappeared on rebuild");
+        // The board's own `manifest` tool wins over the manifest entry of the same name, and
+        // the five old command names stay reachable through it.
+        assert!(app.is_visible("manifest"), "the built-in disappeared on rebuild");
         let v = app.call_tool("manifest_apply", &json!({ "manifest": { "tools": [] } })).unwrap();
         assert_eq!(v["applied"], true, "the built-in no longer applies: {v}");
     }

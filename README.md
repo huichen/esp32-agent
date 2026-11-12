@@ -15,7 +15,7 @@ sensor can be declared in JSON while the board runs.
 | What | In detail |
 |---|---|
 | A model runs on the board | Loop, tools, memory and transcript are firmware; the model is any OpenAI-compatible or Anthropic endpoint. [Model](docs/model.md) |
-| The tool set is a document | `manifest_apply` validates a JSON manifest, compiles it into tools, live in the same turn. [Manifest](docs/manifest.md) |
+| The tool set is a document | `manifest` (`command: apply`) validates a JSON manifest, compiles it into tools, live in the same turn. [Manifest](docs/manifest.md) |
 | It finds its own hardware | I2C, 1-Wire and declared pins are probed at boot; only what answers gets tools. [Capabilities](docs/capabilities.md) |
 | One tool set, two callers | The MCP endpoint and the on-board agent see the same tools, from one description. [HTTP and MCP API](docs/http-api.md) |
 | A console over HTTPS | Chat with the model and configure devices, tools, schedule, logs, WiFi and the model, from a phone; the board issues its own certificate. [Web console](docs/web-console.md) |
