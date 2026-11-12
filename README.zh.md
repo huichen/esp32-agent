@@ -19,7 +19,7 @@
 | 自己发现硬件 | 启动时探测 I2C、1-Wire 与已声明的引脚；只有应答的才得到工具。[能力](docs/capabilities.md) |
 | 一套工具，两个调用方 | MCP 端点与板载智能体看到同一批工具，来自同一份描述。[HTTP 与 MCP API](docs/http-api.md) |
 | 通过 HTTPS 的控制台 | 在手机上对话，并配置设备、工具、定时、日志、WiFi 与模型；证书由板子自己签发。[网页控制台](#网页控制台) |
-| 无人值守也会动作 | 定时提示，以及阈值被越过时触发提示的传感器规则。[定时任务](#定时任务) |
+| 无人值守也会动作 | 定时提示，以及读数越过阈值时触发提示的传感器规则。[定时任务](#定时任务) |
 | 一个 shell 和一门脚本语言 | `shell` 有 26 个按 NuttX 命名的命令，还有一个对工具调用做循环的解释器。[Shell](#shell) · [脚本](#脚本) |
 | 常驻指令 | 系统提示词里的 2 KB，写这块板是用来做什么的，可从控制台、`shell` 与 HTTP 写入。[常驻指令](#常驻指令) |
 | 路径中没有云端 | 由板子提供 HTTPS，证书由它生成，三类调用方一个 PIN。[认证](#认证) |
@@ -71,7 +71,8 @@ curl -sS -X POST http://<board>/api/agent/message -H 'Content-Type: application/
   -d '{"text":"write HELLO on the OLED, set the LED blue, then scan I2C"}'
 ```
 
-三种协议：`chat`、`responses`、`anthropic`。控制台附加的图像按 content parts 发出。
+三种协议：`chat`（OpenAI chat completions）、`responses`（OpenAI Responses API）与
+`anthropic`（Messages API）。控制台附加的图像按 content parts 发出。
 `reasoning` 设置思考级别，`max_steps` 限制每轮的模型调用次数（0 表示不限），
 `context_tokens` 与 `max_output_tokens` 设置窗口与回复预留，会话记录在窗口用到 80% 时压
 缩。没有密钥时，把 `base_url` 指向板子自身的 `/selftest/chat/completions`，循环仍然能跑。
@@ -85,9 +86,10 @@ curl -sS -X POST http://<board>/api/agent/prompt -H 'Content-Type: application/j
   -d '{"action":"set","text":"The pump relay is on GPIO12. Never run it past two minutes."}'
 ```
 
-`action` 取 `set`、`append` 或 `clear`；`GET /api/agent/prompt` 显示模型将收到的提示词，
-包括自定义部分；智能体用 `shell {"command":"system_prompt set …"}` 到达它。存放在 NVS
-中，上限 2 KB，因此重启后仍在。
+`action` 取 `set`、`append` 或 `clear`，而 `system_prompt get` 从板上把它读回来；
+`GET /api/agent/prompt` 显示模型将收到的提示词，包括自定义部分；智能体用
+`shell {"command":"system_prompt set …"}` 到达它。存放在 NVS 中，上限 2 KB，因此重启后
+仍在。
 
 ## Shell
 
@@ -140,8 +142,8 @@ curl -sS -X POST http://<board>/api/sched -H 'Content-Type: application/json' -d
   "rules":[{"id":"r1","tool":"bme280_read","path":"temperature_c","op":"gt","value":30,"prompt":"it is hot"}]}'
 ```
 
-`at_hhmm` 改为按 UTC 挂钟时间运行。智能体可以用 `schedule {"action":"add", …}` 给自己安排
-任务。任务在重启后保留。
+`at_hhmm` 改为按 UTC 挂钟时间运行，而每个回答都以 `source: "schedule:t1"` 标记落入会话
+记录。智能体可以用 `schedule {"action":"add", …}` 给自己安排任务。任务在重启后保留。
 
 ## 清单
 
@@ -161,7 +163,8 @@ curl -sS -X POST http://<board>/api/sched -H 'Content-Type: application/json' -d
 添加硬件有三条路径：清单（不需要时序或状态机，在线生效）、编译驱动
 （`drivers/<chip>.rs`，用于状态机与严格时序），或板级配置（无法探测的事实，例如 LED 与
 按键用哪些引脚）。只有当探测到设备时才列出驱动，因此写了一半的驱动无法报告并不存在的硬
-件。[docs/adding-a-device.md](docs/adding-a-device.md) 覆盖这两条。
+件。校验在板上运行：参数范围与 `safety` 的每分钟上限会在引脚动作之前检查，越界的调用会
+返回它能接受的范围。[docs/adding-a-device.md](docs/adding-a-device.md) 覆盖这三条。
 
 ## 认证
 
@@ -193,7 +196,7 @@ cargo run -p esp32-agent-sim
 及检出好的 ESP-IDF。
 
 ```
-crates/agent-core/    hardware.rs (the trait) · drivers/ (one module per chip) ·
+crates/agent-core/    hardware.rs (the trait) · drivers/ (one module per chip) · boards.rs ·
                       manifest.rs · agent.rs + llm.rs · sched.rs · tools/ ·
                       http.rs · app.rs · sitemap.rs + settings.rs · virtual_board.rs
 crates/agent-sim/     the virtual board behind an HTTP port
