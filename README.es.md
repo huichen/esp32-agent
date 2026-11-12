@@ -24,6 +24,7 @@ marcha.
 | Actúa sin nadie delante | Prompts temporizados y reglas de sensores que lanzan un prompt cuando una lectura cruza un umbral. [Trabajo programado](docs/scheduling.md) |
 | Un shell y un lenguaje de script | `shell` con 55 comandos con nombres de NuttX, y un intérprete para bucles sobre llamadas a herramientas. [Shell](docs/shell.md) · [Script](docs/scripting.md) |
 | Recuerda lo que se le dijo | Órdenes permanentes, `/AGENTS.md`, un índice `/MEMORY.md` y habilidades, ensamblados en el prompt en cada turno. [Lo que el modelo ve en cada turno](docs/context.md) |
+| Llega con habilidades | Tres procedimientos en el firmware — escribir una habilidad, levantar el cableado, recuperar una placa que parece rota — que aparecen en `/skills` al primer arranque; lo que edites queda tuyo. [Skills](docs/agent-skills.md) |
 | Sin nube en el camino | HTTPS desde la placa, un certificado que genera ella misma, un PIN para tres invocadores. [Autenticación](docs/security.md) |
 | Comprobable sin hardware | El simulador ejecuta el mismo `agent-core` contra una placa virtual. [Simulador](docs/simulator.md) |
 
@@ -47,6 +48,8 @@ poner el PIN.
 **Desde un agente**: `GET http://<board>/agent.json` devuelve la interfaz en JSON: cada ruta
 con su método, cuerpo y autenticación, la superficie MCP, la tabla de ajustes con tipos y
 valores por defecto, y los límites. Un agente que sepa pedir una URL no necesita nada más.
+
+**Una placa nueva ya sabe tres cosas.** `/skills/create-skill` dice cómo el agente escribe su siguiente procedimiento, `/skills/pinout` cómo averiguar el cableado y anotarlo en `/MEMORY.md`, `/skills/recover-board` qué hacer cuando la placa parece rota. Son archivos normales del espacio de trabajo, instalados en el primer arranque donde la ruta esté vacía; un restablecimiento de fábrica los repone y `skills.seed_defaults=false` lo impide. La primera frase útil para una placa recién flasheada puede ser «apunta tu cableado».
 
 ## Dale un modelo
 
@@ -98,7 +101,7 @@ restricción más ajustada aquí.
 [API HTTP y MCP](docs/http-api.md) · [Añadir un dispositivo](docs/adding-a-device.md) · [Grabación](docs/flashing.md) ·
 [Solución de problemas](docs/troubleshooting.md) · [Bucle de agente](docs/agent-loop.md) · [Flujo](docs/agent-stream.md) ·
 [Skills](docs/agent-skills.md) · [Memoria](docs/agent-memory.md) · [Scripting](docs/scripting.md) ·
-[Model](docs/model.md) · [Web console](docs/web-console.md) · [Scheduling](docs/scheduling.md) · [Shell](docs/shell.md) · [Context layers](docs/context.md) · [Security](docs/security.md) · [Simulator](docs/simulator.md) · [Performance](docs/performance.md)
+[Model](docs/model.md) · [Web console](docs/web-console.md) · [Scheduling](docs/scheduling.md) · [Shell](docs/shell.md) · [Context layers](docs/context.md) · [Security](docs/security.md) · [Simulator](docs/simulator.md) · [Audio](docs/audio.md)
 
 ## Contribuir
 

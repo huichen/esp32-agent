@@ -137,6 +137,12 @@ const BOARD: &[Field] = &[
         "true",
         "keep the conversation in flash across a reboot; the stored tail is capped at 16 KB",
     ),
+    f(
+        "skills.seed_defaults",
+        "boolean",
+        "true",
+        "install the built-in skills into /skills on boot, wherever the file is missing; off means a deleted one stays deleted",
+    ),
 ];
 
 const SCHEDULE: &[Field] = &[
@@ -149,11 +155,6 @@ const SCHEDULE: &[Field] = &[
     f("rules[].path", "string", "", "which field of the result to watch"),
     f("rules[].above/below", "number", "", "threshold that fires"),
     f("rules[].min_interval_s", "integer", "", "rate limit"),
-];
-
-const GOAL: &[Field] = &[
-    f("goal", "string", "", "the objective; POST starts the loop"),
-    f("max_iterations", "integer", "10", "iterations before it stops"),
 ];
 
 const MEMORY: &[Field] = &[f("keep", "integer", "0", "exchanges to keep; 0 drops the whole conversation")];
@@ -182,12 +183,6 @@ pub const GROUPS: &[Group] = &[
         endpoint: "POST /api/sched",
         summary: "Recurring prompts and sensor-triggered rules; the board runs them itself",
         fields: SCHEDULE,
-    },
-    Group {
-        group: "goal",
-        endpoint: "POST /api/goal",
-        summary: "A long-running objective the board works on across runs",
-        fields: GOAL,
     },
     Group {
         group: "conversation",
@@ -284,6 +279,18 @@ mod tests {
             .expect("agent.persist_transcript is documented");
         assert_eq!(field.kind, "boolean");
         assert_eq!(field.default, "true", "the feature is on unless a board says otherwise");
+    }
+
+    #[test]
+    fn the_board_group_documents_the_skill_seed() {
+        let board = GROUPS.iter().find(|g| g.group == "board").expect("board group");
+        let field = board
+            .fields
+            .iter()
+            .find(|f| f.name == "skills.seed_defaults")
+            .expect("skills.seed_defaults is documented");
+        assert_eq!(field.kind, "boolean");
+        assert_eq!(field.default, "true", "a new board gets the skills unless it says otherwise");
     }
 
     #[test]

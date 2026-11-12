@@ -22,6 +22,7 @@
 | يعمل بلا مراقبة | موجّهات موقوتة وقواعد حسّاسات تُطلق موجّها عندما تتجاوز قراءة عتبة ما. [العمل المجدول](docs/scheduling.md) |
 | طرفية ولغة سكربت | `shell` بـ 55 أمرا بأسماء من NuttX، ومفسّر لحلقات على استدعاءات الأدوات. [Shell](docs/shell.md) · [Script](docs/scripting.md) |
 | يتذكر ما قيل له | أوامر دائمة، و`/AGENTS.md`، وفهرس `/MEMORY.md`، ومهارات، تُجمَع في الموجّه في كل دورة. [ما يراه النموذج دائما](docs/context.md) |
+| تأتي بمهارات | ثلاثة إجراءات داخل البرنامج الثابت — كتابة مهارة، وحصر التوصيلات، وإنقاذ لوحة تبدو معطلة — تُثبَّت في `/skills` عند أول إقلاع؛ وما تحرره يبقى لك. [Skills](docs/agent-skills.md) |
 | لا سحابة في الطريق | HTTPS من اللوحة، وشهادة تولّدها بنفسها، ورقم PIN واحد لثلاثة مستدعين. [المصادقة](docs/security.md) |
 | قابل للاختبار بلا عتاد | المحاكي يشغّل `agent-core` نفسه على لوحة افتراضية. [المحاكي](docs/simulator.md) |
 
@@ -43,6 +44,8 @@ espflash write-bin --chip esp32s3 --flash-size 16mb 0x0 esp32-agent-vX.Y.Z.bin
 **من وكيل**: `GET http://<board>/agent.json` يعيد الواجهة بصيغة JSON: كل مسار بطريقته وجسمه
 ومصادقته، وسطح MCP، وجدول الإعدادات بأنواعها وقيمها الافتراضية، والحدود. وكيل يستطيع جلب رابط
 واحد لا يحتاج شيئا آخر.
+
+**اللوحة الجديدة تعرف ثلاثة أشياء مسبقا.** `/skills/create-skill` يشرح كيف يكتب الوكيل إجراءه التالي، و`/skills/pinout` كيف يحصر التوصيلات ويسجلها في `/MEMORY.md`، و`/skills/recover-board` ما يُفعل حين تبدو اللوحة معطلة. وهي ملفات عادية في مساحة العمل تُثبَّت عند أول إقلاع حيث يكون المسار فارغا؛ وإعادة ضبط المصنع تعيدها، و`skills.seed_defaults=false` يمنع ذلك. وأول جملة مفيدة للوحة حديثة التثبيت قد تكون «اكتب توصيلاتك».
 
 ## أعطه نموذجا
 
@@ -91,7 +94,7 @@ espflash write-bin --chip esp32s3 --flash-size 16mb 0x0 esp32-agent-vX.Y.Z.bin
 [HTTP وMCP](docs/http-api.md) · [إضافة جهاز](docs/adding-a-device.md) · [الحرق](docs/flashing.md) ·
 [استكشاف الأخطاء](docs/troubleshooting.md) · [حلقة الوكيل](docs/agent-loop.md) · [التدفق](docs/agent-stream.md) ·
 [المهارات](docs/agent-skills.md) · [الذاكرة](docs/agent-memory.md) · [Scripting](docs/scripting.md) ·
-[Model](docs/model.md) · [Web console](docs/web-console.md) · [Scheduling](docs/scheduling.md) · [Shell](docs/shell.md) · [Context layers](docs/context.md) · [Security](docs/security.md) · [Simulator](docs/simulator.md) · [Performance](docs/performance.md)
+[Model](docs/model.md) · [Web console](docs/web-console.md) · [Scheduling](docs/scheduling.md) · [Shell](docs/shell.md) · [Context layers](docs/context.md) · [Security](docs/security.md) · [Simulator](docs/simulator.md) · [Audio](docs/audio.md)
 
 ## المساهمة
 

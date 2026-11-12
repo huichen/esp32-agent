@@ -507,6 +507,13 @@ function handleEvent(name, data) {
       }
       break;
     }
+    case "retried": {
+      // One line, once per model call: a retry that worked is not a failure, so it goes in
+      // the collapsed trace rather than in a toast, and the failed attempts never appear.
+      const box = ensureLiveTrace();
+      chip(box, "retried", [["why", data.text || "the model request was retried"]]);
+      break;
+    }
     case "error":
       toast(data.text || "run failed");
       break;
@@ -528,7 +535,7 @@ function handleEvent(name, data) {
 const EVENT_KINDS = [
   "message_start", "thinking_start", "thinking_delta", "thinking_end",
   "text_start", "text_delta", "text_end", "tool_use", "tool_progress",
-  "tool_result", "usage", "message_end", "error", "run_end",
+  "tool_result", "retried", "usage", "message_end", "error", "run_end",
 ];
 
 function connectStream() {
@@ -819,7 +826,7 @@ function init() {
 
   // One image per message. It is downscaled in the browser, because what crosses the LAN
   // has to fit the request the board can send and the heap it can spare.
-  // A run can start without this page — a schedule, a goal, another client — and the event
+  // A run can start without this page — a schedule, another client — and the event
 // stream only follows the run this page asked for. So look every 20 s, and only redraw
 // when the transcript actually changed: a phone should not spend its battery on a page
 // that has nothing new to say.
