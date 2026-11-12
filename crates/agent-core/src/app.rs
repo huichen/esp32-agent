@@ -84,6 +84,13 @@ pub const GOAL_BLOB_MAX: usize = 3500;
 pub const WORKSPACE_FILE_MAX: usize = 2048;
 pub const WORKSPACE_TOTAL_MAX: usize = 8192;
 
+/// The longest `sleep` / `usleep` waits this board will actually wait.
+///
+/// One loop serves the MCP endpoint, the portal and the agent, so a sleeping command
+/// blocks everything else — a `sleep 30` would look like a hung device. The cap is what
+/// keeps the command useful without letting it become an outage.
+pub const MAX_SHELL_SLEEP_MS: u64 = 10_000;
+
 /// How many scheduled prompts and sensor rules the board keeps. The scheduler
 /// tick walks both lists on every tick, so this is bounded like everything else.
 pub const MAX_TASKS: usize = 8;
@@ -224,6 +231,12 @@ pub struct App {
     pub rules: Vec<SensorRule>,
     /// The workspace behind the `fs_*` tools.
     pub workspace: AppWorkspace,
+    /// `setenv`/`env`/`unsetenv`: variables that live in this `App` and nowhere else.
+    ///
+    /// Deliberately *not* in [`Config`]: a shell variable is not a setting, it is state one
+    /// session made up, and writing it to NVS would turn a typo into a boot-time fact.
+    /// Nothing here is persisted, and `env` says so.
+    pub shell_env: std::collections::BTreeMap<String, String>,
     /// Script runs submitted over HTTP, newest last. Bounded: this is a queue for a
     /// person or an external agent, not for anything that retries in a loop.
     pub scripts: Vec<ScriptJob>,
@@ -322,6 +335,7 @@ impl App {
             tool_specs_cache: std::cell::RefCell::new(None),
             script_seq: 0,
             workspace: AppWorkspace::default(),
+            shell_env: std::collections::BTreeMap::new(),
             goal: idle_goal(),
             turn_source: String::new(),
             tool_transport: None,
@@ -3505,7 +3519,13 @@ impl App {
             };
             return Ok(json!({ "help": text }).to_string());
         }
-        let mut inner = crate::tools::shell::arguments(&parsed)?;
+        // A missing argument is a wrong command line like any other, so it answers with the
+        // usage line too: `cp` with one word should not be the one error that stays silent
+        // about how the command is written.
+        let mut inner = match crate::tools::shell::arguments(&parsed) {
+            Ok(inner) => inner,
+            Err(e) => return Err(with_usage(&op, e)),
+        };
         if args.get("help").and_then(|v| v.as_bool()).unwrap_or(false) {
             inner["help"] = json!(true);
         }
@@ -3531,6 +3551,28 @@ impl App {
             "shell_sha256sum" => self.shell_hash(&inner, true),
             "shell_md5sum" => self.shell_hash(&inner, false),
             "shell_system_prompt" => self.shell_system_prompt(&inner),
+            "shell_wc" => self.shell_wc(&inner),
+            "shell_head" => self.shell_head(&inner),
+            "shell_cut" => self.shell_cut(&inner),
+            "shell_sort" => self.shell_sort(&inner),
+            "shell_uniq" => self.shell_uniq(&inner),
+            "shell_tr" => self.shell_tr(&inner),
+            "shell_tee" => self.shell_tee(&inner),
+            "shell_touch" => self.shell_touch(&inner),
+            "shell_du" => Ok(self.shell_du()),
+            "shell_strings" => self.shell_strings(&inner),
+            "shell_sleep" => self.shell_sleep(&inner),
+            "shell_jot" => self.shell_jot(&inner),
+            "shell_crc32" => self.shell_crc32(&inner),
+            "shell_hostname" => self.shell_hostname(&inner),
+            "shell_whoami" => Ok(self.shell_whoami()),
+            "shell_id" => Ok(self.shell_id()),
+            "shell_env" => self.shell_env(&inner),
+            "shell_netstat" => Ok(self.shell_netstat()),
+            "shell_route" => Ok(self.shell_route()),
+            "shell_arp" => Ok(self.shell_arp()),
+            "shell_type" => self.shell_type(&inner),
+            "shell_help" => Ok(json!({ "help": crate::tools::shell::help_text() }).to_string()),
             other => self.fs_or_net_call(other, &inner),
         };
         result.map_err(|e| {
@@ -3743,19 +3785,29 @@ impl App {
             return Err("`path` is required".into());
         }
         let width = args.get("width").and_then(|v| v.as_u64()).unwrap_or(16).clamp(4, 32) as usize;
+        // `od` and `hexdump` are the same walk over the same bytes; the base is the only
+        // difference, and `od` is the one that prints octal.
+        let octal = args.get("octal").and_then(|v| v.as_bool()).unwrap_or(false);
         let data = fs_tools::Workspace::read(&self.workspace, path)?.into_bytes();
-        // A tool result is 2 KB; four columns per byte would eat 70 bytes per line, so dump
+        // A tool result is 2 KB; a column per byte eats 4 (octal) or 5 (hex) bytes, so dump
         // as much as arrives whole and say what was left out.
-        let lines_that_fit = 1800 / (width * 5 + 12);
+        let lines_that_fit = 1800 / (width * if octal { 4 } else { 5 } + 12);
         let mut out = String::new();
         for (row, chunk) in data.chunks(width).enumerate() {
             if row >= lines_that_fit {
                 out.push_str(&format!("… {} more bytes\n", data.len() - row * width));
                 break;
             }
-            out.push_str(&format!("{:04x}  ", row * width));
-            for byte in chunk {
-                out.push_str(&format!("{byte:02x} "));
+            if octal {
+                out.push_str(&format!("{:07o}  ", row * width));
+                for byte in chunk {
+                    out.push_str(&format!("{byte:03o} "));
+                }
+            } else {
+                out.push_str(&format!("{:04x}  ", row * width));
+                for byte in chunk {
+                    out.push_str(&format!("{byte:02x} "));
+                }
             }
             out.push_str(" |");
             for byte in chunk {
@@ -3763,7 +3815,8 @@ impl App {
             }
             out.push_str("|\n");
         }
-        Ok(serde_json::json!({ "path": path, "bytes": data.len(), "hexdump": out }).to_string())
+        Ok(serde_json::json!({ "path": path, "bytes": data.len(), "octal": octal, "hexdump": out })
+            .to_string())
     }
 
     /// `base64`: encode a file to base64, or decode base64 back into one.
@@ -3878,6 +3931,559 @@ impl App {
         }
         Ok(json!({ "entries": out, "count": out.len() }).to_string())
     }
+
+    // ------------------------------------------------- the text filters, one file at a time
+
+    // A pipe would carry the text from one command to the next; this board has none, so
+    // every filter below opens a file and every one of them is one call. That is the whole
+    // reason these exist separately from `grep`: the model can still ask "how many lines",
+    // it just has to name the file it is asking about.
+
+    /// The `path` argument, or the error that names the command that wanted it.
+    fn shell_path(args: &Value, op: &str) -> std::result::Result<String, String> {
+        let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+        if path.is_empty() {
+            return Err(format!("{op}: `path` is required"));
+        }
+        Ok(path)
+    }
+
+    /// `wc [-l|-w|-c] <path>`: lines, words or bytes, whichever was asked for.
+    fn shell_wc(&mut self, args: &Value) -> std::result::Result<String, String> {
+        let path = App::shell_path(args, "wc")?;
+        let text = fs_tools::Workspace::read(&self.workspace, &path)?;
+        let lines = text.lines().count();
+        let words = text.split_whitespace().count();
+        let bytes = text.len();
+        let mode = args.get("mode").and_then(|v| v.as_str()).unwrap_or("");
+        let mut out = json!({ "path": path });
+        match mode {
+            // One flag prints one number, the way `wc -l` does.
+            "lines" | "words" | "bytes" => {
+                let count = match mode {
+                    "lines" => lines,
+                    "words" => words,
+                    _ => bytes,
+                };
+                out["count"] = json!(count);
+                out["unit"] = json!(mode);
+            }
+            // No flag prints all three, which is what plain `wc` answers.
+            _ => {
+                out["lines"] = json!(lines);
+                out["words"] = json!(words);
+                out["bytes"] = json!(bytes);
+            }
+        }
+        Ok(out.to_string())
+    }
+
+    /// `head` / `tail [-n N] <path>`: the first or last `N` lines, default 10.
+    fn shell_head(&mut self, args: &Value) -> std::result::Result<String, String> {
+        let tail = args.get("tail").and_then(|v| v.as_bool()).unwrap_or(false);
+        let path = App::shell_path(args, if tail { "tail" } else { "head" })?;
+        let text = fs_tools::Workspace::read(&self.workspace, &path)?;
+        let want = args
+            .get("lines")
+            .and_then(|v| v.as_u64().or_else(|| v.as_str().and_then(|s| s.trim().parse().ok())))
+            .unwrap_or(10)
+            .clamp(1, 200) as usize;
+        let all: Vec<&str> = text.lines().collect();
+        let start = if tail { all.len().saturating_sub(want) } else { 0 };
+        let end = if tail { all.len() } else { want.min(all.len()) };
+        let picked = &all[start..end];
+        Ok(json!({
+            "path": path,
+            "tail": tail,
+            "lines": picked.len(),
+            "total_lines": all.len(),
+            "truncated": picked.len() < all.len(),
+            "text": picked.join("\n"),
+        })
+        .to_string())
+    }
+
+    /// `cut -d <delimiter> -f <field> <path>`: one column out of every line.
+    fn shell_cut(&mut self, args: &Value) -> std::result::Result<String, String> {
+        let path = App::shell_path(args, "cut")?;
+        let delimiter = args.get("delimiter").and_then(|v| v.as_str()).unwrap_or("\t").to_string();
+        let mut chars = delimiter.chars();
+        let delim = chars.next().unwrap_or('\t');
+        if chars.next().is_some() {
+            return Err("cut: the delimiter is one character".into());
+        }
+        let field = args
+            .get("field")
+            .and_then(|v| v.as_u64().or_else(|| v.as_str().and_then(|s| s.trim().parse().ok())))
+            .unwrap_or(1) as usize;
+        if field == 0 {
+            return Err("cut: fields are numbered from 1".into());
+        }
+        let text = fs_tools::Workspace::read(&self.workspace, &path)?;
+        let mut out: Vec<&str> = Vec::new();
+        let mut missing = 0usize;
+        for line in text.lines() {
+            match line.split(delim).nth(field - 1) {
+                Some(value) => out.push(value),
+                None => missing += 1,
+            }
+        }
+        Ok(json!({
+            "path": path,
+            "delimiter": delim.to_string(),
+            "field": field,
+            "lines": out.len(),
+            "lines_without_that_field": missing,
+            "text": out.join("\n"),
+        })
+        .to_string())
+    }
+
+    /// `sort [-r] [-u] <path>`: byte order, like `LC_ALL=C sort`.
+    fn shell_sort(&mut self, args: &Value) -> std::result::Result<String, String> {
+        let path = App::shell_path(args, "sort")?;
+        let reverse = args.get("reverse").and_then(|v| v.as_bool()).unwrap_or(false);
+        let unique = args.get("unique").and_then(|v| v.as_bool()).unwrap_or(false);
+        let text = fs_tools::Workspace::read(&self.workspace, &path)?;
+        let mut lines: Vec<&str> = text.lines().collect();
+        lines.sort_unstable();
+        if reverse {
+            lines.reverse();
+        }
+        let before = lines.len();
+        if unique {
+            lines.dedup();
+        }
+        Ok(json!({
+            "path": path,
+            "lines": lines.len(),
+            "duplicates_removed": before - lines.len(),
+            "text": lines.join("\n"),
+        })
+        .to_string())
+    }
+
+    /// `uniq <path>`: collapse *adjacent* repeats, which is what `uniq` means.
+    fn shell_uniq(&mut self, args: &Value) -> std::result::Result<String, String> {
+        let path = App::shell_path(args, "uniq")?;
+        let text = fs_tools::Workspace::read(&self.workspace, &path)?;
+        let mut lines: Vec<&str> = Vec::new();
+        for line in text.lines() {
+            if lines.last() != Some(&line) {
+                lines.push(line);
+            }
+        }
+        Ok(json!({
+            "path": path,
+            "lines": lines.len(),
+            "removed": text.lines().count().saturating_sub(lines.len()),
+            "text": lines.join("\n"),
+            "note": "adjacent repeats only, as uniq does; pipe it through `sort -u` to collapse all",
+        })
+        .to_string())
+    }
+
+    /// `tr <from> <to> <path>`: character for character, literal characters only.
+    fn shell_tr(&mut self, args: &Value) -> std::result::Result<String, String> {
+        let from = args.get("from").and_then(|v| v.as_str()).unwrap_or("");
+        let to = args.get("to").and_then(|v| v.as_str()).unwrap_or("");
+        if from.is_empty() {
+            return Err("tr: `from` is required".into());
+        }
+        if to.is_empty() {
+            return Err("tr: `to` is required (deleting a set is not implemented)".into());
+        }
+        let path = App::shell_path(args, "tr")?;
+        let text = fs_tools::Workspace::read(&self.workspace, &path)?;
+        // `tr` repeats the last character of SET2 when SET2 is shorter; ranges are *not*
+        // expanded, so `a-z` is three literal characters and the result says so.
+        let mut map: std::collections::BTreeMap<char, char> = std::collections::BTreeMap::new();
+        let mut replacement = to.chars();
+        let mut last = to.chars().last().unwrap_or(' ');
+        for c in from.chars() {
+            if let Some(r) = replacement.next() {
+                last = r;
+            }
+            map.insert(c, last);
+        }
+        let mut out = String::with_capacity(text.len());
+        let mut changed = 0usize;
+        for c in text.chars() {
+            match map.get(&c) {
+                Some(r) => {
+                    if *r != c {
+                        changed += 1;
+                    }
+                    out.push(*r);
+                }
+                None => out.push(c),
+            }
+        }
+        Ok(json!({
+            "path": path,
+            "from": from,
+            "to": to,
+            "chars_changed": changed,
+            "text": out,
+            "note": "literal characters only: `a-z` is three characters here, not a range",
+        })
+        .to_string())
+    }
+
+    /// `tee <path> -i <text>`: write the text and echo it, since there is no pipe to fill.
+    fn shell_tee(&mut self, args: &Value) -> std::result::Result<String, String> {
+        let path = App::shell_path(args, "tee")?;
+        let input = args.get("input").and_then(|v| v.as_str()).unwrap_or("");
+        if input.is_empty() {
+            return Err("tee: `-i <text>` is required — this board has no pipe to read".into());
+        }
+        fs_tools::Workspace::write(&mut self.workspace, &path, input)?;
+        self.persist_workspace();
+        Ok(json!({
+            "path": path,
+            "bytes": input.len(),
+            "text": input,
+            "note": "tee without a pipe: the text is an argument, and it is both written and echoed",
+        })
+        .to_string())
+    }
+
+    /// `touch <path>`: create an empty file. There is no mtime to move, and it says so.
+    fn shell_touch(&mut self, args: &Value) -> std::result::Result<String, String> {
+        let path = App::shell_path(args, "touch")?;
+        let exists = fs_tools::Workspace::read(&self.workspace, &path).is_ok();
+        if !exists {
+            fs_tools::Workspace::write(&mut self.workspace, &path, "")?;
+            self.persist_workspace();
+        }
+        Ok(json!({
+            "path": path,
+            "created": !exists,
+            "exists": true,
+            "mtime": Value::Null,
+            "note": if exists {
+                "the file is already there; the workspace stores text and no timestamps, so there is no mtime to update"
+            } else {
+                "created empty; the workspace keeps no timestamps"
+            },
+        })
+        .to_string())
+    }
+
+    /// `du`: the workspace, file by file, biggest first.
+    fn shell_du(&self) -> String {
+        let json = self.workspace.to_json();
+        let mut files: Vec<(String, usize)> = json["files"]
+            .as_object()
+            .map(|map| {
+                map.iter().map(|(path, text)| (path.clone(), text.as_str().unwrap_or("").len())).collect()
+            })
+            .unwrap_or_default();
+        files.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        let total: usize = files.iter().map(|(_, bytes)| bytes).sum();
+        json!({
+            "count": files.len(),
+            "bytes": total,
+            "limit_bytes": WORKSPACE_TOTAL_MAX,
+            "files": files.iter().map(|(path, bytes)| json!({ "path": path, "bytes": bytes })).collect::<Vec<_>>(),
+            "note": "one storage area: there are no directories to total separately",
+        })
+        .to_string()
+    }
+
+    /// `strings [-n <min>] <path>`: the printable runs, shortest useful one first.
+    fn shell_strings(&mut self, args: &Value) -> std::result::Result<String, String> {
+        let path = App::shell_path(args, "strings")?;
+        let min = args
+            .get("min")
+            .and_then(|v| v.as_u64().or_else(|| v.as_str().and_then(|s| s.trim().parse().ok())))
+            .unwrap_or(4)
+            .clamp(2, 64) as usize;
+        let data = fs_tools::Workspace::read(&self.workspace, &path)?.into_bytes();
+        let mut found: Vec<String> = Vec::new();
+        let mut run = String::new();
+        let mut budget = 1600usize;
+        // A NUL past the end closes a run that reaches the last byte.
+        for byte in data.iter().chain(std::iter::once(&0u8)) {
+            if (0x20..0x7f).contains(byte) || *byte == b'\t' {
+                run.push(*byte as char);
+                continue;
+            }
+            if run.len() >= min && budget >= run.len() {
+                budget -= run.len();
+                found.push(std::mem::take(&mut run));
+            } else {
+                run.clear();
+            }
+        }
+        let mut out = json!({
+            "path": path,
+            "min": min,
+            "bytes": data.len(),
+            "strings": found,
+        });
+        if found.is_empty() {
+            out["note"] = json!(format!("no printable run of {min} or more bytes"));
+        }
+        Ok(out.to_string())
+    }
+
+    /// `sleep <s>` / `usleep <ms>`: a real wait, capped, because it blocks the one loop.
+    fn shell_sleep(&mut self, args: &Value) -> std::result::Result<String, String> {
+        let ms_unit = args.get("unit").and_then(|v| v.as_str()) == Some("ms");
+        let op = if ms_unit { "usleep" } else { "sleep" };
+        let raw = args.get("value").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+        let (wanted, ms) = plan_sleep(ms_unit, &raw).map_err(|e| format!("{op}: {e}"))?;
+        std::thread::sleep(Duration::from_millis(ms));
+        Ok(json!({
+            "slept_ms": ms,
+            "requested_ms": wanted,
+            "clamped": ms < wanted,
+            "note": "one loop serves the endpoint, the portal and the agent: the wait is capped at 10 s so it cannot look like a hang",
+        })
+        .to_string())
+    }
+
+    /// `jot <count> [start [step]]`: a sequence, because the shell has no `for`.
+    fn shell_jot(&mut self, args: &Value) -> std::result::Result<String, String> {
+        let count = arg_number(args, "count").ok_or("jot: `count` must be a number")?;
+        let start = arg_number(args, "start").unwrap_or(1.0);
+        let step = arg_number(args, "step").unwrap_or(1.0);
+        let count = (count.round() as i64).clamp(1, 100);
+        let numbers: Vec<String> =
+            (0..count).map(|i| plain_number(start + step * i as f64)).collect::<Vec<_>>();
+        Ok(json!({
+            "count": count,
+            "start": plain_number(start),
+            "step": plain_number(step),
+            "numbers": numbers,
+            "text": numbers.join(" "),
+        })
+        .to_string())
+    }
+
+    /// `crc32 <path>`: the same CRC-32 the zip writer already uses, so there is one of it.
+    fn shell_crc32(&mut self, args: &Value) -> std::result::Result<String, String> {
+        let path = App::shell_path(args, "crc32")?;
+        let bytes = fs_tools::Workspace::read(&self.workspace, &path)?.into_bytes();
+        let crc = crate::zlib::crc32(&bytes);
+        Ok(json!({
+            "path": path,
+            "bytes": bytes.len(),
+            "crc32": format!("{crc:08x}"),
+            "note": "CRC-32 (IEEE), the checksum a zip entry carries",
+        })
+        .to_string())
+    }
+
+    /// `hostname [name]`: the name the network sees, read from or written to the config.
+    fn shell_hostname(&mut self, args: &Value) -> std::result::Result<String, String> {
+        let wanted = args.get("name").and_then(|v| v.as_str()).map(|s| s.trim().to_string());
+        match wanted {
+            Some(name) if !name.is_empty() => {
+                if name.len() > 32 {
+                    return Err("hostname: at most 32 characters".into());
+                }
+                if name.chars().any(|c| !(c.is_ascii_alphanumeric() || c == '-' || c == '.')) {
+                    return Err("hostname: letters, digits, `-` and `.` only".into());
+                }
+                let previous = self.cfg.wifi.hostname.clone();
+                self.cfg.wifi.hostname = name.clone();
+                self.persist_config();
+                Ok(json!({
+                    "hostname": name,
+                    "previous": previous,
+                    "saved": true,
+                    "note": "saved to the config; the DHCP lease carries the new name after the next reconnect",
+                })
+                .to_string())
+            }
+            _ => Ok(json!({
+                "hostname": self.cfg.wifi.hostname,
+                "device_name": self.cfg.device_name,
+                "note": "this is the interface name; `whoami` answers with the device name",
+            })
+            .to_string()),
+        }
+    }
+
+    /// `whoami`: the device name, because the board has one account and no login.
+    fn shell_whoami(&self) -> String {
+        json!({
+            "whoami": self.cfg.device_name,
+            "note": "one account and no login: this is the name the portal and MCP `initialize` show",
+        })
+        .to_string()
+    }
+
+    /// `id`: uid 0 / gid 0, and nothing more to say than that.
+    fn shell_id(&self) -> String {
+        json!({
+            "uid": 0,
+            "gid": 0,
+            "user": "root",
+            "groups": [0],
+            "note": "one user, no passwords and no permission bits: every tool runs as uid 0",
+            "device_name": self.cfg.device_name,
+        })
+        .to_string()
+    }
+
+    /// `env` / `setenv` / `unsetenv`: variables for this `App`, in RAM, nowhere else.
+    fn shell_env(&mut self, args: &Value) -> std::result::Result<String, String> {
+        let action = args.get("action").and_then(|v| v.as_str()).unwrap_or("list");
+        match action {
+            "list" => Ok(json!({
+                "count": self.shell_env.len(),
+                "vars": self.shell_env,
+                "persisted": false,
+                "note": "session variables: they live in RAM until the next boot and are never written to NVS",
+            })
+            .to_string()),
+            "set" => {
+                let key = args.get("key").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+                let value = args.get("value").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                if key.is_empty() {
+                    return Err("setenv: `key` is required".into());
+                }
+                if !key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+                    return Err("setenv: a key is letters, digits and `_`".into());
+                }
+                let previous = self.shell_env.insert(key.clone(), value.clone());
+                Ok(json!({
+                    "key": key,
+                    "value": value,
+                    "previous": previous,
+                    "persisted": false,
+                    "note": "this session only: nothing about it reaches NVS, and the config is untouched",
+                })
+                .to_string())
+            }
+            "unset" => {
+                let key = args.get("key").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+                if key.is_empty() {
+                    return Err("unsetenv: `key` is required".into());
+                }
+                let existed = self.shell_env.remove(&key);
+                Ok(json!({ "key": key, "removed": existed.is_some(), "persisted": false }).to_string())
+            }
+            other => Err(format!("env: unknown action `{other}`")),
+        }
+    }
+
+    /// `netstat`: the sessions and counters this build keeps, and no invented socket table.
+    fn shell_netstat(&self) -> String {
+        let sessions: Vec<Value> = self
+            .runtime
+            .sessions
+            .iter()
+            .map(|s| {
+                json!({
+                    "id": s.id,
+                    "client": s.client,
+                    "protocol": s.protocol,
+                    "initialized": s.initialized,
+                    "requests": s.requests,
+                    "age_s": now_ms().saturating_sub(s.created_ms) / 1000,
+                    "idle_s": now_ms().saturating_sub(s.last_seen_ms) / 1000,
+                })
+            })
+            .collect();
+        json!({
+            "listen": {
+                "enabled": self.cfg.mcp.enabled,
+                "port": self.cfg.mcp.port,
+                "path": self.cfg.mcp.path,
+                "max_sessions": self.cfg.mcp.max_sessions,
+            },
+            "sessions": sessions,
+            "session_count": self.runtime.sessions.len(),
+            "counters": self.runtime.counters_json(),
+            "sockets": Vec::<Value>::new(),
+            "note": "this build does not expose lwIP's socket table, so open connections cannot be listed: sessions and counters are what there is",
+        })
+        .to_string()
+    }
+
+    /// `route`: the configured gateway, which is the one thing that answers "is my override on".
+    fn shell_route(&mut self) -> String {
+        let wifi = self.hw.wifi_status();
+        let gateway = self.cfg.wifi.gateway.trim().to_string();
+        json!({
+            "destination": "default",
+            "gateway": if gateway.is_empty() { Value::Null } else { json!(gateway) },
+            "source": if gateway.is_empty() { "DHCP lease" } else { "configured" },
+            "interface": "wlan0",
+            "state": wifi.state,
+            "ip": wifi.ip,
+            "netmask": self.cfg.wifi.netmask,
+            "dns": [self.cfg.wifi.dns, self.cfg.wifi.dns2],
+            "note": "one interface and one default route, so this is not a table: an empty gateway means the lease's",
+        })
+        .to_string()
+    }
+
+    /// `arp`: an empty table and the reason, rather than an invented neighbour list.
+    fn shell_arp(&self) -> String {
+        json!({
+            "entries": Vec::<Value>::new(),
+            "count": 0,
+            "available": false,
+            "note": "lwIP's ARP table is not reachable from ESP-IDF on this build, so neighbours cannot be listed — this is empty because the board cannot see them, not because there are none",
+        })
+        .to_string()
+    }
+
+    /// `type` / `which <name>`: is this a shell command, a tool, or nothing?
+    fn shell_type(&mut self, args: &Value) -> std::result::Result<String, String> {
+        let wanted = args.get("name").and_then(|v| v.as_str()).unwrap_or("").trim().to_ascii_lowercase();
+        if wanted.is_empty() {
+            return Err("type: `name` is required".into());
+        }
+        let which = args.get("which").and_then(|v| v.as_bool()).unwrap_or(false);
+        let command = crate::tools::shell::route(&wanted);
+        let registered = self.tools.get(&wanted).map(|def| def.spec.clone());
+        // The tools `call_tool` dispatches by name instead of through the registry: they
+        // need the app's own state (the workspace, the attachments, the model), so a
+        // registry lookup alone would call `read` nothing.
+        const STANDALONE: &[&str] = &["read", "write", "edit", "image_read", "script"];
+        let standalone = STANDALONE.contains(&wanted.as_str());
+        let is_tool = registered.is_some() || standalone;
+        let kind = match (command.is_some(), is_tool) {
+            (true, true) => "shell command and tool",
+            (true, false) => "shell command",
+            (false, true) => "tool",
+            (false, false) => "nothing",
+        };
+        let mut out = json!({
+            "name": wanted,
+            "kind": kind,
+            "shell_command": command.is_some(),
+            "tool": is_tool,
+            "registered": registered.is_some(),
+            "looked_in": "the shell command table, the tool registry and the tools dispatched by name (there is no PATH on this board)",
+        });
+        if let Some(handler) = command {
+            out["handler"] = json!(handler);
+            // `which` says where it is; `type` says how to write it.
+            if !which {
+                out["usage"] = json!(crate::tools::shell::usage(&wanted).unwrap_or(""));
+            }
+        }
+        if let Some(spec) = registered {
+            out["title"] = json!(spec.title);
+            out["category"] = json!(spec.category);
+            out["description"] = json!(spec.description);
+        }
+        if standalone {
+            out["dispatched"] = json!("by name in call_tool, because it needs the app's own state");
+        }
+        if kind == "nothing" {
+            out["note"] =
+                json!("no shell command and no tool of that name; `help` lists the commands, `tools_list` the tools");
+        }
+        Ok(out.to_string())
+    }
 }
 
 /// `YYYY-MM-DD HH:MM:SS` in UTC, from a unix time. No library: the board only needs this
@@ -3908,6 +4514,40 @@ fn with_usage(name: &str, error: String) -> String {
     match crate::tools::shell::usage(name) {
         Some(line) if !error.contains("usage:") => format!("{error}\n\nusage: {line}"),
         _ => error,
+    }
+}
+
+/// `sleep`/`usleep`: how long was asked for, and how long this board will wait.
+///
+/// Split out of the handler so the cap can be tested without a test that takes ten
+/// seconds: the waiting is the one thing a test should not do to prove arithmetic.
+fn plan_sleep(ms_unit: bool, raw: &str) -> std::result::Result<(u64, u64), String> {
+    let value: f64 = raw.parse().map_err(|_| format!("`{raw}` is not a number"))?;
+    if !value.is_finite() {
+        return Err(format!("`{raw}` is not a number"));
+    }
+    if value < 0.0 {
+        return Err("a negative wait is not a wait".to_string());
+    }
+    let wanted = (if ms_unit { value } else { value * 1000.0 }).round() as u64;
+    Ok((wanted, wanted.min(MAX_SHELL_SLEEP_MS)))
+}
+
+/// A number argument, whether the command line handed it over as text or as a number.
+fn arg_number(args: &Value, key: &str) -> Option<f64> {
+    match args.get(key) {
+        Some(Value::Number(n)) => n.as_f64(),
+        Some(Value::String(s)) => s.trim().parse().ok(),
+        _ => None,
+    }
+}
+
+/// `3` rather than `3.0`, and `1.5` rather than `1.5000000000000002`:
+fn plain_number(value: f64) -> String {
+    if (value - value.round()).abs() < 1e-9 {
+        format!("{}", value.round() as i64)
+    } else {
+        format!("{value}")
     }
 }
 
@@ -5652,6 +6292,370 @@ mod tests {
         assert!(err.message.contains("usage: read <path>"), "{}", err.message);
         let help = app.call_tool("ping", &json!({"help":true})).unwrap();
         assert_eq!(help["help"], json!("usage: ping <host> [-c <count>]"));
+    }
+
+    // ---- the commands added to grow `nsh` past the original set (docs/shell.md) ----
+
+    /// One shell command, with its JSON answer. Every command answers with JSON text, so a
+    /// test reads fields instead of substrings wherever the shape is the thing under test.
+    fn sh(app: &mut App, line: &str) -> Value {
+        let out = ToolHost::call_tool(app, "shell", &json!({ "command": line }))
+            .unwrap_or_else(|e| panic!("`{line}` failed: {e}"));
+        serde_json::from_str(&out).unwrap_or_else(|_| json!({ "text": out }))
+    }
+
+    fn write_file(app: &mut App, path: &str, text: &str) {
+        ToolHost::call_tool(app, "write", &json!({"path": path, "text": text})).expect("write");
+    }
+
+    /// `cat` is `read` under the name a person types, and a missing file says so with the
+    /// usage line attached.
+    #[test]
+    fn cat_answers_what_read_answers() {
+        let mut app = test_app();
+        write_file(&mut app, "/note.txt", "a note\n");
+        let cat = sh(&mut app, "cat /note.txt");
+        assert_eq!(cat["text"], json!("a note\n"));
+        let read = ToolHost::call_tool(&mut app, "read", &json!({"path": "/note.txt"})).expect("read");
+        let read: Value = serde_json::from_str(&read).unwrap();
+        assert_eq!(read["text"], cat["text"], "the same file, the same answer");
+        let err = ToolHost::call_tool(&mut app, "shell", &json!({"command": "cat /nope"})).unwrap_err();
+        assert!(err.contains("usage: cat <path>"), "{err}");
+    }
+
+    #[test]
+    fn wc_counts_lines_words_and_bytes() {
+        let mut app = test_app();
+        write_file(&mut app, "/w.txt", "one two\nthree\n");
+        let all = sh(&mut app, "wc /w.txt");
+        assert_eq!(all["lines"], json!(2), "{all}");
+        assert_eq!(all["words"], json!(3), "{all}");
+        assert_eq!(all["bytes"], json!(14), "{all}");
+        assert_eq!(sh(&mut app, "wc -l /w.txt")["count"], json!(2));
+        assert_eq!(sh(&mut app, "wc -w /w.txt")["count"], json!(3));
+        assert_eq!(sh(&mut app, "wc -c /w.txt")["count"], json!(14), "-c is the path too");
+    }
+
+    #[test]
+    fn head_takes_the_first_lines() {
+        let mut app = test_app();
+        write_file(&mut app, "/h.txt", "1\n2\n3\n4\n");
+        let out = sh(&mut app, "head -n 2 /h.txt");
+        assert_eq!(out["text"], json!("1\n2"), "{out}");
+        assert_eq!(out["truncated"], json!(true));
+        assert_eq!(sh(&mut app, "head /h.txt")["lines"], json!(4), "default keeps everything that fits");
+    }
+
+    #[test]
+    fn tail_takes_the_last_lines() {
+        let mut app = test_app();
+        write_file(&mut app, "/t.txt", "1\n2\n3\n4\n");
+        let out = sh(&mut app, "tail -n 2 /t.txt");
+        assert_eq!(out["text"], json!("3\n4"), "{out}");
+        assert_eq!(out["total_lines"], json!(4));
+    }
+
+    #[test]
+    fn cut_takes_one_column() {
+        let mut app = test_app();
+        write_file(&mut app, "/c.csv", "a,1\nb,2\nc\n");
+        let out = sh(&mut app, "cut -d , -f 2 /c.csv");
+        assert_eq!(out["text"], json!("1\n2"), "{out}");
+        assert_eq!(out["lines_without_that_field"], json!(1));
+        // No `-d` means a tab, as everywhere else.
+        write_file(&mut app, "/c.tsv", "x\ty\n");
+        assert_eq!(sh(&mut app, "cut -f 2 /c.tsv")["text"], json!("y"));
+        let err =
+            ToolHost::call_tool(&mut app, "shell", &json!({"command": "cut -d , -f 0 /c.csv"})).unwrap_err();
+        assert!(err.contains("numbered from 1"), "{err}");
+    }
+
+    #[test]
+    fn sort_orders_and_optionally_collapses() {
+        let mut app = test_app();
+        write_file(&mut app, "/s.txt", "b\na\nb\n");
+        assert_eq!(sh(&mut app, "sort /s.txt")["text"], json!("a\nb\nb"));
+        assert_eq!(sh(&mut app, "sort -r /s.txt")["text"], json!("b\nb\na"));
+        let unique = sh(&mut app, "sort -u /s.txt");
+        assert_eq!(unique["text"], json!("a\nb"));
+        assert_eq!(unique["duplicates_removed"], json!(1));
+    }
+
+    #[test]
+    fn uniq_collapses_adjacent_repeats_only() {
+        let mut app = test_app();
+        write_file(&mut app, "/u.txt", "a\na\nb\na\n");
+        let out = sh(&mut app, "uniq /u.txt");
+        assert_eq!(out["text"], json!("a\nb\na"), "only neighbours collapse");
+        assert_eq!(out["removed"], json!(1));
+    }
+
+    #[test]
+    fn tr_maps_characters_one_for_one() {
+        let mut app = test_app();
+        write_file(&mut app, "/tr.txt", "abc\n");
+        let out = sh(&mut app, "tr a x /tr.txt");
+        assert_eq!(out["text"], json!("xbc\n"));
+        assert_eq!(out["chars_changed"], json!(1));
+        write_file(&mut app, "/lower.txt", "abc\n");
+        let upper = sh(&mut app, "tr abc XYZ /lower.txt");
+        assert_eq!(upper["text"], json!("XYZ\n"));
+        // A range would be three characters here, and the answer says so rather than lying.
+        assert!(upper["note"].as_str().unwrap().contains("not a range"), "{upper}");
+    }
+
+    #[test]
+    fn tee_writes_the_text_it_is_given() {
+        let mut app = test_app();
+        let out = sh(&mut app, "tee /teed.txt -i hello");
+        assert_eq!(out["text"], json!("hello"));
+        assert_eq!(out["bytes"], json!(5));
+        assert_eq!(sh(&mut app, "cat /teed.txt")["text"], json!("hello"));
+        let err = ToolHost::call_tool(&mut app, "shell", &json!({"command": "tee /teed.txt"})).unwrap_err();
+        assert!(err.contains("usage: tee <path> -i <text>"), "{err}");
+    }
+
+    #[test]
+    fn touch_creates_a_file_and_admits_it_has_no_mtime() {
+        let mut app = test_app();
+        let first = sh(&mut app, "touch /new.txt");
+        assert_eq!(first["created"], json!(true));
+        assert_eq!(first["mtime"], Value::Null, "the workspace keeps no timestamps: {first}");
+        let second = sh(&mut app, "touch /new.txt");
+        assert_eq!(second["created"], json!(false));
+        assert!(second["note"].as_str().unwrap().contains("no mtime to update"), "{second}");
+    }
+
+    #[test]
+    fn du_totals_the_workspace() {
+        let mut app = test_app();
+        write_file(&mut app, "/a.txt", "12345");
+        write_file(&mut app, "/b.txt", "123");
+        let out = sh(&mut app, "du");
+        assert_eq!(out["count"], json!(2), "{out}");
+        assert_eq!(out["bytes"], json!(8));
+        assert_eq!(out["files"][0]["path"], json!("/a.txt"), "biggest first: {out}");
+        assert_eq!(out["limit_bytes"], json!(WORKSPACE_TOTAL_MAX));
+    }
+
+    #[test]
+    fn strings_prints_the_printable_runs() {
+        let mut app = test_app();
+        write_file(&mut app, "/bin.dat", "abc\u{0}hello\u{0}world\u{0}");
+        let out = sh(&mut app, "strings /bin.dat");
+        assert_eq!(out["strings"], json!(["hello", "world"]), "runs of four or more: {out}");
+        assert_eq!(out["min"], json!(4));
+        assert_eq!(sh(&mut app, "strings -n 3 /bin.dat")["strings"], json!(["abc", "hello", "world"]));
+    }
+
+    #[test]
+    fn od_is_the_octal_dump() {
+        let mut app = test_app();
+        write_file(&mut app, "/o.txt", "A");
+        let out = sh(&mut app, "od /o.txt");
+        let dump = out["hexdump"].as_str().unwrap();
+        assert!(dump.starts_with("0000000  101"), "octal 101 is `A`: {dump}");
+        assert_eq!(out["octal"], json!(true));
+        let hex = sh(&mut app, "hexdump /o.txt");
+        assert!(hex["hexdump"].as_str().unwrap().contains("41"), "{hex}");
+        assert_eq!(hex["octal"], json!(false));
+    }
+
+    #[test]
+    fn sleep_waits_and_says_the_wait_is_capped() {
+        let mut app = test_app();
+        let out = sh(&mut app, "sleep 0");
+        assert_eq!(out["slept_ms"], json!(0));
+        assert_eq!(out["clamped"], json!(false));
+        // The cap is arithmetic, so it is tested without waiting ten seconds for it.
+        assert_eq!(plan_sleep(false, "100").unwrap(), (100_000, MAX_SHELL_SLEEP_MS));
+        assert!(plan_sleep(false, "5").is_ok());
+        assert!(plan_sleep(true, "-1").is_err());
+        let err = ToolHost::call_tool(&mut app, "shell", &json!({"command": "sleep soon"})).unwrap_err();
+        assert!(err.contains("usage: sleep <seconds>"), "{err}");
+    }
+
+    #[test]
+    fn usleep_waits_in_milliseconds() {
+        let mut app = test_app();
+        let out = sh(&mut app, "usleep 1");
+        assert_eq!(out["slept_ms"], json!(1), "{out}");
+        assert_eq!(out["requested_ms"], json!(1));
+        assert_eq!(plan_sleep(true, "999999").unwrap(), (999_999, MAX_SHELL_SLEEP_MS));
+    }
+
+    #[test]
+    fn jot_prints_a_sequence() {
+        let mut app = test_app();
+        assert_eq!(sh(&mut app, "jot 3")["text"], json!("1 2 3"));
+        assert_eq!(sh(&mut app, "jot 3 10 -2")["text"], json!("10 8 6"), "a negative step counts down");
+        assert_eq!(sh(&mut app, "jot 2 0 0.5")["text"], json!("0 0.5"));
+        assert_eq!(sh(&mut app, "jot 500")["count"], json!(100), "bounded, like everything else here");
+    }
+
+    #[test]
+    fn crc32_is_the_checksum_of_the_file() {
+        let mut app = test_app();
+        write_file(&mut app, "/crc.txt", "abc");
+        let out = sh(&mut app, "crc32 /crc.txt");
+        assert_eq!(out["crc32"], json!("352441c2"), "the IEEE CRC-32 of `abc`: {out}");
+        assert_eq!(out["bytes"], json!(3));
+    }
+
+    #[test]
+    fn hostname_reads_and_writes_the_name_the_network_sees() {
+        let mut app = test_app();
+        let set = sh(&mut app, "hostname bench-1");
+        assert_eq!(set["hostname"], json!("bench-1"));
+        assert_eq!(set["saved"], json!(true));
+        assert_eq!(app.cfg.wifi.hostname, "bench-1");
+        assert_eq!(sh(&mut app, "hostname")["hostname"], json!("bench-1"));
+        let err =
+            ToolHost::call_tool(&mut app, "shell", &json!({"command": "hostname 'two words'"})).unwrap_err();
+        assert!(err.contains("usage: hostname [name]"), "{err}");
+    }
+
+    #[test]
+    fn whoami_is_the_device_name() {
+        let mut app = test_app();
+        app.cfg.device_name = "bench board".to_string();
+        let out = sh(&mut app, "whoami");
+        assert_eq!(out["whoami"], json!("bench board"));
+        assert!(out["note"].as_str().unwrap().contains("one account"), "{out}");
+    }
+
+    #[test]
+    fn id_says_there_is_one_user_and_it_is_root() {
+        let mut app = test_app();
+        let out = sh(&mut app, "id");
+        assert_eq!(out["uid"], json!(0));
+        assert_eq!(out["gid"], json!(0));
+        assert_eq!(out["groups"], json!([0]));
+    }
+
+    #[test]
+    fn env_lists_the_session_variables() {
+        let mut app = test_app();
+        let out = sh(&mut app, "env");
+        assert_eq!(out["count"], json!(0));
+        assert_eq!(out["persisted"], json!(false));
+        assert!(out["note"].as_str().unwrap().contains("never written to NVS"), "{out}");
+    }
+
+    /// The variables live in the `App` and nowhere else: a shell variable is state, not a
+    /// setting, so writing it into the config would turn a typo into a boot-time fact.
+    #[test]
+    fn setenv_keeps_the_value_in_the_session_and_out_of_the_config() {
+        let mut app = test_app();
+        let out = sh(&mut app, "setenv MODE test");
+        assert_eq!(out["key"], json!("MODE"));
+        assert_eq!(out["persisted"], json!(false));
+        assert_eq!(sh(&mut app, "env")["vars"]["MODE"], json!("test"));
+        assert!(!app.cfg.to_json_string().contains("MODE"), "the config must not learn the variable");
+        assert_eq!(app.store.get(crate::config::NVS_KEY_CONFIG).unwrap_or_default().contains("MODE"), false);
+    }
+
+    #[test]
+    fn unsetenv_removes_the_variable() {
+        let mut app = test_app();
+        sh(&mut app, "setenv TEMP 1");
+        let out = sh(&mut app, "unsetenv TEMP");
+        assert_eq!(out["removed"], json!(true));
+        assert_eq!(sh(&mut app, "env")["count"], json!(0));
+        assert_eq!(sh(&mut app, "unsetenv TEMP")["removed"], json!(false), "twice is not an error");
+    }
+
+    /// `netstat` reports the sessions and counters this build keeps, and refuses to invent
+    /// the socket table it cannot read.
+    #[test]
+    fn netstat_reports_sessions_and_the_listen_port() {
+        let mut app = test_app();
+        app.cfg.mcp.port = 8080;
+        let out = sh(&mut app, "netstat");
+        assert_eq!(out["listen"]["port"], json!(8080), "{out}");
+        assert_eq!(out["session_count"], json!(0));
+        assert!(out["sockets"].as_array().unwrap().is_empty());
+        assert!(out["note"].as_str().unwrap().contains("lwIP"), "{out}");
+        assert!(out["counters"]["http_requests"].is_number(), "{out}");
+    }
+
+    #[test]
+    fn route_reports_the_gateway_and_where_it_came_from() {
+        let mut app = test_app();
+        let leased = sh(&mut app, "route");
+        assert_eq!(leased["gateway"], Value::Null);
+        assert_eq!(leased["source"], json!("DHCP lease"));
+        app.cfg.wifi.gateway = "192.168.3.1".to_string();
+        let configured = sh(&mut app, "route");
+        assert_eq!(configured["gateway"], json!("192.168.3.1"));
+        assert_eq!(configured["source"], json!("configured"));
+    }
+
+    /// The ARP table is not reachable from this build, and an empty table that says so is
+    /// the honest answer — a made-up neighbour would be worse than nothing.
+    #[test]
+    fn arp_says_the_table_is_not_available() {
+        let mut app = test_app();
+        let out = sh(&mut app, "arp");
+        assert_eq!(out["count"], json!(0));
+        assert_eq!(out["available"], json!(false));
+        assert!(out["entries"].as_array().unwrap().is_empty());
+        assert!(out["note"].as_str().unwrap().contains("cannot see them, not because there are none"));
+    }
+
+    #[test]
+    fn type_says_what_a_name_is() {
+        let mut app = test_app();
+        let command = sh(&mut app, "type ls");
+        assert_eq!(command["kind"], json!("shell command"));
+        assert_eq!(command["handler"], json!("fs_ls"));
+        assert_eq!(command["usage"], json!("ls [path]"));
+        let tool = sh(&mut app, "type read");
+        assert_eq!(tool["kind"], json!("tool"), "read is a tool of its own: {tool}");
+        assert_eq!(tool["tool"], json!(true));
+        let nothing = sh(&mut app, "type sudo");
+        assert_eq!(nothing["kind"], json!("nothing"));
+        assert!(nothing["note"].as_str().unwrap().contains("no shell command"), "{nothing}");
+    }
+
+    #[test]
+    fn which_says_where_a_name_is() {
+        let mut app = test_app();
+        let out = sh(&mut app, "which od");
+        assert_eq!(out["kind"], json!("shell command"));
+        assert_eq!(out["handler"], json!("shell_hexdump"), "od is the octal half of hexdump");
+        assert_eq!(out.get("usage"), None, "which reports where, not how");
+        assert!(out["looked_in"].as_str().unwrap().contains("no PATH"), "{out}");
+    }
+
+    /// `help` is generated from the same table every command routes through, so it cannot
+    /// fall behind, and every command's usage line is reachable by getting it wrong.
+    #[test]
+    fn help_lists_every_command_and_every_usage_line_is_reachable() {
+        let mut app = test_app();
+        let help = sh(&mut app, "help")["help"].as_str().unwrap().to_string();
+        for (op, _) in crate::tools::shell::OPS {
+            let line = crate::tools::shell::usage(op).unwrap_or_else(|| panic!("`{op}` has no usage"));
+            assert!(help.contains(line), "`{op}` is missing from help:\n{help}");
+        }
+        assert_eq!(
+            help.lines().filter(|l| l.starts_with("  ")).count(),
+            crate::tools::shell::OPS.len(),
+            "one line per command"
+        );
+
+        // A bare command either runs or answers with its usage line — `{op}` with no
+        // arguments is how a model gets there, and silence would teach it nothing.
+        for (op, _) in crate::tools::shell::OPS {
+            let line = crate::tools::shell::usage(op).unwrap();
+            match ToolHost::call_tool(&mut app, "shell", &json!({ "command": op })) {
+                Ok(_) => {}
+                Err(e) => assert!(
+                    e.contains(&format!("usage: {line}")),
+                    "`{op}` failed without its usage line: {e}"
+                ),
+            }
+        }
     }
 
     // ---- the live journal stream (docs/agent-stream.md §1) ----
