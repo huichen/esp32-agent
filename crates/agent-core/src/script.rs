@@ -141,14 +141,11 @@ Adopt every device a probe found but did not adopt:
       i = i + 1
     }
 
-Play a melody (notes are Hz; `speaker_tone` needs a speaker device):
+Play a melody in one call (`speaker_play` needs a speaker device; a note is `{hz, ms}`,
+and `hz` 0 is a rest). The board synthesizes the whole score into one buffer, so nothing
+falls between the notes — one call per note is both dearer and audibly worse:
 
-    let notes = [440, 494, 523, 587]
-    let i = 0
-    while i < 4 {
-      tool("speaker_tone", {freq_hz: notes[i], ms: 150, volume: 20})
-      i = i + 1
-    }
+    tool("speaker_play", {notes: [{hz: 523, ms: 400}, {hz: 523, ms: 400}, {hz: 784, ms: 800}], volume: 20})
 
 Report and stop early on a failure:
 
@@ -1570,6 +1567,15 @@ fn num_op(a: Val, b: Val, op: &str, f: fn(f64, f64) -> f64) -> Result<Val, Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The snippet `script("examples")` hands a model has to be a program this parser
+    /// reads, or it teaches a call that fails with a syntax error at the third note.
+    #[test]
+    fn the_melody_example_is_a_program_the_parser_reads() {
+        let src = r#"tool("speaker_play", {notes: [{hz: 523, ms: 400}, {hz: 523, ms: 400}, {hz: 784, ms: 800}], volume: 20})"#;
+        let l = lint(src);
+        assert!(l.ok(), "{:?}", l.errors);
+    }
 
     struct NoHost;
     impl ScriptHost for NoHost {
