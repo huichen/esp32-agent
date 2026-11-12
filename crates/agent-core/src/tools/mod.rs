@@ -7,6 +7,7 @@
 pub mod fs;
 pub mod knowledge;
 pub mod net;
+pub mod shell;
 
 use crate::capability::{cap, CapSet};
 use crate::error::McpError;
