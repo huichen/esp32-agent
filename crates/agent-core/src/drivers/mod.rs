@@ -12,14 +12,22 @@
 pub mod actuator;
 pub mod ads1115;
 pub mod audio;
+pub mod bdc_motor;
 pub mod bme280;
+pub mod encoder;
 pub mod expander;
+pub mod hx711;
 pub mod ina219;
+pub mod max7219;
 pub mod motion;
 pub mod onewire;
+pub mod pir;
 pub mod ranging;
+pub mod rc522;
 pub mod sht3x;
 pub mod ssd1306;
+pub mod stepper;
+pub mod tm1637;
 
 use crate::boards::BoardProfile;
 use crate::config::Config;
@@ -161,8 +169,8 @@ pub static CATALOG: &[CatalogEntry] = &[
     CatalogEntry {
         kind: "rc522",
         name: "MFRC522 RFID reader",
-        detection: "not implemented yet",
-        status: "planned",
+        detection: "SPI + reset: version register 0x37 (0x91/0x92 read back)",
+        status: "implemented",
         caps: &["rc522"],
         docs: "docs/adding-a-device.md",
     },
@@ -233,8 +241,8 @@ pub static CATALOG: &[CatalogEntry] = &[
     CatalogEntry {
         kind: "hx711",
         name: "HX711 load cell amplifier",
-        detection: "not implemented yet: a bit-banged 24-bit shift, so a driver rather than a manifest",
-        status: "planned",
+        detection: "declared only: two GPIOs, bit-banged 24-bit read; `identify` needs a stable conversion",
+        status: "implemented",
         caps: &["hx711"],
         docs: "ROADMAP.md",
     },
@@ -249,49 +257,49 @@ pub static CATALOG: &[CatalogEntry] = &[
     CatalogEntry {
         kind: "bdc_motor",
         name: "L298N / TB6612 / DRV8833 brushed motor",
-        detection: "not implemented yet: two PWM pins and a direction pin, with a speed limit",
-        status: "planned",
+        detection: "declared only: PWM + direction or two PWM; not probeable, an H-bridge has no id",
+        status: "implemented",
         caps: &["motor"],
         docs: "ROADMAP.md",
     },
     CatalogEntry {
         kind: "stepper",
         name: "A4988 / DRV8825 / TMC2208 stepper",
-        detection: "not implemented yet: step/dir pulses need timing a manifest sequence cannot hold",
-        status: "planned",
+        detection: "declared only: STEP/DIR pulses with a move time limit; the driver owns the timing",
+        status: "implemented",
         caps: &["stepper"],
         docs: "ROADMAP.md",
     },
     CatalogEntry {
         kind: "encoder",
         name: "Rotary encoder (KY-040 and bare)",
-        detection: "not implemented yet: needs an interrupt or a polled quadrature decoder",
-        status: "planned",
+        detection: "declared only: two GPIOs, polled quadrature; a fast turn can drop a detent",
+        status: "implemented",
         caps: &["encoder"],
         docs: "ROADMAP.md",
     },
     CatalogEntry {
         kind: "pir",
         name: "HC-SR501 PIR motion",
-        detection:
-            "not implemented yet: a digital pin; a manifest could wrap it, a debounce belongs in a driver",
-        status: "planned",
+        detection: "declared only: one GPIO; a quiet sensor looks like an undriven pin",
+        status: "implemented",
         caps: &["pir"],
         docs: "ROADMAP.md",
     },
     CatalogEntry {
         kind: "tm1637",
         name: "TM1637 four-digit display",
-        detection: "not implemented yet: a two-wire protocol of its own, not I2C",
-        status: "planned",
+        detection: "declared only: two GPIOs, its own clocked protocol; `identify` reads the brightness echo",
+        status: "implemented",
         caps: &["sevenseg"],
         docs: "ROADMAP.md",
     },
     CatalogEntry {
         kind: "max7219",
         name: "MAX7219 LED matrix",
-        detection: "not implemented yet: SPI, with a framebuffer like the OLED driver",
-        status: "planned",
+        detection:
+            "declared only: SPI with a chip select; `identify` writes and reads back the intensity register",
+        status: "implemented",
         caps: &["matrix"],
         docs: "ROADMAP.md",
     },
@@ -331,8 +339,28 @@ pub struct DetectResult {
 /// without an `adopt` body: it comes from the board profile (I2S audio) and declaring it
 /// again would be a no-op that reads like a success.
 const DECLARABLE: &[&str] = &[
-    "ssd1306", "bme280", "sht3x", "ina219", "mpu6050", "ads1115", "pcf8574", "ds18b20", "hcsr04", "servo",
-    "relay", "led", "buttons", "lcd",
+    "ssd1306",
+    "bme280",
+    "sht3x",
+    "ina219",
+    "mpu6050",
+    "ads1115",
+    "pcf8574",
+    "ds18b20",
+    "hcsr04",
+    "servo",
+    "relay",
+    "led",
+    "buttons",
+    "lcd",
+    "bdc_motor",
+    "stepper",
+    "encoder",
+    "pir",
+    "hx711",
+    "tm1637",
+    "max7219",
+    "rc522",
 ];
 
 /// Probe every configured bus and every declared pin.
@@ -765,6 +793,60 @@ pub fn instantiate(spec: &crate::manifest::DeviceSpec, hw: &mut dyn Hardware) ->
                 return Err(McpError::invalid_params("driver `buttons` needs pins, e.g. {\"boot\": 0}"));
             }
             Box::new(actuator::Buttons::new(buttons))
+        }
+        // ---- motion and actuators -------------------------------------------------
+        // None of these four can be probed: an H-bridge, a stepper driver, a quadrature
+        // encoder and a PIR look electrically identical to an idle pin. The manifest is
+        // the interface, and the driver is what the manifest cannot express (timing,
+        // state, a quadrature decode).
+        "bdc_motor" => {
+            let wiring = if let (Some(in1), Some(in2)) = (pin("in1"), pin("in2")) {
+                bdc_motor::Wiring::TwoPwm { in1, in2 }
+            } else {
+                let pwm = needs_pin(pin("pwm").or_else(|| pin("ena")), "pwm")?;
+                let dir = needs_pin(pin("dir"), "dir")?;
+                bdc_motor::Wiring::PwmDir { pwm, dir }
+            };
+            Box::new(bdc_motor::BdcMotor::new(wiring))
+        }
+        "stepper" => {
+            let step = needs_pin(pin("step"), "step")?;
+            let dir = needs_pin(pin("dir"), "dir")?;
+            let microsteps = opt("microsteps").and_then(|m| m.parse().ok()).unwrap_or(1u32).max(1);
+            Box::new(stepper::Stepper::new(step, dir, pin("enable"), microsteps))
+        }
+        "encoder" => {
+            let a = needs_pin(pin("a"), "a")?;
+            let b = needs_pin(pin("b"), "b")?;
+            Box::new(encoder::Encoder::new(a, b))
+        }
+        "pir" => {
+            let p = needs_pin(pin("out").or_else(|| pin("data")), "out")?;
+            // `active_high` is a board fact, not something a pin can report: HC-SR501
+            // modules ship both ways depending on the jumper.
+            let active_high = opt("active_high").map(|v| v != "false").unwrap_or(true);
+            Box::new(pir::Pir::new(p, active_high))
+        }
+        // ---- SPI and bit-banged parts ---------------------------------------------
+        "hx711" => {
+            let dout = needs_pin(pin("dout"), "dout")?;
+            let sck = needs_pin(pin("sck"), "sck")?;
+            Box::new(hx711::Hx711::probe(hw, dout, sck, 1)?)
+        }
+        "tm1637" => {
+            let clk = needs_pin(pin("clk"), "clk")?;
+            let dio = needs_pin(pin("dio"), "dio")?;
+            Box::new(tm1637::Tm1637::probe(hw, clk, dio, 1)?)
+        }
+        "max7219" => {
+            let cs = needs_pin(pin("cs"), "cs")?;
+            let count = opt("count").and_then(|c| c.parse().ok()).unwrap_or(1usize).max(1);
+            Box::new(max7219::Max7219::probe(hw, bus, cs, count, 1)?)
+        }
+        "rc522" => {
+            let cs = needs_pin(pin("cs"), "cs")?;
+            let rst = needs_pin(pin("rst"), "rst")?;
+            Box::new(rc522::Rc522::probe(hw, bus, cs, rst, 1)?)
         }
         other => {
             return Err(McpError::invalid_params(format!(
