@@ -31,15 +31,15 @@ pub struct Family {
     /// The tool name the model sees, e.g. `manifest`.
     pub name: &'static str,
     /// One sentence: what the whole family is for. It reaches the schema, so it is short.
-    pub summary: &'static str,
+    pub summary: String,
     /// The commands, in the order `help` lists them. Each one keeps its own handler and
     /// schema; the family only changes how it is reached.
     pub subs: Vec<ToolDef>,
 }
 
 impl Family {
-    pub fn new(name: &'static str, summary: &'static str, subs: Vec<ToolDef>) -> Self {
-        Self { name, summary, subs }
+    pub fn new(name: &'static str, summary: impl Into<String>, subs: Vec<ToolDef>) -> Self {
+        Self { name, summary: summary.into(), subs }
     }
 
     pub fn commands(&self) -> Vec<&str> {
@@ -72,7 +72,6 @@ impl Family {
                 )
             })
             .collect();
-        let summary = self.summary;
         let mut variant = words.clone();
         variant.push("help".to_string());
         let schema = object_schema(
@@ -95,22 +94,24 @@ impl Family {
             &["command"],
         );
         let shared = Arc::new(self);
-        ToolDef::new(name, summary).title(name).category(name).core().schema(schema).bind(move |ctx, args| {
-            let command =
-                args.get("command").and_then(Value::as_str).unwrap_or("").trim().to_ascii_lowercase();
-            if command == "help" {
-                return Ok(json!({
-                    "commands": words,
-                    "usage": usage.iter().map(|(cmd, about, takes)| json!({
-                        "command": format!("{name} {cmd}"),
-                        "about": about,
-                        "arguments": takes,
-                    })).collect::<Vec<Value>>(),
-                    "how_to_call": "{\"command\": \"<command>\", \"arguments\": {...}}",
-                }));
-            }
-            shared.dispatch(ctx, args, &command)
-        })
+        ToolDef::new(name, &shared.summary).title(name).category(name).core().schema(schema).bind(
+            move |ctx, args| {
+                let command =
+                    args.get("command").and_then(Value::as_str).unwrap_or("").trim().to_ascii_lowercase();
+                if command == "help" {
+                    return Ok(json!({
+                        "commands": words,
+                        "usage": usage.iter().map(|(cmd, about, takes)| json!({
+                            "command": format!("{name} {cmd}"),
+                            "about": about,
+                            "arguments": takes,
+                        })).collect::<Vec<Value>>(),
+                        "how_to_call": "{\"command\": \"<command>\", \"arguments\": {...}}",
+                    }));
+                }
+                shared.dispatch(ctx, args, &command)
+            },
+        )
     }
 
     fn dispatch(&self, ctx: &mut ToolCtx<'_>, args: &Value, command: &str) -> Result<Value> {

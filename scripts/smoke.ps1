@@ -73,7 +73,7 @@ try {
   $before = Rpc '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
   $beforeNames = Tool-Names $before
   Write-Host ("tools before: " + ($beforeNames -join ', ')) -ForegroundColor DarkGray
-  Check 'OLED tools present because the panel was detected' { $beforeNames -contains 'oled_text' }
+  Check 'OLED tools present because the panel was detected' { $beforeNames -contains 'display' }
   Check 'IMU tools absent because no MPU is wired' { -not ($beforeNames -contains 'mpu6050_read') }
 
   $manifest = @'

@@ -70,7 +70,7 @@ nothing.
 - `tools/list` emits only tools whose `requires ⊆ board caps + device caps`, minus the
   names the user disabled.
 
-So an absent OLED never shows the model an `oled_text` it would then call and fail on.
+So an absent OLED never shows the model a `display` tool it would then call and fail on.
 `tools_mode = "generic"` collapses the device tools further into `device_invoke`, which
 keeps a many-peripheral board from eating the context window.
 
