@@ -78,6 +78,15 @@ pub const MAX_SAVED_REASONING_BYTES: usize = 200;
 /// Tool arguments are echoed to the model when the transcript is rebuilt, so they are
 /// stored; a `write` of a whole file is not worth the budget, so they are cut too.
 pub const MAX_SAVED_ARG_BYTES: usize = 256;
+/// How much of a tool call's arguments `/api/agent/history` carries, in bytes.
+///
+/// Larger than the stored copy because this one is not rewritten every turn, and smaller
+/// than a tool result because the transcript is served as one JSON document that the portal
+/// polls: a `write` of a whole file must not ride along every 20 s. Over the limit the
+/// arguments arrive as a string with the first `MAX_HISTORY_ARG_BYTES` bytes, plus
+/// `arguments_elided_bytes` saying what was left out, so the portal can say so rather than
+/// show a cut document as if it were whole.
+pub const MAX_HISTORY_ARG_BYTES: usize = 1024;
 /// The stored format's version. A blob written by a version this build does not know is
 /// refused rather than parsed on a guess.
 pub const TRANSCRIPT_VERSION: u32 = 1;
@@ -1244,8 +1253,31 @@ fn message_json(seq: usize, message: &Message) -> Value {
         out["reasoning"] = json!(message.reasoning);
     }
     if !message.tool_calls.is_empty() {
-        let calls: Vec<Value> =
-            message.tool_calls.iter().map(|call| json!({ "id": call.id, "name": call.name })).collect();
+        // The arguments travel too: without them a restored transcript shows `script()` with
+        // empty parens, which reads as "the model called it with nothing". They are cut at
+        // the same order of magnitude as a tool result, because a `write` can carry a whole
+        // file and this JSON is polled every 20 s by the portal.
+        let calls: Vec<Value> = message
+            .tool_calls
+            .iter()
+            .map(|call| {
+                let text = call.arguments.to_string();
+                if text.len() <= MAX_HISTORY_ARG_BYTES {
+                    json!({ "id": call.id, "name": call.name, "arguments": call.arguments })
+                } else {
+                    let mut cut = MAX_HISTORY_ARG_BYTES;
+                    while !text.is_char_boundary(cut) {
+                        cut -= 1;
+                    }
+                    json!({
+                        "id": call.id,
+                        "name": call.name,
+                        "arguments": &text[..cut],
+                        "arguments_elided_bytes": text.len() - cut,
+                    })
+                }
+            })
+            .collect();
         out["tool_calls"] = Value::Array(calls);
     }
     if let Some(id) = &message.tool_call_id {
@@ -2469,6 +2501,45 @@ mod tests {
             assert_eq!(msgs[0]["role"], "system");
             assert_ne!(msgs.get(1).map(|m| m["role"].clone()), Some(json!("tool")));
         }
+    }
+
+    /// A tool call's arguments used to be dropped from the transcript the portal renders:
+    /// after a reload every call read `script()` with empty parens, which looks like the
+    /// model passing nothing. They travel now, cut at a known size so a `write` of a whole
+    /// file does not ride along on every poll — and the cut says so.
+    #[test]
+    fn the_transcript_carries_tool_arguments_and_says_what_it_cut() {
+        let message = Message::assistant(
+            "",
+            vec![
+                llm::ToolCall {
+                    id: "c1".into(),
+                    name: "script".into(),
+                    arguments: json!({ "source": "print(1)" }),
+                },
+                llm::ToolCall {
+                    id: "c2".into(),
+                    name: "write".into(),
+                    arguments: json!({ "content": "x".repeat(4000) }),
+                },
+            ],
+            7,
+        );
+
+        let out = message_json(0, &message);
+        let calls = out["tool_calls"].as_array().expect("calls");
+        assert_eq!(calls[0]["arguments"], json!({ "source": "print(1)" }), "{}", calls[0]);
+        assert!(calls[0].get("arguments_elided_bytes").is_none(), "{}", calls[0]);
+
+        let cut = calls[1]["arguments"].as_str().expect("a cut argument is a string");
+        assert_eq!(cut.len(), MAX_HISTORY_ARG_BYTES, "the cut is exactly the budget");
+        assert!(cut.is_char_boundary(cut.len()));
+        assert_eq!(
+            calls[1]["arguments_elided_bytes"].as_u64(),
+            Some(4000u64 + "{\"content\":\"\"}".len() as u64 - MAX_HISTORY_ARG_BYTES as u64),
+            "{}",
+            calls[1]
+        );
     }
 
     #[test]
