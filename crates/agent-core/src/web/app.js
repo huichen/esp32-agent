@@ -237,6 +237,43 @@ function addRow(who) {
   return { row, bubble };
 }
 
+/** A tool argument or a tool result, laid out so a person can read it.
+ *
+ * The board hands these over as JSON text, and the payload people actually read is usually
+ * one string field — a script's source, a shell's `stdout`, a tool's `text` — with its
+ * newlines escaped. Printing the JSON as-is is the wall of text with `\n` in it that the
+ * console used to show. So: decode that field into a block of its own and put the rest of
+ * the object on one line after it. Everything else gets two-space JSON, and anything that
+ * is not JSON is left exactly as it came — a tool result is not always structured. */
+const PROSE_FIELDS = ["text", "output", "stdout", "stderr", "message", "error", "detail", "source"];
+
+function pretty(text) {
+  if (text == null) return "";
+  const raw = String(text);
+  const trimmed = raw.trim();
+  if (!/^[[{]/.test(trimmed)) return raw;
+  let value;
+  try {
+    value = JSON.parse(trimmed);
+  } catch {
+    return raw;
+  }
+  if (value && typeof value === "object" && !Array.isArray(value)) {
+    const key = PROSE_FIELDS.find((k) => typeof value[k] === "string" && value[k].includes("\n"));
+    if (key) {
+      const rest = Object.keys(value)
+        .filter((k) => k !== key)
+        .map((k) => {
+          const v = value[k];
+          return k + ": " + (typeof v === "string" ? v : JSON.stringify(v));
+        })
+        .join(", ");
+      return value[key] + (rest ? "\n\n— " + rest : "");
+    }
+  }
+  return JSON.stringify(value, null, 2);
+}
+
 function chip(tools, label, detail) {
   // A tool call reads as one compact line; the arguments and the result live behind the
   // disclosure triangle. A chat that shows every result inline is a log, not a chat.
@@ -247,7 +284,7 @@ function chip(tools, label, detail) {
   wrap.appendChild(summary);
   for (const [name, text] of detail || []) {
     const pre = document.createElement("pre");
-    pre.textContent = name + ": " + text;
+    pre.textContent = name + ": " + pretty(text);
     wrap.appendChild(pre);
   }
   tools.appendChild(wrap);
@@ -504,6 +541,7 @@ async function send(text) {
 let liveTrace = null;
 let liveBubble = null;
 let liveCalls = 0;
+let liveNote = null;
 
 /** The run in progress: a trace that grows, and a bubble for the text it streams. */
 function ensureLiveTrace() {
@@ -529,6 +567,42 @@ function updateLiveSummary() {
   summary.textContent = liveCalls
     ? counter(liveCalls, "tool call", "tool calls") + " \u00b7 running"
     : "working\u2026";
+  if (liveNote) {
+    liveNote.textContent = liveCalls ? counter(liveCalls, "tool call", "tool calls") + " \u2026" : "working\u2026";
+  }
+}
+
+/** A row with moving dots, between the last message and whatever comes next.
+ *
+ * A model call takes seconds and the board sends nothing until it has an answer, so the
+ * page has to say "still working" on its own: without it a long turn is indistinguishable
+ * from a page that stopped listening. It is not a transcript entry -`run_end` removes it. */
+function showLiveNote() {
+  if (liveNote) return;
+  const row = document.createElement("div");
+  row.className = "row agent live-row";
+  const note = document.createElement("div");
+  note.className = "live-note";
+  for (let i = 0; i < 3; i += 1) {
+    const dot = document.createElement("span");
+    dot.className = "dot-anim";
+    note.appendChild(dot);
+  }
+  const label = document.createElement("span");
+  label.className = "live-label";
+  label.textContent = "working\u2026";
+  note.appendChild(label);
+  row.appendChild(note);
+  $("#chat").appendChild(row);
+  liveNote = label;
+  scrollToEnd();
+}
+
+function hideLiveNote() {
+  if (!liveNote) return;
+  const row = liveNote.closest(".live-row");
+  if (row) row.remove();
+  liveNote = null;
 }
 
 function ensureLiveBubble() {
@@ -548,6 +622,7 @@ function handleEvent(name, data) {
       liveBubble = null;
       liveCalls = 0;
       $("#link").className = "dot busy";
+      showLiveNote();
       break;
     case "thinking_delta": {
       const box = ensureLiveTrace();
@@ -588,8 +663,12 @@ function handleEvent(name, data) {
     case "tool_result": {
       if (!liveTrace) break;
       const rows = Array.from(liveTrace.querySelectorAll("details.tool"));
+      // By id first: the event carries `tool_call_id`, and a turn that calls the same tool
+      // twice used to attach every result to the last unanswered chip -so the arguments
+      // shown beside a result belonged to a different call than the result did.
+      const open = rows.filter((d) => !d.classList.contains("ok") && !d.classList.contains("err"));
       const last =
-        rows.filter((d) => !d.classList.contains("ok") && !d.classList.contains("err")).pop() || rows.pop();
+        (data.tool_call_id && open.find((d) => d.dataset.id === data.tool_call_id)) || open.pop() || rows.pop();
       if (last) {
         const pre = document.createElement("pre");
         pre.textContent = "result: " + (data.text || "");
@@ -606,10 +685,12 @@ function handleEvent(name, data) {
       break;
     }
     case "error":
+      hideLiveNote();
       toast(data.text || "run failed");
       break;
     case "run_end":
       S.busy = false;
+      hideLiveNote();
       liveTrace = null;
       liveBubble = null;
       liveCalls = 0;
@@ -807,7 +888,7 @@ async function loadSched() {
         (t) =>
           '<div class="item' + (t.enabled ? "" : " faint") + '"><b>' + escapeHtml(t.id) + "</b><span>" +
           escapeHtml(t.every_s ? "every " + t.every_s + "s" : t.at_hhmm) + " · " +
-          escapeHtml((t.prompt || "").slice(0, 60)) + "</span>" +
+          escapeHtml(((t.script ? "script: " + t.script : t.prompt) || "").slice(0, 60)) + "</span>" +
           '<button class="btn ghost" data-sched="' + escapeHtml(t.id) + '" data-op="' +
           (t.enabled ? "sched_disable" : "sched_enable") + '">' + (t.enabled ? "Pause" : "Resume") +
           "</button>" +
@@ -1003,12 +1084,14 @@ $("#attach").onclick = () => $("#attach-input").click();
           op: "add",
           task: {
             prompt: $("#sched-prompt").value.trim(),
+            script: $("#sched-script").value.trim(),
             every_s: Number($("#sched-every").value || 0),
             at_hhmm: $("#sched-at").value.trim(),
           },
         },
       });
       $("#sched-prompt").value = "";
+      $("#sched-script").value = "";
       loadSched();
       toast("task added");
     } catch (e) { toast(e.message); }
