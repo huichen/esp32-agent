@@ -472,6 +472,77 @@ pub fn detect(
             }
         }
 
+        // The BME680 shares 0x76/0x77 with the BME280, so it is tried after it: the
+        // BME280 driver checks the id register it knows, and only a part that answers
+        // 0x61 gets here.
+        for addr in bme680::Bme680::ADDRESSES {
+            if !present(&scan, &claimed, *addr) || bme680::Bme680::identify(hw, bus, *addr).is_none() {
+                continue;
+            }
+            let suffix = next_suffix("bme680");
+            match bme680::Bme680::probe(hw, bus, *addr, suffix) {
+                Ok(d) => {
+                    log.info("probe", format!("BME680 at 0x{addr:02X}"));
+                    claimed.insert(*addr);
+                    devices.push(Box::new(d));
+                }
+                Err(e) => log.warn("probe", format!("BME680 at 0x{addr:02X}: {}", e.message)),
+            }
+        }
+
+        // AHT20: no id register, so a part is taken as present when it accepts the
+        // initialisation and answers with a calibrated status byte.
+        for addr in aht20::Aht20::ADDRESSES {
+            if !present(&scan, &claimed, *addr) {
+                continue;
+            }
+            let suffix = next_suffix("aht20");
+            match aht20::Aht20::probe(hw, bus, *addr, suffix) {
+                Ok(d) => {
+                    log.info("probe", format!("AHT20 at 0x{addr:02X}"));
+                    claimed.insert(*addr);
+                    devices.push(Box::new(d));
+                }
+                Err(e) => log.warn("probe", format!("AHT20 at 0x{addr:02X}: {}", e.message)),
+            }
+        }
+
+        // BH1750 needs a conversion to answer at all, which is why the probe costs
+        // ~180 ms and is only worth attempting at the two addresses it uses.
+        for addr in bh1750::Bh1750::ADDRESSES {
+            if !present(&scan, &claimed, *addr) {
+                continue;
+            }
+            let suffix = next_suffix("bh1750");
+            match bh1750::Bh1750::probe(hw, bus, *addr, suffix) {
+                Ok(d) => {
+                    log.info("probe", format!("BH1750 at 0x{addr:02X}"));
+                    claimed.insert(*addr);
+                    devices.push(Box::new(d));
+                }
+                Err(e) => log.warn("probe", format!("BH1750 at 0x{addr:02X}: {}", e.message)),
+            }
+        }
+
+        // DS3231 is deliberately not probed: 0x68 is also the MPU-6050's address and the
+        // part has no id register, so "it decodes as a plausible time" would adopt an IMU
+        // that happens to look like one. It is declared in the manifest instead, and the
+        // driver is still there to serve the declaration.
+        for addr in vl53l0x::Vl53l0x::ADDRESSES {
+            if !present(&scan, &claimed, *addr) || vl53l0x::Vl53l0x::identify(hw, bus, *addr).is_none() {
+                continue;
+            }
+            let suffix = next_suffix("vl53l0x");
+            match vl53l0x::Vl53l0x::probe(hw, bus, *addr, suffix) {
+                Ok(d) => {
+                    log.info("probe", format!("VL53L0X at 0x{addr:02X}"));
+                    claimed.insert(*addr);
+                    devices.push(Box::new(d));
+                }
+                Err(e) => log.warn("probe", format!("VL53L0X at 0x{addr:02X}: {}", e.message)),
+            }
+        }
+
         for addr in ina219::Ina219::ADDRESSES {
             if !present(&scan, &claimed, *addr) {
                 continue;
@@ -954,5 +1025,119 @@ mod cap_tests {
         assert!(!caps.iter().any(|c| c == "mic"), "mic advertised with no driver: {caps:?}");
         assert!(!caps.iter().any(|c| c == "speaker"), "speaker advertised with no driver: {caps:?}");
         assert!(caps.iter().any(|c| c == "gpio"), "the real caps are still there: {caps:?}");
+    }
+
+    /// Every kind added in this wave has to be buildable from a manifest, and the device
+    /// it produces has to expose at least one tool. A driver that compiles but has no
+    /// tool behind it is the failure mode this test exists for: it would appear in
+    /// `devices_list` and change nothing the model can call.
+    #[test]
+    fn each_declarable_driver_builds_a_device_with_tools() {
+        let cases: &[(&str, serde_json::Value)] = &[
+            ("bdc_motor", serde_json::json!({"in1": 4, "in2": 5})),
+            ("bdc_motor", serde_json::json!({"pwm": 4, "dir": 5})),
+            ("stepper", serde_json::json!({"step": 4, "dir": 5, "enable": 6})),
+            ("encoder", serde_json::json!({"a": 4, "b": 5})),
+            ("pir", serde_json::json!({"out": 4})),
+            ("hx711", serde_json::json!({"dout": 4, "sck": 5})),
+            ("tm1637", serde_json::json!({"clk": 4, "dio": 5})),
+            ("max7219", serde_json::json!({"cs": 4})),
+            ("rc522", serde_json::json!({"cs": 4, "rst": 5})),
+            ("bme680", serde_json::json!({"address": 118})),
+            ("aht20", serde_json::json!({"address": 56})),
+            ("bh1750", serde_json::json!({"address": 35})),
+            ("ds3231", serde_json::json!({"address": 104})),
+            ("vl53l0x", serde_json::json!({"address": 41})),
+        ];
+        for (kind, pins) in cases {
+            let spec = crate::manifest::DeviceSpec {
+                id: format!("{kind}_t"),
+                kind: kind.to_string(),
+                driver: Some(kind.to_string()),
+                bus: Some(0),
+                address: pins.get("address").and_then(|a| a.as_u64()).map(|a| a as u8),
+                pins: pins
+                    .as_object()
+                    .map(|m| {
+                        m.iter().filter_map(|(k, v)| v.as_i64().map(|n| (k.clone(), n as i32))).collect()
+                    })
+                    .unwrap_or_default(),
+                options: Default::default(),
+                enabled: true,
+                note: String::new(),
+            };
+            assert!(DECLARABLE.contains(kind), "{kind} must be declarable in a manifest");
+            let mut hw = crate::virtual_board::VirtualBoard::new();
+            match instantiate(&spec, &mut hw) {
+                Ok(device) => assert!(
+                    !device.tools().is_empty(),
+                    "{kind} built but exposes no tool, so the model cannot use it"
+                ),
+                Err(e) => {
+                    // The parts that have to answer on a bus cannot be built against an
+                    // empty virtual board. That is the right error as long as it names the
+                    // missing part: "no compiled driver" would mean the wiring is absent,
+                    // and that is the failure this whole test exists to catch.
+                    assert!(
+                        !e.message.contains("no compiled driver"),
+                        "{kind} is in the catalogue but instantiate does not know it: {}",
+                        e.message
+                    );
+                    assert!(
+                        e.message.contains("GPIO")
+                            || e.message.contains("no ")
+                            || e.message.contains("did not"),
+                        "{kind} failed without saying what was missing: {}",
+                        e.message
+                    );
+                }
+            }
+        }
+    }
+
+    /// The five parts that can be probed must answer `identify` on a bus that has them
+    /// and refuse on one that does not — that is the difference between discovering
+    /// hardware and inventing it.
+    #[test]
+    fn only_parts_that_answer_are_identified() {
+        // An empty bus answers nothing. A driver that invents presence is worse than one
+        // that reports the chip as unknown, and this is the cheapest proof of that: every
+        // identification path is asked on a board with no parts on it.
+        let mut empty = crate::virtual_board::VirtualBoard::new();
+        assert!(bme680::Bme680::identify(&mut empty, 0, 0x76).is_none());
+        assert!(vl53l0x::Vl53l0x::identify(&mut empty, 0, 0x29).is_none());
+        assert!(aht20::Aht20::probe(&mut empty, 0, 0x38, 1).is_err());
+        assert!(bh1750::Bh1750::probe(&mut empty, 0, 0x23, 1).is_err());
+        assert!(!rtc::Ds3231::identify(&mut empty, 0, 0x68));
+
+        // And a part that is there is found: the BME680 answers 0x61 at the address the
+        // BME280 also uses, which is why detection tries the BME280 first.
+        let mut board = crate::virtual_board::VirtualBoard::new();
+        board.add(0x76, crate::virtual_board::FakeKind::Bme280);
+        assert!(bme280::Bme280::identify(&mut board, 0, 0x76).is_some());
+    }
+
+    /// 0x68 is both the DS3231 and the MPU-6050, and detection has to settle that without
+    /// guesswork: the IMU is probed (it has a WHO_AM_I), the clock is declared.
+    #[test]
+    fn address_68_belongs_to_the_part_that_can_prove_it() {
+        let mut hw = crate::virtual_board::VirtualBoard::new();
+        hw.add(0x68, crate::virtual_board::FakeKind::Mpu6050);
+        assert!(motion::Mpu6050::identify(&mut hw, 0, 0x68).is_some());
+        let mut cfg = crate::config::Config::default();
+        cfg.bus.i2c = serde_json::from_value(serde_json::json!([
+            {"bus": 0, "sda": 41, "scl": 42, "freq_khz": 400}
+        ]))
+        .expect("an I2C bus config");
+        let profile = crate::boards::find("esp32s3-xiaozhi-bread").expect("profile");
+        let log = std::sync::Arc::new(crate::logbuf::LogBuf::new(64));
+        let found = detect(&mut hw, &cfg, profile, &log);
+        let infos = found.devices.infos();
+        let kinds: Vec<&str> = infos.iter().map(|i| i.kind.as_str()).collect();
+        assert!(kinds.contains(&"mpu6050"), "the IMU is discovered: {kinds:?}");
+        assert!(
+            !kinds.contains(&"ds3231"),
+            "the clock is never auto-adopted at the IMU's address: {kinds:?}"
+        );
     }
 }
