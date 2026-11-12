@@ -169,6 +169,19 @@ pub trait Hardware: Send {
     /// Microsecond-accurate delay (1-Wire, HC-SR04, bit-banged buses).
     fn delay_us(&mut self, _us: u32) {}
 
+    /// The same busy-wait, saying so when the platform cannot time microseconds.
+    ///
+    /// [`Hardware::delay_us`] predates this and is infallible: its default is a silent
+    /// no-op, which is fine for "wait at least this long before reading a register" and
+    /// wrong for a bus whose pulse widths *are* the data. A driver that samples a
+    /// waveform therefore asks for this one, and a board that cannot honour microsecond
+    /// timing refuses instead of returning a plausible wrong number.
+    ///
+    /// Defaulted: the default is the refusal.
+    fn delay_us_checked(&mut self, _us: u32) -> Result<()> {
+        Err(McpError::unsupported("this platform has no microsecond delay"))
+    }
+
     fn millis(&mut self) -> u64 {
         0
     }

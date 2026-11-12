@@ -18,6 +18,7 @@ pub mod bh1750;
 pub mod bme280;
 pub mod bme680;
 pub mod camera;
+pub mod dht;
 pub mod encoder;
 pub mod expander;
 pub mod hx711;
@@ -29,6 +30,7 @@ pub mod pir;
 pub mod ranging;
 pub mod rc522;
 pub mod rtc;
+pub mod sdcard;
 pub mod sht3x;
 pub mod ssd1306;
 pub mod stepper;
@@ -168,7 +170,7 @@ pub static CATALOG: &[CatalogEntry] = &[
         kind: "dht11",
         name: "DHT11 / DHT22 temperature + humidity",
         detection: "not implemented yet",
-        status: "planned",
+        status: "implemented",
         caps: &["dht"],
         docs: "docs/adding-a-device.md",
     },
@@ -192,7 +194,7 @@ pub static CATALOG: &[CatalogEntry] = &[
         kind: "sdcard",
         name: "SD card over SPI",
         detection: "not implemented yet",
-        status: "planned",
+        status: "implemented",
         caps: &["sdcard"],
         docs: "docs/adding-a-device.md",
     },
@@ -370,6 +372,9 @@ const DECLARABLE: &[&str] = &[
     "rc522",
     "bme680",
     "camera",
+    "dht11",
+    "dht22",
+    "sdcard",
     "aht20",
     "bh1750",
     "ds3231",
@@ -837,6 +842,16 @@ pub fn instantiate(spec: &crate::manifest::DeviceSpec, hw: &mut dyn Hardware) ->
         // Declared, never scanned: the SCCB id would identify the part, but the frame has to
         // come from the platform's capture path, and 0x3C is the OLED's address on most
         // boards. A camera in the manifest is a person saying "there is one here".
+        // A DHT is one pin and a decoding table chosen by `options.kind`; a card is a chip
+        // select and an init handshake. Neither can be discovered, so both are declared.
+        "dht11" | "dht22" => {
+            let data = needs_pin(pin("out").or_else(|| pin("data")), "out")?;
+            Box::new(dht::Dht::from_options(data, &spec.options)?)
+        }
+        "sdcard" => {
+            let cs = needs_pin(pin("cs"), "cs")?;
+            Box::new(sdcard::SdCard::init(hw, bus, cs)?)
+        }
         "camera" => {
             let opts = camera::Options::from_options(&spec.options)?;
             Box::new(camera::Camera::probe(hw, bus, needs_addr(addr)?, opts, 1)?)

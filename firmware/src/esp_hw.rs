@@ -556,6 +556,13 @@ impl Hardware for EspHw {
         unsafe { sys::esp_rom_delay_us(us) };
     }
 
+    /// The fallible form a bit-banged driver asks for. The ROM busy-wait *is* the
+    /// microsecond timing, so this board never refuses one.
+    fn delay_us_checked(&mut self, us: u32) -> Result<()> {
+        self.delay_us(us);
+        Ok(())
+    }
+
     fn millis(&mut self) -> u64 {
         (unsafe { sys::esp_timer_get_time() } - self.boot_us) as u64 / 1000
     }

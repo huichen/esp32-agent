@@ -418,6 +418,14 @@ impl Hardware for VirtualBoard {
         std::thread::sleep(std::time::Duration::from_micros(us.min(2_000) as u64));
     }
 
+    /// The virtual board can honour the fallible form: it has no timing to fail at, and a
+    /// DHT read on the simulator should get as far as a missing handshake rather than a
+    /// blanket refusal.
+    fn delay_us_checked(&mut self, us: u32) -> Result<()> {
+        self.delay_us(us);
+        Ok(())
+    }
+
     fn millis(&mut self) -> u64 {
         self.start.elapsed().as_millis() as u64
     }
