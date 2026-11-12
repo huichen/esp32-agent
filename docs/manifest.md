@@ -1,8 +1,15 @@
 # Manifest specification v1
 
 A manifest is a JSON document in the NVS `manifest` key. It decides which hardware this
-board exposes, as which tools. Call `manifest_apply` to make it take effect: `tools/list`
-changes immediately, without a reboot or a reflash.
+board exposes, as which tools. Call `manifest` with `command: apply` to make it take
+effect: `tools/list` changes immediately, without a reboot or a reflash.
+
+The five manifest operations are one tool with five commands — `get`, `describe`,
+`validate`, `apply`, `reset` — called as `{"command": "apply", "arguments": {...}}`.
+`{"command": "help"}` lists them with their arguments in about a kilobyte, which is what
+lets the board send one declaration instead of five. The old names (`manifest_apply` and
+the rest) still answer, so a stored script keeps working; they are no longer listed, and
+`/api/tools` says which command each one became.
 
 ## 0. Manifest or driver?
 
@@ -13,7 +20,7 @@ They are not alternatives to each other; they answer different questions.
 | Question | "this board has X wired to pin 12 — what may a caller do with it?" | "how does a chip of type X actually work?" |
 | Form | JSON in NVS, edited at runtime | Rust module in `drivers/`, compiled in |
 | Changes how | which tools exist and what they compose | what the board can detect and how it talks to the chip |
-| Needs a reflash | no — `manifest_apply` is live | yes |
+| Needs a reflash | no — `manifest` with `command: apply` is live | yes |
 | Typical case | a relay, a servo, a raw I2C register read, a sequence of GPIO steps | SSD1306, INA226, DS18B20, I2S audio, anything with a state machine, calibration or timing |
 
 A manifest **tool** is built from primitives (`gpio_write`, `i2c_read`, `delay`, `sequence`,
@@ -73,7 +80,7 @@ Limits: `tools ≤ 48`, `sequence.steps ≤ 8`, cumulative `delay ≤ 5000 ms` p
   48 characters, must be unique. The restriction is the wire charset, not a style
   choice: `function.name` is validated against `^[a-zA-Z0-9_-]+$`, and every request
   carries the whole tool list — one name outside it fails **every** call, including the
-  `manifest_apply` call that would repair the manifest.
+  `manifest` call (`command: apply`) that would repair the manifest.
 - `name` must not be one the board already provides: the built-in tools
   (`board_status`, `manifest_apply`, `i2c_read`, …) and the driver tools of the detected
   hardware (`bme280_read`, `led_set`, …). Reusing one is refused with
@@ -124,7 +131,7 @@ or rate limiting is `-32005` (forbidden), with the range in the message.
 
 ## 6. Validation and errors
 
-`manifest_apply` returns:
+`manifest` with `command: apply` returns:
 
 ```json
 { "applied": false,
@@ -141,7 +148,7 @@ changes nothing.** On success it returns
   (the usual choice while iterating).
 - `mode: "replace"`: replace the whole document (the usual choice when importing).
 - `dry_run: true`: validate only, and return `would_add` / `would_remove`.
-- `manifest_reset`: clear it, keeping only the built-in tools.
+- `manifest` with `command: reset`: clear it, keeping only the built-in tools.
 - The previous version is not backed up automatically: to roll back, apply an older
   document again (the current one can be read from the `mcp://manifest` resource).
 

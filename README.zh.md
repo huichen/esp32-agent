@@ -14,7 +14,7 @@
 | 要点 | 细节 |
 |---|---|
 | 模型跑在板上 | 循环、工具、记忆与会话记录都是固件；模型可以是任何 OpenAI 兼容或 Anthropic 端点。[给它一个模型](docs/model.md) |
-| 工具集就是一份文档 | `manifest_apply` 校验 JSON 清单，把它编译成工具，同一轮内即生效。[清单](docs/manifest.md) |
+| 工具集就是一份文档 | `manifest` (`command: apply`) 校验 JSON 清单，把它编译成工具，同一轮内即生效。[清单](docs/manifest.md) |
 | 自己发现硬件 | 启动时探测 I2C、1-Wire 与已声明的引脚；只有应答的才得到工具。[能力](docs/capabilities.md) |
 | 一套工具，两个调用方 | MCP 端点与板载智能体看到同一批工具，来自同一份描述。[HTTP 与 MCP API](docs/http-api.md) |
 | 通过 HTTPS 的控制台 | 在手机上对话，并配置设备、工具、定时、日志、WiFi 与模型；证书由板子自己签发。[网页控制台](docs/web-console.md) |

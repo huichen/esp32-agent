@@ -20,13 +20,13 @@ curl -sS -X POST http://<board>:80/mcp -H 'Content-Type: application/json' -d '{
   {"id":"ssd1306","kind":"ssd1306","bus":"i2c","address":60,"adopted":false,
    "adopt": {"devices":[{"id":"ssd1306","kind":"ssd1306","driver":"ssd1306",
                          "bus":0,"address":60,"options":{"height":"32"}}]},
-   "note":"manifest_apply {mode: \"merge\", manifest: adopt}"},
+   "note":"manifest apply: this is the body to send, with mode merge"},
   {"id":"mic","kind":"mic","bus":"i2s","adopted":false,"adopt":null,
    "note":"provided by the board profile; there is nothing to declare"}
 ]}
 ```
 
-`adopt` is not a suggestion — it is the exact body `manifest_apply` accepts, because
+`adopt` is not a suggestion — it is the exact body `manifest` accepts with `command: apply`, because
 `instantiate` reads `bus` as a number, omits a missing address rather than sending `null`,
 and takes an OLED's height from `options`. `adopt: null` marks hardware that only the board
 profile can provide (I2S audio): declaring it would be a no-op that reads like a success.
@@ -60,6 +60,6 @@ nothing: the second run is visibly a no-op.
 ## Related
 
 - [Scripting](scripting.md): the language a discovery script is written in, including the
-  `tool()` call it uses to reach `manifest_apply`.
+  `tool()` call it uses to reach `manifest` (command `apply`).
 - [Capabilities](capabilities.md): what the probe can and cannot recognise.
 - [Manifest](manifest.md): the shape `adopt` is written in.

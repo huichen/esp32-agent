@@ -16,7 +16,7 @@ répond avec eux ; un nouveau capteur peut être déclaré en JSON pendant que
 | Quoi | En détail |
 |---|---|
 | Un modèle tourne sur la carte | Boucle, outils, mémoire et transcription sont dans le firmware ; le modèle est n’importe quel point de terminaison compatible OpenAI ou Anthropic. [Donnez-lui un modèle](docs/model.md) |
-| Le jeu d’outils est un document | `manifest_apply` valide un manifeste JSON, le compile en outils, effectif dans le même tour. [Manifeste](docs/manifest.md) |
+| Le jeu d’outils est un document | `manifest` (`command: apply`) valide un manifeste JSON, le compile en outils, effectif dans le même tour. [Manifeste](docs/manifest.md) |
 | Il trouve son propre matériel | L’I2C, le 1-Wire et les broches déclarées sont sondés au démarrage ; seul ce qui répond obtient des outils. [Capacités](docs/capabilities.md) |
 | Un seul jeu d’outils, deux appelants | Le point de terminaison MCP et l’agent embarqué voient les mêmes outils, à partir d’une seule description. [API HTTP et MCP](docs/http-api.md) |
 | Une console en HTTPS | Discutez avec le modèle et configurez les périphériques, outils, planification, journaux, WiFi et modèle depuis un téléphone ; la carte émet son propre certificat. [Console web](docs/web-console.md) |
