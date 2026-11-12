@@ -12,23 +12,68 @@
 use crate::tool::{object_schema, string, ToolDef};
 use serde_json::{json, Value};
 
-/// Every `op`, in the order the description lists them, with the tool it stands for.
+/// Every `op`, with the handler it stands for.
+///
+/// Reading, writing and editing a file are their own tools, and the network commands are
+/// `curl`/`wget`/`nslookup`/`nc`: those are the names people already use, and a model
+/// knows what they mean without reading a description. What stays here is what has no
+/// familiar single-command equivalent on a board with one storage area.
 pub const OPS: &[(&str, &str)] = &[
     ("ls", "fs_ls"),
-    ("cat", "fs_read"),
-    ("write", "fs_write"),
-    ("edit", "fs_edit"),
     ("rm", "fs_rm"),
     ("cp", "fs_cp"),
     ("mv", "fs_mv"),
     ("grep", "fs_grep"),
-    ("get", "net_get"),
-    ("post", "net_post"),
-    ("dns", "net_dns"),
-    ("tcp", "net_tcp"),
     ("zip", "shell_zip"),
     ("unzip", "shell_unzip"),
 ];
+
+/// How each command is written, in the order it takes its arguments.
+///
+/// This exists because a model that gets a command wrong needs the correction in the
+/// error, not in a document it must go and fetch: `rm` without `confirm` answers with
+/// `usage: rm <path> --confirm`, and `shell help` lists every line.
+pub fn usage(op: &str) -> Option<&'static str> {
+    Some(match op {
+        "ls" => "ls [path]",
+        "rm" => "rm <path> --confirm",
+        "cp" => "cp <from> <to>",
+        "mv" => "mv <from> <to> --confirm",
+        "grep" => "grep <pattern> [path]",
+        "zip" => "zip --name <archive> [--files {name: text}] [--paths [path]]",
+        "unzip" => "unzip --archive_b64 <base64>",
+        // The commands that are tools of their own. They share the table so `--help` and
+        // the error suffix say the same thing wherever the model reaches them.
+        "read" => "read <path>",
+        "write" => "write <path> <text>",
+        "edit" => "edit <path> <find> <replace>",
+        "curl" => "curl <url> [--data <body>] [--format text|raw]",
+        "wget" => "wget <url> [--path <path>] [--format text|raw]",
+        "nslookup" => "nslookup <host> [--port n]",
+        "nc" => "nc <host> [--port n] [--timeout_ms n]",
+        "ping" => "ping <host> [--count n]",
+        "ifconfig" => "ifconfig",
+        _ => return None,
+    })
+}
+
+/// Every command with its usage, for `shell {"op":"help"}`.
+pub fn help_text() -> String {
+    let mut out = String::from("shell commands (op + arguments):\n");
+    for (op, _) in OPS {
+        if let Some(line) = usage(op) {
+            out.push_str("  ");
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    out.push_str(
+        "Separate tools with their own names: read <path> · write <path> <text> · edit <path> <find> <replace> · \
+         curl <url> [--data <body>] [--format text|raw] · wget <url> [--path <path>] · nslookup <host> [--port n] · \
+         nc <host> [--port n] [--timeout_ms n] · ping <host> [--count n] · ifconfig",
+    );
+    out
+}
 
 /// The handler a command maps to, or `None` for an operator nobody has.
 pub fn route(op: &str) -> Option<&'static str> {
@@ -40,34 +85,24 @@ pub fn route(op: &str) -> Option<&'static str> {
 pub fn spec() -> ToolDef {
     ToolDef::new(
         "shell",
-        "The board's command line, as one tool. `op` picks the command and the other fields are its arguments:\n\
-         ls{path} · cat{path} · write{path,text} · edit{path,find,replace} · rm{path,confirm} · cp{from,to} · mv{from,to,confirm}\n\
-         grep{pattern,path} · get{url,format} · post{url,body} · dns{host,port} · tcp{host,port,timeout_ms}\n\
-         zip{name,files} · unzip{archive_b64}\n\
-         `get` reduces an HTML page to its text unless format=raw. `zip` writes a stored archive and returns it as base64; `unzip` reads stored or deflated archives.",
+        "Workspace commands that have no tool of their own. `op` picks the command and the other fields are its arguments:\n\
+         ls{path} · rm{path,confirm} · cp{from,to} · mv{from,to,confirm} · grep{pattern,path} · zip{name,files} · unzip{archive_b64}\n\
+         Read, write and edit a file with the `read`, `write` and `edit` tools; fetch a URL with `curl` or `wget`. `zip` writes a stored archive and returns it as base64; `unzip` reads stored or deflated archives.",
     )
     .title("Shell")
     .category("system")
     .schema(object_schema(
         &[
-            ("op", string("the command: ls, cat, write, edit, rm, cp, mv, grep, get, post, dns, tcp, zip, unzip")),
-            ("path", string("file or directory, for ls/cat/write/edit/rm/grep")),
-            ("text", string("contents, for write")),
-            ("find", string("literal text, must occur exactly once, for edit")),
-            ("replace", string("replacement, for edit")),
+            ("op", string("the command: ls, rm, cp, mv, grep, zip, unzip")),
+            ("path", string("file or directory, for ls/rm/grep")),
             ("from", string("source path, for cp/mv")),
             ("to", string("destination path, for cp/mv")),
             ("confirm", json!({ "type": "boolean", "description": "must be true for rm and mv" })),
             ("pattern", string("literal substring, for grep")),
-            ("url", string("http:// or https:// URL, for get/post")),
-            ("format", string("text (default) or raw, for get")),
-            ("body", string("request body, for post")),
-            ("host", string("hostname or address, for dns/tcp")),
-            ("port", json!({ "type": "integer", "minimum": 1, "maximum": 65535, "description": "port, for dns/tcp" })),
-            ("timeout_ms", json!({ "type": "integer", "minimum": 100, "maximum": 20000, "description": "for tcp, default 3000" })),
             ("name", string("archive name, for zip")),
             ("files", json!({ "type": "object", "description": "for zip: {name: text} entries to pack" })),
             ("archive_b64", string("for unzip: the archive, base64")),
+            ("help", json!({ "type": "boolean", "description": "return the usage lines instead of running anything" })),
         ],
         &["op"],
     ))
