@@ -43,6 +43,22 @@ Order inside one tool call: `tool_use` → `tool_progress(start)` → [`tool_res
 marks the boundaries and carries the elapsed time — a client that ignores it loses
 nothing.
 
+### `retried`
+
+One further kind, emitted **at most once per model call**, when the request that produced
+the reply took more than one attempt:
+
+```
+{"seq":44,"event":"retried","at_ms":...,"text":"the model request was retried 2 times (waited 250, 500 ms); the last failure was llm: POST … failed: HTTP 503: …"}
+```
+
+It comes first in that call's group — `retried` → `usage` → `thinking_*` → `text_*` — and
+the failed attempts themselves are not journaled. A client reading the stream learns that
+this answer took two tries; it never sees three failures and one success. Attempts that
+run out never reach a reply: they are one `error` whose text carries both numbers
+("… (gave up after 3 attempts)"), followed by `run_end` with `is_error`. The retry policy
+itself is in `docs/agent-loop.md`; there is no event per wait.
+
 ### `agent.tick_ms`
 
 `GET /api/agent/config` reports `tick_ms`; `POST` accepts `{"tick_ms":500}`, clamped

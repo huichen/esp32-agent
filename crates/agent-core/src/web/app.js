@@ -507,6 +507,13 @@ function handleEvent(name, data) {
       }
       break;
     }
+    case "retried": {
+      // One line, once per model call: a retry that worked is not a failure, so it goes in
+      // the collapsed trace rather than in a toast, and the failed attempts never appear.
+      const box = ensureLiveTrace();
+      chip(box, "retried", [["why", data.text || "the model request was retried"]]);
+      break;
+    }
     case "error":
       toast(data.text || "run failed");
       break;
@@ -528,7 +535,7 @@ function handleEvent(name, data) {
 const EVENT_KINDS = [
   "message_start", "thinking_start", "thinking_delta", "thinking_end",
   "text_start", "text_delta", "text_end", "tool_use", "tool_progress",
-  "tool_result", "usage", "message_end", "error", "run_end",
+  "tool_result", "retried", "usage", "message_end", "error", "run_end",
 ];
 
 function connectStream() {
