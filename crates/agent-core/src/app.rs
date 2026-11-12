@@ -3500,7 +3500,11 @@ impl App {
                 }
                 self.log.warn("system", "reboot requested from the portal");
                 self.runtime.restart_requested = true;
-                self.hw.reboot();
+                // No `hw.reboot()` here: restarting from inside this request would cut the
+                // reply off and, more importantly, drop whatever the store writer has queued
+                // (its tick is up to 100 ms away, and `esp_restart` does not wait for it).
+                // The platform's loop notices the flag, flushes on a stack it has checked, and
+                // restarts — `/api/config` already works that way for a bus or board change.
                 Response::json(&json!({ "ok": true, "note": "rebooting" }))
             }
             ("POST", "/api/factory-reset") => {
