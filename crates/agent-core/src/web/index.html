@@ -27,6 +27,9 @@
 </main>
 
 <form id="composer" class="composer" autocomplete="off">
+  <div id="attach-chip" class="attach-chip" hidden></div>
+  <input id="attach-input" type="file" accept="image/*" hidden>
+  <button id="attach" class="attach" type="button" aria-label="Attach an image">+</button>
   <textarea id="input" rows="1" placeholder="Ask the board&hellip;" enterkeyhint="send"></textarea>
   <button id="send" class="send" type="submit" aria-label="Send">&#8593;</button>
 </form>

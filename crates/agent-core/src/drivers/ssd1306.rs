@@ -82,6 +82,40 @@ impl Ssd1306 {
         &self.fb
     }
 
+    /// What the panel is showing, read back out of the frame buffer by matching each 6x8
+    /// cell against the font it was drawn with.
+    ///
+    /// A bitmap is useless to a text model — `board_status` cannot answer "what is on the
+    /// screen" and a base64 frame is 684 characters of nothing the model can read. This
+    /// turns the pixels back into the text they came from; anything drawn by
+    /// `oled_bitmap` or `oled_rect` shows up as spaces or `?`, which is the honest answer.
+    pub fn read_text(&self) -> Vec<String> {
+        let cols = self.width as usize / FONT_W;
+        let mut out = Vec::with_capacity(self.pages());
+        for page in 0..self.pages() {
+            let mut line = String::with_capacity(cols);
+            for col in 0..cols {
+                let mut cell = [0u8; FONT_W];
+                for (k, byte) in cell.iter_mut().enumerate() {
+                    let x = col * FONT_W + k;
+                    *byte = self.fb.get(page * self.stride() + x).copied().unwrap_or(0);
+                }
+                if cell.iter().all(|b| *b == 0) {
+                    line.push(' ');
+                    continue;
+                }
+                let ch = FONT6X8
+                    .iter()
+                    .position(|g| g[..] == cell[..])
+                    .map(|i| (i as u32 + 0x20) as u8 as char)
+                    .unwrap_or('?');
+                line.push(ch);
+            }
+            out.push(line.trim_end().to_string());
+        }
+        out
+    }
+
     fn cmd(&mut self, hw: &mut dyn Hardware, bytes: &[u8]) -> Result<()> {
         hw.i2c_write(self.bus, self.addr, Some(CMD), bytes)
     }
@@ -293,6 +327,7 @@ impl Device for Ssd1306 {
         let id_rect = id.clone();
         let id_bitmap = id.clone();
         let id_contrast = id.clone();
+        let id_read = id.clone();
         vec![
             ToolDef::new("oled_text", "Write ASCII text on the OLED using the panel's own 6x8 font")
                 .title("OLED text")
@@ -317,6 +352,14 @@ impl Device for Ssd1306 {
                         "text": text, "line": line, "x": x, "clear": clear
                     }), ctx.hw)
                 }),
+            ToolDef::new(
+                "oled_read",
+                "Read back what the OLED is showing. The frame buffer is decoded with the same 6x8 font it was drawn with, so text drawn by oled_text comes back as text; pixels drawn by oled_bitmap or oled_rect read as spaces or '?'",
+            )
+            .title("OLED read")
+            .category("display")
+            .requires(&["oled"])
+            .bind(move |ctx, _args| ctx.devices.call(&id_read, "oled_read", &json!({}), ctx.hw)),
             ToolDef::new("oled_clear", "Clear the OLED panel")
                 .title("OLED clear")
                 .category("display")
@@ -385,6 +428,16 @@ impl Device for Ssd1306 {
                 self.flush(hw)?;
                 Ok(json!({ "ok": true, "chars": text.chars().count(), "line": line }))
             }
+            "oled_read" => {
+                let lines = self.read_text();
+                Ok(json!({
+                    "ok": true,
+                    "width": self.width,
+                    "height": self.height,
+                    "lines": lines,
+                    "text": lines.join("\n").trim().to_string(),
+                }))
+            }
             "oled_clear" => {
                 self.clear();
                 self.flush(hw)?;
@@ -440,5 +493,38 @@ impl Device for Ssd1306 {
             }
             other => Err(McpError::not_found(format!("oled has no tool `{other}`"))),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn bare_panel() -> Ssd1306 {
+        Ssd1306 {
+            bus: 0,
+            addr: 0x3c,
+            width: 128,
+            height: 32,
+            controller: Controller::Ssd1306,
+            fb: vec![0; 128 * 4],
+            inverted: false,
+            powered: true,
+            contrast: 0xcf,
+            id: "ssd1306".into(),
+        }
+    }
+
+    /// The read-back walks the same font the draw used; a round trip is the only check
+    /// that matters, because a mismatch would silently report a screen that is not there.
+    #[test]
+    fn oled_read_returns_the_text_that_was_drawn() {
+        let mut panel = bare_panel();
+        panel.text(0, 0, "HELLO", true);
+        let lines = panel.read_text();
+        assert_eq!(lines.len(), 4, "one line per 8 px page");
+        assert_eq!(lines[0].trim_end(), "HELLO", "{lines:?}");
+        panel.clear();
+        assert!(panel.read_text().iter().all(|l| l.trim().is_empty()), "a cleared panel reads empty");
     }
 }
