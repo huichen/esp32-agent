@@ -43,7 +43,7 @@ curl -sS -X POST http://<ip>:80/mcp \
 
 # call a tool
 curl -sS -X POST http://<ip>:80/mcp -H 'Content-Type: application/json' \
-  -d '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"board_status","arguments":{}}}'
+  -d '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"board","arguments":{"command":"status"}}}'
 ```
 
 Supported JSON-RPC methods: `initialize`, `ping`, `tools/list`, `tools/call`,

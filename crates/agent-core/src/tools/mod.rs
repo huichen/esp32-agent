@@ -15,6 +15,7 @@ use crate::error::McpError;
 use crate::hardware::PinMode;
 use crate::json as j;
 use crate::tool::{boolean, enumeration, integer, object_schema, string, ToolCtx, ToolDef};
+use crate::tools::family::Family;
 use crate::util::hex;
 use serde_json::{json, Value};
 
@@ -645,6 +646,54 @@ fn device_invoke_tool() -> ToolDef {
         }
         ctx.devices.call(&device, &tool, &inner, ctx.hw)
     })
+}
+
+/// The commands of the `board` family: the tools about the board itself, rather than about
+/// a bus, a pin or a device.
+///
+/// One list. The declaration, the `help` text and the names the family takes over are all
+/// derived from it, and `board_commands()` resolves each name against the tools that declare
+/// themselves — so a rename shortens the family instead of leaving a command in `help` that
+/// dispatch cannot reach.
+const BOARD_COMMANDS: &[&str] = &[
+    "board_status",
+    "board_config_get",
+    "config_set",
+    "chip_temp",
+    "logs_tail",
+    "reboot",
+    "factory_reset",
+    "delay",
+    "inventory",
+];
+
+/// The commands, as tools. Each one keeps the handler it already had; only the name it is
+/// reached by changes.
+pub fn board_commands() -> Vec<ToolDef> {
+    let mut pool = always_tools();
+    pool.extend(manifest_tools::board_extra_tools());
+    let mut picked: Vec<ToolDef> = Vec::with_capacity(BOARD_COMMANDS.len());
+    for name in BOARD_COMMANDS {
+        if let Some(at) = pool.iter().position(|d| d.spec.name == *name) {
+            picked.push(pool.remove(at));
+        }
+    }
+    picked
+}
+
+/// The `board` family: one tool, nine commands.
+pub fn board_family() -> ToolDef {
+    Family::new(
+        "board",
+        "The board itself: status, config, chip temperature, logs, restart, delay, inventory; `command: help` lists what each takes",
+        board_commands(),
+    )
+    .into_tool()
+}
+
+/// The names the family takes over, derived from the commands themselves.
+pub fn board_members() -> Vec<String> {
+    board_commands().into_iter().map(|d| d.spec.name).collect()
 }
 
 /// Capabilities satisfied by the board rather than by a device, exposed for the

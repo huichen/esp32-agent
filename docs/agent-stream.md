@@ -13,7 +13,7 @@ Server-Sent Events, `Content-Type: text/event-stream`, `Cache-Control: no-cache`
   ```
   id: 42
   event: tool_use
-  data: {"seq":42,"event":"tool_use","at_ms":...,"tool_call_id":"c1","name":"board_status","text":"{}"}
+  data: {"seq":42,"event":"tool_use","at_ms":...,"tool_call_id":"c1","name":"board","text":"{}"}
   ```
   `data` is exactly the JSON object `Event::json()` produces; `id` and `event` repeat `seq`
   and `kind` so a browser `EventSource` can use them;
@@ -30,8 +30,8 @@ Server-Sent Events, `Content-Type: text/event-stream`, `Cache-Control: no-cache`
 One extra journal kind, emitted by the agent around each tool execution:
 
 ```
-{"seq":43,"event":"tool_progress","at_ms":...,"tool_call_id":"c1","name":"board_status","phase":"start"}
-{"seq":47,"event":"tool_progress","at_ms":...,"tool_call_id":"c1","name":"board_status","phase":"end","elapsed_ms":12}
+{"seq":43,"event":"tool_progress","at_ms":...,"tool_call_id":"c1","name":"board","phase":"start"}
+{"seq":47,"event":"tool_progress","at_ms":...,"tool_call_id":"c1","name":"board","phase":"end","elapsed_ms":12}
 ```
 
 Order inside one tool call: `tool_use` → `tool_progress(start)` → [`tool_result`] →

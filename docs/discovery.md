@@ -10,7 +10,7 @@ just stop deciding:
 ```bash
 curl -sS -X POST http://<board>:80/mcp -H 'Content-Type: application/json' -d '{
   "jsonrpc":"2.0","id":1,"method":"tools/call",
-  "params":{"name":"config_set","arguments":{"patch":{"discovery":"manual"}}}}'
+  "params":{"name":"board","arguments":{"command":"config_set","arguments":{"patch":{"discovery":"manual"}}}}}'
 ```
 
 `devices_list` then answers with an empty device list and a **candidate** list:
