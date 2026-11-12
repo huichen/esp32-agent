@@ -450,7 +450,7 @@ pub fn document(dynamic: Value) -> Value {
             "ids": "JSON-RPC ids in the MCP surface; sequence numbers in the polling endpoints",
             "encoding": "UTF-8 everywhere; binary payloads are base64 in a string field",
             "limits": {
-                "tool_result_bytes": 2048,
+                "tool_result_bytes": 8192,
                 "reply_bytes": 8192,
                 "http_connections": 6,
                 "event_streams": 2,

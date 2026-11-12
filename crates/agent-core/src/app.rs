@@ -76,7 +76,7 @@ pub const MAX_SHELL_SLEEP_MS: u64 = 10_000;
 ///
 /// The same reason `hexdump` and `unzip` have budgets: a tool result is about 2 KB, and a
 /// pipeline can multiply what a single command would have returned.
-pub const PIPE_RESULT_MAX: usize = 1800;
+pub const PIPE_RESULT_MAX: usize = 8192;
 
 /// How many scheduled prompts and sensor rules the board keeps. The scheduler
 /// tick walks both lists on every tick, so this is bounded like everything else.
@@ -3709,7 +3709,7 @@ impl App {
             "url": url,
         });
         if truncated {
-            out["note"] = json!("the file holds the first 2048 bytes of the response");
+            out["note"] = json!("the file holds the first 8192 bytes of the response");
         }
         Ok(out.to_string())
     }
@@ -4755,7 +4755,7 @@ fn pipe_text(op: &str, answer: &Value) -> std::result::Result<String, String> {
         "wget" => text("body"),
         // `jq` prints one value per line: that is exactly the text a `head` or a `grep`
         // downstream wants, and the reason `curl api | jq .x | head` is the shape people type.
-        "jq" => text("out"),
+        "jq" => text("text"),
         other => return Err(format!("`{other}` has no line form to hand down a pipe")),
     })
 }
