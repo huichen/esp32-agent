@@ -21,7 +21,7 @@ answers; a new sensor can be declared with a JSON manifest while the board runs.
 | 4 | **One tool set, two callers.** The MCP endpoint and the on-board agent see the same tools: 48 today, with the shell among them. |
 | 5 | **A web console over HTTPS.** Chat with the model, and change devices, tools, manifest, schedule, logs, WiFi and model settings from a phone. |
 | 6 | **It works while nobody watches.** Timed prompts, sensor rules, and an objective it iterates on across runs. |
-| 7 | **A shell and a scripting language.** 22 shell commands (files, network, diagnostics) and a small interpreter for loops and conditions over tool calls. |
+| 7 | **A shell and a scripting language.** `nsh` with 26 commands named as NuttX names them (files, network, hashing, diagnostics), and a small interpreter for loops and conditions over tool calls. |
 | 8 | **Self-contained on the LAN.** HTTP and HTTPS from the board, a certificate it generates itself, a PIN and a token for the three callers. |
 | 9 | **Testable without hardware.** The simulator runs the same core against a virtual board. |
 
@@ -82,6 +82,22 @@ sent as content parts. `reasoning` selects the thinking level (`off`/`low`/`medi
 Without a key, point `base_url` at the board's own `/selftest/chat/completions` and the loop
 still runs.
 
+## Standing orders
+
+The system prompt has a slot for what this board is *for*, which the owner writes and the
+model reads on every turn:
+
+```bash
+curl -sS -X POST http://<board>/api/agent/prompt -H 'Content-Type: application/json' \
+  -d '{"action":"set","text":"The pump relay is on GPIO12 and waters the plants. Never run it for more than two minutes at a time."}'
+```
+
+`action` is `set`, `append` or `clear`; `GET /api/agent/prompt` shows the whole prompt the
+model will receive, custom part included. The agent can do the same with
+`nsh {"command": "system_prompt set …"}`, and `system_prompt get` reads it back. The text is
+capped at 2 KB and stored in NVS, so it survives a reboot and costs one line in every
+request.
+
 ## What the board can do
 
 | Area | Tools |
@@ -97,39 +113,39 @@ still runs.
 Tool results are capped at 2 KB and replies at 8 KB. The board has 8 MB of PSRAM and a few
 dozen kilobytes of internal SRAM; the limits exist because of the second number.
 
-## Shell
+## nsh: the shell
 
 The board has one writable area, 8 KB of text in NVS, and two ways to use it: three tools
-for the common operations, and a `shell` for the rest.
+for the common operations, and the NuttX-style shell `nsh` for the rest.
 
 ```text
 read   {"path":"/notes/a.txt"}
 write  {"path":"/notes/a.txt","text":"..."}
 edit   {"path":"/notes/a.txt","find":"old","replace":"new"}
 
-shell  {"command": "ls /notes"}
-shell  {"command": "cp /a.txt /b.txt"}
-shell  {"command": "grep GPIO /"}
-shell  {"command": "rm /a.txt --confirm"}
-shell  {"command": "zip t.zip /a.txt /notes/b.md"}
-shell  {"command": "unzip UEsDB..."}
+nsh    {"command": "ls /notes"}
+nsh    {"command": "cp /a.txt /b.txt"}
+nsh    {"command": "grep GPIO /"}
+nsh    {"command": "rm /a.txt --confirm"}
+nsh    {"command": "zip t.zip /a.txt /notes/b.md"}
+nsh    {"command": "unzip UEsDB..."}
 ```
 
-`shell` takes one command line and parses it, the way a shell does: words, quotes, and
+`nsh` takes one command line and parses it, the way a shell does: words, quotes, and
 `-f`/`--flag` options. `{"op":"ls","path":"/notes"}` still works when a client would rather
 build an object than a string.
 
 The commands a shell has for looking at itself, as NuttX's `nsh` does:
 
 ```text
-shell  {"command": "df"}          # workspace usage against its 8 KB
-shell  {"command": "free"}        # heap, free and minimum
-shell  {"command": "uptime"}      # uptime and model runs
-shell  {"command": "date"}        # clock, and whether SNTP has synced
-shell  {"command": "uname"}       # soc, cores, flash, PSRAM, IDF, MAC
-shell  {"command": "ps"}          # tasks with state and stack headroom
-shell  {"command": "hexdump /dl/img.bin"}
-shell  {"command": "base64 /notes/a.txt"}   # -d to decode, -o to write elsewhere
+nsh    {"command": "df"}          # workspace usage against its 8 KB
+nsh    {"command": "free"}        # heap, free and minimum
+nsh    {"command": "uptime"}      # uptime and model runs
+nsh    {"command": "date"}        # clock, and whether SNTP has synced
+nsh    {"command": "uname"}       # soc, cores, flash, PSRAM, IDF, MAC
+nsh    {"command": "ps"}          # tasks with state and stack headroom
+nsh    {"command": "hexdump /dl/img.bin"}
+nsh    {"command": "base64 /notes/a.txt"}   # -d to decode, -o to write elsewhere
 ```
 
 `edit` refuses when `find` occurs zero or several times, so an ambiguous edit cannot rewrite
@@ -140,18 +156,26 @@ deflated entries and checks each CRC.
 Network commands use the names they have everywhere else:
 
 ```text
-shell  {"command": "curl https://example.com/"}                # GET, HTML reduced to text
-shell  {"command": "curl -d {\"a\":1} https://example.com/"}    # POST
-shell  {"command": "curl -f raw https://example.com/"}         # the document as it arrived
-shell  {"command": "wget -o /dl/page.txt https://example.com/"} # save the body
-shell  {"command": "nslookup example.com"}
-shell  {"command": "nc -p 443 example.com"}
-shell  {"command": "ping -c 3 192.168.3.1"}
-shell  {"command": "ifconfig"}                                 # ip, gateway, DNS, SSID, RSSI, MAC
+nsh    {"command": "curl https://example.com/"}                # GET, HTML reduced to text
+nsh    {"command": "curl -d {\"a\":1} https://example.com/"}    # POST
+nsh    {"command": "curl -f raw https://example.com/"}         # the document as it arrived
+nsh    {"command": "wget -o /dl/page.txt https://example.com/"} # save the body
+nsh    {"command": "nslookup example.com"}
+nsh    {"command": "nc -p 443 example.com"}
+nsh    {"command": "ping -c 3 192.168.3.1"}
+nsh    {"command": "ifconfig"}                                 # ip, gateway, DNS, SSID, RSSI, MAC
 ```
 
 `ifconfig` reports the configured gateway and DNS rather than the lease, which answers
 "did my override take effect". `ping` sends real ICMP echoes through ESP-IDF's ping session.
+
+The commands that came with the last batch:
+
+```text
+nsh  {"command": "sha256sum /notes/a.txt"}   # also md5sum
+nsh  {"command": "base64enc /notes/a.txt"}    # base64dec to go back
+nsh  {"command": "system_prompt get"}         # the standing orders, see below
+```
 
 **When a command is wrong, the error says how to write it:**
 
@@ -162,7 +186,7 @@ unknown op         → "`sudo` is not a shell command" ... followed by every usa
 {"help":true} on curl, read, ping, … → the same one-line usage
 ```
 
-`shell {"op":"help"}` lists every command. The usage lines come from one table, so the
+`nsh {"command":"help"}` lists every command. The usage lines come from one table, so the
 error suffix and the help output cannot disagree.
 
 ## Script

@@ -41,7 +41,12 @@ pub const OPS: &[(&str, &str)] = &[
     ("uname", "shell_uname"),
     ("ps", "shell_ps"),
     ("hexdump", "shell_hexdump"),
-    ("base64", "shell_base64"),
+    ("xd", "shell_hexdump"),
+    ("base64enc", "shell_base64"),
+    ("base64dec", "shell_base64"),
+    ("sha256sum", "shell_sha256sum"),
+    ("md5sum", "shell_md5sum"),
+    ("system_prompt", "shell_system_prompt"),
 ];
 
 /// One command line, split the way a shell splits it: words, with quotes respected.
@@ -170,12 +175,18 @@ pub fn arguments(parsed: &Parsed) -> Result<serde_json::Value, String> {
             json!({ "name": name, "paths": parsed.args.iter().skip(1).collect::<Vec<_>>(), "files": files })
         }
         "unzip" => json!({ "archive_b64": need(0, "<archive_b64>")? }),
-        "hexdump" => json!({ "path": need(0, "<path>")?, "width": flag("width", "w") }),
-        "base64" => json!({
+        "hexdump" | "xd" => json!({ "path": need(0, "<path>")?, "width": flag("width", "w") }),
+        "base64" | "base64enc" | "base64dec" => json!({
             "path": need(0, "<path>")?,
-            "decode": flag_bool("decode", "d"),
+            "decode": parsed.name == "base64dec" || flag_bool("decode", "d"),
             "out": flag("out", "o"),
         }),
+        "sha256sum" | "md5sum" => json!({ "path": need(0, "<path>")? }),
+        "system_prompt" => {
+            let action = arg(0).unwrap_or_else(|| "get".into());
+            let text = parsed.args.iter().skip(1).cloned().collect::<Vec<_>>().join(" ");
+            json!({ "action": action, "text": text })
+        }
         "curl" => json!({
             "url": need(0, "<url>")?,
             "data": flag("data", "d"),
@@ -213,7 +224,12 @@ pub fn usage(op: &str) -> Option<&'static str> {
         "uname" => "uname",
         "ps" => "ps",
         "hexdump" => "hexdump <path> [-w <bytes per line>]",
-        "base64" => "base64 <path> [-d] [-o <out>]",
+        "xd" => "xd <path> [-w <bytes per line>]  (same as hexdump)",
+        "base64enc" => "base64enc <path> [-o <out>]",
+        "base64dec" => "base64dec <path> [-o <out>]",
+        "sha256sum" => "sha256sum <path>",
+        "md5sum" => "md5sum <path>",
+        "system_prompt" => "system_prompt get | set <text> | append <text> | clear",
         // The commands that are tools of their own. They share the table so `--help` and
         // the error suffix say the same thing wherever the model reaches them.
         "read" => "read <path>",
@@ -252,7 +268,7 @@ pub fn route(op: &str) -> Option<&'static str> {
 /// The one tool definition the model and MCP clients see.
 pub fn spec() -> ToolDef {
     ToolDef::new(
-        "shell",
+        "nsh",
         "Run a command on the board, as on any unix shell: one `command` string.\n\
          ls [path] · rm <path> --confirm · cp <from> <to> · mv <from> <to> --confirm · grep <pattern> [path]\n\
          curl <url> [-d body] [-f text|raw] · wget <url> [-o path] · nslookup <host> · nc <host> [-p port] · ping <host> [-c n] · ifconfig\n\
@@ -260,7 +276,7 @@ pub fn spec() -> ToolDef {
          df · free · uptime · date · uname · ps · help\n\
          `curl` reduces an HTML page to its text unless -f raw. A wrong command answers with its usage; `shell help` lists everything.",
     )
-    .title("Shell")
+    .title("NuttX shell")
     .category("system")
     .schema(object_schema(
         &[
@@ -308,7 +324,7 @@ mod tests {
         }
         assert_eq!(route("sudo"), None);
         let spec = spec();
-        assert_eq!(spec.spec.name, "shell");
+        assert_eq!(spec.spec.name, "nsh");
         assert!(spec.spec.input_schema["properties"]["command"].is_object());
     }
 }
