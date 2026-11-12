@@ -153,18 +153,221 @@ impl Device for Ina219 {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use crate::hardware::BoardInfo;
+    use std::collections::HashMap;
+
+    /// A register file with a bus on it: the INA219 is 16-bit big-endian registers and
+    /// nothing else, so a map of register to value is a faithful fake. Reads and writes are
+    /// logged with their register so a test can check both the value and the address.
+    #[derive(Default)]
+    struct Chip {
+        regs: HashMap<u8, u16>,
+        reads: Vec<(u8, u8, Option<u8>)>,
+        writes: Vec<(Option<u8>, Vec<u8>)>,
+        /// A register that NAKs, to prove a failed read reaches the caller.
+        fail_reg: Option<u8>,
+    }
+
+    impl Chip {
+        fn with(regs: &[(u8, u16)]) -> Self {
+            Self { regs: regs.iter().copied().collect(), ..Default::default() }
+        }
+
+        fn written(&self, reg: u8) -> Vec<u8> {
+            self.writes.iter().find(|(r, _)| *r == Some(reg)).map(|(_, d)| d.clone()).unwrap_or_default()
+        }
+    }
+
+    impl Hardware for Chip {
+        fn board_info(&mut self) -> BoardInfo {
+            BoardInfo { soc: "fake".into(), firmware: "test".into(), ..Default::default() }
+        }
+
+        fn i2c_read(&mut self, bus: u8, addr: u8, reg: Option<u8>, out: &mut [u8]) -> Result<()> {
+            if reg.is_some() && reg == self.fail_reg {
+                return Err(McpError::hardware("I2C NAK"));
+            }
+            self.reads.push((bus, addr, reg));
+            assert_eq!(out.len(), 2, "every INA register is 16 bits");
+            let v = reg.and_then(|r| self.regs.get(&r).copied()).unwrap_or(0);
+            out.copy_from_slice(&v.to_be_bytes());
+            Ok(())
+        }
+
+        fn i2c_write(&mut self, _bus: u8, _addr: u8, reg: Option<u8>, data: &[u8]) -> Result<()> {
+            self.writes.push((reg, data.to_vec()));
+            Ok(())
+        }
+    }
+
+    fn close(got: &Value, want: f64) -> bool {
+        (got.as_f64().unwrap_or(f64::NAN) - want).abs() < 1e-3
+    }
+
+    /// `0x5449` is "TI" in the manufacturer register, and only the INA226 has that register.
+    /// Getting this wrong means every current reading is off by a factor of 12.5.
     #[test]
-    fn bus_voltage_conversion_matches_datasheet() {
-        // Raw 0x2710 = 10000 -> 10000 >> 3 = 1250 -> 5 V
-        let raw: u16 = 0x2710;
-        let mv = (raw >> 3) as f32 * 4.0;
-        assert!((mv / 1000.0 - 5.0).abs() < 0.001);
+    fn probe_recognises_the_ina226_from_its_manufacturer_register() {
+        let mut chip = Chip::with(&[(REG_MANUF, INA219_MANUF)]);
+        let d = Ina219::probe(&mut chip, 0, 0x40, 100, 1).expect("probe");
+        assert_eq!(d.variant, Variant::Ina226);
+        assert_eq!(d.id, "ina226", "the id follows the part, not the configured kind");
+        assert_eq!(d.info().kind, "ina226");
+        assert_eq!(chip.written(REG_CONFIG), vec![0x39, 0x9F], "32 V, 320 mV, 12-bit, continuous");
+    }
+
+    /// An INA219 has nothing at 0xFE, so the probe reads zeros (or NAKs) and the part is
+    /// taken as an INA219 by default rather than refused: it is the common part.
+    #[test]
+    fn probe_falls_back_to_the_ina219_when_there_is_no_id_register() {
+        let mut chip = Chip::default();
+        let d = Ina219::probe(&mut chip, 0, 0x41, 100, 1).expect("probe");
+        assert_eq!(d.variant, Variant::Ina219);
+        assert_eq!(d.id, "ina219");
+
+        // A NAK on the manufacturer read is not a probe failure either.
+        let mut chip = Chip { fail_reg: Some(REG_MANUF), ..Default::default() };
+        let d = Ina219::probe(&mut chip, 0, 0x41, 100, 1).expect("a NAK on 0xFE is still an INA219");
+        assert_eq!(d.variant, Variant::Ina219);
+
+        // And a register that answers something else is not "TI".
+        let mut chip = Chip::with(&[(REG_MANUF, 0x1234)]);
+        assert_eq!(Ina219::probe(&mut chip, 0, 0x40, 100, 1).expect("probe").variant, Variant::Ina219);
     }
 
     #[test]
-    fn calibration_for_a_one_tenth_ohm_shunt() {
-        let cal = (40_960_000u64 / 100) as u16;
-        assert_eq!(cal, 409_600u32 as u16); // truncated by the register width
-        assert_eq!((40_960_000u64 / 1000) as u16, 40_960);
+    fn a_second_monitor_gets_a_numbered_id() {
+        let mut chip = Chip::default();
+        let d = Ina219::probe(&mut chip, 0, 0x41, 100, 2).expect("probe");
+        assert_eq!(d.id, "ina219_2");
+        let mut chip = Chip::with(&[(REG_MANUF, INA219_MANUF)]);
+        let d = Ina219::probe(&mut chip, 0, 0x41, 100, 3).expect("probe");
+        assert_eq!(d.id, "ina226_3");
+    }
+
+    /// Calibration is `0.04096 / (current_lsb * Rshunt)`, and this is the number in the
+    /// datasheet's own worked example: 100 uA LSB over 0.1 ohm is 4096.
+    #[test]
+    fn the_calibration_register_holds_the_datasheet_value_for_a_point_one_ohm_shunt() {
+        let mut chip = Chip::default();
+        let d = Ina219::probe(&mut chip, 0, 0x40, 100, 1).expect("probe");
+        assert_eq!(chip.written(REG_CALIB), vec![0x10, 0x00], "4096 as big-endian bytes");
+        assert_eq!(d.cal, 4096);
+        assert_eq!(d.info().detail["calibration"], 4096);
+        assert_eq!(d.info().detail["shunt_mohm"], 100);
+    }
+
+    /// A zero shunt would divide by zero on real hardware and produce a calibration word of
+    /// 0, which turns every current reading into 0. It is clamped to 1 mohm instead.
+    #[test]
+    fn a_zero_shunt_is_clamped_instead_of_dividing_by_zero() {
+        let mut chip = Chip::default();
+        let d = Ina219::probe(&mut chip, 0, 0x40, 0, 1).expect("probe");
+        assert_eq!(d.shunt_mohm, 1);
+        assert_eq!(d.cal, (409_600u64) as u16, "the truncation the register forces");
+    }
+
+    #[test]
+    fn a_write_failure_during_setup_fails_the_probe() {
+        struct Naks;
+        impl Hardware for Naks {
+            fn board_info(&mut self) -> BoardInfo {
+                BoardInfo { soc: "fake".into(), ..Default::default() }
+            }
+            fn i2c_read(&mut self, _b: u8, _a: u8, _r: Option<u8>, out: &mut [u8]) -> Result<()> {
+                out.fill(0);
+                Ok(())
+            }
+            fn i2c_write(&mut self, _b: u8, _a: u8, _r: Option<u8>, _d: &[u8]) -> Result<()> {
+                Err(McpError::hardware("I2C NAK on write"))
+            }
+        }
+        let err = Ina219::probe(&mut Naks, 0, 0x40, 100, 1)
+            .err()
+            .expect("a part that cannot be configured is not usable");
+        assert_eq!(err.code, crate::error::code::HARDWARE);
+    }
+
+    /// The four registers, decoded with the datasheet's LSBs: bus 4 mV/bit with the low
+    /// three bits unused, shunt 10 uV/bit signed, current and power in the calibration's
+    /// units. A 5 V rail drawing 10 mA is the reference reading.
+    #[test]
+    fn a_full_reading_decodes_all_four_registers() {
+        let mut chip = Chip::with(&[
+            (REG_BUS, 0x2710),   // 10000 -> 1250 * 4 mV = 5 V
+            (REG_SHUNT, 0xFFF6), // -10 * 10 uV = -0.1 mV, i.e. current flowing the other way
+            (REG_CURRENT, 100),  // 100 * 0.1 mA = 10 mA
+            (REG_POWER, 25),     // 25 * 2 mW = 50 mW
+        ]);
+        let mut d = Ina219::probe(&mut chip, 0, 0x40, 100, 1).expect("probe");
+        let (v, shunt_mv, ma, mw) = d.read(&mut chip).expect("read");
+        assert!((v - 5.0).abs() < 1e-6, "bus voltage {v}");
+        assert!((shunt_mv + 0.1).abs() < 1e-6, "shunt voltage {shunt_mv}");
+        assert!((ma - 10.0).abs() < 1e-6, "current {ma}");
+        assert!((mw - 50.0).abs() < 1e-6, "power {mw}");
+    }
+
+    /// The INA226's current register is 1.25 mA per bit, not the INA219's 0.1 mA. This is
+    /// the only place the variant changes a number, so it gets its own case.
+    #[test]
+    fn the_ina226_current_register_is_scaled_by_one_and_a_quarter() {
+        let mut chip = Chip::with(&[(REG_MANUF, INA219_MANUF), (REG_CURRENT, 100)]);
+        let mut d = Ina219::probe(&mut chip, 0, 0x40, 100, 1).expect("probe");
+        let (_, _, ma, _) = d.read(&mut chip).expect("read");
+        assert!((ma - 125.0).abs() < 1e-6, "current {ma}");
+    }
+
+    #[test]
+    fn a_register_that_does_not_answer_fails_the_read() {
+        let mut chip = Chip { fail_reg: Some(REG_CURRENT), ..Default::default() };
+        let mut d = Ina219::probe(&mut chip, 0, 0x40, 100, 1).expect("probe");
+        let err = d.read(&mut chip).expect_err("a NAK must not become a measurement");
+        assert_eq!(err.code, crate::error::code::HARDWARE);
+    }
+
+    #[test]
+    fn the_tool_reports_every_register_with_its_unit() {
+        let mut chip =
+            Chip::with(&[(REG_BUS, 0x2710), (REG_SHUNT, 0xFFF6), (REG_CURRENT, 100), (REG_POWER, 25)]);
+        let mut d = Ina219::probe(&mut chip, 0, 0x40, 100, 1).expect("probe");
+        let v = d.call("power_read", &json!({}), &mut chip).expect("read");
+        assert!(close(&v["bus_voltage_v"], 5.0), "{v}");
+        assert!(close(&v["shunt_voltage_mv"], -0.1), "{v}");
+        assert!(close(&v["current_ma"], 10.0), "{v}");
+        assert!(close(&v["power_mw"], 50.0), "{v}");
+        assert!(close(&v["shunt_ohm"], 0.1), "the shunt it was calibrated with: {v}");
+    }
+
+    #[test]
+    fn the_inventory_row_names_the_variant_and_its_registers() {
+        let mut chip = Chip::default();
+        let d = Ina219::probe(&mut chip, 1, 0x41, 100, 1).expect("probe");
+        let info = d.info();
+        assert_eq!(info.kind, "ina219");
+        assert_eq!(info.bus, "i2c");
+        assert_eq!(info.address, Some(0x41));
+        assert!(info.name.contains("INA219") && info.name.contains("0x41"), "{}", info.name);
+        assert!(info.caps.contains(&"power".to_string()));
+        assert_eq!(info.detail["variant"], "INA219");
+        assert_eq!(info.detail["bus"], 1);
+        assert_eq!(info.tools, vec!["power_read"]);
+    }
+
+    #[test]
+    fn the_published_tool_is_dispatchable_and_nothing_else_is() {
+        let mut chip = Chip::default();
+        let names: Vec<String> = Ina219::probe(&mut chip, 0, 0x40, 100, 1)
+            .expect("probe")
+            .tools()
+            .iter()
+            .map(|t| t.spec.name.clone())
+            .collect();
+        assert_eq!(names, vec!["power_read"]);
+        let mut d = Ina219::probe(&mut chip, 0, 0x40, 100, 1).expect("probe");
+        d.call(&names[0], &json!({}), &mut chip).expect("the published name works");
+        let err = d.call("power", &json!({}), &mut chip).expect_err("a near miss is not a tool");
+        assert_eq!(err.code, crate::error::code::NOT_FOUND);
+        assert!(err.message.contains("power"), "{}", err.message);
     }
 }
