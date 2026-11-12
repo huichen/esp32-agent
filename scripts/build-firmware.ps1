@@ -86,7 +86,18 @@ try {
   # sccache fails to spawn it with `os error 206` (the command line is too long). Cargo
   # does not let an environment variable turn a configured wrapper off, so this has to be
   # said out loud before it costs someone an hour.
-  $wrapped = & cargo +esp config get build.rustc-wrapper 2>$null
+  $wrapped = ''
+  # `cargo config get` is unstable, so on a stable channel it exits non-zero and writes a
+  # message to stderr. Under `$ErrorActionPreference = 'Stop'` that aborts the whole
+  # script, which is worse than the warning it was meant to print: probe it quietly.
+  $saved = $ErrorActionPreference
+  $ErrorActionPreference = 'Continue'
+  try {
+    $wrapped = (& cargo +esp config get build.rustc-wrapper 2>$null | Out-String)
+  } catch {
+    $wrapped = ''
+  }
+  $ErrorActionPreference = $saved
   if ($wrapped -match 'sccache') {
     Write-Warning "cargo is configured with rustc-wrapper = $wrapped; esp-idf-sys fails on Windows with 'os error 206' because its command line is too long. Move the [build] rustc-wrapper line out of the cargo config for this build."
   }

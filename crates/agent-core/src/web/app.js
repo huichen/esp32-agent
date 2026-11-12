@@ -676,6 +676,8 @@ async function loadAgent() {
     $("#agent-base").value = d.base_url || "";
     $("#agent-model").value = d.model || "";
     $("#agent-steps").value = d.max_steps;
+  $("#agent-context").value = d.context_tokens || 8192;
+  $("#agent-output").value = d.max_output_tokens || 2048;
     $("#agent-temperature").value = d.temperature;
     $("#agent-protocol").value = d.protocol || "chat";
     $("#agent-reasoning").value = d.reasoning || "";
@@ -872,6 +874,8 @@ $("#attach").onclick = () => $("#attach-input").click();
       base_url: $("#agent-base").value.trim(),
       model: $("#agent-model").value.trim(),
       max_steps: Number($("#agent-steps").value || 0),
+      context_tokens: Number($("#agent-context").value || 8192),
+      max_output_tokens: Number($("#agent-output").value || 2048),
       temperature: Number($("#agent-temperature").value || 0.2),
       protocol: $("#agent-protocol").value,
       reasoning: $("#agent-reasoning").value,
