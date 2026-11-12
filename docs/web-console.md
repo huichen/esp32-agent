@@ -42,6 +42,24 @@ Two details that cost an afternoon each when they are wrong:
 - every response carries `Cache-Control: no-store`, because a browser holding the previous
   `app.js` beside the new HTML renders a blank page that looks exactly like a dead board.
 
+## The composer is measured, not asserted in prose
+
+The bottom bar is the page's only input, and CSS can remove it without touching a single
+rule anyone would think to re-read: `.attach-chip { display: flex }` outranked the UA
+`[hidden] { display: none }`, so the empty chip stayed a 366 px flex item, took the
+composer's one line, and pushed the field and the send button off a 390 px phone. Every
+declaration said what it meant; only the rectangles were wrong.
+
+`crates/agent-core/tests/page_layout.rs` therefore renders the shipped page in a headless
+browser, in a 390 px and a 360 px iframe, and asserts on `getBoundingClientRect()` with
+nothing attached, with the attachment chip shown, and after it is removed. A failure prints
+the whole measurement, so it needs no screenshot to read.
+
+It is part of `cargo test -p esp32-agent-core`, which means the gate needs a Chromium-family
+browser (Chrome, Edge or Chromium). Set `ESP32_AGENT_BROWSER` to the executable when it is
+not in a standard location; without one the test fails rather than skipping, because a
+skipped layout test is how this bug came back.
+
 ## The certificate
 
 Generated on first boot (EC P-256, self-signed, valid 2020–2035 so a 1970 clock still works),
