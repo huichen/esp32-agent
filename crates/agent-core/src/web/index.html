@@ -149,6 +149,10 @@
         <input id="wifi-ssid" type="text" autocomplete="off">
         <label for="wifi-password">Password</label>
         <input id="wifi-password" type="password" autocomplete="new-password">
+        <label for="wifi-gateway">Gateway (empty = from DHCP)</label>
+        <input id="wifi-gateway" type="text" inputmode="decimal" placeholder="192.168.1.1">
+        <label for="wifi-dns">DNS (empty = from DHCP)</label>
+        <input id="wifi-dns" type="text" inputmode="decimal" placeholder="192.168.1.1">
         <div class="buttons">
           <button id="wifi-connect" class="btn primary">Save and join</button>
           <button id="wifi-scan" class="btn ghost">Scan</button>
