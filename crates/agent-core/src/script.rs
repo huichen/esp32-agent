@@ -104,9 +104,10 @@ OPERATORS  + - * / %   == != < <= > >=   and or not   (unary -)
            `+` also joins strings and concatenates lists
 ACCESS     d.field   d["field"]   list[0]   (missing key -> nil)
 RESULT     the value of the last expression is returned
-NOTE       the interpreter runs on the board's HTTP thread: a script that does not finish
-           makes the portal unreachable until it does, so the clock, not the step count,
-           is the limit that matters
+NOTE       the interpreter runs on the thread that called it: the portal's listener when a
+           person runs a script, the agent thread when the model does. A script that does
+           not finish holds that thread, so the clock — not the step count — is the limit
+           that matters
 LIMITS     30 s or 5 000 000 steps, 32 nested blocks, 4 KB strings, 64 log lines
 "#;
 
@@ -1567,20 +1568,26 @@ impl<'a> Run<'a> {
                     None => return Err("sleep() needs milliseconds".into()),
                 };
                 let left = SLEEP_TOTAL_MS.saturating_sub(self.slept_ms);
-                if left == 0 {
+                // Said out loud rather than cut silently: a script that asked for 10 s and
+                // waited 2 would look like it worked, and the author would draw the wrong
+                // conclusion about the sensor it was timing.
+                if ms > SLEEP_MAX_MS {
                     return Err(format!(
-                        "this script already slept its {SLEEP_TOTAL_MS} ms (a script holds the \
-                         portal while it waits)"
+                        "sleep({ms}) is longer than the {SLEEP_MAX_MS} ms one sleep may take"
                     ));
                 }
-                // Never past the wall clock either: the loop that checks it only runs
-                // between statements, and a script that sleeps may have few of them left.
+                if ms > left {
+                    return Err(format!(
+                        "this script has {left} ms of sleep left of its {SLEEP_TOTAL_MS} ms"
+                    ));
+                }
                 let spent = now_ms().saturating_sub(self.started_ms);
-                let budget = MAX_MS.saturating_sub(spent).saturating_sub(1);
-                let nap = ms.min(SLEEP_MAX_MS).min(left).min(budget);
-                if nap > 0 {
-                    std::thread::sleep(std::time::Duration::from_millis(nap));
-                    self.slept_ms += nap;
+                if spent + ms > MAX_MS {
+                    return Err(format!("sleep({ms}) would pass the {MAX_MS} ms a script may run"));
+                }
+                if ms > 0 {
+                    std::thread::sleep(std::time::Duration::from_millis(ms));
+                    self.slept_ms += ms;
                 }
                 Ok(Val::Nil)
             }
@@ -1674,7 +1681,11 @@ mod tests {
             slept_ms: SLEEP_TOTAL_MS,
         };
         let err = runner.execute(program).unwrap_err();
-        assert!(err.contains("already slept"), "{err}");
+        assert!(err.contains("sleep left"), "{err}");
+
+        // A nap longer than one call may take is named, not cut short.
+        let err = run("sleep(5000)", &mut NoHost).unwrap_err();
+        assert!(err.contains("longer than the 2000 ms"), "{err}");
     }
 
     /// 50 000 steps stopped honest loops (about 0.2 s of work); the bound is now the clock.
