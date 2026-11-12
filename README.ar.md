@@ -20,74 +20,55 @@
 | مجموعة أدوات واحدة، مستدعيان | نقطة نهاية MCP والوكيل على اللوحة يريان الأدوات نفسها من وصف واحد. [HTTP وMCP API](docs/http-api.md) |
 | وحدة تحكم عبر HTTPS | محادثة مع النموذج وإعداد للأجهزة والأدوات والجدولة والسجلات وWiFi والنموذج من هاتف؛ واللوحة تصدر شهادتها بنفسها. [وحدة تحكم الويب](docs/web-console.md) |
 | يعمل بلا مراقبة | موجّهات موقوتة وقواعد حسّاسات تُطلق موجّها عندما تتجاوز قراءة عتبة ما. [العمل المجدول](docs/scheduling.md) |
-| طرفية ولغة سكربت | `shell` بـ 26 أمرا بأسماء من NuttX، ومفسّر لحلقات على استدعاءات الأدوات. [Shell](docs/shell.md) · [Script](docs/scripting.md) |
+| طرفية ولغة سكربت | `shell` بـ 55 أمرا بأسماء من NuttX، ومفسّر لحلقات على استدعاءات الأدوات. [Shell](docs/shell.md) · [Script](docs/scripting.md) |
 | يتذكر ما قيل له | أوامر دائمة، و`/AGENTS.md`، وفهرس `/MEMORY.md`، ومهارات، تُجمَع في الموجّه في كل دورة. [ما يراه النموذج دائما](docs/context.md) |
 | لا سحابة في الطريق | HTTPS من اللوحة، وشهادة تولّدها بنفسها، ورقم PIN واحد لثلاثة مستدعين. [المصادقة](docs/security.md) |
 | قابل للاختبار بلا عتاد | المحاكي يشغّل `agent-core` نفسه على لوحة افتراضية. [المحاكي](docs/simulator.md) |
 
 ## التثبيت والاتصال
 
-```bash
-cargo install espup espflash ldproxy
-espup install
-powershell scripts/build-firmware.ps1 -Flash -Port COM3
-```
-
-**بلا سلسلة أدوات؟** كل إصدار موسوم يأتي بصورة مدمجة مبنية من ذلك الوسم:
-`espflash write-bin --chip esp32s3 --flash-size 16mb 0x0 esp32-agent-vX.Y.Z.bin`.
-سكربتات `scripts/` مكتوبة بـPowerShell؛ وعلى macOS أو Linux الخطوات نفسها هي
-`. $HOME/export-esp.sh` ثم `cargo build --release --target xtensa-esp32s3-espidf` داخل
-`firmware/` ([التفاصيل](docs/flashing.md)).
-
-بلا بيانات اعتماد مخزّنة ترفع اللوحة نقطة وصول خاصة بها. اتصل بها من هاتف وافتح
-`http://192.168.4.1/`، أو أرسل `provision <ssid> <password>` عبر USB. تذهب بيانات الاعتماد إلى
-NVS، ولا تدخل الصورة أبدا.
+اكتب الصورة المدمجة من [إصدار](https://github.com/huichen/esp32-agent/releases) عند الإزاحة 0 (أو ابنِها بنفسك، انظر
+[docs/flashing.md](docs/flashing.md)):
 
 ```bash
-curl -sS http://<board>/agent.json | jq '.endpoints | length'
-curl -sS -X POST http://<board>/mcp -H 'Content-Type: application/json' \
-  -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' | jq '.result.tools | length'
-curl -k -sS https://<board>/api/tls | jq -r .fingerprint
+espflash write-bin --chip esp32s3 --flash-size 16mb 0x0 esp32-agent-vX.Y.Z.bin
 ```
 
-المنفذ 443 يقدّم المسارات نفسها عبر TLS بشهادة تُولَّد عند أول إقلاع؛ والمتصفحات تحذّر، لذا قارن
-البصمة. المنفذ 80 يبقى مفتوحا، فشهادة سيئة تكلّف عنوان URL لا اللوحة. `GET /agent.json` هو
-الواجهة كلها كبيانات: 40 مسارا بالطريقة والجسم والقيمة المرجعة والمصادقة، مع كل إعداد قابل
-للكتابة ونوعه وقيمته الافتراضية.
+بلا بيانات محفوظة، ترفع اللوحة نقطة وصول باسم `esp32-agent-setup`. اتصل بها من الهاتف، وافتح
+**http://192.168.4.1/** واكتب اسم شبكة WiFi وكلمة مرورها. تُحفظ في NVS ولا تدخل الصورة، وهي
+ما تحتاجه اللوحة للوصول إلى أي شيء خارج الشبكة المحلية: النموذج، أو مرآة حزم، أو ملف
+`/agent.json` على مكتب مجاور.
+
+## الاستخدام
+
+اللوحة لشيئين فقط.
+
+**شخص بهاتف.** افتح `http://<board>/` (أو نفسه عبر https على 443): محادثة مع النموذج، ورؤية
+الأجهزة المكتشفة، وإيقاف أداة، وقراءة السجل، وضبط PIN.
+
+**وكيل يُسلَّم `http://<board>/agent.json`.** ذلك المستند هو الواجهة كبيانات: كل مسار بطريقته
+وجسمه ومصادقته، وسطح MCP، ونقاط التدفق، وجدول الإعدادات بأنواعها وقيمها الافتراضية، والحدود.
+وكيل يستطيع جلب رابط واحد يمكنه استخدام هذه اللوحة دون قراءة سطر من هذا الملف: لذلك وُجد هذا
+المسار.
 
 ## أعطه نموذجا
 
-النموذج إعداد وليس بناء:
+طريقتان، ونفس الحقول الثلاثة.
+
+**في وحدة التحكم.** افتح الصفحة، لوحة Agent، اكتب العنوان والنموذج والمفتاح، واحفظ. المفتاح
+للكتابة فقط: يذهب إلى NVS ويُقرأ كـ`__set__`.
+
+**بواسطة وكيل.** `POST /api/agent/config` بنفس الحقول:
 
 ```bash
 curl -sS -X POST http://<board>/api/agent/config -H 'Content-Type: application/json' \
   -d '{"base_url":"https://your-provider/v1/chat/completions","model":"…","api_key":"…"}'
-curl -sS -X POST http://<board>/api/agent/message -H 'Content-Type: application/json' \
-  -d '{"text":"اكتب HELLO على شاشة OLED واجعل المصباح أزرق"}'
 ```
 
 ثلاثة بروتوكولات (`chat` و`responses` و`anthropic`)، ومستوى تفكير، ونافذة سياق، وسقف للمخرجات،
-كلها في لوحة Agent داخل وحدة التحكم أو بنفس طلب `POST`. وبدون مفتاح، وجّه `base_url` إلى
-`http://127.0.0.1/selftest/chat/completions` وسيعمل الحلقة كما هي.
-[Model](docs/model.md) فيه جدول الحقول والبروتوكولات الثلاثة جنبا إلى جنب.
-
-## الاستخدام
-
-| من | ماذا تحصل |
-|---|---|
-| `http://<board>/` من الهاتف | محادثة مع النموذج، ورؤية الأجهزة والأدوات، وتغيير كل شيء |
-| `POST /mcp` من عميل MCP | نفس الأدوات التي يستخدمها وكيل اللوحة |
-| `POST /api/script` و`POST /api/sched` | شغّل سكربتا الآن، أو جدوله |
-| `GET /agent.json` | الواجهة كلها كبيانات: المسارات والإعدادات والحدود |
-
-```bash
-curl -sS -X POST http://<board>/mcp -H 'Content-Type: application/json' \
-  -d '{"jsonrpc":"2.0","id":1,"method":"tools/call",
-       "params":{"name":"shell","arguments":{"command":"ls /"}}}'
-```
-
-ويستطيع وكيل اللوحة أن يضيف لنفسه عتادا (`manifest_apply`)، وذاكرة (`write /memory/…`)،
-ووصولا إلى shell: نفس النداءات ونفس PIN.
+كلها في اللوحة نفسها والمسار نفسه. وبلا أي مفتاح، وجّه `base_url` إلى
+`http://127.0.0.1/selftest/chat/completions` وستعمل الحلقة كما هي، فتُختبر اللوحة قبل وجود
+حساب. جدول الحقول في [Model](docs/model.md).
 
 ## ملاحظات أمنية
 
@@ -100,22 +81,6 @@ curl -sS -X POST http://<board>/mcp -H 'Content-Type: application/json' \
   وكيل يقوم بعمله ومارّ يقوم به.
 
 [Security](docs/security.md) يوضح ما لا يُدافع عنه عن قصد.
-
-## بنية المستودع
-
-`crates/` يُبنى ويُختبر على مضيف؛ و`firmware/` هو خلفية ESP-IDF. `agent-core` هو اللوحة خلف سمة
-`Hardware` واحدة بلا كود خاص بشريحة، فيشغّله `cargo test` على حاسوب محمول؛ و`agent-sim` ينفّذ
-تلك السمة على ملف سجلات. دمجهما يضع المحاكي في كل صورة وتبعيات البرنامج الثابت في كل اختبار.
-`firmware/` خارج الـworkspace لأنه يحتاج `cargo +esp` و`-Zbuild-std` وESP-IDF مسحوبا.
-
-```
-crates/agent-core/    hardware.rs (the trait) · drivers/ (one module per chip) · boards.rs ·
-                      manifest.rs · agent.rs + llm.rs · sched.rs · tools/ ·
-                      http.rs · app.rs · sitemap.rs + settings.rs · virtual_board.rs
-crates/agent-sim/     the virtual board behind an HTTP port
-firmware/             main.rs (boot order) · runner.rs (agent thread, TLS) ·
-                      esp_hw.rs (GPIO/I2C/PWM/ADC/RMT/I2S) · console.rs · wifi.rs
-```
 
 ## الحالة
 

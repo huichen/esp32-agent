@@ -21,75 +21,55 @@
 | Один набор инструментов, два вызывающих | Эндпоинт MCP и агент на плате видят одни и те же инструменты из одного описания. [HTTP и MCP API](docs/http-api.md) |
 | Консоль по HTTPS | С телефона — чат с моделью и настройка устройств, инструментов, расписания, журналов, WiFi и модели; сертификат плата выпускает сама. [Веб-консоль](docs/web-console.md) |
 | Работает без присмотра | Задания по времени и правила по датчикам, которые запускают задание, когда показание пересекает порог. [Работа по расписанию](docs/scheduling.md) |
-| Shell и язык скриптов | `shell` с 26 командами с именами из NuttX и интерпретатор для циклов по вызовам инструментов. [Shell](docs/shell.md) · [Script](docs/scripting.md) |
+| Shell и язык скриптов | `shell` с 55 командами с именами из NuttX и интерпретатор для циклов по вызовам инструментов. [Shell](docs/shell.md) · [Script](docs/scripting.md) |
 | Помнит, что ей сказали | Постоянные указания, `/AGENTS.md`, индекс `/MEMORY.md` и навыки, собранные в промпт на каждом ходу. [Что модель видит всегда](docs/context.md) |
 | Никакого облака на пути | HTTPS с платы, сертификат, который она генерирует, один PIN на три вида вызывающих. [Аутентификация](docs/security.md) |
 | Проверяемо без железа | Симулятор запускает тот же `agent-core` на виртуальной плате. [Симулятор](docs/simulator.md) |
 
-## Прошивка и подключение
+## Прошить и подключить
+
+Запишите собранный образ из [релиза](https://github.com/huichen/esp32-agent/releases) по смещению 0 (или соберите сами, см.
+[docs/flashing.md](docs/flashing.md)):
 
 ```bash
-cargo install espup espflash ldproxy
-espup install
-powershell scripts/build-firmware.ps1 -Flash -Port COM3
+espflash write-bin --chip esp32s3 --flash-size 16mb 0x0 esp32-agent-vX.Y.Z.bin
 ```
 
-**Не хотите ставить тулчейн?** К каждому тегированному релизу прилагается собранный образ:
-`espflash write-bin --chip esp32s3 --flash-size 16mb 0x0 esp32-agent-vX.Y.Z.bin`.
-Скрипты в `scripts/` — PowerShell; в macOS и Linux те же шаги это `. $HOME/export-esp.sh`,
-затем `cargo build --release --target xtensa-esp32s3-espidf` в `firmware/`
-([подробности](docs/flashing.md)).
+Без сохранённых данных плата поднимает точку доступа `esp32-agent-setup`. Подключитесь к ней
+с телефона, откройте **http://192.168.4.1/** и введите имя и пароль WiFi. Они хранятся в NVS,
+а не в образе, и именно они нужны плате, чтобы выйти за пределы локальной сети: к модели,
+к зеркалу пакетов, к чужому `/agent.json`.
 
-Без сохранённых учётных данных плата поднимает собственную точку доступа. Подключитесь к ней с
-телефона и откройте `http://192.168.4.1/`, либо отправьте `provision <ssid> <password>` по USB.
-Учётные данные уходят в NVS и никогда в образ.
+## Использование
 
-```bash
-curl -sS http://<board>/agent.json | jq '.endpoints | length'
-curl -sS -X POST http://<board>/mcp -H 'Content-Type: application/json' \
-  -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' | jq '.result.tools | length'
-curl -k -sS https://<board>/api/tls | jq -r .fingerprint
-```
+Он нужен для двух вещей.
 
-Порт 443 отдаёт те же маршруты по TLS с сертификатом, сгенерированным при первой загрузке;
-браузеры предупреждают, поэтому сравните отпечаток. Порт 80 остаётся открытым, так что плохой
-сертификат стоит одного URL, а не платы. `GET /agent.json` — весь интерфейс как данные: 40
-маршрутов с методом, телом, возвратом и аутентификацией, плюс каждая записываемая настройка с её
-типом и значением по умолчанию.
+**Человек с телефоном.** Открыть `http://<board>/` (или то же по https на 443): поговорить с
+моделью, посмотреть найденные устройства, отключить инструмент, прочитать журнал, задать PIN.
+
+**Агент, которому дали `http://<board>/agent.json`.** Этот документ — интерфейс в виде данных:
+каждый маршрут с методом, телом и авторизацией, поверхность MCP, потоковые эндпоинты, таблица
+настроек с типами и значениями по умолчанию, и пределы. Агент, умеющий запросить один URL,
+может пользоваться этой платой, не читая ни строки из README: для этого эндпоинт и сделан.
 
 ## Дайте ей модель
 
-Модель — это настройка, а не сборка:
+Два способа, одни и те же три поля.
+
+**В консоли.** Откройте страницу, панель Agent, введите адрес, модель и ключ, сохраните. Ключ
+только на запись: он уходит в NVS и читается как `__set__`.
+
+**Через агента.** `POST /api/agent/config` с теми же полями:
 
 ```bash
 curl -sS -X POST http://<board>/api/agent/config -H 'Content-Type: application/json' \
   -d '{"base_url":"https://your-provider/v1/chat/completions","model":"…","api_key":"…"}'
-curl -sS -X POST http://<board>/api/agent/message -H 'Content-Type: application/json' \
-  -d '{"text":"напиши HELLO на OLED и сделай светодиод синим"}'
 ```
 
-Три протокола (`chat`, `responses`, `anthropic`), уровень рассуждений, окно контекста и
-потолок вывода — в панели Agent консоли или тем же `POST`. Без ключа укажите в `base_url`
-`http://127.0.0.1/selftest/chat/completions`, и цикл всё равно работает.
-[Model](docs/model.md) — список полей и три протокола рядом.
-
-## Использование
-
-| Откуда | Что получаете |
-|---|---|
-| `http://<board>/` с телефона | разговор с моделью, устройства и инструменты, любые настройки |
-| `POST /mcp` из MCP-клиента | те же инструменты, что у агента на плате |
-| `POST /api/script`, `POST /api/sched` | выполнить скрипт сейчас или по расписанию |
-| `GET /agent.json` | весь интерфейс как данные: маршруты, настройки, пределы |
-
-```bash
-curl -sS -X POST http://<board>/mcp -H 'Content-Type: application/json' \
-  -d '{"jsonrpc":"2.0","id":1,"method":"tools/call",
-       "params":{"name":"shell","arguments":{"command":"ls /"}}}'
-```
-
-Агент на плате может и сам добавить себе железо (`manifest_apply`), память
-(`write /memory/…`) и доступ к shell: те же вызовы, тот же PIN.
+Три протокола (`chat`, `responses`, `anthropic`), уровень рассуждений, окно контекста и потолок
+вывода — на той же панели и том же маршруте. Совсем без ключа укажите в `base_url`
+`http://127.0.0.1/selftest/chat/completions`, и цикл всё равно работает: плату можно проверить
+до появления аккаунта. Список полей — в [Model](docs/model.md).
 
 ## О безопасности
 
@@ -104,23 +84,6 @@ curl -sS -X POST http://<board>/mcp -H 'Content-Type: application/json' \
   граница между агентом за работой и прохожим.
 
 [Security](docs/security.md) перечисляет, что намеренно не защищается.
-
-## Структура репозитория
-
-`crates/` собирается и тестируется на хосте; `firmware/` — бэкенд ESP-IDF. `agent-core` — это
-плата за одним трейтом `Hardware`, без кода под конкретный чип, поэтому `cargo test` гоняет его
-на ноутбуке; `agent-sim` реализует этот трейт поверх файла регистров. Их слияние вложило бы
-симулятор в каждый образ, а зависимости прошивки — в каждый тест. `firmware/` исключён из
-workspace, потому что ему нужны `cargo +esp`, `-Zbuild-std` и выкачанный ESP-IDF.
-
-```
-crates/agent-core/    hardware.rs (the trait) · drivers/ (one module per chip) · boards.rs ·
-                      manifest.rs · agent.rs + llm.rs · sched.rs · tools/ ·
-                      http.rs · app.rs · sitemap.rs + settings.rs · virtual_board.rs
-crates/agent-sim/     the virtual board behind an HTTP port
-firmware/             main.rs (boot order) · runner.rs (agent thread, TLS) ·
-                      esp_hw.rs (GPIO/I2C/PWM/ADC/RMT/I2S) · console.rs · wifi.rs
-```
 
 ## Состояние
 

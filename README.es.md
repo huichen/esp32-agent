@@ -22,75 +22,57 @@ marcha.
 | Un conjunto de herramientas, dos invocadores | El endpoint MCP y el agente de la placa ven las mismas herramientas, desde una sola descripción. [API HTTP y MCP](docs/http-api.md) |
 | Una consola sobre HTTPS | Hablar con el modelo y configurar dispositivos, herramientas, programación, registros, WiFi y el modelo desde un teléfono; la placa emite su propio certificado. [Consola web](docs/web-console.md) |
 | Actúa sin nadie delante | Prompts temporizados y reglas de sensores que lanzan un prompt cuando una lectura cruza un umbral. [Trabajo programado](docs/scheduling.md) |
-| Un shell y un lenguaje de script | `shell` con 26 comandos con nombres de NuttX, y un intérprete para bucles sobre llamadas a herramientas. [Shell](docs/shell.md) · [Script](docs/scripting.md) |
+| Un shell y un lenguaje de script | `shell` con 55 comandos con nombres de NuttX, y un intérprete para bucles sobre llamadas a herramientas. [Shell](docs/shell.md) · [Script](docs/scripting.md) |
 | Recuerda lo que se le dijo | Órdenes permanentes, `/AGENTS.md`, un índice `/MEMORY.md` y habilidades, ensamblados en el prompt en cada turno. [Lo que el modelo ve en cada turno](docs/context.md) |
 | Sin nube en el camino | HTTPS desde la placa, un certificado que genera ella misma, un PIN para tres invocadores. [Autenticación](docs/security.md) |
 | Comprobable sin hardware | El simulador ejecuta el mismo `agent-core` contra una placa virtual. [Simulador](docs/simulator.md) |
 
-## Grabación y conexión
+## Grabar y conectar
+
+Escribe la imagen fusionada de una [release](https://github.com/huichen/esp32-agent/releases) en el desplazamiento 0 (o
+compílala, ver [docs/flashing.md](docs/flashing.md)):
 
 ```bash
-cargo install espup espflash ldproxy
-espup install
-powershell scripts/build-firmware.ps1 -Flash -Port COM3
+espflash write-bin --chip esp32s3 --flash-size 16mb 0x0 esp32-agent-vX.Y.Z.bin
 ```
 
-**¿Sin toolchain?** Cada release etiquetada incluye una imagen fusionada construida desde ese
-tag: `espflash write-bin --chip esp32s3 --flash-size 16mb 0x0 esp32-agent-vX.Y.Z.bin`.
-Los scripts de `scripts/` son PowerShell; en macOS o Linux los mismos pasos son
-`. $HOME/export-esp.sh` y luego `cargo build --release --target xtensa-esp32s3-espidf` en
-`firmware/` ([detalles](docs/flashing.md)).
+Sin credenciales guardadas, la placa levanta un punto de acceso llamado `esp32-agent-setup`.
+Únete desde el móvil, abre **http://192.168.4.1/** y escribe el nombre y la contraseña del
+WiFi. Se guardan en NVS, nunca en la imagen, y son lo que la placa necesita para llegar a algo
+fuera de la red local: el modelo, un espejo de paquetes, un `/agent.json` en la mesa de al lado.
 
-Sin credenciales guardadas, la placa levanta su propio punto de acceso. Se puede conectar a él
-desde un teléfono y abrir `http://192.168.4.1/`, o enviar `provision <ssid> <password>` por USB.
-Las credenciales van a NVS, nunca dentro de la imagen.
+## Uso
 
-```bash
-curl -sS http://<board>/agent.json | jq '.endpoints | length'
-curl -sS -X POST http://<board>/mcp -H 'Content-Type: application/json' \
-  -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' | jq '.result.tools | length'
-curl -k -sS https://<board>/api/tls | jq -r .fingerprint
-```
+Sirve para dos cosas.
 
-El puerto 443 sirve las mismas rutas sobre TLS con un certificado generado en el primer
-arranque; los navegadores avisan, así que conviene comparar la huella. El puerto 80 sigue
-abierto, así que un certificado malo cuesta una URL y no la placa. `GET /agent.json` es toda la
-interfaz como datos: 40 rutas con método, cuerpo, retorno y autenticación, más cada ajuste
-escribible con su tipo y su valor por defecto.
+**Una persona con un móvil.** Abrir `http://<board>/` (o lo mismo en https en 443): hablar con
+el modelo, ver los dispositivos encontrados, apagar una herramienta, leer el registro, poner el
+PIN.
+
+**Un agente al que se le entrega `http://<board>/agent.json`.** Ese documento es la interfaz
+como datos: cada ruta con método, cuerpo y autenticación, la superficie MCP, los puntos de
+streaming, la tabla de ajustes con tipos y valores por defecto, y los límites. Un agente que
+pueda pedir una URL puede usar esta placa sin leer una línea de este README: para eso existe el
+endpoint.
 
 ## Dale un modelo
 
-El modelo es un ajuste, no una compilación:
+Dos formas, los mismos tres campos.
+
+**En la consola.** Abre la página, panel Agent, escribe endpoint, modelo y clave, guarda. La
+clave es de solo escritura: va a NVS y se relee como `__set__`.
+
+**Por un agente.** `POST /api/agent/config` con los mismos campos:
 
 ```bash
 curl -sS -X POST http://<board>/api/agent/config -H 'Content-Type: application/json' \
   -d '{"base_url":"https://your-provider/v1/chat/completions","model":"…","api_key":"…"}'
-curl -sS -X POST http://<board>/api/agent/message -H 'Content-Type: application/json' \
-  -d '{"text":"escribe HELLO en el OLED y pon el LED en azul"}'
 ```
 
 Tres protocolos (`chat`, `responses`, `anthropic`), un nivel de razonamiento, una ventana de
-contexto y un tope de salida, en el panel Agent de la consola o con el mismo `POST`. Sin clave,
-apunta `base_url` a `http://127.0.0.1/selftest/chat/completions` y el bucle funciona igual.
-[Model](docs/model.md) tiene la lista de campos y los tres protocolos en paralelo.
-
-## Uso
-
-| Desde | Qué obtienes |
-|---|---|
-| `http://<board>/` en el móvil | hablar con el modelo, ver dispositivos y herramientas, cambiarlo todo |
-| `POST /mcp` desde un cliente MCP | las mismas herramientas que usa el agente de la placa |
-| `POST /api/script`, `POST /api/sched` | ejecutar un script ahora, o programarlo |
-| `GET /agent.json` | toda la interfaz como datos: rutas, ajustes, límites |
-
-```bash
-curl -sS -X POST http://<board>/mcp -H 'Content-Type: application/json' \
-  -d '{"jsonrpc":"2.0","id":1,"method":"tools/call",
-       "params":{"name":"shell","arguments":{"command":"ls /"}}}'
-```
-
-El agente de la placa también puede añadirse hardware (`manifest_apply`), memoria
-(`write /memory/…`) y shell: las mismas llamadas, el mismo PIN.
+contexto y un tope de salida están en el mismo panel y la misma ruta. Sin ninguna clave, apunta
+`base_url` a `http://127.0.0.1/selftest/chat/completions` y el bucle funciona igual, así que una
+placa se prueba antes de tener cuenta. La lista de campos está en [Model](docs/model.md).
 
 ## Notas de seguridad
 
@@ -104,24 +86,6 @@ El agente de la placa también puede añadirse hardware (`manifest_apply`), memo
   placa; el PIN separa al agente haciendo su trabajo de un transeúnte haciéndolo.
 
 [Security](docs/security.md) dice qué no se defiende a propósito.
-
-## Estructura del repositorio
-
-`crates/` compila y se prueba en un host; `firmware/` es el backend de ESP-IDF. `agent-core` es
-la placa detrás de un único trait `Hardware` sin código específico de chip, así que `cargo test`
-lo ejecuta en un portátil; `agent-sim` implementa ese trait sobre un fichero de registros.
-Fusionarlos metería el simulador en cada imagen y las dependencias del firmware en cada prueba.
-`firmware/` queda fuera del workspace porque necesita `cargo +esp`, `-Zbuild-std` y un ESP-IDF
-descargado.
-
-```
-crates/agent-core/    hardware.rs (the trait) · drivers/ (one module per chip) · boards.rs ·
-                      manifest.rs · agent.rs + llm.rs · sched.rs · tools/ ·
-                      http.rs · app.rs · sitemap.rs + settings.rs · virtual_board.rs
-crates/agent-sim/     the virtual board behind an HTTP port
-firmware/             main.rs (boot order) · runner.rs (agent thread, TLS) ·
-                      esp_hw.rs (GPIO/I2C/PWM/ADC/RMT/I2S) · console.rs · wifi.rs
-```
 
 ## Estado
 
