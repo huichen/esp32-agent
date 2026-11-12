@@ -215,8 +215,7 @@ pub static CATALOG: &[CatalogEntry] = &[
     CatalogEntry {
         kind: "camera",
         name: "OV2640 / OV3660 camera (DVP, esp32-camera)",
-        detection:
-            "declared only: SCCB ids 0x26/0x36 at the module's address, but the frame has to come \
+        detection: "declared only: SCCB ids 0x26/0x36 at the module's address, but the frame has to come \
              through the platform, so a camera is never auto-adopted — 0x3C is also the OLED's",
         status: "implemented",
         caps: &["camera"],
