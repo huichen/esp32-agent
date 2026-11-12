@@ -921,7 +921,17 @@ fn serve_tls(
     let conn = match handshake(stream) {
         Some(c) => c,
         None => {
-            log.warn("http", format!("{peer}: tls handshake failed"));
+            // A browser opens speculative TLS connections and drops the ones it does not
+            // need; a phone on the LAN does the same when a page is refreshed. Logging
+            // each one at warn fills the ring with the same line and buries the failures
+            // that matter. Count them, say it the first few times, then once a minute.
+            let n = TLS_FAILS.fetch_add(1, Ordering::Relaxed) + 1;
+            let now = (crate::app::now_ms() / 1000) as u32;
+            let last = TLS_FAIL_AT_S.load(Ordering::Relaxed);
+            if n <= 3 || now.saturating_sub(last) > 60 {
+                TLS_FAIL_AT_S.store(now, Ordering::Relaxed);
+                log.warn("http", format!("{peer}: tls handshake failed ({n} since boot)"));
+            }
             return;
         }
     };
@@ -935,6 +945,12 @@ fn serve_tls(
         }
     }
 }
+
+/// Handshake failures since boot, and when the last one was logged. A busy client can
+/// produce dozens of them per page load; see `serve_tls`.
+static TLS_FAILS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+// Seconds, not milliseconds: the xtensa target has no 64-bit atomics.
+static TLS_FAIL_AT_S: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 /// Whether an accepted socket has anything for us yet.
 enum Ready {
