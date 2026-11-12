@@ -677,6 +677,8 @@ async function loadAgent() {
     $("#agent-model").value = d.model || "";
     $("#agent-steps").value = d.max_steps;
     $("#agent-temperature").value = d.temperature;
+    $("#agent-reasoning").value = d.reasoning || "";
+    $("#agent-vision").value = d.vision === false ? "false" : "true";
     $("#auth-tick").value = d.tick_ms;
     const prompt = await api("/api/agent/prompt");
     kv($("#conversation-kv"), [
@@ -868,6 +870,8 @@ $("#attach").onclick = () => $("#attach-input").click();
       model: $("#agent-model").value.trim(),
       max_steps: Number($("#agent-steps").value || 0),
       temperature: Number($("#agent-temperature").value || 0.2),
+      reasoning: $("#agent-reasoning").value,
+      vision: $("#agent-vision").value === "true",
     };
     const key = $("#agent-key").value.trim();
     if (key) body.api_key = key;

@@ -94,9 +94,28 @@ pub struct Message {
     /// `""` | `"http"` | `"schedule:<id>"` | `"sensor:<id>"`; user messages only.
     pub source: String,
     pub at_ms: u64,
+    /// Images the user attached, as base64 with their mime type. They ride on the
+    /// message rather than in a side table so the request that carries them and the
+    /// transcript that reports them cannot disagree.
+    pub attachments: Vec<Attachment>,
+}
+
+/// One image attached to a user message.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Attachment {
+    pub name: String,
+    pub mime: String,
+    /// Base64 of the bytes, exactly as it arrived: re-encoding on every request would
+    /// cost more than the bytes themselves.
+    pub data_b64: String,
 }
 
 impl Message {
+    pub fn with_attachments(mut self, attachments: Vec<Attachment>) -> Self {
+        self.attachments = attachments;
+        self
+    }
+
     pub fn user(text: &str, source: &str, at_ms: u64) -> Self {
         Self {
             role: Role::User,
@@ -107,6 +126,7 @@ impl Message {
             is_error: false,
             source: source.to_string(),
             at_ms,
+            attachments: Vec::new(),
         }
     }
 
@@ -131,6 +151,7 @@ impl Message {
             is_error: false,
             source: String::new(),
             at_ms,
+            attachments: Vec::new(),
         }
     }
 
@@ -150,6 +171,7 @@ impl Message {
             is_error,
             source: String::new(),
             at_ms,
+            attachments: Vec::new(),
         }
     }
 }
@@ -205,7 +227,6 @@ pub enum AgentStep {
 }
 
 /// The transcript plus the queue. Lives behind the app mutex.
-#[derive(Default)]
 pub struct Agent {
     pub history: Vec<Message>,
     /// A deterministic index of what compression dropped: one line per exchange, taken
@@ -226,6 +247,32 @@ pub struct Agent {
     turn_steps: u8,
     turn_limit: u8,
     turn_tools: Value,
+    /// Whether image attachments go out as content parts. Mirrors `llm.vision`: a
+    /// text-only endpoint rejects the multimodal shape, and the board cannot tell from a
+    /// model name which kind it is talking to.
+    pub vision: bool,
+}
+
+impl Default for Agent {
+    fn default() -> Self {
+        Self {
+            history: Vec::new(),
+            archive: Vec::new(),
+            pending: None,
+            last_error: String::new(),
+            runs: 0,
+            events: std::collections::VecDeque::new(),
+            event_seq: 0,
+            usage_run: llm::Usage::default(),
+            usage_total: llm::Usage::default(),
+            turn_steps: 0,
+            turn_limit: 0,
+            turn_tools: Value::Null,
+            // On by default: the model this board ships configured for is multimodal, and
+            // an image the user attached going nowhere would be the surprising outcome.
+            vision: true,
+        }
+    }
 }
 
 /// One journal entry. The kinds are the host agent's event names on purpose
@@ -697,7 +744,7 @@ impl Agent {
         let mut out = Vec::with_capacity(self.history.len() + 1);
         out.push(json!({ "role": Role::System.as_str(), "content": self.system_message(host) }));
         for message in &self.history {
-            out.push(openai_message(message));
+            out.push(openai_message(message, self.vision));
         }
         Value::Array(out)
     }
@@ -808,7 +855,7 @@ fn head(text: &str, max: usize) -> String {
     format!("{cut}…")
 }
 
-fn openai_message(message: &Message) -> Value {
+fn openai_message(message: &Message, vision: bool) -> Value {
     match message.role {
         Role::Assistant if !message.tool_calls.is_empty() => {
             let calls: Vec<Value> = message
@@ -843,6 +890,21 @@ fn openai_message(message: &Message) -> Value {
                 "content": message.text,
                 "reasoning_content": message.reasoning,
             })
+        }
+        Role::User if vision && !message.attachments.is_empty() => {
+            // OpenAI's multimodal shape: one text part, then one image part per file. A
+            // text-only endpoint refuses this outright, which is why `llm.vision` gates it.
+            let mut parts: Vec<Value> = Vec::with_capacity(message.attachments.len() + 1);
+            if !message.text.is_empty() {
+                parts.push(json!({ "type": "text", "text": message.text }));
+            }
+            for a in &message.attachments {
+                parts.push(json!({
+                    "type": "image_url",
+                    "image_url": { "url": format!("data:{};base64,{}", a.mime, a.data_b64) },
+                }));
+            }
+            json!({ "role": Role::User.as_str(), "content": parts })
         }
         Role::Tool => json!({
             "role": Role::Tool.as_str(),
@@ -904,6 +966,26 @@ fn merge_sources(a: &str, b: &str) -> String {
 mod tests {
     use super::*;
     use std::collections::VecDeque;
+
+    #[test]
+    fn an_image_goes_out_as_a_content_part() {
+        let message = Message::user("what is this?", "http", 1).with_attachments(vec![Attachment {
+            name: "shot.jpg".into(),
+            mime: "image/jpeg".into(),
+            data_b64: "aGVsbG8=".into(),
+        }]);
+        let wire = openai_message(&message, true);
+        let parts = wire["content"].as_array().expect("content parts");
+        assert_eq!(parts.len(), 2, "{wire}");
+        assert_eq!(parts[0]["type"], "text");
+        assert_eq!(parts[1]["type"], "image_url");
+        assert_eq!(parts[1]["image_url"]["url"], "data:image/jpeg;base64,aGVsbG8=");
+
+        // A text-only model gets the text and nothing it cannot parse.
+        let plain = openai_message(&message, false);
+        assert!(plain["content"].is_string(), "{plain}");
+        assert_eq!(plain["content"], "what is this?");
+    }
 
     /// Canned transport: replies in order, requests recorded.
     struct StubTransport {

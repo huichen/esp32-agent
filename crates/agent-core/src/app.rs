@@ -105,18 +105,6 @@ pub struct FwMeta {
     pub build: String,
 }
 
-/// A file the user attached to a message.
-///
-/// Kept in RAM, not on the workspace or in NVS: the workspace is 8 kB in total and NVS is
-/// not a place for images. An attachment therefore lives as long as the board runs, and
-/// the model is *told* about it — see `agent_message`.
-#[derive(Clone, Debug, Default)]
-pub struct Attachment {
-    pub name: String,
-    pub mime: String,
-    pub bytes: Vec<u8>,
-}
-
 /// Two images of ~24 kB each is what a phone screenshot downscaled in the browser comes
 /// to; anything larger does not fit the request the board can send over TLS.
 pub const MAX_ATTACHMENT_BYTES: usize = 24 * 1024;
@@ -179,7 +167,7 @@ pub struct App {
     pub lan_url: String,
     /// Files attached to the most recent message. Replaced, never accumulated: an
     /// attachment belongs to one turn, and the heap is the scarcest thing here.
-    pub attachments: Vec<Attachment>,
+    pub attachments: Vec<crate::agent::Attachment>,
     /// The board's own certificate, when it serves https on a second port. The
     /// fingerprint is what a person compares against the browser's warning page —
     /// it is the only proof that this board, and not something on the path, answered.
@@ -1515,7 +1503,8 @@ impl App {
                     "[attached: {name}, {mime}, {} kB — fetch with GET /api/attachment/{name}]",
                     bytes.len().div_ceil(1024)
                 ));
-                self.attachments.push(Attachment { name, mime, bytes });
+                let data_b64 = crate::util::b64_encode(&bytes);
+                self.attachments.push(crate::agent::Attachment { name, mime, data_b64 });
             }
             if !notes.is_empty() {
                 text.push_str("\n\n");
@@ -1531,8 +1520,17 @@ impl App {
                 &json!({ "error": format!("`text` is {} bytes; the limit is {AGENT_TEXT_MAX}", text.len()) }),
             );
         }
+        // Kept twice on purpose: the app serves the bytes back, the message sends them.
+        // Vecs over 512 bytes live in PSRAM and an attachment is capped at 24 kB.
+        let attachments = self.attachments.clone();
+        self.agent.vision = self.llm.vision;
         if !self.agent.push_user(&text, "http", now_ms()) {
             return Response::json_status(400, &json!({ "error": "`text` is required" }));
+        }
+        // Attachments belong to the message, not to the app: the request that carries
+        // them and the transcript that reports them must not be able to disagree.
+        if let Some(message) = self.agent.pending.as_mut() {
+            message.attachments = attachments;
         }
         // The index this message will occupy once the run appends it: the queue is
         // depth 1, so a second trigger coalesces into the same slot.
@@ -2138,7 +2136,11 @@ impl App {
             let name = crate::http::url_decode(name);
             return match self.attachments.iter().find(|a| a.name == name) {
                 Some(a) => {
-                    Response::new(200, &a.mime, a.bytes.clone()).with_header("Cache-Control", "no-store")
+                    let mut bytes = Vec::new();
+                    if crate::util::b64_decode(&a.data_b64, &mut bytes).is_err() {
+                        return Response::error_json(500, "attachment is not decodable");
+                    }
+                    Response::new(200, &a.mime, bytes).with_header("Cache-Control", "no-store")
                 }
                 None => Response::error_json(404, "no attachment by that name"),
             };
@@ -2897,6 +2899,8 @@ fn llm_json(cfg: &LlmConfig, with_key: bool) -> Value {
         "max_steps": cfg.max_steps,
         "temperature": cfg.temperature,
         "timeout_s": cfg.timeout_s,
+        "reasoning": cfg.reasoning,
+        "vision": cfg.vision,
     });
     if with_key {
         v["api_key"] = json!(cfg.api_key);
@@ -2929,7 +2933,24 @@ fn llm_apply_json(cfg: &mut LlmConfig, v: &Value) {
     if let Some(t) = v.get("timeout_s").and_then(|x| x.as_u64()) {
         cfg.timeout_s = t.clamp(5, 180) as u32;
     }
+    // `off | low | medium | high`, or empty for the provider's own default. Anything else
+    // is refused by name rather than forwarded as a typo the endpoint would reject.
+    if let Some(r) = v.get("reasoning") {
+        let text = r.as_str().unwrap_or("").trim().to_ascii_lowercase().replace("none", "off");
+        cfg.reasoning = if text.is_empty() || REASONING_LEVELS.contains(&text.as_str()) {
+            text
+        } else {
+            cfg.reasoning.clone()
+        };
+    }
+    if let Some(b) = v.get("vision").and_then(|x| x.as_bool()) {
+        cfg.vision = b;
+    }
 }
+
+/// What `reasoning` may say. `none` is accepted as a synonym for `off` because that is
+/// what DeepSeek calls it.
+pub const REASONING_LEVELS: &[&str] = &["off", "low", "medium", "high"];
 
 fn task_json(t: &ScheduledTask) -> Value {
     json!({
@@ -3890,7 +3911,10 @@ mod tests {
         let resp = app.route(&post("/api/agent/message", &body.to_string()));
         assert_eq!(resp.status, 202, "{}", String::from_utf8_lossy(&resp.body));
         assert_eq!(app.attachments.len(), 1);
-        assert_eq!(app.attachments[0].bytes, b"hello");
+        assert_eq!(app.attachments[0].data_b64, "aGVsbG8=");
+        let queued = app.agent.pending.as_ref().expect("a queued turn");
+        assert_eq!(queued.attachments.len(), 1, "the message carries the image");
+        assert_eq!(queued.attachments[0].mime, "image/jpeg");
 
         // The model is told what arrived, because it cannot look at it.
         let text = app.agent.pending.as_ref().expect("a queued turn").text.clone();
