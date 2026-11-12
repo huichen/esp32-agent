@@ -36,8 +36,12 @@ Start with `GET /api/logs` (or the console's log tab). Every boot-time line carr
 
 ## A tool is missing from `tools/list`
 
-- `GET /api/tools`: each entry has `visible` and `missing`. A non-empty `missing` means the
-  hardware was not detected.
+- `GET /api/tools`: each entry has `visible`, and when it is not offered, `why` — the
+  sentence, e.g. `no camera on this board` — plus `missing` for a registry tool whose
+  capability list is not met.
+- `/api/status` reports `mcp.tools_visible` (what the model actually receives, including
+  `shell`, `script` and the file tools) and `mcp.tools_hidden` as `[{name, why}]`. A
+  missing tool that is not listed there is a bug, not a setting.
 - Did the user disable it? `mcp.disabled_tools`.
 - With `tools_mode = "generic"` the device tools are collapsed into `device_invoke`; switch
   back to `auto` if you want them individually.
