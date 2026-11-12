@@ -176,7 +176,7 @@ pub fn parse(line: &str) -> Result<Parsed, String> {
         } else if word.len() > 1 && word.starts_with('-') && word != "-" {
             // Short flags: `-r`, and `-o value` for the ones that take one.
             let key = word[1..].to_ascii_lowercase();
-            let takes_value = matches!(key.as_str(), "o" | "p" | "c" | "w" | "f" | "d" | "n" | "i");
+            let takes_value = matches!(key.as_str(), "o" | "p" | "c" | "w" | "f" | "d" | "t" | "n" | "i");
             if takes_value {
                 if let Some(next) = rest.get(index + 1) {
                     flags.insert(key, next.clone());
