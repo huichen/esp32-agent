@@ -20,7 +20,7 @@ answers; a new sensor can be declared with a JSON manifest while the board runs.
 | It finds its own hardware | Drivers probe I2C, 1-Wire and configured pins at boot; only what answers gets tools. Unrecognised addresses are reported, so a chip without a driver is still visible. [Capabilities](docs/capabilities.md) |
 | One tool set, two callers | The MCP endpoint and the on-board agent see the same 48 tools. A manifest edit moves both at once, because there is one description. [HTTP and MCP API](docs/http-api.md) |
 | A web console over HTTPS | Chat with the model and change devices, tools, manifest, schedule, logs, WiFi and the model settings from a phone; the board generates its own certificate. [Web console](#web-console) |
-| It works while nobody watches | Timed prompts (`every_s`, `at_hhmm`), sensor rules that fire a prompt on a threshold, and an objective it iterates on across runs. [Scheduled work](#scheduled-work) |
+| It works while nobody watches | Timed prompts (`every_s`, `at_hhmm`) and sensor rules that fire a prompt when a threshold is crossed. [Scheduled work](#scheduled-work) |
 | A shell and a scripting language | `shell` with 26 commands named as NuttX names them — files, network, hashing, inspection — and a small interpreter for loops and conditions over tool calls. [Shell](#shell) · [Script](#script) |
 | Standing orders | A 2 KB slot in the system prompt for what this board is for, writable from the portal, from `shell` and from HTTP. [Standing orders](#standing-orders) |
 | Self-contained on a LAN | HTTP and HTTPS from the board, a certificate it generates itself, a PIN and a token for the three callers, no cloud in the path. [Authentication](#authentication) |
