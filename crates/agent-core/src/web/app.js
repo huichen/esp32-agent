@@ -744,6 +744,8 @@ async function loadSettings() {
   try {
     const d = await api("/api/config");
     $("#wifi-ssid").value = d.wifi.ssid || "";
+    $("#wifi-gateway").value = d.wifi.gateway || "";
+    $("#wifi-dns").value = d.wifi.dns || "";
     $("#wifi-password").value = "";
   } catch (e) {
     if (!String(e.message).includes("PIN")) toast(e.message);
@@ -911,6 +913,12 @@ $("#attach").onclick = () => $("#attach-input").click();
   $("#wifi-connect").onclick = async () => {
     $("#wifi-result").textContent = "joining…";
     try {
+      // The gateway and DNS belong to the device config, not to the join request: they
+      // describe the network the board sits on, not the credentials it uses.
+      await api("/api/config", {
+        method: "POST",
+        body: { wifi: { gateway: $("#wifi-gateway").value.trim(), dns: $("#wifi-dns").value.trim() } },
+      });
       await api("/api/wifi/connect", {
         method: "POST",
         body: { ssid: $("#wifi-ssid").value.trim(), password: $("#wifi-password").value },

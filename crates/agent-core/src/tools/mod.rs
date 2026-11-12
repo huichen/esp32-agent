@@ -497,7 +497,7 @@ pub fn script_specs() -> Value {
         "type": "function",
         "function": {
             "name": "script",
-            "description": "Run a small script on the board — the way to write a loop or a condition the fixed tools cannot express. Syntax: `let x = 1`, `x = 2`, `l[0] = 9`, `if c { } else { }`, `while c { }` with `break`, values are numbers, strings, bools, nil, lists `[1,2]` and maps `{a: 1}`; operators `+ - * / %`, `== != < <= > >=`, `and or not`; builtins `len str num type log` and `tool(name, args)` which calls any other board tool; `#` starts a comment; the last expression is the result. Send {\"lint\": true} with `source` to check it without running, {\"help\": true} (or {\"section\": \"overview\"|\"builtins\"|\"examples\"}) for the full reference. Bounded at 50000 steps; `tool(\"script\")` is refused.",
+            "description": "Run a small script on the board — the way to write a loop or a condition the fixed tools cannot express. Syntax: `let x = 1`, `x = 2`, `l[0] = 9`, `if c { } else { }`, `while c { }` with `break`, values are numbers, strings, bools, nil, lists `[1,2]` and maps `{a: 1}`; operators `+ - * / %`, `== != < <= > >=`, `and or not`; builtins `len str num type log` and `tool(name, args)` which calls any other board tool; `#` starts a comment; the last expression is the result. Send {\"lint\": true} with `source` to check it without running, {\"help\": true} (or {\"section\": \"overview\"|\"builtins\"|\"examples\"}) for the full reference. Bounded by wall clock (10 s) and, as a backstop, 5 000 000 steps; `tool(\"script\")` is refused.",
             "parameters": {
                 "type": "object",
                 "properties": {
