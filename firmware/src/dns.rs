@@ -9,8 +9,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use esp_idf_svc::sys;
-
 pub struct MiniDns {
     stop: Arc<AtomicBool>,
 }
@@ -35,20 +33,17 @@ impl MiniDns {
         // for internal RAM first and only falls back to PSRAM when 16 KB is not there.
         //
         // `esp_pthread_set_cfg` is read by `pthread_create` from the *calling* thread, so
-        // `runner::with_stack_caps` sets it around this one spawn and puts it back: the
-        // HTTP listener is created from here later, and a PSRAM stack for that one would
-        // be a crash waiting for the next config save.
-        let caps = sys::MALLOC_CAP_SPIRAM | sys::MALLOC_CAP_8BIT;
-        let spawned = crate::runner::with_stack_caps(caps, || {
-            std::thread::Builder::new().name("dns".into()).stack_size(4 * 1024).spawn(move || {
-                let mut buf = [0u8; 512];
-                while !stop_thread.load(Ordering::SeqCst) {
-                    let Ok((n, peer)) = socket.recv_from(&mut buf) else { continue };
-                    if let Some(reply) = answer(&buf[..n], ip) {
-                        let _ = socket.send_to(&reply, peer);
-                    }
+        // `threads::spawn` sets it around this one spawn and puts the default back: the
+        // HTTP listener is created from here later, and a config left behind would give
+        // it this name, this priority and a PSRAM stack.
+        let spawned = crate::threads::spawn(b"dns\0", 4 * 1024, crate::threads::PSRAM, None, move || {
+            let mut buf = [0u8; 512];
+            while !stop_thread.load(Ordering::SeqCst) {
+                let Ok((n, peer)) = socket.recv_from(&mut buf) else { continue };
+                if let Some(reply) = answer(&buf[..n], ip) {
+                    let _ = socket.send_to(&reply, peer);
                 }
-            })
+            }
         });
         // A `JoinHandle` for a thread that never returns is a handle to nowhere: dropping
         // it detaches, which is what this thread is.

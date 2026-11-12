@@ -26,10 +26,15 @@ use std::sync::Arc;
 
 /// Start the console reader. Call once, after the radio thread exists.
 pub fn start(app: Shared, log: Arc<LogBuf>) {
-    let spawned = std::thread::Builder::new()
-        .name("provision".into())
-        .stack_size(6 * 1024)
-        .spawn(move || read_console(app, log));
+    // A named thread, because `ps` reads the FreeRTOS name and this one answers `provision`
+    // on the console. Internal RAM: provisioning stores credentials in NVS.
+    let spawned = crate::threads::spawn(
+        b"provision\0",
+        6 * 1024,
+        crate::threads::INTERNAL,
+        None,
+        move || read_console(app, log),
+    );
     if spawned.is_err() {
         log::error!("could not start the console provisioning thread");
     }

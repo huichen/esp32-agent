@@ -17,11 +17,10 @@
 //!   thread — on that assertion, roughly every 8 s, because the task was still due after
 //!   every reboot. `runner.rs` now asks for internal RAM first and only falls back to PSRAM.
 //!
-//! So this task is not left to a default: it is spawned with
-//! `esp_pthread_set_cfg(stack_alloc_caps = MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)`, which
-//! tells the pthread layer to take the stack from internal RAM, and then it *checks* that
-//! its stack really is inside the DRAM window before it writes anything. If the check
-//! fails it does not write at all and says so — in the log and in `/api/status.store`.
+//! So this task is not left to a default: `threads::spawn` names it and asks for a stack in
+//! internal RAM (`MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT`), and then it *checks* that its
+//! stack really is inside the DRAM window before it writes anything. If the check fails it
+//! does not write at all and says so — in the log and in `/api/status.store`.
 //!
 //! It has to be a pthread rather than a plain FreeRTOS task: the queue and the log are
 //! behind `std::sync::Mutex`, and ESP-IDF's `pthread_self()` asserts when the calling task
@@ -49,48 +48,26 @@ const PRIORITY: usize = 2;
 /// only, which is why the reboot path flushes synchronously first ([`flush_now`]).
 const PERIOD_MS: u32 = 100;
 
-/// `tskNO_AFFINITY` from `freertos/task.h`, which is a macro and therefore not in the
-/// bindings. Unpinned on purpose: whichever core is idle should do the write.
-const NO_AFFINITY: std::os::raw::c_int = 0x7FFF_FFFF;
-
 /// The task's name, also what the log lines and `/api/status.store` say.
 const NAME: &str = "nvs-writer";
 
 /// Start the writer. Called once, before anything can queue a write.
 pub fn start(shared: Shared, log: Arc<LogBuf>) -> Result<(), String> {
-    // `pthread_create` reads this config from the *creating* thread, so it applies to every
-    // thread this one spawns while it is set — the agent thread included, and that one must
-    // keep its 16 KB and its priority 5. Save what is there and put it back the moment the
-    // writer exists.
-    let previous = current_pthread_config();
-
-    // The one setting that matters. `inherit_cfg = false` on purpose: the writer's own
-    // children (it has none) must not be born on a 6 KB internal stack.
-    let cfg = sys::esp_pthread_cfg_t {
-        thread_name: b"nvs-writer\0".as_ptr() as *const std::os::raw::c_char,
-        stack_size: STACK_BYTES,
-        prio: PRIORITY,
-        inherit_cfg: false,
-        pin_to_core: NO_AFFINITY,
-        stack_alloc_caps: (sys::MALLOC_CAP_INTERNAL | sys::MALLOC_CAP_8BIT) as u32,
-    };
-    let rc = unsafe { sys::esp_pthread_set_cfg(&cfg) };
-    if rc != sys::ESP_OK {
-        let why = format!(
-            "esp_pthread_set_cfg returned {rc}; the writer would get any stack, so it was not started"
-        );
-        with_app_mut(&shared, |app| app.attach_store_writer(NAME, false));
-        log.error("store", why.clone());
-        return Err(why);
-    }
-
-    let spawned = std::thread::Builder::new().name(NAME.to_string()).stack_size(STACK_BYTES).spawn({
-        let shared = shared.clone();
-        let log = log.clone();
-        move || run(shared, log)
-    });
-    // Whatever happened, the next thread `main` spawns is not this one.
-    let _ = unsafe { sys::esp_pthread_set_cfg(&previous) };
+    // The name, the 6 KB and the internal RAM are set around this one spawn by
+    // `threads::spawn`, and the default config is put back afterwards. Doing it by hand was
+    // the bug this replaces: the config outlived the spawn and the console, radio and agent
+    // threads came up as `nvs-writer` at priority 2.
+    let spawned = crate::threads::spawn(
+        b"nvs-writer\0",
+        STACK_BYTES,
+        crate::threads::INTERNAL,
+        Some(PRIORITY),
+        {
+            let shared = shared.clone();
+            let log = log.clone();
+            move || run(shared, log)
+        },
+    );
 
     match spawned {
         Ok(_) => Ok(()),
@@ -101,14 +78,6 @@ pub fn start(shared: Shared, log: Arc<LogBuf>) -> Result<(), String> {
             Err(why)
         }
     }
-}
-
-/// The creating thread's pthread config, or the defaults when nothing has set one — which is
-/// the same thing in effect.
-fn current_pthread_config() -> sys::esp_pthread_cfg_t {
-    let mut cfg = unsafe { sys::esp_pthread_get_default_config() };
-    let _ = unsafe { sys::esp_pthread_get_cfg(&mut cfg) };
-    cfg
 }
 
 /// Perform queued writes now, from whichever task is running.
