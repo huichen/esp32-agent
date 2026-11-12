@@ -1,18 +1,18 @@
 //! The platform half of the on-board agent: a socket, a clock, and one thread.
 //!
-//! Everything that can be tested without hardware — the loop, the transcript, the
-//! tool routing, the schedule predicates — lives in `esp32_agent_core`. What is left
+//! Everything that can be tested without hardware 鈥?the loop, the transcript, the
+//! tool routing, the schedule predicates 鈥?lives in `esp32_agent_core`. What is left
 //! for the board is exactly three things:
 //!
-//! * [`EspHttpTransport`] — the single `POST` that the model call and the `net_*`
+//! * [`EspHttpTransport`] 鈥?the single `POST` that the model call and the `net_*`
 //!   tools both need, spoken as HTTP/1.1 over `std::net::TcpStream` for `http://` and
 //!   over esp-tls (mbedTLS, verified against the ESP-IDF certificate bundle) for
 //!   `https://`. The TLS path adds a handshake and ~40 KB of heap for the session, not
 //!   a different request: the bytes after the handshake are the same ones the plain
 //!   socket would have carried.
-//! * [`attach`] — hands that transport to the `App`, which owns the only place the
+//! * [`attach`] 鈥?hands that transport to the `App`, which owns the only place the
 //!   rest of the firmware looks for it.
-//! * [`start`] — one thread, one tick per configured interval (`agent.tick_ms`, re-read
+//! * [`start`] 鈥?one thread, one tick per configured interval (`agent.tick_ms`, re-read
 //!   on every tick, so a portal edit takes effect on the next tick rather than on
 //!   reboot): fire what the schedule says is due, then run the queued turn if there is
 //!   one. The queue is depth-1 and coalescing, so a trigger that arrives mid-run is
@@ -21,18 +21,22 @@
 //! Two consequences of the core design are visible here and are deliberate, not
 //! accidents:
 //!
-//! * A run happens under the `App` mutex, because the loop needs the `App` as its
-//!   `ToolHost`. A model call therefore blocks the portal for as long as the
-//!   endpoint takes to answer — the thread logs when a run starts so the bench does
-//!   not read that as a hang.
+//! * A run is a sequence of **phases**, each taking the `App` mutex for as long as that
+//!   phase's work; the model call between two phases holds no lock at all. That is why
+//!   `/api/status` answered in 鈮?253 ms while a 2.5 s model call was in flight
+//!   (`ROADMAP.md`, measured on the board): the thread that would otherwise hold the
+//!   lock is blocked on the socket. A *tool* call is the opposite case 鈥?it runs inside
+//!   a phase, under the lock 鈥?so a slow tool really does stall the portal for its
+//!   duration, which is why `sleep` is capped at 10 s. The thread logs when a run
+//!   starts so the bench does not read that as a hang.
 //! * The scheduler's clock is [`esp32_agent_core::app::now_ms`], the same clock the
 //!   rest of the firmware stamps things with. Before SNTP syncs it starts at the
 //!   epoch, so `every_s` tasks work immediately while `at_hhmm` tasks only mean a
 //!   wall-clock time once the clock is real; the thread says which it is at boot.
 //!
 //! The blocks between the `===` markers (transport, one tick, the clock) depend
-//! deliberately on nothing but `std`, `log`, `esp32_agent_core` and — for the TLS
-//! handshake only — `esp_idf_svc::tls`, so the HTTP framing below is the same code on
+//! deliberately on nothing but `std`, `log`, `esp32_agent_core` and 鈥?for the TLS
+//! handshake only 鈥?`esp_idf_svc::tls`, so the HTTP framing below is the same code on
 //! both sides: this crate cannot run `cargo test`, and an untested HTTP client is
 //! where the bench would lose a day.
 
@@ -56,7 +60,7 @@ use esp32_agent_core::logbuf::LogBuf;
 /// It is asked for in **internal RAM** first, which is what a thread that touches flash
 /// needs: an NVS write or a partition read runs with both caches off, and at that moment a
 /// stack in PSRAM is not there at all (IDF asserts exactly this). PSRAM is the fallback for a
-/// boot where 16 KB contiguous internal RAM is gone — see [`with_stack_caps`] — and it is a
+/// boot where 16 KB contiguous internal RAM is gone 鈥?see [`with_stack_caps`] 鈥?and it is a
 /// safe fallback because no NVS write happens on this thread any more: they are queued and
 /// performed by `firmware/src/nvs_writer.rs`.
 const STACK_BYTES: usize = 16 * 1024;
@@ -64,7 +68,7 @@ const STACK_BYTES: usize = 16 * 1024;
 /// Run `f` with thread stacks allocated from `caps`.
 ///
 /// `pthread_create` allocates stacks with `MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT` unless the
-/// calling thread's config says otherwise — even with
+/// calling thread's config says otherwise 鈥?even with
 /// `CONFIG_SPIRAM_ALLOW_STACK_EXTERNAL_MEMORY` in the sdkconfig, which only *permits* an
 /// external stack, it does not ask for one. That is the whole reason a board with 8 MB of
 /// PSRAM free can still fail to start a 16 KB thread with `ENOMEM`.
@@ -72,7 +76,7 @@ const STACK_BYTES: usize = 16 * 1024;
 /// The config is per-thread and read by `pthread_create` from the *creating* thread, so it is
 /// set immediately around the one spawn and restored afterwards: everything else that starts
 /// later (a request thread, a stream, the store writer) keeps allocating where it used to.
-fn with_stack_caps<T>(caps: u32, create: impl FnOnce() -> T) -> T {
+pub(crate) fn with_stack_caps<T>(caps: u32, create: impl FnOnce() -> T) -> T {
     use esp_idf_svc::sys;
     let mut before: sys::esp_pthread_cfg_t = unsafe { std::mem::zeroed() };
     let have_before = unsafe { sys::esp_pthread_get_cfg(&mut before) } == sys::ESP_OK;
@@ -196,8 +200,8 @@ impl ChatTransport for EspHttpTransport {
 
 /// The socket a reply arrives on: plain TCP, or esp-tls when the endpoint is `https`.
 ///
-/// Both arms expose the same three operations, so [`read_response`] — the part with
-/// the framing rules in it — is written once and cannot drift between the two schemes.
+/// Both arms expose the same three operations, so [`read_response`] 鈥?the part with
+/// the framing rules in it 鈥?is written once and cannot drift between the two schemes.
 enum Conn {
     Plain(TcpStream),
     Tls(Box<EspTls<InternalSocket>>),
@@ -237,7 +241,7 @@ impl Conn {
                 target.authority(),
                 unsafe { esp_idf_svc::sys::time(std::ptr::null_mut()) },
                 if unsafe { esp_idf_svc::sys::time(std::ptr::null_mut()) } < 1_700_000_000 {
-                    " — SNTP has not synced"
+                    " 鈥?SNTP has not synced"
                 } else {
                     ""
                 },
@@ -262,7 +266,7 @@ impl Conn {
                 // A bare ESP_FAIL here says nothing: the request is routinely 20-30 kB
                 // (51 tool definitions plus the tool results), and the board has a few kB
                 // of internal RAM to spare. Report the size and the heap at the moment of
-                // failure — that is what decides whether this is a size or a memory fault.
+                // failure 鈥?that is what decides whether this is a size or a memory fault.
                 let free = unsafe { esp_idf_svc::sys::esp_get_free_internal_heap_size() } / 1024;
                 let largest = unsafe {
                     esp_idf_svc::sys::heap_caps_get_largest_free_block(
@@ -738,9 +742,10 @@ fn tick(
         static LAST_WARN_S: AtomicU32 = AtomicU32::new(0);
         let now_s = (now / 1000) as u32;
         let last = LAST_WARN_S.load(Ordering::Relaxed);
-        // 20 kB is the normal steady state on this board (a TLS page costs ~11 kB of it
-        // once), so warning above 8 kB only taught people to ignore the log. Below 8 kB a
-        // stream thread (6 kB of stack) or a handshake really does start failing.
+        // The threshold is about what a *new* thread needs, not about the steady state:
+        // a console stream asks for 6 kB of contiguous stack, and below that a stream or
+        // a TLS handshake is what starts failing. The steady state today is 160+ kB free
+        // (`docs/troubleshooting.md`), so this is a floor to catch a leak, not a trend.
         if internal_kb < 8 && now_s.saturating_sub(last) > 600 {
             LAST_WARN_S.store(now_s, Ordering::Relaxed);
             log.warn(

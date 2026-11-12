@@ -7,7 +7,7 @@
 //! follow the datasheets (BME280 calibration words, INA226's 0x5449, ...).
 
 use crate::error::{McpError, Result};
-use crate::hardware::{BoardInfo, Hardware, PinMode, WifiAp, WifiStatus};
+use crate::hardware::{BoardInfo, Hardware, HeapPool, PinMode, WifiAp, WifiStatus};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::time::Instant;
@@ -309,9 +309,33 @@ impl Hardware for VirtualBoard {
 
     fn tasks(&mut self) -> Vec<serde_json::Value> {
         vec![
-            json!({"name": "main", "state": "running", "priority": 1, "stack_free_words": 2048}),
-            json!({"name": "httpd", "state": "blocked", "priority": 5, "stack_free_words": 1024}),
-            json!({"name": "agent", "state": "blocked", "priority": 4, "stack_free_words": 1536}),
+            json!({"name": "main", "state": "running", "priority": 1, "stack_free_bytes": 2048}),
+            json!({"name": "httpd", "state": "blocked", "priority": 5, "stack_free_bytes": 1024}),
+            json!({"name": "agent", "state": "blocked", "priority": 4, "stack_free_bytes": 1536}),
+        ]
+    }
+
+    /// Two pools, because the point of the reading is that the firmware asks instead of
+    /// assuming: a client sees the shape here and reads real numbers off a board. The
+    /// values are fixed, like the virtual board's other memory figures.
+    fn heap_pools(&mut self) -> Vec<HeapPool> {
+        vec![
+            HeapPool {
+                pool: "internal_8bit".into(),
+                note: "thread stacks and anything that must survive with the cache off".into(),
+                total_kb: 320,
+                free_kb: 172,
+                largest_kb: 96,
+                min_free_kb: 128,
+            },
+            HeapPool {
+                pool: "spiram".into(),
+                note: "PSRAM: allocation only, no stacks, no DMA descriptors".into(),
+                total_kb: 8192,
+                free_kb: 7930,
+                largest_kb: 7800,
+                min_free_kb: 7800,
+            },
         ]
     }
 

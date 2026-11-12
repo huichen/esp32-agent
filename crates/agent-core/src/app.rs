@@ -1028,6 +1028,22 @@ impl App {
         self.tools.iter().filter(|d| self.is_visible(&d.spec.name)).map(|d| d.spec.name.clone()).collect()
     }
 
+    /// How many tools the model is offered, without building the list.
+    ///
+    /// `/api/status` needs this number on every poll, and `tool_specs()` answers with a deep
+    /// clone of the whole array — an 18 KB `Value`, which is a fresh allocation for every
+    /// string, object and array in it, in PSRAM, for a `filter().count()`. The predicate is
+    /// the same one `tool_specs_uncached` uses, so the two cannot disagree; the test that
+    /// compares `/api/status` with `ToolHost::tool_specs` would fail if they did.
+    fn visible_tool_count(&self) -> usize {
+        let registry = self.tools.iter().filter(|d| self.is_visible(&d.spec.name)).count();
+        let extras = Self::extra_entries()
+            .into_iter()
+            .filter(|entry| self.extra_why_hidden(entry["function"]["name"].as_str().unwrap_or("")).is_none())
+            .count();
+        registry + extras
+    }
+
     /// Every tool that exists but is not offered, with the reason — registry entries first,
     /// then the out-of-registry ones, each in name order.
     ///
@@ -1177,6 +1193,7 @@ impl App {
         let info = self.hw.board_info();
         let wifi = self.hw.wifi_status();
         let internal = self.hw.heap_internal();
+        let threads = self.threads_json();
         let now = now_ms();
         json!({
             "device_name": self.cfg.device_name,
@@ -1214,6 +1231,11 @@ impl App {
                 "internal_kb": internal.map(|(free, _)| free / 1024),
                 "largest_internal_kb": internal.map(|(_, largest)| largest / 1024),
             },
+            // The other half of the memory picture: which pool, and how much stack each
+            // task has left at its deepest point. Without this, deciding whether a stack
+            // constant can come down is guesswork, and a stack that is too small shows up
+            // as an assert and a reboot rather than as a number.
+            "threads": threads,
             "uptime_s": self.runtime.uptime_s(now),
             "wifi": wifi,
             "setup": {
@@ -1229,8 +1251,8 @@ impl App {
                 // What the model actually receives, not the registry count: the out-of-
                 // registry tools (`shell`, `script`, `read`/`write`/`edit`) are tools the
                 // model can call, and leaving them out made this number disagree with
-                // `/api/tools` by six.
-                "tools_visible": self.tool_specs().as_array().map(|a| a.len()).unwrap_or(0),
+                // `/api/tools` by six. Counted rather than cloned: see `visible_tool_count`.
+                "tools_visible": self.visible_tool_count(),
                 "tools_hidden": self.hidden_tools(),
                 "sessions": self.runtime.sessions.len(),
                 "auth_required": !self.cfg.auth.mcp_token.is_empty(),
@@ -1271,6 +1293,31 @@ impl App {
             },
             "pins": self.cfg.pins,
         })
+    }
+
+    /// The tasks the platform can enumerate, each with the stack it has left at its
+    /// deepest point — the field a stack constant has to be justified against.
+    ///
+    /// FreeRTOS' "high-water mark" is the *lowest free* figure a task ever reported, so
+    /// `high_water_kb` is headroom, not use: the peak use is the size in the source minus
+    /// this. Both readings are needed to apply a rule like "≥ max(2 × peak, peak + 4 kB)",
+    /// which is why the size stays in the source instead of being guessed from here.
+    fn threads_json(&mut self) -> Vec<Value> {
+        self.hw
+            .tasks()
+            .into_iter()
+            .map(|t| {
+                json!({
+                    "name": t["name"],
+                    "state": t["state"],
+                    "priority": t["priority"],
+                    // One decimal: a 4 KB stack's answer has to be readable as 2.1, not 2.
+                    "high_water_kb": t["stack_free_bytes"]
+                        .as_u64()
+                        .map(|bytes| ((bytes as f64 / 1024.0) * 10.0).round() / 10.0),
+                })
+            })
+            .collect()
     }
 
     /// True while the board is waiting to be told which WiFi to join.
@@ -3162,6 +3209,20 @@ impl App {
             ("GET", "/api/status") => {
                 let v = self.status_json();
                 Response::json(&v)
+            }
+            // The heap, pool by pool. `/api/status` carries the one number that decides
+            // whether a socket or a handshake fits; this carries the split, so a change
+            // that claims to free internal RAM can be checked against the pool it moved.
+            ("GET", "/api/memory") => {
+                let pools = self.hw.heap_pools();
+                if pools.is_empty() {
+                    Response::json(&json!({
+                        "available": false,
+                        "why": "this platform cannot split its heap by capability; `memory` in /api/status and `shell ps` are the readings it has",
+                    }))
+                } else {
+                    Response::json(&json!({ "available": true, "pools": pools }))
+                }
             }
             ("GET", "/api/config") => {
                 if let Err(r) = self.require_read(req) {
@@ -10633,6 +10694,55 @@ mod tests {
         for row in hidden {
             assert!(!row["why"].as_str().unwrap_or("").is_empty(), "hidden without a reason: {row}");
             assert!(!row["name"].as_str().unwrap_or("").is_empty(), "hidden without a name: {row}");
+        }
+    }
+
+    /// The heap pool by pool, when the platform can split it, and a plain "cannot" when it
+    /// cannot. The split is what a memory change is checked against: "internal RAM went up"
+    /// is only good news if the pool that went up is the one the change was about.
+    #[test]
+    fn the_memory_route_splits_the_heap_or_says_it_cannot() {
+        let mut app = test_app();
+        let split = body_json(&app.route(&get("/api/memory")));
+        assert_eq!(split["available"], json!(true), "{split}");
+        let pools = split["pools"].as_array().expect("pools");
+        assert!(pools.len() >= 2, "the virtual board has an internal and a PSRAM pool");
+        for pool in pools {
+            for key in ["pool", "note", "total_kb", "free_kb", "largest_kb", "min_free_kb"] {
+                assert!(!pool[key].is_null(), "{} is missing {key}: {pool}", pool["pool"]);
+            }
+            assert!(
+                pool["largest_kb"].as_u64().unwrap_or(0) <= pool["free_kb"].as_u64().unwrap_or(0),
+                "the largest block cannot exceed the free total: {pool}"
+            );
+        }
+
+        // A platform with one heap answers without pretending to have four.
+        let mut bare = App::new(
+            Box::new(crate::hardware::NullHardware),
+            Box::new(SharedStore::new()),
+            LogBuf::new(64),
+            FwMeta::default(),
+        );
+        let one = body_json(&bare.route(&get("/api/memory")));
+        assert_eq!(one["available"], json!(false), "{one}");
+        assert!(one["why"].as_str().unwrap_or("").contains("cannot split"), "{one}");
+    }
+
+    /// Every thread in `/api/status` carries the stack it has left at its deepest point —
+    /// the reading that decides whether a stack constant can come down. Without it the
+    /// answer is "guess and watch for a reboot".
+    #[test]
+    fn status_reports_each_threads_stack_headroom() {
+        let mut app = test_app();
+        let status = body_json(&app.route(&get("/api/status")));
+        let threads = status["threads"].as_array().expect("threads");
+        assert_eq!(threads.len(), 3, "the virtual board reports three tasks: {status}");
+        assert_eq!(threads[0]["name"], json!("main"));
+        // 2048 bytes free is 2.0 kB, and the number is a float so a 4 KB stack can say 2.1.
+        assert_eq!(threads[0]["high_water_kb"], json!(2.0));
+        for t in threads {
+            assert!(t["high_water_kb"].as_f64().is_some(), "every thread needs a high-water reading: {t}");
         }
     }
 

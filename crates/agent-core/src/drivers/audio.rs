@@ -405,23 +405,104 @@ fn samples_for(ms: u32) -> usize {
 /// inside the last step needs no wrap-around.
 const SINE_STEPS: usize = 1024;
 
-/// `sin(2π i / SINE_STEPS)`, built once.
+/// `sin(2π i / SINE_STEPS)`, as a table the compiler builds.
 ///
 /// `f32::sin` costs ~16 µs per sample on this chip — measured on the bench: 1,915 ms of
 /// synthesis for a 4,800 ms melody, so the board spent 40% of the tune answering nothing
 /// (the numbers are in the tool result as `synth_ms` and `write_ms`). A table plus a
 /// linear interpolation replaces that with a shift and a lerp, and the phase is an
 /// integer, so it cannot drift over a long melody either.
-static SINE: std::sync::OnceLock<[f32; SINE_STEPS + 1]> = std::sync::OnceLock::new();
+///
+/// The table used to be a `OnceLock` filled on the first note, which cost 4 KB of internal
+/// DRAM from boot whether or not anyone ever played a tone — on this board that is a
+/// thread stack's worth of the scarcest memory. A read-only `static` lives in flash with
+/// the code and is read through the cache: 4 KB is a fraction of the 32 KB window, the
+/// values are constants, and `const fn` arithmetic is what makes them constants.
+///
+/// `static`, not `const`: every use of a `const` array is a fresh temporary, and the point
+/// here is one copy with one address.
+static SINE: [f32; SINE_STEPS + 1] = sine_table();
 
-fn sine_table() -> &'static [f32; SINE_STEPS + 1] {
-    SINE.get_or_init(|| {
-        let mut t = [0.0f32; SINE_STEPS + 1];
-        for (i, v) in t.iter_mut().enumerate() {
-            *v = (2.0 * std::f32::consts::PI * i as f32 / SINE_STEPS as f32).sin();
-        }
-        t
-    })
+/// The table, computed at compile time in `f64` and rounded once, at the cast.
+const fn sine_table() -> [f32; SINE_STEPS + 1] {
+    let mut t = [0.0f32; SINE_STEPS + 1];
+    let mut i = 0;
+    while i <= SINE_STEPS {
+        // τ·i/N, in f64: the index arithmetic itself must not be the error.
+        t[i] = const_sin(2.0 * std::f64::consts::PI * i as f64 / SINE_STEPS as f64) as f32;
+        i += 1;
+    }
+    t
+}
+
+/// `sin(x)` as a `const fn`: quarter-period reduction, then the Taylor series on
+/// `[0, π/4]`.
+///
+/// `f64::sin` is not a `const fn`, so the series is here. On `[0, π/4]` the first dropped
+/// term of the sine series is `x^19/19! < 2e-19` and of the cosine series `x^16/16! < 1e-17`
+/// — below the f64 epsilon at that magnitude, so what the cast to `f32` rounds is the only
+/// error left, and the bench test compares the result with `sin` at the same rate.
+const fn const_sin(x: f64) -> f64 {
+    const PI_2: f64 = std::f64::consts::FRAC_PI_2;
+    const PI_4: f64 = std::f64::consts::FRAC_PI_4;
+    // A full period is four quarter turns, not two: `2 * PI_2` is π, and reducing modulo
+    // π flips the sign of every angle in the second half — which is one bug this test
+    // caught on the first run.
+    const TAU: f64 = 4.0 * PI_2;
+
+    // One period, then whole quarter turns: `q` says which.
+    let mut t = x;
+    while t < 0.0 {
+        t += TAU;
+    }
+    while t >= TAU {
+        t -= TAU;
+    }
+    let mut q = 0;
+    while t >= PI_2 {
+        t -= PI_2;
+        q += 1;
+    }
+    // Fold [0, π/2) onto [0, π/4]: past the fold the sine is the other series' value.
+    let (s, c) =
+        if t <= PI_4 { (sin_series(t), cos_series(t)) } else { (cos_series(PI_2 - t), sin_series(PI_2 - t)) };
+    match q {
+        0 => s,
+        1 => c,
+        2 => -s,
+        _ => -c,
+    }
+}
+
+/// `sin(u)` on `[0, π/4]`, through `u^17`.
+const fn sin_series(u: f64) -> f64 {
+    let u2 = u * u;
+    let u3 = u2 * u;
+    let u5 = u3 * u2;
+    let u7 = u5 * u2;
+    let u9 = u7 * u2;
+    let u11 = u9 * u2;
+    let u13 = u11 * u2;
+    let u15 = u13 * u2;
+    let u17 = u15 * u2;
+    u - u3 / 6.0 + u5 / 120.0 - u7 / 5040.0 + u9 / 362880.0 - u11 / 39916800.0 + u13 / 6227020800.0
+        - u15 / 1307674368000.0
+        + u17 / 355687428096000.0
+}
+
+/// `cos(u)` on `[0, π/4]`, through `u^16`.
+const fn cos_series(u: f64) -> f64 {
+    let u2 = u * u;
+    let u4 = u2 * u2;
+    let u6 = u4 * u2;
+    let u8 = u6 * u2;
+    let u10 = u8 * u2;
+    let u12 = u10 * u2;
+    let u14 = u12 * u2;
+    let u16 = u14 * u2;
+    1.0 - u2 / 2.0 + u4 / 24.0 - u6 / 720.0 + u8 / 40320.0 - u10 / 3628800.0 + u12 / 479001600.0
+        - u14 / 87178291200.0
+        + u16 / 20922789888000.0
 }
 
 /// The sine at `phase`, where a full cycle is `u32::MAX` — 10 bits of table index and 12
@@ -442,7 +523,7 @@ fn sine_at(table: &[f32; SINE_STEPS + 1], phase: u32) -> f32 {
 /// ramp is a dip in the envelope, not a gap in the stream — no samples are skipped.
 pub fn melody(notes: &[(f32, u32)], volume: f32) -> Vec<i16> {
     let amp = volume.clamp(0.0, 1.0) * 32767.0;
-    let table = sine_table();
+    let table = &SINE;
     let mut out = Vec::with_capacity(notes.iter().map(|(_, ms)| samples_for(*ms)).sum());
     let last = notes.len().saturating_sub(1);
     for (idx, (freq, ms)) in notes.iter().enumerate() {
@@ -681,6 +762,25 @@ mod tests {
         // centre sample is not usable — at 440 Hz, 50 ms in is a whole number of periods.)
         let peak = pcm[n / 4..n * 3 / 4].iter().map(|s| s.abs()).max().unwrap_or(0);
         assert!(peak > 10_000, "the body of a note is not attenuated: peak {peak}");
+    }
+
+    /// The table is built by the compiler now, so it needs its own check: every entry
+    /// against `sin`, and the four quarter-cycle points exactly where they belong. A
+    /// reduction bug in `const_sin` shows up here as one wrong quadrant, not as a melody
+    /// that sounds "a bit odd".
+    #[test]
+    fn the_compiled_table_is_the_sine_it_claims_to_be() {
+        let mut worst = 0.0f64;
+        for i in 0..=SINE_STEPS {
+            let want = (2.0 * std::f64::consts::PI * i as f64 / SINE_STEPS as f64).sin();
+            worst = worst.max((SINE[i] as f64 - want).abs());
+        }
+        assert!(worst < 1e-6, "worst deviation from sin: {worst}");
+        assert_eq!(SINE[0], 0.0);
+        assert!((SINE[SINE_STEPS / 4] - 1.0).abs() < 1e-6, "a quarter cycle is a peak");
+        assert!(SINE[SINE_STEPS / 2].abs() < 1e-6, "a half cycle is zero");
+        assert!((SINE[SINE_STEPS * 3 / 4] + 1.0).abs() < 1e-6, "three quarters is a trough");
+        assert!(SINE[SINE_STEPS].abs() < 1e-6, "the last entry is the wrap point");
     }
 
     /// The oscillator is a table and an integer phase, which is fast but only as good as
