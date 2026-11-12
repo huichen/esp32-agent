@@ -149,6 +149,25 @@ impl Default for FwMeta {
     }
 }
 
+/// One run submitted through `POST /api/script`.
+///
+/// The board has one agent thread, so an asynchronous run is not a second thread: it is a
+/// job the platform tick picks up and finishes. That keeps the RAM cost at a string and a
+/// result, and makes "async" mean "you do not wait" rather than "the board runs two things
+/// at once", which a chip with kilobytes of internal SRAM cannot honour.
+#[derive(Clone, Debug, Default)]
+pub struct ScriptJob {
+    pub id: String,
+    pub source: String,
+    /// `queued`, `running`, `done`, `failed`.
+    pub state: String,
+    pub result: serde_json::Value,
+    pub output: Vec<String>,
+    pub steps: u64,
+    pub ms: u64,
+    pub error: String,
+}
+
 pub struct App {
     pub cfg: Config,
     pub manifest: Manifest,
@@ -183,6 +202,11 @@ pub struct App {
     pub rules: Vec<SensorRule>,
     /// The workspace behind the `fs_*` tools.
     pub workspace: AppWorkspace,
+    /// Script runs submitted over HTTP, newest last. Bounded: this is a queue for a
+    /// person or an external agent, not for anything that retries in a loop.
+    pub scripts: Vec<ScriptJob>,
+    /// Monotonic counter for job ids; not persisted, because the queue is not either.
+    pub script_seq: u64,
     /// The objective the board is working towards on its own, and how far it got.
     /// Idle until a client posts one; the scheduler tick is what advances it.
     pub goal: Goal,
@@ -267,6 +291,8 @@ impl App {
             llm: LlmConfig::default(),
             tasks: Vec::new(),
             rules: Vec::new(),
+            scripts: Vec::new(),
+            script_seq: 0,
             workspace: AppWorkspace::default(),
             goal: idle_goal(),
             turn_source: String::new(),
@@ -834,6 +860,75 @@ impl App {
     /// The script gets a host that calls back into this dispatcher, so `tool()` inside a
     /// script has exactly the reach of the caller: no extra capability, no bypass of
     /// `is_visible`, and `script` itself is refused to stop unbounded recursion.
+    /// Submit a script for execution, returning the job.
+    ///
+    /// `inline` runs it now and fills the result before returning; otherwise it is queued
+    /// and `run_next_script` (one per scheduler tick) finishes it. Both paths go through
+    /// [`Self::run_script`], so an asynchronous run has exactly the permissions of a
+    /// synchronous one and of the on-board agent: the same tool dispatch, the same
+    /// `mcp.disabled_tools`, the same refusal to call `script` from inside a script.
+    pub fn submit_script(&mut self, source: &str, inline: bool) -> ScriptJob {
+        let id = format!("s{}", self.script_seq + 1);
+        self.script_seq += 1;
+        let job =
+            ScriptJob { id, source: source.to_string(), state: "queued".to_string(), ..Default::default() };
+        self.scripts.push(job);
+        // Four is enough for a person and an external agent to each have one in flight; a
+        // longer queue would only hide that the board runs one at a time anyway.
+        while self.scripts.len() > 4 {
+            self.scripts.remove(0);
+        }
+        if inline {
+            let id = self.scripts.last().expect("just pushed").id.clone();
+            self.run_script_job(&id);
+            return self.scripts.iter().find(|j| j.id == id).cloned().unwrap_or_default();
+        }
+        self.scripts.last().cloned().unwrap_or_default()
+    }
+
+    /// Finish the oldest queued job, if any. Called once per tick.
+    pub fn run_next_script(&mut self) {
+        let next = self.scripts.iter().find(|j| j.state == "queued").map(|j| j.id.clone());
+        if let Some(id) = next {
+            self.run_script_job(&id);
+        }
+    }
+
+    /// Look up a job by id, for `GET /api/script/<id>`.
+    pub fn script_job(&self, id: &str) -> Option<ScriptJob> {
+        self.scripts.iter().find(|j| j.id == id).cloned()
+    }
+
+    fn run_script_job(&mut self, id: &str) {
+        let Some(index) = self.scripts.iter().position(|j| j.id == id) else {
+            return;
+        };
+        let source = self.scripts[index].source.clone();
+        self.scripts[index].state = "running".to_string();
+        let started = now_ms();
+        match self.run_script(&json!({ "source": source })) {
+            Ok(value) => {
+                let job = &mut self.scripts[index];
+                job.state = "done".to_string();
+                job.result = value.get("result").cloned().unwrap_or(Value::Null);
+                job.output = value
+                    .get("output")
+                    .and_then(|o| o.as_array())
+                    .map(|a| a.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
+                    .unwrap_or_default();
+                job.steps = value.get("steps").and_then(|s| s.as_u64()).unwrap_or(0);
+                job.ms = now_ms().saturating_sub(started);
+                job.error.clear();
+            }
+            Err(e) => {
+                let job = &mut self.scripts[index];
+                job.state = "failed".to_string();
+                job.ms = now_ms().saturating_sub(started);
+                job.error = e.message;
+            }
+        }
+    }
+
     fn run_script(&mut self, args: &Value) -> Result<Value> {
         // No `source` means the caller wants the reference, not a run: a model writing its
         // first script has no other way to learn the syntax, and one paragraph in the tool
@@ -1265,8 +1360,12 @@ impl App {
     /// microseconds. `None` means nothing was queued.
     pub fn agent_begin(&mut self) -> Option<AgentStep> {
         let max_steps = self.llm.max_steps;
+        let (context_tokens, max_output_tokens) = (self.llm.context_tokens, self.llm.max_output_tokens);
         self.turn_source = self.pending_source();
-        self.with_agent(move |agent, host| agent.begin(host, now_ms, max_steps))
+        self.with_agent(move |agent, host| {
+            agent.set_budget(context_tokens, max_output_tokens);
+            agent.begin(host, now_ms, max_steps)
+        })
     }
 
     /// Phase 2: fold one model reply back in (journal, tool calls, transcript) and say
@@ -1304,9 +1403,21 @@ impl App {
             }
             let source = format!("schedule:{}", self.tasks[i].id);
             let prompt = self.tasks[i].prompt.clone();
+            let script = self.tasks[i].script.clone();
             self.tasks[i].last_run_ms = at_ms;
             dirty = true;
-            if source.len() < 64 && !prompt.trim().is_empty() {
+            if source.len() >= 64 {
+                continue;
+            }
+            // A task either asks the model something or runs a script. The script path
+            // costs no tokens and no model call, which is the reason it exists: a five
+            // minute rule that pulses a relay should not pay for a chat turn.
+            let script = if script.trim().is_empty() { None } else { Some(script) };
+            if let Some(source_text) = script {
+                let job = self.submit_script(&source_text, true);
+                self.log.info("script", format!("{source} ran a script: {}", job.id));
+                fired.push(source);
+            } else if !prompt.trim().is_empty() {
                 self.agent.push_user(&prompt, &source, at_ms);
                 self.log.info("agent", format!("queued {source}"));
                 fired.push(source);
@@ -2486,6 +2597,68 @@ impl App {
                 self.agent_config_apply(req)
             }
             ("GET", "/api/sched") => Response::json(&self.sched_json()),
+            // Run a script from outside: a client writes one and wants the answer. Inline is
+            // the default because that is what "call and get the result" means; `async` hands
+            // back a job id for a script that loops over hardware for a while.
+            ("POST", "/api/script") => {
+                // A script can move pins, so it is a write whatever it does: the same PIN rule
+                // as `manifest_apply`, for the same reason.
+                if let Err(r) = self.require_pin(req) {
+                    return r;
+                }
+                let body = match req.json() {
+                    Ok(v) => v,
+                    Err(e) => return Response::error_json(400, &format!("invalid JSON: {e}")),
+                };
+                let source = body.get("source").and_then(|s| s.as_str()).unwrap_or("").to_string();
+                if source.trim().is_empty() {
+                    return Response::json_status(
+                        400,
+                        &json!({
+                            "error": "`source` is required; send {\"source\": \"<script>\"}",
+                            "help": "script {\"help\": true} prints the language",
+                        }),
+                    );
+                }
+                if source.len() > crate::script::MAX_SOURCE {
+                    return Response::json_status(
+                        413,
+                        &json!({ "error": format!("script is larger than {} bytes", crate::script::MAX_SOURCE) }),
+                    );
+                }
+                let want_async = body.get("async").and_then(|a| a.as_bool()).unwrap_or(false);
+                let job = self.submit_script(&source, !want_async);
+                let mut out = json!({ "id": job.id, "state": job.state, "async": want_async });
+                if want_async {
+                    out["poll"] = json!(format!("/api/script/{}", job.id));
+                } else {
+                    out["ok"] = json!(job.state == "done");
+                    out["result"] = job.result;
+                    out["output"] = json!(job.output);
+                    out["steps"] = json!(job.steps);
+                    out["ms"] = json!(job.ms);
+                    if !job.error.is_empty() {
+                        out["error"] = json!(job.error);
+                    }
+                }
+                Response::json(&out)
+            }
+            ("GET", path) if path.starts_with("/api/script/") => {
+                let id = &path["/api/script/".len()..];
+                match self.script_job(id) {
+                    Some(job) => Response::json(&json!({
+                        "id": job.id,
+                        "state": job.state,
+                        "ok": job.state == "done",
+                        "result": job.result,
+                        "output": job.output,
+                        "steps": job.steps,
+                        "ms": job.ms,
+                        "error": job.error,
+                    })),
+                    None => Response::json_status(404, &json!({ "error": format!("no script job `{id}`") })),
+                }
+            }
             ("POST", "/api/sched") => {
                 if let Err(r) = self.require_pin(req) {
                     return r;
@@ -3502,6 +3675,8 @@ fn llm_json(cfg: &LlmConfig, with_key: bool) -> Value {
         "reasoning": cfg.reasoning,
         "vision": cfg.vision,
         "protocol": cfg.protocol,
+        "context_tokens": cfg.context_tokens,
+        "max_output_tokens": cfg.max_output_tokens,
     });
     if with_key {
         v["api_key"] = json!(cfg.api_key);
@@ -3550,6 +3725,15 @@ fn llm_apply_json(cfg: &mut LlmConfig, v: &Value) {
     if let Some(p) = v.get("protocol").and_then(|x| x.as_str()) {
         cfg.protocol = crate::llm::Protocol::parse(p).as_str().to_string();
     }
+    // The two budgets: clamped rather than rejected, because a page that sends 0 or a
+    // negative number means "I did not fill this in", and a 400 there would lose the
+    // rest of the patch.
+    if let Some(n) = v.get("context_tokens").and_then(|x| x.as_u64()) {
+        cfg.context_tokens = n.clamp(512, 2_000_000) as u32;
+    }
+    if let Some(n) = v.get("max_output_tokens").and_then(|x| x.as_u64()) {
+        cfg.max_output_tokens = n.clamp(64, 128_000) as u32;
+    }
 }
 
 /// What `reasoning` may say. `none` is accepted as a synonym for `off` because that is
@@ -3560,6 +3744,7 @@ fn task_json(t: &ScheduledTask) -> Value {
     json!({
         "id": t.id,
         "prompt": t.prompt,
+        "script": t.script,
         "every_s": t.every_s,
         "at_hhmm": t.at_hhmm,
         "enabled": t.enabled,
@@ -3577,7 +3762,11 @@ fn task_from(v: &Value, fallback_id: &str) -> Option<ScheduledTask> {
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| fallback_id.to_string());
     let prompt = v.get("prompt").and_then(|p| p.as_str()).unwrap_or("").trim().to_string();
-    if id.is_empty() || prompt.is_empty() {
+    let script = v.get("script").and_then(|s| s.as_str()).unwrap_or("").trim().to_string();
+    // A task needs something to do: a prompt, a script, or both. A task with neither would
+    // fire on schedule and accomplish nothing, which is the kind of silence that looks like
+    // a bug six hours later.
+    if id.is_empty() || (prompt.is_empty() && script.is_empty()) {
         return None;
     }
     Some(ScheduledTask {
@@ -3585,6 +3774,7 @@ fn task_from(v: &Value, fallback_id: &str) -> Option<ScheduledTask> {
         prompt,
         every_s: v.get("every_s").and_then(|e| e.as_u64()).unwrap_or(0).min(u32::MAX as u64) as u32,
         at_hhmm: v.get("at_hhmm").and_then(|a| a.as_str()).unwrap_or("").trim().to_string(),
+        script: v.get("script").and_then(|s| s.as_str()).unwrap_or("").to_string(),
         enabled: v.get("enabled").and_then(|e| e.as_bool()).unwrap_or(true),
         last_run_ms: v.get("last_run_ms").and_then(|l| l.as_u64()).unwrap_or(0),
     })
@@ -4106,6 +4296,76 @@ mod tests {
     fn test_app() -> App {
         let log = LogBuf::new(256);
         App::new(Box::new(VirtualBoard::new()), Box::new(MemoryStore::new()), log, FwMeta::default())
+    }
+
+    #[test]
+    fn a_script_can_be_run_over_http_inline_or_as_a_job() {
+        let mut app = test_app();
+
+        // Inline is the default: the caller gets the answer in the same response.
+        let resp = app.route(&post("/api/script", r#"{"source":"1 + 2"}"#));
+        assert_eq!(resp.status, 200);
+        let body = body_json(&resp);
+        assert_eq!(body["ok"], json!(true), "{body}");
+        assert_eq!(body["result"], json!(3));
+        assert_eq!(body["state"], json!("done"));
+
+        // Asynchronous: a job id comes back, the plateform tick runs it, the result is read.
+        let resp = app.route(&post(
+            "/api/script",
+            r#"{"source":"let t = 0\nfor x in [1,2,3] { t = t + x }\nt","async":true}"#,
+        ));
+        assert_eq!(resp.status, 200);
+        let body = body_json(&resp);
+        let id = body["id"].as_str().expect("an id").to_string();
+        assert_eq!(body["state"], json!("queued"), "{body}");
+        assert!(body["result"].is_null(), "nothing ran yet: {body}");
+
+        app.run_next_script();
+        let resp = app.route(&get(&format!("/api/script/{id}")));
+        assert_eq!(resp.status, 200);
+        let done = body_json(&resp);
+        assert_eq!(done["state"], json!("done"), "{done}");
+        assert_eq!(done["result"], json!(6));
+
+        // An unknown job is a 404 that names the id.
+        let resp = app.route(&get("/api/script/s999"));
+        assert_eq!(resp.status, 404);
+        assert!(body_json(&resp)["error"].as_str().unwrap_or("").contains("s999"));
+
+        // A failing script says so: `ok: false` with the interpreter's line and column, so
+        // a caller can tell "it ran and refused" from "it never ran".
+        let resp = app.route(&post("/api/script", r#"{"source":"let = 3"}"#));
+        let body = body_json(&resp);
+        assert_eq!(body["ok"], json!(false));
+        assert!(body["error"].as_str().unwrap_or("").contains("line"), "{body}");
+
+        // No source at all is refused before anything is queued.
+        let resp = app.route(&post("/api/script", "{}"));
+        assert_eq!(resp.status, 400);
+    }
+
+    #[test]
+    fn a_scheduled_task_can_run_a_script_instead_of_a_prompt() {
+        let mut app = test_app();
+        // One call per task, in the shape the route documents: `kind` + `op` + `task`.
+        for body in [
+            r#"{"kind":"task","op":"add","task":{"id":"t1","prompt":"say hi","every_s":60}}"#,
+            r#"{"kind":"task","op":"add","task":{"id":"t2","script":"1 + 1","every_s":60}}"#,
+        ] {
+            let resp = app.route(&post("/api/sched", body));
+            assert_eq!(resp.status, 200, "{:?}", body_json(&resp));
+        }
+
+        let fired = app.sched_tick(60_000, 0);
+        assert_eq!(fired.len(), 2, "{fired:?}");
+        assert!(fired.contains(&"schedule:t2".to_string()));
+
+        // The script task ran without the model: its value is in the job, and no turn was
+        // queued for it. The prompt task queued a message as before.
+        let job = app.scripts.iter().find(|j| j.state == "done").expect("a finished job");
+        assert_eq!(job.result, json!(2));
+        assert!(app.agent.pending.is_some(), "the prompt task still queues a message");
     }
 
     /// The map is only worth reading if it is true.

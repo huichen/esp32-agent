@@ -159,6 +159,48 @@ heaviest endpoint the portal calls, so if it answers, the page will load.
   audio devices until the next reboot. The firmware now leaves an open channel alone, and
   `devices_list` keeps `mic` and `speaker` across an apply.
 
+## How much conversation the board can carry
+
+`MAX_HISTORY_BYTES` bounds the transcript. It started at 24 KB, which was a guess made
+before anything was measured; it is 512 KB today. Two measurements got it there, and the
+second one stopped short of where the asking went.
+
+**First ladder, against a real model.** One long reply per turn, `/api/status` read between
+turns:
+
+| Turn | Messages | History | Request body (history + ~18 KB of tool schemas) | Internal SRAM | Result |
+|---|---|---|---|---|---|
+| 3 | 5 | 4.7 KB | ~23 KB | 6 kB | ok |
+| 9 | 17 | 35.3 KB | ~53 KB | 6 kB | ok |
+| 12 | 23 | 59.8 KB | ~78 KB | 6 kB | ok |
+| 13 | 21 | 63.5 KB | ~82 KB | 6 kB | compacted, then ok |
+
+**Second ladder, against a local stub** (a stand-in chat endpoint on the LAN, so the run cost
+no tokens; same transport, same serialisation, 8 KB replies):
+
+| Turn | Messages | History | PSRAM free | Internal SRAM | Result |
+|---|---|---|---|---|---|
+| 60 | 119 | 249 KB | 7 111 kB | 6 kB | ok |
+| 120 | 240 | 507 KB | 6 593 kB | 6 kB | ok |
+| ~180 | — | — | — | — | **board rebooted**, cause not captured |
+
+What that says:
+
+1. **Internal SRAM never moves** (6 kB free throughout): transcript, JSON body and mbedTLS
+   buffers are all in PSRAM, so a bigger transcript costs the resource that does not run out.
+2. **Each turn costs about four times its text.** PSRAM fell ~95 kB per ten 4 KB turns: the
+   message, a copy in the event journal, and the serialised request all exist at once.
+3. **The 48-message cap was the first thing to bind**, not the byte cap: at 2 messages a turn
+   it stopped at ~101 KB. Both caps have to move together, which is why
+   `MAX_HISTORY_MESSAGES` is 256 now.
+4. **1 MB has not been proved.** The board survived 507 KB and rebooted somewhere below 1 MB.
+   The panic was not captured because nothing was holding the serial port. That capture is the
+   next step, and until it exists 512 KB is the highest figure with evidence behind it.
+
+The one failure in the first ladder was not memory: it was
+`reading the reply over TLS failed: ERROR (the session times out after 45 s)` on a deliberately
+long reply. Raise `llm.timeout_s` before raising the history cap.
+
 ## Performance and stability
 
 | Symptom | Cause / fix |

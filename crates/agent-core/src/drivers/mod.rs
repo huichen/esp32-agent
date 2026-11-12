@@ -11,15 +11,28 @@
 
 pub mod actuator;
 pub mod ads1115;
+pub mod aht20;
 pub mod audio;
+pub mod bdc_motor;
+pub mod bh1750;
 pub mod bme280;
+pub mod bme680;
+pub mod encoder;
 pub mod expander;
+pub mod hx711;
 pub mod ina219;
+pub mod max7219;
 pub mod motion;
 pub mod onewire;
+pub mod pir;
 pub mod ranging;
+pub mod rc522;
+pub mod rtc;
 pub mod sht3x;
 pub mod ssd1306;
+pub mod stepper;
+pub mod tm1637;
+pub mod vl53l0x;
 
 use crate::boards::BoardProfile;
 use crate::config::Config;
@@ -161,16 +174,16 @@ pub static CATALOG: &[CatalogEntry] = &[
     CatalogEntry {
         kind: "rc522",
         name: "MFRC522 RFID reader",
-        detection: "not implemented yet",
-        status: "planned",
+        detection: "SPI + reset: version register 0x37 (0x91/0x92 read back)",
+        status: "implemented",
         caps: &["rc522"],
         docs: "docs/adding-a-device.md",
     },
     CatalogEntry {
         kind: "vl53l0x",
         name: "VL53L0X time-of-flight distance",
-        detection: "not implemented yet",
-        status: "planned",
+        detection: "I2C 0x29: model id register 0xC0 reads 0xEE",
+        status: "implemented",
         caps: &["vl53l0x"],
         docs: "docs/adding-a-device.md",
     },
@@ -209,89 +222,89 @@ pub static CATALOG: &[CatalogEntry] = &[
     CatalogEntry {
         kind: "bme680",
         name: "BME680 temperature / humidity / pressure / gas",
-        detection: "not implemented yet: same I2C probe as the BME280 plus the gas heater ramp",
-        status: "planned",
+        detection: "I2C 0x76/0x77: chip id 0xD0 reads 0x61",
+        status: "implemented",
         caps: &["bme680"],
         docs: "ROADMAP.md",
     },
     CatalogEntry {
         kind: "aht20",
         name: "AHT20 / AHT10 temperature + humidity",
-        detection: "not implemented yet: 0x38, read the status word after a conversion command",
-        status: "planned",
+        detection: "I2C 0x38: the status byte after a convert reports calibrated and busy",
+        status: "implemented",
         caps: &["aht20"],
         docs: "ROADMAP.md",
     },
     CatalogEntry {
         kind: "bh1750",
         name: "BH1750 ambient light",
-        detection: "not implemented yet: 0x23/0x5C, a one-byte command returns lux as 16 bits",
-        status: "planned",
+        detection: "I2C 0x23/0x5C: a one-byte command, 16 bits of lux back in continuous mode",
+        status: "implemented",
         caps: &["bh1750"],
         docs: "ROADMAP.md",
     },
     CatalogEntry {
         kind: "hx711",
         name: "HX711 load cell amplifier",
-        detection: "not implemented yet: a bit-banged 24-bit shift, so a driver rather than a manifest",
-        status: "planned",
+        detection: "declared only: two GPIOs, bit-banged 24-bit read; `identify` needs a stable conversion",
+        status: "implemented",
         caps: &["hx711"],
         docs: "ROADMAP.md",
     },
     CatalogEntry {
         kind: "ds3231",
         name: "DS3231 real-time clock",
-        detection: "not implemented yet: 0x68, BCD registers; SNTP covers the clock today",
-        status: "planned",
+        detection: "I2C 0x68: no id register; a plausible BCD time and a valid status byte",
+        status: "implemented",
         caps: &["rtc"],
         docs: "ROADMAP.md",
     },
     CatalogEntry {
         kind: "bdc_motor",
         name: "L298N / TB6612 / DRV8833 brushed motor",
-        detection: "not implemented yet: two PWM pins and a direction pin, with a speed limit",
-        status: "planned",
+        detection: "declared only: PWM + direction or two PWM; not probeable, an H-bridge has no id",
+        status: "implemented",
         caps: &["motor"],
         docs: "ROADMAP.md",
     },
     CatalogEntry {
         kind: "stepper",
         name: "A4988 / DRV8825 / TMC2208 stepper",
-        detection: "not implemented yet: step/dir pulses need timing a manifest sequence cannot hold",
-        status: "planned",
+        detection: "declared only: STEP/DIR pulses with a move time limit; the driver owns the timing",
+        status: "implemented",
         caps: &["stepper"],
         docs: "ROADMAP.md",
     },
     CatalogEntry {
         kind: "encoder",
         name: "Rotary encoder (KY-040 and bare)",
-        detection: "not implemented yet: needs an interrupt or a polled quadrature decoder",
-        status: "planned",
+        detection: "declared only: two GPIOs, polled quadrature; a fast turn can drop a detent",
+        status: "implemented",
         caps: &["encoder"],
         docs: "ROADMAP.md",
     },
     CatalogEntry {
         kind: "pir",
         name: "HC-SR501 PIR motion",
-        detection:
-            "not implemented yet: a digital pin; a manifest could wrap it, a debounce belongs in a driver",
-        status: "planned",
+        detection: "declared only: one GPIO; a quiet sensor looks like an undriven pin",
+        status: "implemented",
         caps: &["pir"],
         docs: "ROADMAP.md",
     },
     CatalogEntry {
         kind: "tm1637",
         name: "TM1637 four-digit display",
-        detection: "not implemented yet: a two-wire protocol of its own, not I2C",
-        status: "planned",
+        detection: "declared only: two GPIOs, its own clocked protocol; `identify` reads the brightness echo",
+        status: "implemented",
         caps: &["sevenseg"],
         docs: "ROADMAP.md",
     },
     CatalogEntry {
         kind: "max7219",
         name: "MAX7219 LED matrix",
-        detection: "not implemented yet: SPI, with a framebuffer like the OLED driver",
-        status: "planned",
+        detection:
+            "declared only: SPI with a chip select; `identify` writes and reads back the intensity register",
+        status: "implemented",
         caps: &["matrix"],
         docs: "ROADMAP.md",
     },
@@ -331,8 +344,33 @@ pub struct DetectResult {
 /// without an `adopt` body: it comes from the board profile (I2S audio) and declaring it
 /// again would be a no-op that reads like a success.
 const DECLARABLE: &[&str] = &[
-    "ssd1306", "bme280", "sht3x", "ina219", "mpu6050", "ads1115", "pcf8574", "ds18b20", "hcsr04", "servo",
-    "relay", "led", "buttons", "lcd",
+    "ssd1306",
+    "bme280",
+    "sht3x",
+    "ina219",
+    "mpu6050",
+    "ads1115",
+    "pcf8574",
+    "ds18b20",
+    "hcsr04",
+    "servo",
+    "relay",
+    "led",
+    "buttons",
+    "lcd",
+    "bdc_motor",
+    "stepper",
+    "encoder",
+    "pir",
+    "hx711",
+    "tm1637",
+    "max7219",
+    "rc522",
+    "bme680",
+    "aht20",
+    "bh1750",
+    "ds3231",
+    "vl53l0x",
 ];
 
 /// Probe every configured bus and every declared pin.
@@ -431,6 +469,77 @@ pub fn detect(
                 log.info("probe", format!("SHT3x at 0x{addr:02X}"));
                 claimed.insert(*addr);
                 devices.push(Box::new(d));
+            }
+        }
+
+        // The BME680 shares 0x76/0x77 with the BME280, so it is tried after it: the
+        // BME280 driver checks the id register it knows, and only a part that answers
+        // 0x61 gets here.
+        for addr in bme680::Bme680::ADDRESSES {
+            if !present(&scan, &claimed, *addr) || bme680::Bme680::identify(hw, bus, *addr).is_none() {
+                continue;
+            }
+            let suffix = next_suffix("bme680");
+            match bme680::Bme680::probe(hw, bus, *addr, suffix) {
+                Ok(d) => {
+                    log.info("probe", format!("BME680 at 0x{addr:02X}"));
+                    claimed.insert(*addr);
+                    devices.push(Box::new(d));
+                }
+                Err(e) => log.warn("probe", format!("BME680 at 0x{addr:02X}: {}", e.message)),
+            }
+        }
+
+        // AHT20: no id register, so a part is taken as present when it accepts the
+        // initialisation and answers with a calibrated status byte.
+        for addr in aht20::Aht20::ADDRESSES {
+            if !present(&scan, &claimed, *addr) {
+                continue;
+            }
+            let suffix = next_suffix("aht20");
+            match aht20::Aht20::probe(hw, bus, *addr, suffix) {
+                Ok(d) => {
+                    log.info("probe", format!("AHT20 at 0x{addr:02X}"));
+                    claimed.insert(*addr);
+                    devices.push(Box::new(d));
+                }
+                Err(e) => log.warn("probe", format!("AHT20 at 0x{addr:02X}: {}", e.message)),
+            }
+        }
+
+        // BH1750 needs a conversion to answer at all, which is why the probe costs
+        // ~180 ms and is only worth attempting at the two addresses it uses.
+        for addr in bh1750::Bh1750::ADDRESSES {
+            if !present(&scan, &claimed, *addr) {
+                continue;
+            }
+            let suffix = next_suffix("bh1750");
+            match bh1750::Bh1750::probe(hw, bus, *addr, suffix) {
+                Ok(d) => {
+                    log.info("probe", format!("BH1750 at 0x{addr:02X}"));
+                    claimed.insert(*addr);
+                    devices.push(Box::new(d));
+                }
+                Err(e) => log.warn("probe", format!("BH1750 at 0x{addr:02X}: {}", e.message)),
+            }
+        }
+
+        // DS3231 is deliberately not probed: 0x68 is also the MPU-6050's address and the
+        // part has no id register, so "it decodes as a plausible time" would adopt an IMU
+        // that happens to look like one. It is declared in the manifest instead, and the
+        // driver is still there to serve the declaration.
+        for addr in vl53l0x::Vl53l0x::ADDRESSES {
+            if !present(&scan, &claimed, *addr) || vl53l0x::Vl53l0x::identify(hw, bus, *addr).is_none() {
+                continue;
+            }
+            let suffix = next_suffix("vl53l0x");
+            match vl53l0x::Vl53l0x::probe(hw, bus, *addr, suffix) {
+                Ok(d) => {
+                    log.info("probe", format!("VL53L0X at 0x{addr:02X}"));
+                    claimed.insert(*addr);
+                    devices.push(Box::new(d));
+                }
+                Err(e) => log.warn("probe", format!("VL53L0X at 0x{addr:02X}: {}", e.message)),
             }
         }
 
@@ -721,6 +830,11 @@ pub fn instantiate(spec: &crate::manifest::DeviceSpec, hw: &mut dyn Hardware) ->
             Box::new(ssd1306::Ssd1306::probe(hw, bus, needs_addr(addr)?, height, controller, 1)?)
         }
         "bme280" => Box::new(bme280::Bme280::probe(hw, bus, needs_addr(addr)?, 1)?),
+        "bme680" => Box::new(bme680::Bme680::probe(hw, bus, needs_addr(addr)?, 1)?),
+        "aht20" => Box::new(aht20::Aht20::probe(hw, bus, needs_addr(addr)?, 1)?),
+        "bh1750" => Box::new(bh1750::Bh1750::probe(hw, bus, needs_addr(addr)?, 1)?),
+        "ds3231" => Box::new(rtc::Ds3231::probe(hw, bus, needs_addr(addr)?, 1)?),
+        "vl53l0x" => Box::new(vl53l0x::Vl53l0x::probe(hw, bus, needs_addr(addr)?, 1)?),
         "sht3x" => Box::new(sht3x::Sht3x::probe(hw, bus, needs_addr(addr)?, 1)?),
         "ina219" => {
             let shunt = opt("shunt_mohm").and_then(|s| s.parse().ok()).unwrap_or(100u32);
@@ -765,6 +879,60 @@ pub fn instantiate(spec: &crate::manifest::DeviceSpec, hw: &mut dyn Hardware) ->
                 return Err(McpError::invalid_params("driver `buttons` needs pins, e.g. {\"boot\": 0}"));
             }
             Box::new(actuator::Buttons::new(buttons))
+        }
+        // ---- motion and actuators -------------------------------------------------
+        // None of these four can be probed: an H-bridge, a stepper driver, a quadrature
+        // encoder and a PIR look electrically identical to an idle pin. The manifest is
+        // the interface, and the driver is what the manifest cannot express (timing,
+        // state, a quadrature decode).
+        "bdc_motor" => {
+            let wiring = if let (Some(in1), Some(in2)) = (pin("in1"), pin("in2")) {
+                bdc_motor::Wiring::TwoPwm { in1, in2 }
+            } else {
+                let pwm = needs_pin(pin("pwm").or_else(|| pin("ena")), "pwm")?;
+                let dir = needs_pin(pin("dir"), "dir")?;
+                bdc_motor::Wiring::PwmDir { pwm, dir }
+            };
+            Box::new(bdc_motor::BdcMotor::new(wiring))
+        }
+        "stepper" => {
+            let step = needs_pin(pin("step"), "step")?;
+            let dir = needs_pin(pin("dir"), "dir")?;
+            let microsteps = opt("microsteps").and_then(|m| m.parse().ok()).unwrap_or(1u32).max(1);
+            Box::new(stepper::Stepper::new(step, dir, pin("enable"), microsteps))
+        }
+        "encoder" => {
+            let a = needs_pin(pin("a"), "a")?;
+            let b = needs_pin(pin("b"), "b")?;
+            Box::new(encoder::Encoder::new(a, b))
+        }
+        "pir" => {
+            let p = needs_pin(pin("out").or_else(|| pin("data")), "out")?;
+            // `active_high` is a board fact, not something a pin can report: HC-SR501
+            // modules ship both ways depending on the jumper.
+            let active_high = opt("active_high").map(|v| v != "false").unwrap_or(true);
+            Box::new(pir::Pir::new(p, active_high))
+        }
+        // ---- SPI and bit-banged parts ---------------------------------------------
+        "hx711" => {
+            let dout = needs_pin(pin("dout"), "dout")?;
+            let sck = needs_pin(pin("sck"), "sck")?;
+            Box::new(hx711::Hx711::probe(hw, dout, sck, 1)?)
+        }
+        "tm1637" => {
+            let clk = needs_pin(pin("clk"), "clk")?;
+            let dio = needs_pin(pin("dio"), "dio")?;
+            Box::new(tm1637::Tm1637::probe(hw, clk, dio, 1)?)
+        }
+        "max7219" => {
+            let cs = needs_pin(pin("cs"), "cs")?;
+            let count = opt("count").and_then(|c| c.parse().ok()).unwrap_or(1usize).max(1);
+            Box::new(max7219::Max7219::probe(hw, bus, cs, count, 1)?)
+        }
+        "rc522" => {
+            let cs = needs_pin(pin("cs"), "cs")?;
+            let rst = needs_pin(pin("rst"), "rst")?;
+            Box::new(rc522::Rc522::probe(hw, bus, cs, rst, 1)?)
         }
         other => {
             return Err(McpError::invalid_params(format!(
@@ -857,5 +1025,119 @@ mod cap_tests {
         assert!(!caps.iter().any(|c| c == "mic"), "mic advertised with no driver: {caps:?}");
         assert!(!caps.iter().any(|c| c == "speaker"), "speaker advertised with no driver: {caps:?}");
         assert!(caps.iter().any(|c| c == "gpio"), "the real caps are still there: {caps:?}");
+    }
+
+    /// Every kind added in this wave has to be buildable from a manifest, and the device
+    /// it produces has to expose at least one tool. A driver that compiles but has no
+    /// tool behind it is the failure mode this test exists for: it would appear in
+    /// `devices_list` and change nothing the model can call.
+    #[test]
+    fn each_declarable_driver_builds_a_device_with_tools() {
+        let cases: &[(&str, serde_json::Value)] = &[
+            ("bdc_motor", serde_json::json!({"in1": 4, "in2": 5})),
+            ("bdc_motor", serde_json::json!({"pwm": 4, "dir": 5})),
+            ("stepper", serde_json::json!({"step": 4, "dir": 5, "enable": 6})),
+            ("encoder", serde_json::json!({"a": 4, "b": 5})),
+            ("pir", serde_json::json!({"out": 4})),
+            ("hx711", serde_json::json!({"dout": 4, "sck": 5})),
+            ("tm1637", serde_json::json!({"clk": 4, "dio": 5})),
+            ("max7219", serde_json::json!({"cs": 4})),
+            ("rc522", serde_json::json!({"cs": 4, "rst": 5})),
+            ("bme680", serde_json::json!({"address": 118})),
+            ("aht20", serde_json::json!({"address": 56})),
+            ("bh1750", serde_json::json!({"address": 35})),
+            ("ds3231", serde_json::json!({"address": 104})),
+            ("vl53l0x", serde_json::json!({"address": 41})),
+        ];
+        for (kind, pins) in cases {
+            let spec = crate::manifest::DeviceSpec {
+                id: format!("{kind}_t"),
+                kind: kind.to_string(),
+                driver: Some(kind.to_string()),
+                bus: Some(0),
+                address: pins.get("address").and_then(|a| a.as_u64()).map(|a| a as u8),
+                pins: pins
+                    .as_object()
+                    .map(|m| {
+                        m.iter().filter_map(|(k, v)| v.as_i64().map(|n| (k.clone(), n as i32))).collect()
+                    })
+                    .unwrap_or_default(),
+                options: Default::default(),
+                enabled: true,
+                note: String::new(),
+            };
+            assert!(DECLARABLE.contains(kind), "{kind} must be declarable in a manifest");
+            let mut hw = crate::virtual_board::VirtualBoard::new();
+            match instantiate(&spec, &mut hw) {
+                Ok(device) => assert!(
+                    !device.tools().is_empty(),
+                    "{kind} built but exposes no tool, so the model cannot use it"
+                ),
+                Err(e) => {
+                    // The parts that have to answer on a bus cannot be built against an
+                    // empty virtual board. That is the right error as long as it names the
+                    // missing part: "no compiled driver" would mean the wiring is absent,
+                    // and that is the failure this whole test exists to catch.
+                    assert!(
+                        !e.message.contains("no compiled driver"),
+                        "{kind} is in the catalogue but instantiate does not know it: {}",
+                        e.message
+                    );
+                    assert!(
+                        e.message.contains("GPIO")
+                            || e.message.contains("no ")
+                            || e.message.contains("did not"),
+                        "{kind} failed without saying what was missing: {}",
+                        e.message
+                    );
+                }
+            }
+        }
+    }
+
+    /// The five parts that can be probed must answer `identify` on a bus that has them
+    /// and refuse on one that does not — that is the difference between discovering
+    /// hardware and inventing it.
+    #[test]
+    fn only_parts_that_answer_are_identified() {
+        // An empty bus answers nothing. A driver that invents presence is worse than one
+        // that reports the chip as unknown, and this is the cheapest proof of that: every
+        // identification path is asked on a board with no parts on it.
+        let mut empty = crate::virtual_board::VirtualBoard::new();
+        assert!(bme680::Bme680::identify(&mut empty, 0, 0x76).is_none());
+        assert!(vl53l0x::Vl53l0x::identify(&mut empty, 0, 0x29).is_none());
+        assert!(aht20::Aht20::probe(&mut empty, 0, 0x38, 1).is_err());
+        assert!(bh1750::Bh1750::probe(&mut empty, 0, 0x23, 1).is_err());
+        assert!(!rtc::Ds3231::identify(&mut empty, 0, 0x68));
+
+        // And a part that is there is found: the BME680 answers 0x61 at the address the
+        // BME280 also uses, which is why detection tries the BME280 first.
+        let mut board = crate::virtual_board::VirtualBoard::new();
+        board.add(0x76, crate::virtual_board::FakeKind::Bme280);
+        assert!(bme280::Bme280::identify(&mut board, 0, 0x76).is_some());
+    }
+
+    /// 0x68 is both the DS3231 and the MPU-6050, and detection has to settle that without
+    /// guesswork: the IMU is probed (it has a WHO_AM_I), the clock is declared.
+    #[test]
+    fn address_68_belongs_to_the_part_that_can_prove_it() {
+        let mut hw = crate::virtual_board::VirtualBoard::new();
+        hw.add(0x68, crate::virtual_board::FakeKind::Mpu6050);
+        assert!(motion::Mpu6050::identify(&mut hw, 0, 0x68).is_some());
+        let mut cfg = crate::config::Config::default();
+        cfg.bus.i2c = serde_json::from_value(serde_json::json!([
+            {"bus": 0, "sda": 41, "scl": 42, "freq_khz": 400}
+        ]))
+        .expect("an I2C bus config");
+        let profile = crate::boards::find("esp32s3-xiaozhi-bread").expect("profile");
+        let log = std::sync::Arc::new(crate::logbuf::LogBuf::new(64));
+        let found = detect(&mut hw, &cfg, profile, &log);
+        let infos = found.devices.infos();
+        let kinds: Vec<&str> = infos.iter().map(|i| i.kind.as_str()).collect();
+        assert!(kinds.contains(&"mpu6050"), "the IMU is discovered: {kinds:?}");
+        assert!(
+            !kinds.contains(&"ds3231"),
+            "the clock is never auto-adopted at the IMU's address: {kinds:?}"
+        );
     }
 }

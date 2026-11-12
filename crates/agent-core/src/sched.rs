@@ -28,6 +28,12 @@ pub struct ScheduledTask {
     /// Stable id, e.g. `t1`. The portal and `POST /api/sched` address tasks by it.
     pub id: String,
     pub prompt: String,
+    /// A script to run instead of asking the model. Empty means "use `prompt`".
+    ///
+    /// A timed script costs no tokens and no model call, so a rule that should pulse a
+    /// relay every five minutes can be scheduled without paying for a chat turn. When both
+    /// are set the script wins, and the prompt is kept as documentation of the intent.
+    pub script: String,
     /// Interval in seconds; `0` = use `at_hhmm`.
     pub every_s: u32,
     /// Local daily time, `"07:30"` or `""`.
@@ -44,6 +50,7 @@ impl Default for ScheduledTask {
         Self {
             id: String::new(),
             prompt: String::new(),
+            script: String::new(),
             every_s: 0,
             at_hhmm: String::new(),
             enabled: true,
@@ -234,6 +241,7 @@ mod tests {
         ScheduledTask {
             id: "t1".into(),
             prompt: "report temperature".into(),
+            script: String::new(),
             every_s,
             at_hhmm: at_hhmm.into(),
             enabled: true,

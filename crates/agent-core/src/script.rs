@@ -48,6 +48,9 @@ pub const MAX_MS: u64 = 30_000;
 pub const MAX_STEPS: u64 = 5_000_000;
 /// Nested blocks (and `if`/`while` bodies) a script may enter.
 const MAX_DEPTH: usize = 32;
+/// Recursion depth. Each frame is a map of its own, so this is also a memory bound: 32
+/// frames of a few locals is what an 8 KB workspace and a few kilobytes of stack allow.
+const MAX_CALLS: usize = 32;
 /// A string or a list may not grow past this: the board has kilobytes, not megabytes.
 const MAX_STRING: usize = 4096;
 const MAX_LIST: usize = 256;
@@ -226,6 +229,13 @@ fn collect_calls(stmts: &[Stmt], out: &mut Vec<String>) {
                 collect_calls(then, out);
                 collect_calls(otherwise, out);
             }
+            Stmt::For(_, iterable, body) => {
+                collect_expr(iterable, out);
+                collect_calls(body, out);
+            }
+            Stmt::Fn(_, _, body) => collect_calls(body, out),
+            Stmt::Return(Some(e)) => collect_expr(e, out),
+            Stmt::Return(None) => {}
             Stmt::While(c, body) => {
                 collect_expr(c, out);
                 collect_calls(body, out);
@@ -581,6 +591,15 @@ enum Stmt {
     SetIndex(String, Expr, Expr),
     If(Expr, Vec<Stmt>, Vec<Stmt>),
     While(Expr, Vec<Stmt>),
+    /// `for name in <list or map keys> { ... }`. A `while` loop already made the language
+    /// Turing complete; this exists because every script that walks a sensor list was
+    /// spending four lines on an index it never used for anything else.
+    For(String, Expr, Vec<Stmt>),
+    /// `fn name(a, b) { ... }`. Definitions are hoisted: a script may call a function
+    /// before the line that defines it, which is what makes mutual recursion usable.
+    Fn(String, Vec<String>, Vec<Stmt>),
+    /// `return <expr>`, and a bare `return` for nil.
+    Return(Option<Expr>),
     Break,
     Expr(Expr),
 }
@@ -635,6 +654,82 @@ impl Parser {
         Ok(out)
     }
 
+    /// `fn name(a, b) { ... }`, `for x in expr { ... }`, `return [expr]`.
+    ///
+    /// They are parsed here rather than as expression forms because all three read better
+    /// as statements, and because a `for` header needs `in`, which is not an operator.
+    fn keyword_stmt(&mut self) -> Option<Result<Stmt, String>> {
+        let word = match self.peek() {
+            Tok::Ident(w) => w.clone(),
+            _ => return None,
+        };
+        match word.as_str() {
+            "fn" => {
+                self.next();
+                let name = match self.next() {
+                    Tok::Ident(n) => n,
+                    other => return Some(Err(format!("expected a name after `fn`, found {other:?}"))),
+                };
+                let mut params = Vec::new();
+                if self.peek() == &Tok::LParen {
+                    self.next();
+                    while self.peek() != &Tok::RParen {
+                        match self.next() {
+                            Tok::Ident(p) => params.push(p),
+                            other => return Some(Err(format!("expected a parameter name, found {other:?}"))),
+                        }
+                        if self.peek() == &Tok::Comma {
+                            self.next();
+                        } else {
+                            break;
+                        }
+                    }
+                    if let Err(e) = self.expect(&Tok::RParen) {
+                        return Some(Err(e));
+                    }
+                }
+                match self.block() {
+                    Ok(body) => Some(Ok(Stmt::Fn(name, params, body))),
+                    Err(e) => Some(Err(e)),
+                }
+            }
+            "return" => {
+                self.next();
+                if matches!(self.peek(), Tok::RBrace | Tok::Eof) {
+                    return Some(Ok(Stmt::Return(None)));
+                }
+                match self.expr_opt() {
+                    Ok(e) => Some(Ok(Stmt::Return(Some(e)))),
+                    Err(e) => Some(Err(e)),
+                }
+            }
+            "for" => {
+                self.next();
+                let name = match self.next() {
+                    Tok::Ident(n) => n,
+                    other => {
+                        return Some(Err(format!("expected a loop variable after `for`, found {other:?}")))
+                    }
+                };
+                match self.next() {
+                    Tok::Ident(w) if w == "in" => {}
+                    other => {
+                        return Some(Err(format!("expected `in` after the loop variable, found {other:?}")))
+                    }
+                }
+                let iterable = match self.expr_opt() {
+                    Ok(e) => e,
+                    Err(e) => return Some(Err(e)),
+                };
+                match self.block() {
+                    Ok(body) => Some(Ok(Stmt::For(name, iterable, body))),
+                    Err(e) => Some(Err(e)),
+                }
+            }
+            _ => None,
+        }
+    }
+
     fn block(&mut self) -> Result<Vec<Stmt>, String> {
         self.expect(&Tok::LBrace)?;
         let mut out = Vec::new();
@@ -649,6 +744,9 @@ impl Parser {
     }
 
     fn stmt(&mut self) -> Result<Stmt, String> {
+        if let Some(parsed) = self.keyword_stmt() {
+            return parsed;
+        }
         match self.peek().clone() {
             Tok::Let => {
                 self.next();
@@ -723,6 +821,10 @@ impl Parser {
                 Ok(Stmt::Expr(e))
             }
         }
+    }
+
+    fn expr_opt(&mut self) -> Result<Expr, String> {
+        self.expr()
     }
 
     fn expr(&mut self) -> Result<Expr, String> {
@@ -934,11 +1036,17 @@ impl Expr {
 enum Flow {
     Normal,
     Break,
+    /// A function returned a value; unwinds to the call that started it.
+    Return(Val),
 }
 
 struct Run<'a> {
     host: &'a mut dyn ScriptHost,
     scopes: Vec<BTreeMap<String, Val>>,
+    /// User-defined functions, hoisted before the first statement runs.
+    fns: BTreeMap<String, (Vec<String>, Vec<Stmt>)>,
+    /// Call depth, separate from block depth: recursion costs both.
+    calls: usize,
     steps: u64,
     depth: usize,
     output: Vec<String>,
@@ -958,15 +1066,28 @@ pub fn run(source: &str, host: &mut dyn ScriptHost) -> Result<Outcome, String> {
     let mut runner = Run {
         host,
         scopes: vec![BTreeMap::new()],
+        fns: BTreeMap::new(),
+        calls: 0,
         steps: 0,
         depth: 0,
         output: Vec::new(),
         started_ms: now_ms(),
     };
+    // Hoist the definitions first: a script may call a function on the line before the one
+    // that defines it, which is what makes mutual recursion usable.
+    for stmt in &program {
+        if let Stmt::Fn(name, params, body) = stmt {
+            runner.fns.insert(name.clone(), (params.clone(), body.clone()));
+        }
+    }
     let mut last = Val::Nil;
     for stmt in &program {
         match runner.stmt(stmt)? {
             Flow::Break => break,
+            Flow::Return(v) => {
+                last = v;
+                break;
+            }
             Flow::Normal => {}
         }
         if let Stmt::Expr(e) = stmt {
@@ -1026,7 +1147,14 @@ impl<'a> Run<'a> {
         self.depth += 1;
         if self.depth > MAX_DEPTH {
             self.depth -= 1;
-            return Err("script nests deeper than the board allows".into());
+            // Recursion consumes block depth too, so the two bounds meet at the same point.
+            // Name the one the script actually did: a runaway `f(n+1)` is a recursion
+            // problem, and telling its author about nesting sends them to the wrong line.
+            return Err(if self.calls > 0 {
+                format!("recursion deeper than {MAX_CALLS} calls")
+            } else {
+                "script nests deeper than the board allows".into()
+            });
         }
         let out = self.stmt_inner(stmt);
         self.depth -= 1;
@@ -1087,6 +1215,34 @@ impl<'a> Run<'a> {
                 }
                 Ok(Flow::Normal)
             }
+            Stmt::For(name, iterable, body) => {
+                let items = match self.eval(iterable)? {
+                    Val::List(items) => items,
+                    Val::Map(m) => m.keys().map(|k| Val::Str(k.clone())).collect::<Vec<_>>(),
+                    Val::Str(text) => text.chars().map(|c| Val::Str(c.to_string())).collect::<Vec<_>>(),
+                    other => return Err(format!("cannot loop over a {}", other.type_name())),
+                };
+                for item in items {
+                    self.tick()?;
+                    self.scopes.last_mut().expect("scope").insert(name.clone(), item);
+                    match self.block(body)? {
+                        Flow::Break => break,
+                        Flow::Return(v) => return Ok(Flow::Return(v)),
+                        Flow::Normal => {}
+                    }
+                }
+                Ok(Flow::Normal)
+            }
+            // Definitions are hoisted before execution starts, so reaching one here is a
+            // statement that does nothing at run time.
+            Stmt::Fn(_, _, _) => Ok(Flow::Normal),
+            Stmt::Return(e) => {
+                let v = match e {
+                    Some(e) => self.eval(e)?,
+                    None => Val::Nil,
+                };
+                Ok(Flow::Return(v))
+            }
             Stmt::Break => Ok(Flow::Break),
             Stmt::Expr(e) => {
                 self.eval(e)?;
@@ -1103,6 +1259,10 @@ impl<'a> Run<'a> {
                 Ok(Flow::Break) => {
                     flow = Flow::Break;
                     break;
+                }
+                Ok(Flow::Return(v)) => {
+                    self.scopes.pop();
+                    return Ok(Flow::Return(v));
                 }
                 Ok(Flow::Normal) => {}
                 Err(e) => {
@@ -1279,6 +1439,30 @@ impl<'a> Run<'a> {
         for arg in args {
             values.push(self.eval(arg)?);
         }
+        // A user function wins over a builtin of the same name: the script wrote it, so the
+        // script meant it. `tool("script")` stays refused below either way.
+        if let Some((params, body)) = self.fns.get(name).cloned() {
+            if params.len() != values.len() {
+                return Err(format!("{name} takes {} argument(s), {} given", params.len(), values.len()));
+            }
+            if self.calls >= MAX_CALLS {
+                return Err(format!("recursion deeper than {MAX_CALLS} calls"));
+            }
+            self.calls += 1;
+            // The frame is a scope of its own, so a parameter cannot leak into the caller.
+            let mut frame = BTreeMap::new();
+            for (param, value) in params.iter().zip(values) {
+                frame.insert(param.clone(), value);
+            }
+            self.scopes.push(frame);
+            let flowed = self.block(&body);
+            self.scopes.pop();
+            self.calls -= 1;
+            return match flowed? {
+                Flow::Return(v) => Ok(v),
+                _ => Ok(Val::Nil),
+            };
+        }
         match name {
             "len" => match values.first() {
                 Some(Val::Str(s)) => Ok(Val::Num(s.chars().count() as f64)),
@@ -1358,8 +1542,6 @@ mod tests {
         assert_eq!(out.result, json!(200000));
         assert!(out.steps > 200_000, "{}", out.steps);
     }
-
-    use super::*;
 
     struct Stub {
         calls: Vec<(String, Value)>,
@@ -1479,6 +1661,41 @@ len(r.issues)"#),
         assert_eq!(host.calls[0].0, "i2c_scan");
         assert_eq!(outcome.result, json!("0x3C"));
         assert_eq!(outcome.output, vec!["found 1".to_string()]);
+    }
+
+    #[test]
+    fn functions_recursion_and_for_loops_work() {
+        let mut host = NoHost;
+
+        // A recursive factorial: the language could already loop, but a user function is
+        // what makes a procedure reusable inside one script.
+        let out = run("fn fact(n) { if n <= 1 { return 1 } return n * fact(n - 1) }\nfact(5)", &mut host)
+            .expect("runs");
+        assert_eq!(out.result, json!(120));
+
+        // Parameters are local: a function cannot see or overwrite the caller's variable.
+        let out = run("let n = 99\nfn f(n) { return n + 1 }\nf(1)\nn", &mut host).expect("runs");
+        assert_eq!(out.result, json!(99), "the caller's `n` survived the call");
+
+        // `for` over a list, a string and a map's keys.
+        let out = run("let t = 0\nfor x in [1,2,3] { t = t + x }\nt", &mut host).expect("runs");
+        assert_eq!(out.result, json!(6));
+        let out = run("let t = \"\"\nfor c in \"abc\" { t = t + c }\nt", &mut host).expect("runs");
+        assert_eq!(out.result, json!("abc"));
+        let out = run("let t = 0\nfor k in {a: 1, b: 2} { t = t + 1 }\nt", &mut host).expect("runs");
+        assert_eq!(out.result, json!(2));
+
+        // Definitions hoist, so a call may precede the definition, and mutual recursion works.
+        let out = run(
+            "is_even(4)\nfn is_even(n) { if n == 0 { return true } return is_odd(n - 1) }\nfn is_odd(n) { if n == 0 { return false } return is_even(n - 1) }",
+            &mut host,
+        )
+        .expect("runs");
+        assert_eq!(out.result, json!(true));
+
+        // Runaway recursion is a message, not a crash.
+        let err = run("fn f(n) { return f(n + 1) }\nf(0)", &mut host).expect_err("refused");
+        assert!(err.contains("recursion"), "{err}");
     }
 
     #[test]

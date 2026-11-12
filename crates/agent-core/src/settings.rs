@@ -41,6 +41,18 @@ const MODEL: &[Field] = &[
     f("model", "string", "", "the provider's model id"),
     f("api_key", "string", "\"\"", "write-only; GET returns __set__ and __set__ leaves it unchanged"),
     f("max_steps", "integer", "0", "model calls per run; 0 means no limit, capped at 200"),
+    f(
+        "context_tokens",
+        "integer",
+        "262144",
+        "transcript budget in tokens; compaction fires at 80% of it (the board also caps text at 24 KB because of RAM)",
+    ),
+    f(
+        "max_output_tokens",
+        "integer",
+        "32768",
+        "reply ceiling in tokens; sent as max_tokens, and reserved out of the window (a reply is still cut at 8 KB on the board)",
+    ),
     f("temperature", "number", "1.0", "0.0 to 2.0"),
     f("timeout_s", "integer", "45", "5 to 180 seconds per model call"),
     f(
