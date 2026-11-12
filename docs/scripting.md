@@ -7,6 +7,30 @@ pointers, and cannot reach anything the caller cannot.
 Discovery scripts — the ones that probe an empty board and declare what they find — are in
 [discovery](discovery.md).
 
+## Arguments and output
+
+A script can take arguments, so one procedure serves several pins:
+
+```json
+{"source": "tool(\"led_set\", {color: args.colour})", "args": {"colour": "#00ff00"}}
+```
+
+`args` is a map of whatever the caller passed; `argv` is its values in declaration order.
+Both exist even when nothing was passed (`args` is then empty and a missing key reads as
+nil), so a script can be written before its arguments are decided.
+
+Output is the `output` array on the result: `print`, `echo` and `log` all write to it, one
+line each, and the caller gets the lines back alongside `result` and `steps`. It is capped at
+64 lines — a script that prints more is stopped with a message rather than filling the 2 KB a
+tool result is allowed.
+
+```text
+print("temperature " + str(t))     -> output: ["temperature 24.5"]
+```
+
+There is no stdin and no terminal: a script reads the board through `tool()`, and its stdout
+is the array it hands back.
+
 ## How a model learns it
 
 `script` describes itself, because a tool description is one paragraph and a language is
