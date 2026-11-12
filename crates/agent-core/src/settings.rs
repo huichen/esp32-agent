@@ -125,6 +125,12 @@ const BOARD: &[Field] = &[
     f("ui.lang", "string", "zh", "portal language"),
     f("ui.theme", "string", "dark", "portal theme"),
     f("agent.tick_ms", "integer", "1000", "how often the agent thread and scheduler tick"),
+    f(
+        "agent.persist_transcript",
+        "boolean",
+        "true",
+        "keep the conversation in flash across a reboot; the stored tail is capped at 16 KB",
+    ),
 ];
 
 const SCHEDULE: &[Field] = &[
@@ -260,6 +266,18 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn the_board_group_documents_keeping_the_transcript() {
+        let board = GROUPS.iter().find(|g| g.group == "board").expect("board group");
+        let field = board
+            .fields
+            .iter()
+            .find(|f| f.name == "agent.persist_transcript")
+            .expect("agent.persist_transcript is documented");
+        assert_eq!(field.kind, "boolean");
+        assert_eq!(field.default, "true", "the feature is on unless a board says otherwise");
     }
 
     #[test]
