@@ -4,10 +4,19 @@
 //! needs: [`write_blob`] / [`read_blob`], which spread a value too long for NVS over
 //! several smaller ones and check it back chunk by chunk. See [`VALUE_MAX`] for why a
 //! single value cannot simply be bigger.
+//!
+//! And on top of that sits [`StoreQueue`]: writes are *asked for* by whoever changed
+//! something and *performed* by one task the platform owns. That split is not tidiness.
+//! An NVS write is an `spi_flash` operation, which runs with both caches disabled, so the
+//! task doing it must have its stack in internal RAM. On this board some threads get a
+//! PSRAM stack, and a write from one of those asserts in
+//! `spi_flash_disable_interrupts_caches_and_other_cpu (esp_task_stack_is_sane_cache_disabled())`
+//! and reboots the board — see the `nvs-writer` task in the firmware.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, Mutex};
 
 /// The most bytes one stored value may hold.
 ///
@@ -266,11 +275,236 @@ fn clip(text: &str) -> String {
 }
 
 /// A tiny string key-value store, which is exactly what ESP-IDF NVS is.
+///
+/// The `App` never holds a store directly: it holds a [`QueuedStore`], so `set` and
+/// `remove` mean "this must be stored" and are performed by the platform's writer task
+/// (see [`StoreQueue`]). The trait itself is unchanged: an implementation of it writes
+/// where and when it is called, and the platform is responsible for calling it from a
+/// task that may touch flash.
 pub trait KvStore: Send {
     fn get(&self, key: &str) -> Option<String>;
     fn set(&mut self, key: &str, value: &str) -> bool;
     fn remove(&mut self, key: &str) -> bool;
     fn keys(&self) -> Vec<String>;
+}
+
+/// One queued operation: `Some` is a write, `None` is a removal.
+type Pending = Vec<(String, Option<String>)>;
+
+/// What one [`StoreQueue::flush`] did.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct FlushReport {
+    /// Operations the store accepted.
+    pub written: usize,
+    /// Operations it refused, which are *not* retried: a value NVS will not take now it
+    /// will not take on the next tick either, and a queue that retried forever would fill
+    /// the log and hide the one line that says what is wrong.
+    pub failed: usize,
+    /// The keys involved, in the order they were applied.
+    pub keys: Vec<String>,
+}
+
+impl FlushReport {
+    pub fn is_empty(&self) -> bool {
+        self.written == 0 && self.failed == 0
+    }
+}
+
+/// The writes an [`App`](crate::app::App) has asked for and nobody has performed yet.
+///
+/// Everything that changes something durable — the config, the manifest, the schedule,
+/// the file workspace, the transcript — goes through this and returns immediately. The
+/// platform hands the same queue to a task whose stack is known to be in internal RAM,
+/// which is the only thing that ever calls the backing [`KvStore`].
+///
+/// Two properties the rest of the code depends on:
+///
+/// * **Read-your-writes.** [`get`](Self::read) answers from the queue first, so a caller
+///   that queued a write and asks for the value back sees what it just wrote. The
+///   transcript's chunk bookkeeping and [`write_blob`]'s stale-tail sweep both read back
+///   what they wrote, and would otherwise re-write or fail to clear.
+/// * **Order.** Operations are applied in the order they were queued, because
+///   [`write_blob`] writes its header last on purpose: a power cut between the chunks and
+///   the header must leave a header that does not match its chunks.
+#[derive(Clone)]
+pub struct StoreQueue {
+    inner: Arc<Mutex<Box<dyn KvStore>>>,
+    pending: Arc<Mutex<Pending>>,
+    written: Arc<AtomicU32>,
+    failed: Arc<AtomicU32>,
+}
+
+impl std::fmt::Debug for StoreQueue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StoreQueue")
+            .field("pending", &self.pending())
+            .field("written", &self.written())
+            .field("failed", &self.failed())
+            .finish()
+    }
+}
+
+impl StoreQueue {
+    pub fn new(inner: Box<dyn KvStore>) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(inner)),
+            pending: Arc::new(Mutex::new(Vec::new())),
+            written: Arc::new(AtomicU32::new(0)),
+            failed: Arc::new(AtomicU32::new(0)),
+        }
+    }
+
+    /// Note a write (`Some`) or a removal (`None`). A key queued twice keeps the position
+    /// of the first time and the value of the last, so a task that rewrites the same blob
+    /// every tick costs one operation, not one per tick.
+    fn enqueue(&self, key: &str, value: Option<String>) -> bool {
+        let mut pending = match self.pending.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        match pending.iter_mut().find(|(queued, _)| queued == key) {
+            Some(entry) => entry.1 = value,
+            None => pending.push((key.to_string(), value)),
+        }
+        true
+    }
+
+    /// The value `key` will have once the queue is drained: the queued one if there is
+    /// one, and `None` if a removal is queued.
+    fn read(&self, key: &str) -> Option<String> {
+        let pending = match self.pending.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if let Some((_, queued)) = pending.iter().rev().find(|(queued, _)| queued == key) {
+            return queued.clone();
+        }
+        drop(pending);
+        match self.inner.lock() {
+            Ok(inner) => inner.get(key),
+            Err(poisoned) => poisoned.into_inner().get(key),
+        }
+    }
+
+    /// Perform every queued operation, in order.
+    ///
+    /// **The caller must be on a task whose stack is in internal RAM.** See the module
+    /// docs. The queue's lock is held for the whole drain so a concurrent
+    /// [`read`](Self::read) can neither see a value in neither place nor be answered out
+    /// of order; enqueues block for the length of a flash write, which is what keeps the
+    /// next write behind the one before it.
+    pub fn flush(&self) -> FlushReport {
+        let mut pending = match self.pending.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let mut report = FlushReport::default();
+        if pending.is_empty() {
+            return report;
+        }
+        let mut inner = match self.inner.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        for (key, value) in pending.drain(..) {
+            let ok = match &value {
+                Some(text) => inner.set(&key, text),
+                // "It was not there" is not a failure: a removal that removes nothing is
+                // what a second boot asks for.
+                None => {
+                    inner.remove(&key);
+                    true
+                }
+            };
+            if ok {
+                report.written += 1;
+                self.written.fetch_add(1, Ordering::Relaxed);
+            } else {
+                report.failed += 1;
+                self.failed.fetch_add(1, Ordering::Relaxed);
+            }
+            report.keys.push(key);
+        }
+        report
+    }
+
+    /// How many writes are queued and waiting for the writer.
+    pub fn pending(&self) -> usize {
+        match self.pending.lock() {
+            Ok(guard) => guard.len(),
+            Err(poisoned) => poisoned.into_inner().len(),
+        }
+    }
+
+    /// Operations the store has accepted since boot.
+    pub fn written(&self) -> u32 {
+        self.written.load(Ordering::Relaxed)
+    }
+
+    /// Operations it has refused since boot. A number above zero is a real problem: the
+    /// change the caller was told about is not on flash.
+    pub fn failed(&self) -> u32 {
+        self.failed.load(Ordering::Relaxed)
+    }
+
+    /// Everything currently stored, queued changes included.
+    pub fn keys(&self) -> Vec<String> {
+        let mut out = match self.inner.lock() {
+            Ok(inner) => inner.keys(),
+            Err(poisoned) => poisoned.into_inner().keys(),
+        };
+        let pending = match self.pending.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        for (key, value) in pending.iter() {
+            match value {
+                Some(_) if !out.contains(key) => out.push(key.clone()),
+                Some(_) => {}
+                None => out.retain(|stored| stored != key),
+            }
+        }
+        out
+    }
+}
+
+/// A [`KvStore`] that queues instead of writing.
+///
+/// This is what the `App` holds, so every existing `store.set(...)` call site means "this
+/// change must be stored" and none of them can reach flash from whatever thread happens
+/// to be running.
+pub struct QueuedStore {
+    queue: StoreQueue,
+}
+
+impl QueuedStore {
+    pub fn new(queue: StoreQueue) -> Self {
+        Self { queue }
+    }
+}
+
+impl KvStore for QueuedStore {
+    fn get(&self, key: &str) -> Option<String> {
+        self.queue.read(key)
+    }
+
+    /// Always true: the write is accepted into the queue. Whether NVS takes it is known
+    /// only after the writer runs, and is reported by [`StoreQueue::failed`] and the log
+    /// line the writer emits — not by this return value.
+    fn set(&mut self, key: &str, value: &str) -> bool {
+        self.queue.enqueue(key, Some(value.to_string()))
+    }
+
+    /// Whether the key exists *now*: a queued value counts, a queued removal does not.
+    fn remove(&mut self, key: &str) -> bool {
+        let had = self.queue.read(key).is_some();
+        self.queue.enqueue(key, None);
+        had
+    }
+
+    fn keys(&self) -> Vec<String> {
+        self.queue.keys()
+    }
 }
 
 /// In-memory store: used by tests and by a simulator run started without a
@@ -569,5 +803,143 @@ mod tests {
         assert!(clear_blob(&mut store, "ws", PLAN));
         assert!(store.map.is_empty(), "left behind: {:?}", store.map.keys().collect::<Vec<_>>());
         assert!(!clear_blob(&mut store, "ws", PLAN), "nothing left to remove");
+    }
+
+    // ------------------------------------------------------- the queued store
+
+    #[test]
+    fn a_queued_write_is_visible_before_it_is_written_and_on_flash_after() {
+        let inner = Shared::default();
+        let queue = StoreQueue::new(Box::new(inner.clone()));
+        let mut store = QueuedStore::new(queue.clone());
+
+        assert!(store.set("ws", "hello"));
+        // Read-your-writes: the blob bookkeeping reads back what it just wrote.
+        assert_eq!(store.get("ws").as_deref(), Some("hello"));
+        assert_eq!(queue.pending(), 1);
+        assert!(inner.all().is_empty(), "nothing may reach flash before the writer runs");
+
+        let report = queue.flush();
+        assert_eq!(report, FlushReport { written: 1, failed: 0, keys: vec!["ws".into()] });
+        assert_eq!(inner.get("ws").as_deref(), Some("hello"));
+        assert_eq!(queue.pending(), 0);
+        assert_eq!(queue.written(), 1);
+        // A second flush has nothing to do and does not count anything.
+        assert!(queue.flush().is_empty());
+        assert_eq!(queue.written(), 1);
+    }
+
+    #[test]
+    fn a_queued_removal_reads_as_absent_and_then_clears_the_value() {
+        let inner = Shared::default();
+        let mut seed = inner.clone();
+        seed.set("k", "v");
+        let queue = StoreQueue::new(Box::new(inner.clone()));
+        let mut store = QueuedStore::new(queue.clone());
+
+        assert!(store.remove("k"), "the key was there");
+        assert_eq!(store.get("k"), None, "a queued removal must not read back the old value");
+        assert!(inner.get("k").is_some(), "and must not have removed it yet");
+
+        queue.flush();
+        assert_eq!(inner.get("k"), None);
+        assert!(!store.remove("k"), "removing what is not there reports nothing");
+    }
+
+    #[test]
+    fn the_order_of_a_blob_write_survives_the_queue() {
+        // `write_blob` writes its header last so a torn write is detectable; a queue that
+        // reordered by key (`ws` before `ws.1`) would quietly undo that.
+        let inner = Shared::default();
+        let queue = StoreQueue::new(Box::new(inner.clone()));
+        let mut store = QueuedStore::new(queue.clone());
+        write_blob(&mut store, "ws", &"x".repeat(2 * CHUNK_BYTES), PLAN).expect("fits");
+        let report = queue.flush();
+        assert_eq!(report.keys, vec!["ws.1".to_string(), "ws.2".to_string(), "ws".to_string()]);
+        assert_eq!(read_blob(&inner, "ws", PLAN), BlobState::Stored("x".repeat(2 * CHUNK_BYTES)));
+    }
+
+    #[test]
+    fn a_key_queued_twice_costs_one_write_and_keeps_the_last_value() {
+        let inner = Shared::default();
+        let queue = StoreQueue::new(Box::new(inner.clone()));
+        let mut store = QueuedStore::new(queue.clone());
+        store.set("sched", "first");
+        store.set("other", "x");
+        store.set("sched", "second");
+        assert_eq!(queue.pending(), 2, "one entry per key");
+        let report = queue.flush();
+        assert_eq!(report.written, 2);
+        assert_eq!(inner.get("sched").as_deref(), Some("second"));
+        assert_eq!(report.keys, vec!["sched".to_string(), "other".to_string()], "first position kept");
+    }
+
+    #[test]
+    fn a_store_that_refuses_a_value_is_counted_not_hidden() {
+        // The board's NVS refuses a value above 4000 bytes; the queue must say so rather
+        // than report a write that did not happen.
+        let queue = StoreQueue::new(Box::new(LimitedStore::default()));
+        let mut store = QueuedStore::new(queue.clone());
+        store.set("ok", "small");
+        store.set("too_long", &"x".repeat(VALUE_MAX + 1));
+        let report = queue.flush();
+        assert_eq!(report.written, 1);
+        assert_eq!(report.failed, 1);
+        assert_eq!(report.keys, vec!["ok".to_string(), "too_long".to_string()]);
+        assert_eq!(queue.failed(), 1);
+        assert_eq!(queue.pending(), 0, "a refused write is dropped, not retried forever");
+    }
+
+    #[test]
+    fn a_flush_is_whole_or_it_has_not_happened() {
+        // A read taken while a flush is under way must see the value in one place or the
+        // other, never in neither. Single-threaded here: the queue keeps the value until
+        // the inner store has taken it, which is what makes the lock ordering matter.
+        let inner = Shared::default();
+        let queue = StoreQueue::new(Box::new(inner.clone()));
+        let mut store = QueuedStore::new(queue.clone());
+        store.set("a", "1");
+        assert_eq!(store.get("a").as_deref(), Some("1"));
+        queue.flush();
+        assert_eq!(store.get("a").as_deref(), Some("1"));
+        assert_eq!(inner.get("a").as_deref(), Some("1"));
+    }
+
+    /// The test store: a map behind a mutex, cloneable so a test can look at what the
+    /// writer produced while the `App` holds the queue.
+    #[derive(Clone, Default)]
+    struct Shared(Arc<Mutex<BTreeMap<String, String>>>);
+
+    impl Shared {
+        fn all(&self) -> Vec<String> {
+            self.0.lock().map(|m| m.keys().cloned().collect()).unwrap_or_default()
+        }
+    }
+
+    impl KvStore for Shared {
+        fn get(&self, key: &str) -> Option<String> {
+            self.0.lock().ok()?.get(key).cloned()
+        }
+
+        fn set(&mut self, key: &str, value: &str) -> bool {
+            match self.0.lock() {
+                Ok(mut m) => {
+                    m.insert(key.to_string(), value.to_string());
+                    true
+                }
+                Err(_) => false,
+            }
+        }
+
+        fn remove(&mut self, key: &str) -> bool {
+            match self.0.lock() {
+                Ok(mut m) => m.remove(key).is_some(),
+                Err(_) => false,
+            }
+        }
+
+        fn keys(&self) -> Vec<String> {
+            self.all()
+        }
     }
 }
