@@ -7,7 +7,7 @@ transcript, so they cost the same whether the conversation is one message or a t
 |---|---|---|---|
 | Standing orders | `agent.system_prompt` (NVS) | all of it, 2 KB cap | the owner, over HTTP or `shell` |
 | Project instructions | `/AGENTS.md` | the first 1 KB, then a marker saying the rest is there | the owner, with `write` |
-| Long-term memory | `/memory.md`, an index over `/memory/<topic>.md` | the index only, 24 lines / 2 KB | the agent itself, as it learns |
+| Long-term memory | `/MEMORY.md`, an index over `/memory/<topic>.md` | the index only, 24 lines / 2 KB | the agent itself, as it learns |
 | Skills | `/skills/<name>/SKILL.md` | one line each: name and description | either |
 
 ```bash
@@ -21,7 +21,7 @@ curl -sS http://<board>/api/agent/prompt | jq -r .system    # what the model wil
 
 ## Memory is just files
 
-`/memory.md` is an index, one pointer per line; the memory itself is `/memory/<topic>.md`.
+`/MEMORY.md` is an index, one pointer per line; the memory itself is `/memory/<topic>.md`.
 An entry is a fact with a date, not a narrative:
 
 ```text
@@ -29,7 +29,7 @@ An entry is a fact with a date, not a narrative:
 ```
 
 Write one with `write /memory/pins.md "GPIO18 = LED strip"` and add the line with `edit`. The
-index collector keeps only lines that carry a path, so a paragraph in `/memory.md` is ignored
+index collector keeps only lines that carry a path, so a paragraph in `/MEMORY.md` is ignored
 instead of eating the budget; the index is capped at 24 lines and the prompt says when it is
 full. Delete the file and the memory is gone — there is no second store to clean up.
 

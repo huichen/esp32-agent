@@ -23,7 +23,7 @@ marcha.
 | Una consola sobre HTTPS | Hablar con el modelo y configurar dispositivos, herramientas, programación, registros, WiFi y el modelo desde un teléfono; la placa emite su propio certificado. [Consola web](docs/web-console.md) |
 | Actúa sin nadie delante | Prompts temporizados y reglas de sensores que lanzan un prompt cuando una lectura cruza un umbral. [Trabajo programado](docs/scheduling.md) |
 | Un shell y un lenguaje de script | `shell` con 26 comandos con nombres de NuttX, y un intérprete para bucles sobre llamadas a herramientas. [Shell](docs/shell.md) · [Script](docs/scripting.md) |
-| Recuerda lo que se le dijo | Órdenes permanentes, `/AGENTS.md`, un índice `/memory.md` y habilidades, ensamblados en el prompt en cada turno. [Lo que el modelo ve en cada turno](docs/context.md) |
+| Recuerda lo que se le dijo | Órdenes permanentes, `/AGENTS.md`, un índice `/MEMORY.md` y habilidades, ensamblados en el prompt en cada turno. [Lo que el modelo ve en cada turno](docs/context.md) |
 | Sin nube en el camino | HTTPS desde la placa, un certificado que genera ella misma, un PIN para tres invocadores. [Autenticación](docs/security.md) |
 | Comprobable sin hardware | El simulador ejecuta el mismo `agent-core` contra una placa virtual. [Simulador](docs/simulator.md) |
 

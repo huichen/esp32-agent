@@ -3363,7 +3363,7 @@ impl ToolHost for App {
             .collect()
     }
 
-    /// The memory index: `/memory.md`, one pointer per memory.
+    /// The memory index: `/MEMORY.md`, one pointer per memory.
     fn memory_index(&self) -> Option<String> {
         crate::tools::knowledge::memory(&self.workspace)
     }
@@ -7875,15 +7875,15 @@ mod tests {
         let mut app = test_app();
         use crate::tools::fs::Workspace as _;
         app.workspace
-            .write("/memory.md", "- [pins](/memory/pins.md) — GPIO18 is the strip\n")
+            .write("/MEMORY.md", "- [pins](/memory/pins.md) — GPIO18 is the strip\n")
             .expect("write");
         app.agent.archive.push("called: board_status({})".into());
         let resp = app.route(&get("/api/agent/prompt"));
         assert_eq!(resp.status, 200);
         let body: Value = serde_json::from_slice(&resp.body).expect("json");
         let system = body["system"].as_str().expect("system");
-        assert!(system.contains("## Memory (/memory.md)"), "{system}");
-        assert!(system.contains("memory/pins.md"), "{system}");
+        assert!(system.contains("## Memory (/MEMORY.md)"), "{system}");
+        assert!(system.contains("/memory/pins.md"), "{system}");
         assert!(system.contains("Earlier in this conversation"), "{system}");
         assert_eq!(body["archive_lines"], 1);
     }
