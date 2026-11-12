@@ -21,7 +21,7 @@ sensor can be declared in JSON while the board runs.
 | A console over HTTPS | Chat with the model and configure devices, tools, schedule, logs, WiFi and the model, from a phone; the board issues its own certificate. [Web console](docs/web-console.md) |
 | It acts unattended | Timed prompts, and sensor rules that fire a prompt when a reading crosses a threshold. [Scheduling](docs/scheduling.md) |
 | A shell and a script language | `shell` with 26 NuttX-named commands, and an interpreter for loops over tool calls. [Shell](docs/shell.md) · [Script](docs/scripting.md) |
-| It remembers what it was told | Standing orders, `/AGENTS.md`, a `/memory.md` index and skills, assembled into the prompt on every turn. [Context layers](docs/context.md) |
+| It remembers what it was told | Standing orders, `/AGENTS.md`, a `/MEMORY.md` index and skills, assembled into the prompt on every turn. [Context layers](docs/context.md) |
 | No cloud in the path | HTTPS from the board, a certificate it generates, one PIN for three callers. [Security](docs/security.md) |
 | Testable without hardware | The simulator runs the same `agent-core` against a virtual board. [Simulator](docs/simulator.md) |
 

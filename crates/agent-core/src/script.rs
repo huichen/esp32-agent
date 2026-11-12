@@ -124,7 +124,7 @@ Only these, plus `tool`:
 `tool` is the only way out: same permissions as the caller, and
 `tool("script", ...)` is refused.
 
-To find what you can call: `devices_list`, `tools/list`, or read `/memory.md`.
+To find what you can call: `devices_list`, `tools/list`, or read `/MEMORY.md`.
 "#;
 
 const EXAMPLES: &str = r#"# board script — examples
