@@ -16,10 +16,11 @@
 <!-- paste the commands and the key output, do not just tick the boxes -->
 
 - [ ] `cargo test -p esp32-agent-core` passes
-- [ ] `powershell -File scripts/smoke.ps1` passes
+- [ ] `powershell -File scripts/smoke.ps1` passes (or `bash scripts/smoke.sh` on macOS and
+      Linux)
 - [ ] `cargo clippy … -D warnings` and `cargo fmt --all --check` pass
-- [ ] When `firmware/` changed: `scripts/build-firmware.ps1` passes (if there is no
-      toolchain on your machine, say so in the description)
+- [ ] When `firmware/` changed: `scripts/build-firmware.ps1` (or `build-firmware.sh`)
+      passes (if there is no toolchain on your machine, say so in the description)
 
 ## Hardware evidence (required for driver or board-profile changes)
 
@@ -30,7 +31,6 @@
 
 - [ ] `docs/capabilities.md` updated (new driver or capability)
 - [ ] `docs/manifest.md` updated (manifest fields changed)
-- [ ] `CHANGELOG.md` has a line
 
 ## Blast radius
 

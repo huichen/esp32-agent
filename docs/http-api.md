@@ -56,7 +56,7 @@ with no body. Batch arrays are handled as JSON-RPC batches.
 | `Mcp-Session-Id` (response) | Allocated on `initialize` or the first request; the client may reuse it |
 | `MCP-Protocol-Version` | The server version comes back in the `initialize` response |
 | `Authorization: Bearer <token>` | Required when `auth.mcp_token` is set, otherwise 401 |
-| `Connection: keep-alive` | Supported; a single connection closes after 32 requests |
+| `Connection: keep-alive` | Supported. An idle socket is parked (up to 8 of them) and dropped after 30 s; the next request on it is answered by the accept thread |
 | `Transfer-Encoding: chunked` | Supported (Node's fetch uses it) |
 | `Expect: 100-continue` | Answers 100 first, then reads the body |
 
@@ -89,9 +89,16 @@ CORS is on by default (`mcp.cors`), so a browser MCP client can connect directly
 | GET | `/api/catalog` | Driver catalog |
 | GET | `/api/sessions` | MCP sessions |
 | GET | `/api/clients` | Client configuration, ready to copy |
+| POST | `/api/script` | Run a script: `{source, async?}`; the answer carries `result`/`output`/`steps`, or `{id, poll}` with `async: true` ([scripting](scripting.md)) |
+| GET | `/api/script/<id>` | One script job: `state` (`queued`/`running`/`done`/`failed`), `result`, `output`, `error` |
+| GET | `/api/attachment/<name>` | The file attached to the last message, with its own mime type ([attachments](#5-attachments)) |
 | POST | `/api/auth` | `{pin}`, check the console PIN |
 | POST | `/api/reboot` | Reboot |
 | POST | `/api/factory-reset` | Clear configuration and manifest, then reboot |
+
+`/assets/app.js` and `/assets/style.css` are the console's two files, served separately from
+the HTML so a browser can cache them; everything else the page needs is inside the single
+`GET /` response.
 
 ### Agent and orchestration
 
@@ -102,6 +109,9 @@ CORS is on by default (`mcp.cors`), so a browser MCP client can connect directly
 | POST | `/api/agent/reset` | Clear the conversation |
 | GET | `/api/agent/config` | Model connection, `tick_ms`, `last_run`/`total` usage |
 | POST | `/api/agent/config` | Update `base_url` / `model` / `api_key` / `tick_ms` |
+| GET | `/api/agent/prompt` | The system prompt as the model receives it, memory and skills included ([context layers](context.md)) |
+| POST | `/api/agent/prompt` | The standing orders: `{action: set\|append\|clear, text}` |
+| POST | `/api/agent/forget` | `{keep: N}`, keep the last N exchanges and drop the rest ([memory](agent-memory.md)) |
 | GET | `/api/agent/events?after=<seq>` | The run journal as JSON (polling) |
 | GET | `/api/agent/stream?after=<seq>` | The same journal as **SSE**: replay, then follow. 503 with `Retry-After: 5` when two streams are already open |
 | GET | `/api/sched` | Scheduled tasks and sensor rules |
@@ -139,7 +149,29 @@ A failing tool still returns `result`, with `isError: true` and the message and 
 body — so the model can see why and fix its arguments instead of hitting a protocol-level
 error. Only protocol errors (unknown method, malformed JSON) use the `error` object.
 
-## 5. Connecting a client
+## 5. Attachments
+
+A message can carry files, which the board stores and hands back — it does not show them
+and does not put the bytes in the prompt:
+
+```bash
+curl -sS -X POST http://<ip>:80/api/agent/message -H 'Content-Type: application/json' -d '{
+  "text": "what does this say?",
+  "attachments": [{"name":"shot.png","mime":"image/png","data_b64":"iVBORw0…"}]}'
+```
+
+- At most **2** attachments, each ≤ **24 KB** decoded; more is `413`.
+- The model is told a file arrived — the user message gets the line
+  `[attached: shot.png, image/png, 17 kB — fetch with GET /api/attachment/shot.png]` — and
+  nothing else. Only the last message's attachments are kept.
+- `GET /api/attachment/<name>` serves the bytes with that mime type, and needs the PIN when
+  one is set (it is one of the reads that expose the conversation).
+- `image_read {name?, prompt?}` is the tool that asks a model about the file: it sends the
+  image to the configured endpoint as a `data:` URL with `vision` forced on, and returns
+  the model's answer (1800 bytes). It needs a configured model and refuses without one,
+  so it is not a way to read a file locally.
+
+## 6. Connecting a client
 
 - **Claude Desktop / Cursor and anything else that speaks HTTP**:
   `{"mcpServers":{"esp32-agent":{"type":"http","url":"http://<ip>:80/mcp"}}}`

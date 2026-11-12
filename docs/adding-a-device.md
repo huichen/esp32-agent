@@ -20,7 +20,7 @@ those.
 3. Put it in `examples/manifests/<name>.json` with a header comment recording the chip, the
    address, the wiring, the datasheet page and the conversion formula.
 4. Add a row to `docs/capabilities.md` with status `manifest`.
-5. Add a call to `scripts/smoke.ps1` (proof that it really runs).
+5. Add a call to `scripts/smoke.ps1` / `smoke.sh` (proof that it really runs).
 
 ## B. Writing a driver
 

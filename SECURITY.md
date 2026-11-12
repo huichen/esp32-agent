@@ -46,5 +46,5 @@ page.
 affected version/commit, reproduction steps, the blast radius (can it trigger a
 physical action), and the fix you would suggest.
 
-We acknowledge within 7 days and credit you in that release's `CHANGELOG.md` unless you
-ask to stay anonymous.
+We acknowledge within 7 days and credit you in the release notes unless you ask to stay
+anonymous.
