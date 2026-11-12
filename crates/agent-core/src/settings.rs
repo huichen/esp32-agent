@@ -44,10 +44,15 @@ const MODEL: &[Field] = &[
     f(
         "context_tokens",
         "integer",
-        "8192",
-        "transcript budget in tokens; compaction fires at 80% of it, and the rest is the reply's headroom",
+        "262144",
+        "transcript budget in tokens; compaction fires at 80% of it (the board also caps text at 24 KB because of RAM)",
     ),
-    f("max_output_tokens", "integer", "2048", "reply ceiling in tokens; sent as max_tokens, and reserved out of the window"),
+    f(
+        "max_output_tokens",
+        "integer",
+        "32768",
+        "reply ceiling in tokens; sent as max_tokens, and reserved out of the window (a reply is still cut at 8 KB on the board)",
+    ),
     f("temperature", "number", "1.0", "0.0 to 2.0"),
     f("timeout_s", "integer", "45", "5 to 180 seconds per model call"),
     f(

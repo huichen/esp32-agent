@@ -288,10 +288,17 @@ pub enum AgentStep {
 /// The transcript plus the queue. Lives behind the app mutex.
 pub struct Agent {
     pub history: Vec<Message>,
-    /// A deterministic index of what compression dropped: one line per exchange, taken
-    /// from the messages themselves. It is **not** a model-written summary — nothing here
-    /// costs a model call, and it survives as long as the transcript does.
+    /// The deterministic index of dropped exchanges: one line per message, taken from the
+    /// messages themselves. It is **not** a model-written summary — nothing here costs a
+    /// model call, and it survives as long as the transcript does.
+    ///
+    /// Two asymmetries follow the host agent's deterministic projection: a user question
+    /// is kept in full (it is the statement of what was wanted), while an answer is
+    /// reduced to its first line — and the count of those reductions is stated in the
+    /// prompt rather than hidden.
     pub archive: Vec<String>,
+    /// How many earlier answers were reduced to a line, so the prompt can say so.
+    pub demoted_answers: usize,
     /// Depth-1 queue: a trigger while a run is in flight coalesces into this.
     pub pending: Option<Message>,
     pub last_error: String,
@@ -323,6 +330,7 @@ impl Default for Agent {
         Self {
             history: Vec::new(),
             archive: Vec::new(),
+            demoted_answers: 0,
             pending: None,
             last_error: String::new(),
             runs: 0,
@@ -767,9 +775,17 @@ impl Agent {
     /// One line for the archive, bounded so the index itself cannot grow without limit.
     fn archive_message(&mut self, message: &Message) {
         let line = match message.role {
-            Role::User => format!("user: {}", head(&message.text, 90)),
+            // A question is the one thing compression must not paraphrase: it is the
+            // statement of what was wanted, and a clipped version of it is what makes a
+            // model re-ask something it was already told. The host agent protects user
+            // text the same way (its `protected_text` never demotes a user block), so the
+            // whole line is kept here, bounded only by what one message may carry.
+            Role::User => format!("user: {}", head(&message.text, MAX_USER_BYTES)),
             Role::Assistant => {
                 if message.tool_calls.is_empty() {
+                    // Answers are demoted, and the demotion is counted rather than silent:
+                    // `retention_note` states how many were reduced to a line.
+                    self.demoted_answers += 1;
                     format!("answer: {}", head(&message.text, 90))
                 } else {
                     let calls: Vec<String> = message
@@ -803,6 +819,7 @@ impl Agent {
         let cut = turn_start(&self.history, keep_turns.min(self.history.len()));
         let removed = self.history.drain(..cut).count();
         self.archive.clear();
+        self.demoted_answers = 0;
         self.pending = None;
         self.last_error.clear();
         (removed, self.history.len())
@@ -951,6 +968,13 @@ impl Agent {
             );
             for line in &self.archive {
                 text.push_str(&format!("- {line}\n"));
+            }
+            if self.demoted_answers > 0 {
+                text.push_str(&format!(
+                    "- ({count} earlier answer(s) are reduced to their first line; the questions \
+                     above are kept in full)\n",
+                    count = self.demoted_answers
+                ));
             }
         }
         text
@@ -1740,6 +1764,53 @@ mod tests {
         };
         assert!(messages.as_array().map(|m| !m.is_empty()).unwrap_or(false), "the request carries messages");
         assert!(agent.last_error.is_empty(), "{}", agent.last_error);
+    }
+
+    #[test]
+    fn a_question_survives_compression_verbatim_and_a_demoted_answer_is_counted() {
+        // The host agent's deterministic projection protects user text and demotes
+        // assistant text, counting the demotions. This is that behaviour, and the reason
+        // it matters: a model that reads a clipped question re-asks what it was told.
+        let mut agent = Agent::new();
+        let question = "rewire the pump relay to GPIO12 and keep the pulse under 2 s, \
+                        the old pin is shorted to ground so do not touch it";
+        agent.history.push(Message::user(question, "portal", 1));
+        agent.history.push(Message::assistant("ok, moving it", Vec::new(), 2));
+        for i in 0..3 {
+            agent.history.push(Message::user(&format!("q{i}"), "portal", 10 + i));
+            agent.history.push(Message::assistant(
+                &format!("a{i} that is a long answer {}", "x".repeat(200)),
+                Vec::new(),
+                20 + i,
+            ));
+        }
+
+        agent.compress(1);
+
+        let user_line = agent
+            .archive
+            .iter()
+            .find(|l| l.starts_with("user: rewire"))
+            .expect("the question is in the index");
+        assert_eq!(
+            user_line.trim_start_matches("user: "),
+            question,
+            "a question is kept whole, not clipped to its first line"
+        );
+        assert!(
+            agent.archive.iter().any(|l| l.starts_with("answer: ok, moving it")),
+            "an answer is reduced: {:?}",
+            agent.archive
+        );
+        assert_eq!(agent.demoted_answers, 3, "every dropped answer is counted");
+
+        let mut host = StubHost::returning("{}");
+        let prompt = agent.system_message(&mut host);
+        assert!(
+            prompt.contains("earlier answer(s) are reduced to their first line"),
+            "the prompt states the demotion instead of hiding it: {prompt}"
+        );
+        assert!(prompt.contains("the old pin is shorted to ground"), "the whole question is carried");
     }
 
     #[test]
