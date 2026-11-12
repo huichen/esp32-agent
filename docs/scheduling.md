@@ -14,7 +14,7 @@ curl -sS -X POST http://<board>/api/sched -H 'Content-Type: application/json' -d
 | Field | Meaning |
 |---|---|
 | `every_s` | interval in seconds |
-| `at_hhmm` | `"07:30"`, **UTC**; used when `every_s` is 0 |
+| `at_hhmm` | `"07:30"`, in UTC unless the firmware was built with `MCP_TZ_OFFSET_H` (`MCP_TZ_OFFSET_H=8` shifts it to UTC+8); used when `every_s` is 0 |
 | `script` | a script to run instead of asking the model — costs no tokens and no call |
 | `enabled` | default true |
 
@@ -44,8 +44,8 @@ web page on a timer is not a sensor.
 
 ## What the scheduler can see
 
-`at_hhmm` needs a clock, so it needs `time.synced: true` in `/api/status` — SNTP starts after
-DHCP and retries every 60 s. A task whose time has passed while the board was off fires once
-on boot, not once per missed interval.
+`at_hhmm` needs a clock, so it needs `time.synced: true` in `/api/status` — SNTP starts
+after the radio is up and is the only thing that makes the wall clock real. A task whose
+time has passed while the board was off fires once on boot, not once per missed interval.
 
 Related: [scripting](scripting.md) · [agent loop](agent-loop.md) · [HTTP API](http-api.md)

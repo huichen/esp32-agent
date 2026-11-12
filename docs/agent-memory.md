@@ -34,11 +34,11 @@ feature: `/MEMORY.md` stays readable, and the prompt only carries what a reader 
 
 ### Writing a memory
 
-There is no memory tool, on purpose. `fs_write` and `fs_edit` already reach the file, and a
+There is no memory tool, on purpose. `write` and `edit` already reach the file, and a
 fourth tool that writes one file costs a definition in every request:
 
 ```json
-{"name":"fs_write","arguments":{
+{"name":"write","arguments":{
   "path":"/memory/pins.md",
   "text":"# pins\nGPIO18 is the WS2812 strip (8 px), active high.\nGPIO48 is the devkit LED.\n"}}
 ```
@@ -46,7 +46,7 @@ fourth tool that writes one file costs a definition in every request:
 then one line appended to the index:
 
 ```json
-{"name":"fs_edit","arguments":{
+{"name":"edit","arguments":{
   "path":"/MEMORY.md",
   "find":"- [wifi]",
   "replace":"- [pins](/memory/pins.md) — GPIO18 is the strip (2026-11-11)\n- [wifi]"}}
@@ -57,9 +57,9 @@ is checkable without a model in the loop.
 
 ## 2. Compression without a summary
 
-When the transcript passes 24 KB or 48 messages, the oldest exchanges are **not** handed to
-a model to summarise. They are replaced by one deterministic line per message, derived from
-the messages themselves:
+When the transcript passes 80% of `agent.context_tokens`, or either hard cap (256
+messages, 512 KB), the oldest exchanges are **not** handed to a model to summarise. They
+are replaced by one deterministic line per message, derived from the messages themselves:
 
 ```text
 ## Earlier in this conversation (compressed)
@@ -104,7 +104,7 @@ editing the conversation it is in the middle of).
 |---|---|
 | Memory index in the prompt | ≤ 2 KB, ≤ 24 lines |
 | Compressed index in the prompt | ≤ 40 lines, ~90 chars each |
-| Transcript kept verbatim | the last 4 exchanges, within 24 KB / 48 messages |
+| Transcript kept verbatim | the last 4 exchanges, within 80% of `context_tokens` and the 512 KB / 256-message caps |
 | Model calls added | none |
 
 ## Verifying it without a model
@@ -113,12 +113,12 @@ editing the conversation it is in the middle of).
 # write a memory through the normal file tools
 curl -sS -X POST http://<board>:80/mcp -H 'Content-Type: application/json' \
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{
-       "name":"fs_write","arguments":{"path":"/memory/pins.md","text":"GPIO18 = strip"}}}'
+       "name":"write","arguments":{"path":"/memory/pins.md","text":"GPIO18 = strip"}}}'
 
 # the index line
 curl -sS -X POST http://<board>:80/mcp -H 'Content-Type: application/json' \
   -d '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{
-       "name":"fs_write","arguments":{
+       "name":"write","arguments":{
          "path":"/MEMORY.md","text":"- [pins](/memory/pins.md) — GPIO18 is the strip\n"}}}'
 
 # what the model will be told
