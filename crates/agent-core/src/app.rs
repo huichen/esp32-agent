@@ -7777,6 +7777,15 @@ mod tests {
         }
         // A schedule table that cannot toggle a task does not meet the brief.
         assert!(web::APP_JS.contains("sched_disable") && web::APP_JS.contains("sched_enable"));
+        // A task can be a script as well as a prompt, and the board has always accepted
+        // both: the form only offered one of them.
+        assert!(web::INDEX_HTML.contains("sched-script"), "the schedule form cannot take a script");
+        assert!(web::APP_JS.contains("script:"), "the form never sends the script field");
+        // A result belongs to the call its `tool_call_id` names, not to whichever chip is
+        // still open: the arguments printed beside a result were sometimes another call's.
+        assert!(web::APP_JS.contains("dataset.id === data.tool_call_id"), "results are matched positionally");
+        // And while the board is silent, the page says it is still working.
+        assert!(web::STYLE_CSS.contains(".dot-anim"), "no live indicator in the stylesheet");
         assert!(web::STYLE_CSS.contains(".bubble"), "bubbles are the transcript");
         assert!(web::STYLE_CSS.contains("100dvh"), "mobile height, not a guessed one");
     }
