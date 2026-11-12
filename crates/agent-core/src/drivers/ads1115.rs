@@ -350,6 +350,22 @@ mod tests {
         }
         assert_eq!(Gain::parse("3.3"), None);
         assert_eq!(Gain::parse(""), None);
+        // The PGA field is three bits, one code per range, and the config word carries it
+        // in bits 9..=11. Getting a code wrong silently reads the wrong voltage.
+        for (gain, code) in [
+            (Gain::V6_144, 0b000),
+            (Gain::V4_096, 0b001),
+            (Gain::V2_048, 0b010),
+            (Gain::V1_024, 0b011),
+            (Gain::V0_512, 0b100),
+            (Gain::V0_256, 0b101),
+        ] {
+            let mut chip = Chip::counts(0);
+            let mut d = dev();
+            d.set_gain(gain);
+            d.read_single(&mut chip, 0).expect("read");
+            assert_eq!(chip.last_config() >> 9 & 0b111, code, "{gain:?}");
+        }
         // Full scale is 32768 LSB over the range, which is where these LSB sizes come from.
         for (gain, full_scale) in [
             (Gain::V6_144, 6.144),

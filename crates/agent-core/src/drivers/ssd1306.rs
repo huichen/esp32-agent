@@ -857,6 +857,24 @@ mod tests {
         assert_eq!(err.code, crate::error::code::INVALID_PARAMS);
         assert!(err.message.contains("1024"), "the message says what it wanted: {}", err.message);
 
+        // Asking for a 128x32 bitmap on a 128x64 panel draws into the top half.
+        let top = vec![0xF0u8; 512];
+        let v = p
+            .call(
+                "oled_bitmap",
+                &json!({ "data_b64": crate::util::b64_encode(&top), "height": 32 }),
+                &mut bus,
+            )
+            .expect("a half-height bitmap");
+        assert_eq!(v["bytes"], 512);
+        assert_eq!(p.framebuffer()[0], 0xF0);
+        assert_eq!(p.framebuffer()[512], 0xFF, "the bottom half still holds the full frame");
+
+        // And clearing is a tool of its own.
+        let v = p.call("oled_clear", &json!({}), &mut bus).expect("clear");
+        assert_eq!(v["ok"], true);
+        assert!(p.framebuffer().iter().all(|b| *b == 0), "the panel is blank");
+
         let err = p.call("oled_bitmap", &json!({ "data_b64": "!!!!" }), &mut bus).expect_err("not base64");
         assert_eq!(err.code, crate::error::code::INVALID_PARAMS);
     }
