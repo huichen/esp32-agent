@@ -23,7 +23,7 @@ sensor can be declared in JSON while the board runs.
 | A shell and a script language | `shell` with 55 NuttX-named commands, and an interpreter for loops over tool calls. [Shell](docs/shell.md) · [Script](docs/scripting.md) |
 | It remembers what it was told | Standing orders, `/AGENTS.md`, a `/MEMORY.md` index and skills, assembled into the prompt on every turn. [Context layers](docs/context.md) |
 | It starts with skills | Three procedures ship in the firmware — write a skill, find the pinout, recover a broken board — and land in `/skills` on the first boot; edit one and it stays yours. [Skills](docs/agent-skills.md) |
-| No cloud in the path | HTTPS from the board, a certificate it generates, one PIN for three callers. [Security](docs/security.md) |
+| The board is the server | HTTPS from the board, a certificate it generates, one PIN for three callers. [Security](docs/security.md) |
 | Testable without hardware | The simulator runs the same `agent-core` against a virtual board. [Simulator](docs/simulator.md) |
 
 ## Flash and connect
