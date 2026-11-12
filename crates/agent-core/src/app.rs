@@ -76,7 +76,7 @@ pub const MAX_SHELL_SLEEP_MS: u64 = 10_000;
 ///
 /// The same reason `hexdump` and `unzip` have budgets: a tool result is about 2 KB, and a
 /// pipeline can multiply what a single command would have returned.
-pub const PIPE_RESULT_MAX: usize = 1800;
+pub const PIPE_RESULT_MAX: usize = 8192;
 
 /// How many scheduled prompts and sensor rules the board keeps. The scheduler
 /// tick walks both lists on every tick, so this is bounded like everything else.
@@ -119,6 +119,12 @@ pub struct FwMeta {
     pub name: String,
     pub version: String,
     pub build: String,
+    /// The git commit the image was built from, as the build script saw it. Empty when the
+    /// build did not provide one; the point is that two images differ here, which is the
+    /// only cheap way to answer "is the board running what I just flashed".
+    pub commit: String,
+    /// When it was built, UTC, from the same source.
+    pub built_at: String,
 }
 
 /// Two images of ~24 kB each is what a phone screenshot downscaled in the browser comes
@@ -160,6 +166,8 @@ impl Default for FwMeta {
         Self {
             name: protocol::SERVER_NAME.into(),
             version: env!("CARGO_PKG_VERSION").into(),
+            commit: String::new(),
+            built_at: String::new(),
             build: "host".into(),
         }
     }
@@ -665,7 +673,7 @@ impl App {
         let tool_count = self.tool_specs().as_array().map(|a| a.len()).unwrap_or(0);
         crate::sitemap::document(json!({
             "base_url": format!("{}://{host}", req.scheme),
-            "firmware": { "name": "esp32-agent", "version": crate::VERSION },
+            "firmware": { "name": "esp32-agent", "version": crate::VERSION, "build": self.firmware.build, "commit": self.firmware.commit, "built_at": self.firmware.built_at },
             "board": { "profile": self.cfg.board, "devices": self.devices.len() },
             "mcp": crate::sitemap::mcp_json(
                 &self.cfg.mcp.path,
@@ -763,6 +771,8 @@ impl App {
                 "name": self.firmware.name,
                 "version": self.firmware.version,
                 "build": self.firmware.build,
+                "commit": self.firmware.commit,
+                "built_at": self.firmware.built_at,
             },
             "board": {
                 "profile": self.profile.id,
@@ -2061,6 +2071,39 @@ impl App {
     }
 
     /// Add, update, enable/disable or delete one task or rule by id.
+    /// Fire one task immediately, the way the tick would have at its due moment.
+    ///
+    /// A task either asks the model something or runs a script, exactly as on the timer, so a
+    /// manual run and a scheduled one cannot diverge. `last_run_ms` is deliberately not
+    /// touched: "run it now" must not postpone the run that was scheduled.
+    fn sched_run_now(&mut self, id: &str) -> std::result::Result<Value, String> {
+        let at_ms = now_ms();
+        let index =
+            self.tasks.iter().position(|t| t.id == id).ok_or_else(|| format!("no scheduled task `{id}`"))?;
+        let source = format!("schedule:{}", self.tasks[index].id);
+        if source.len() >= 64 {
+            return Err(format!("the source tag for `{id}` is too long"));
+        }
+        let prompt = self.tasks[index].prompt.clone();
+        let script = self.tasks[index].script.clone();
+        let script = if script.trim().is_empty() { None } else { Some(script) };
+        let mut out = json!({ "id": id, "source": source });
+        if let Some(text) = script {
+            let job = self.submit_script(&text, true);
+            self.log.info("script", format!("{source} ran a script on demand: {}", job.id));
+            out["kind"] = json!("script");
+            out["job"] = json!(job.id);
+        } else if !prompt.trim().is_empty() {
+            self.agent.push_user(&prompt, &source, at_ms);
+            self.log.info("sched", format!("{source} queued on demand"));
+            out["kind"] = json!("prompt");
+            out["queued"] = json!(true);
+        } else {
+            return Err(format!("task `{id}` has neither a prompt nor a script"));
+        }
+        Ok(out)
+    }
+
     fn sched_apply(&mut self, req: &Request) -> Response {
         let body = match req.json() {
             Ok(v) => v,
@@ -2817,6 +2860,22 @@ impl App {
                     return r;
                 }
                 self.sched_apply(req)
+            }
+            // Fire one task now. "Wait until 06:00" is not a test, and an outside caller may
+            // want the report now. It does not move the schedule: `last_run_ms` is left alone,
+            // so a manual run cannot starve the timer that was set for it.
+            ("POST", "/api/sched/run") => {
+                if let Err(r) = self.require_pin(req) {
+                    return r;
+                }
+                let id = match req.json() {
+                    Ok(body) => body.get("id").and_then(|i| i.as_str()).unwrap_or("").trim().to_string(),
+                    Err(e) => return Response::error_json(400, &format!("invalid JSON: {e}")),
+                };
+                match self.sched_run_now(&id) {
+                    Ok(v) => Response::json(&v),
+                    Err(e) => Response::json_status(404, &json!({ "error": e })),
+                }
             }
             ("GET", "/api/wifi/scan") => match self.hw.wifi_scan() {
                 Ok(aps) => Response::json(&json!({ "networks": aps })),
@@ -3699,7 +3758,7 @@ impl App {
             "url": url,
         });
         if truncated {
-            out["note"] = json!("the file holds the first 2048 bytes of the response");
+            out["note"] = json!("the file holds the first 8192 bytes of the response");
         }
         Ok(out.to_string())
     }
@@ -4743,6 +4802,9 @@ fn pipe_text(op: &str, answer: &Value) -> std::result::Result<String, String> {
         // applies to its own answer applies here, so `| grep` sees words rather than tags.
         "curl" => text("body"),
         "wget" => text("body"),
+        // `jq` prints one value per line: that is exactly the text a `head` or a `grep`
+        // downstream wants, and the reason `curl api | jq .x | head` is the shape people type.
+        "jq" => text("text"),
         other => return Err(format!("`{other}` has no line form to hand down a pipe")),
     })
 }
