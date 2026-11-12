@@ -56,6 +56,20 @@ CONFIG_LWIP_SNTP_UPDATE_DELAY=60000
 # Those buffers are not DMA memory, so PSRAM is the right home for them.
 CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC=y
 
+# https on the board itself: esp-tls needs the server role, and the certificate it serves
+# is generated on first boot — which needs mbedTLS' X.509 writer and PEM output compiled in.
+# Without these three the firmware still builds and http still works; https is simply
+# absent, and `/api/tls` says so.
+CONFIG_ESP_TLS_SERVER=y
+CONFIG_MBEDTLS_X509_CRT_WRITE_C=y
+CONFIG_MBEDTLS_PEM_WRITE_C=y
+# Hardware AES-DMA needs a DMA-capable buffer in internal RAM, and on this board the TLS
+# connection thread runs with ~14 kB of internal RAM left: the first record failed with
+# `esp-aes: Failed to allocate memory` and every https write died with ESP_FAIL. Software
+# AES is a few milliseconds per kilobyte, which for a portal and a 30 kB model request is
+# not worth the internal RAM. The handshake itself succeeded either way.
+CONFIG_MBEDTLS_HARDWARE_AES=n
+
 # Partition table from partitions.csv - factory app plus a two-slot OTA rotation with
 # the otadata record that selects between them.
 CONFIG_PARTITION_TABLE_CUSTOM=y

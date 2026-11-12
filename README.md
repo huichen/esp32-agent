@@ -69,6 +69,16 @@ curl -sS -X POST http://<board>:80/mcp -H 'Content-Type: application/json' \
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' | jq '.result.tools | length'
 ```
 
+Port 443 answers too, with a certificate the board generated for itself on first boot:
+
+```bash
+curl -k -sS https://<board>/api/tls | jq -r .fingerprint   # SHA-256 of its own cert
+```
+
+A browser will warn about the certificate — that is what self-signed means. Compare the
+fingerprint it shows with that line before clicking through; both HTTP and HTTPS stay up,
+so a TLS problem costs a URL, never the board.
+
 ## Bring your own brain
 
 The loop runs on the board: it is handed the board's own tools, calls them, and answers.
@@ -108,6 +118,7 @@ Everything below is an operation, not a fixed menu:
 | Manifest | `manifest_get/describe/validate/apply/reset` — live, no reboot | MCP tools |
 | Files | `fs_ls/read/write/edit/rm/cp/mv/grep` over an NVS workspace | MCP tools |
 | Network | `net_get`, `net_post` over `http://` and `https://` | MCP tools |
+| Inbound TLS | `https://` on 443, self-signed certificate generated on the board (EC P-256, fingerprint in `/api/tls`); http on 80 stays | both ports |
 | Config | WiFi, MCP, buses, pins, auth, log, UI, tick, discovery | `POST /api/config` |
 | Scripts | loops, conditions and `tool()` calls over every tool above | `script` tool |
 | Model | endpoint, model, key, steps, temperature, timeout | `POST /api/agent/config` |

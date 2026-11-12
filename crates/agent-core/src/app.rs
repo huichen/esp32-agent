@@ -105,6 +105,35 @@ pub struct FwMeta {
     pub build: String,
 }
 
+/// HTTPS on this board: the port it listens on and the SHA-256 fingerprint of the
+/// certificate it made for itself. Empty `fingerprint` means no https.
+#[derive(Debug, Clone, Default)]
+pub struct TlsInfo {
+    pub port: u16,
+    /// Lower-case hex, colon-separated, as `openssl x509 -fingerprint -sha256` prints it.
+    pub fingerprint: String,
+    /// Why https is not up, when it is not. Shown on the portal so "no https" is a
+    /// statement rather than a mystery.
+    pub error: String,
+}
+
+impl TlsInfo {
+    pub fn enabled(&self) -> bool {
+        self.port != 0 && !self.fingerprint.is_empty()
+    }
+
+    pub fn json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "enabled": self.enabled(),
+            "port": self.port,
+            "fingerprint": self.fingerprint,
+            "error": self.error,
+            "how_to_check": "compare this with the certificate the browser shows; it is \
+                             SHA-256 over the DER certificate",
+        })
+    }
+}
+
 impl Default for FwMeta {
     fn default() -> Self {
         Self {
@@ -131,6 +160,10 @@ pub struct App {
     pub firmware: FwMeta,
     /// Set by the platform layer once the HTTP server is up.
     pub lan_url: String,
+    /// The board's own certificate, when it serves https on a second port. The
+    /// fingerprint is what a person compares against the browser's warning page —
+    /// it is the only proof that this board, and not something on the path, answered.
+    pub tls: TlsInfo,
     /// The on-board agent: transcript, the one-slot queue and the last error.
     pub agent: Agent,
     /// Where the model lives and how far one run may go. `api_key` is kept in
@@ -220,6 +253,7 @@ impl App {
             profile_exact: true,
             firmware,
             lan_url: String::new(),
+            tls: TlsInfo::default(),
             agent: Agent::new(),
             llm: LlmConfig::default(),
             tasks: Vec::new(),
@@ -503,7 +537,7 @@ impl App {
             .unwrap_or_else(|| format!("<board>:{}", self.cfg.mcp.port));
         let tool_count = self.tool_specs().as_array().map(|a| a.len()).unwrap_or(0);
         crate::sitemap::document(json!({
-            "base_url": format!("http://{host}"),
+            "base_url": format!("{}://{host}", req.scheme),
             "firmware": { "name": "esp32-agent", "version": crate::VERSION },
             "board": { "profile": self.cfg.board, "devices": self.devices.len() },
             "mcp": crate::sitemap::mcp_json(
@@ -516,6 +550,7 @@ impl App {
                 "mcp_token_set": !self.cfg.auth.mcp_token.is_empty(),
                 "note": "with neither set, every route above is open on the local network",
             },
+            "tls": self.tls.json(),
             "model": {
                 "configured": !self.llm.base_url.is_empty() && !self.llm.model.is_empty(),
                 "endpoint": self.llm.base_url,
@@ -669,7 +704,14 @@ impl App {
     }
 
     pub fn mcp_url(&mut self) -> String {
-        if !self.lan_url.is_empty() {
+        self.mcp_url_with("http")
+    }
+
+    /// The MCP endpoint as seen by a client that reached us over `scheme`. A board
+    /// answering TLS that advertises `http://` sends the next agent down a dead path —
+    /// and so does one that keeps the plaintext port in the URL.
+    pub fn mcp_url_with(&mut self, scheme: &str) -> String {
+        if scheme == "http" && !self.lan_url.is_empty() {
             return format!("{}{}", self.lan_url.trim_end_matches('/'), self.cfg.mcp.path);
         }
         let wifi = self.hw.wifi_status();
@@ -680,19 +722,20 @@ impl App {
         } else {
             "<board-ip>".into()
         };
-        format!("http://{host}:{}{}", self.cfg.mcp.port, self.cfg.mcp.path)
+        let port = if scheme == "https" && self.tls.port != 0 { self.tls.port } else { self.cfg.mcp.port };
+        format!("{scheme}://{host}:{port}{}", self.cfg.mcp.path)
     }
 
     /// The text shown to the model at `initialize`, generated from what is really
     /// attached so it never promises hardware that is not there.
-    fn instructions(&mut self) -> String {
+    fn instructions(&mut self, scheme: &str) -> String {
         let mut names: Vec<String> = self.devices.infos().iter().map(|d| d.name.clone()).collect();
         if names.is_empty() {
             names.push("no peripherals detected".into());
         }
         let tools = self.visible_tool_names();
         let setup = self.setup_needed();
-        let url = self.mcp_url();
+        let url = self.mcp_url_with(scheme);
         let soc = self.hw.board_info().soc;
         let board = self.profile.name.to_string();
         format!(
@@ -837,6 +880,9 @@ impl App {
             headers: Default::default(),
             body: body.into_bytes(),
             peer: "self".to_string(),
+            // An in-process call has no listener; it is the caller's own view of the
+            // board, and http is what the self-call path represents.
+            scheme: "http",
         };
         let resp = self.route(&req);
         let text = String::from_utf8_lossy(&resp.body).to_string();
@@ -1697,6 +1743,12 @@ impl App {
     // ---------------------------------------------------------------- RPC
 
     pub fn handle_rpc(&mut self, body: &str, session: Option<&str>) -> Option<Value> {
+        self.handle_rpc_with(body, session, "http")
+    }
+
+    /// As [`Self::handle_rpc`], but knowing which listener answered. `initialize` quotes
+    /// an endpoint, and quoting the wrong scheme sends the next agent to a dead port.
+    pub fn handle_rpc_with(&mut self, body: &str, session: Option<&str>, scheme: &str) -> Option<Value> {
         let messages = match protocol::parse(body) {
             Ok(m) => m,
             Err((id, code_n, message)) => {
@@ -1707,7 +1759,7 @@ impl App {
         let single = messages.len() == 1;
         let mut out = Vec::new();
         for msg in messages {
-            if let Some(v) = self.handle_one(msg, session) {
+            if let Some(v) = self.handle_one(msg, session, scheme) {
                 out.push(v);
             }
         }
@@ -1721,7 +1773,7 @@ impl App {
         }
     }
 
-    fn handle_one(&mut self, msg: RpcIn, session: Option<&str>) -> Option<Value> {
+    fn handle_one(&mut self, msg: RpcIn, session: Option<&str>, scheme: &str) -> Option<Value> {
         let id = msg.id.clone();
         if msg.is_notification {
             self.runtime.counters.notifications += 1;
@@ -1736,7 +1788,7 @@ impl App {
         }
         self.runtime.counters.requests += 1;
         let result = match msg.method.as_str() {
-            "initialize" => Ok(self.on_initialize(&msg.params, session)),
+            "initialize" => Ok(self.on_initialize(&msg.params, session, scheme)),
             "ping" => Ok(json!({})),
             "tools/list" => {
                 if self.cfg.mcp.reprobe_on_list {
@@ -1765,7 +1817,7 @@ impl App {
         }
     }
 
-    fn on_initialize(&mut self, params: &Value, session: Option<&str>) -> Value {
+    fn on_initialize(&mut self, params: &Value, session: Option<&str>, scheme: &str) -> Value {
         let client = params
             .get("clientInfo")
             .and_then(|c| c.get("name"))
@@ -1781,7 +1833,7 @@ impl App {
             let idx = self.runtime.touch_session(s, now_ms(), &client);
             self.runtime.sessions[idx].protocol = protocol_version;
         }
-        let instructions = self.instructions();
+        let instructions = self.instructions(scheme);
         protocol::initialize_result(&self.firmware.name, &self.firmware.version, &instructions, true)
     }
 
@@ -1995,6 +2047,7 @@ impl App {
             // The map an external agent reads before it touches anything. Two paths so a
             // client that guesses either name finds it.
             ("GET", "/agent.json") | ("GET", "/sitemap.json") => Response::json(&self.sitemap_json(req)),
+            ("GET", "/api/tls") => Response::json(&self.tls.json()),
             ("GET", "/api/status") => {
                 let v = self.status_json();
                 Response::json(&v)
@@ -2385,7 +2438,7 @@ impl App {
             return resp;
         }
 
-        let reply = self.handle_rpc(&body, Some(&session_id));
+        let reply = self.handle_rpc_with(&body, Some(&session_id), req.scheme);
         let mut resp = match reply {
             None => Response::empty(202),
             Some(v) => Response::json(&v),
@@ -3352,6 +3405,48 @@ mod tests {
         assert!(endpoints.iter().any(|e| e["path"] == "/agent.json"));
     }
 
+    /// The map is a promise about where to send the next request. Over TLS it has to
+    /// say https, or an external agent connects to a port that is not answering that way.
+    #[test]
+    fn the_discovery_document_follows_the_listener_that_answered() {
+        let mut app = test_app();
+        // What the firmware sets once the 443 listener is up.
+        app.tls = TlsInfo { port: 443, fingerprint: "aa:bb".into(), error: String::new() };
+        let mut req = get("/agent.json");
+        req.headers.insert("host".into(), "192.168.3.7".into());
+        req.scheme = "https";
+        let doc: Value = serde_json::from_slice(&app.route(&req).body).expect("parses");
+        assert_eq!(doc["dynamic"]["base_url"], "https://192.168.3.7");
+
+        // The MCP `initialize` response quotes the same endpoint, by the same rule.
+        let mut init = Request {
+            method: "POST".into(),
+            path: "/mcp".into(),
+            query: Default::default(),
+            headers: Default::default(),
+            body: br#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"t","version":"1"}}}"#.to_vec(),
+            peer: "test".into(),
+            scheme: "https",
+        };
+        init.headers.insert("content-type".into(), "application/json".into());
+        let reply: Value = serde_json::from_slice(&app.route(&init).body).expect("json");
+        let text = reply["result"]["instructions"].as_str().expect("instructions");
+        assert!(text.contains("https://"), "the endpoint told the client: {text}");
+        assert!(!text.contains("Endpoint: http://"), "the endpoint told the client: {text}");
+        // And the port that answers *that* scheme — 443, not the plaintext 80.
+        assert!(
+            text.contains("https://") && text.contains(":443/mcp"),
+            "the endpoint told the client: {text}"
+        );
+
+        // Over plain http the same board keeps naming port 80.
+        let mut plain = init.clone();
+        plain.scheme = "http";
+        let reply: Value = serde_json::from_slice(&app.route(&plain).body).expect("json");
+        let text = reply["result"]["instructions"].as_str().expect("instructions");
+        assert!(text.contains("http://") && text.contains(":80/mcp"), "the endpoint told the client: {text}");
+    }
+
     /// A GET request; the query string is split off into `query` the way the
     /// server does it, so `?after=2` reaches the handler.
     fn get(url: &str) -> Request {
@@ -3379,6 +3474,7 @@ mod tests {
             headers: Default::default(),
             body: body.as_bytes().to_vec(),
             peer: "test".into(),
+            scheme: "http",
         }
     }
 
@@ -4300,7 +4396,10 @@ mod tests {
     fn a_joined_board_does_not_claim_it_is_in_setup_mode() {
         let mut app = test_app();
         assert!(app.setup_needed(), "a board with no SSID is in setup mode");
-        assert!(app.instructions().contains("setup mode"), "with no credentials the instructions say so");
+        assert!(
+            app.instructions("http").contains("setup mode"),
+            "with no credentials the instructions say so"
+        );
 
         let resp = app.route(&post("/api/config", r#"{"wifi":{"ssid":"home"}}"#));
         assert_eq!(resp.status, 200, "the config write must be accepted");
@@ -4313,7 +4412,7 @@ mod tests {
             "/api/status must agree with the instruction text"
         );
         assert!(
-            !app.instructions().contains("setup mode"),
+            !app.instructions("http").contains("setup mode"),
             "a joined board must not be described to a model as unprovisioned"
         );
     }
@@ -5488,6 +5587,7 @@ mod tests {
             headers: Default::default(),
             body: br#"{"device_name":"bench","mcp":{"tools_mode":"auto"}}"#.to_vec(),
             peer: "test".into(),
+            scheme: "http",
         };
         let resp = app.route(&req);
         assert_eq!(resp.status, 200);
@@ -5507,6 +5607,7 @@ mod tests {
             headers: Default::default(),
             body: br#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#.to_vec(),
             peer: "test".into(),
+            scheme: "http",
         };
         assert_eq!(app.route(&req).status, 401);
         req.headers.insert("authorization".into(), "Bearer tok".into());
@@ -5526,6 +5627,7 @@ mod tests {
             headers: Default::default(),
             body: br#"{"device_name":"x"}"#.to_vec(),
             peer: "t".into(),
+            scheme: "http",
         };
         assert_eq!(app.route(&write).status, 401);
         let read = Request { method: "GET".into(), path: "/api/status".into(), ..write.clone() };
@@ -5542,6 +5644,7 @@ mod tests {
             headers: Default::default(),
             body: br#"{"mode":"generic"}"#.to_vec(),
             peer: "t".into(),
+            scheme: "http",
         };
         assert_eq!(app.route(&req).status, 200);
         assert_eq!(app.cfg.mcp.tools_mode, "generic");
