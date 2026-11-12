@@ -6,7 +6,7 @@
 #   2. the transcript is readable through the API the portal uses;
 #   3. a scheduled task fires with no HTTP request involved.
 #
-#   powershell -File tools/agent_smoke.ps1
+#   powershell -File tools/bench-agent.ps1
 param(
     [string]$Board = "192.0.2.2",
     [int]$Port = 8080,
@@ -106,7 +106,7 @@ while ((Get-Date) -lt $deadline) {
 Check "scheduled task fired without an HTTP message" $fired ""
 
 # 4. leave the board tidy: stop the task
-Api "POST" "/api/sched" @{ kind = "task"; id = "bench60"; enabled = $false; delete = $true } | Out-Null
+Api "POST" "/api/sched" @{ kind = "task"; op = "delete"; id = "bench60" } | Out-Null
 
 Write-Host ""
 if ($fail -eq 0) { Write-Host "agent loop: all checks passed" -ForegroundColor Green }

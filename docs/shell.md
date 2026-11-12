@@ -17,7 +17,7 @@ because they are the three most common operations and a wrapper would only add a
 | Group | Commands |
 |---|---|
 | Files | `ls rm cp mv grep zip unzip` |
-| Reading and slicing text | `cat echo wc head tail cut sort uniq tr tee touch du strings od` |
+| Reading and slicing text | `cat echo wc head tail cut sort uniq tr tee touch du strings od jq` |
 | Network | `curl wget nslookup nc ping ifconfig netstat route arp` |
 | Numbers and time | `sleep usleep jot crc32` |
 | Looking at the board | `df free uptime date uname ps hexdump xd hostname whoami id env setenv unsetenv` |
@@ -44,12 +44,12 @@ One line may carry a pipeline, and what a stage prints is what the next one read
 redirect that would not fit is refused with the number of bytes it needed and **nothing is
 written**.
 
-**The stages** are the commands that read or write lines. `cat echo grep sort uniq tr cut
+**The stages** are the commands that read or write lines. `jq cat grep sort uniq tr cut
 head tail wc strings od xd hexdump base64enc base64dec sha256sum md5sum crc32 tee` read
-stdin; `ls jot du df free ps uname date uptime echo` only produce, so they may start a
-pipeline but not continue one (`echo hi | ls` is refused). Every other command — `curl`,
-`rm`, `touch`, `sleep`, `script` — is refused by name: a pipeline is another way to write one
-command line, not a second way into the tool table.
+stdin; `curl wget ls jot du df free ps uname date uptime echo` only produce, so they may
+start a pipeline but not continue one (`echo hi | ls` is refused). Every other command —
+`rm`, `touch`, `sleep`, `ping`, `script` — is refused by name: a pipeline is another way
+to write one command line, not a second way into the tool table.
 
 Up to **five stages**. Each stage goes through the same handler, the same argument table and
 the same credential a single command does, so `ls / | grep txt` cannot reach anything `ls`
@@ -89,6 +89,12 @@ minimum). `od` is `hexdump` in octal, because that is what `od` means.
 `touch <path>` creates an empty file if it is missing. There is nothing to update on an
 existing one: the workspace stores text and no timestamps, so `touch` answers with
 `"mtime": null` and a note rather than pretending it moved a time.
+
+`jq [query] <path>` is a path into a JSON document, not a query language:
+`.name`, `.a.b`, `.[0]`, `.a[0].b`, `.[]` and `.length`, one compact value per line, so a
+`| head` downstream sees one result. `-r` prints a string without its quotes. It is the
+reason `curl <board>/agent.json | jq .endpoints[0].path` works at all — a pipeline of
+`grep` does not survive nested objects.
 
 A filter with no file reads the pipe, a filter with a file ignores the pipe (as `sort a.txt`
 ignores stdin in a shell), and a filter with neither is an error: it has nothing to read.
@@ -143,7 +149,7 @@ shell {"command":"cp /a"}          → usage: cp <from> <to>     (a missing argu
 shell {"command":"ls / |"}         → a pipeline cannot end with `|`, then the pipeline usage
 shell {"command":"sudo ls"}        → `sudo` is not a shell command, then every usage line
 shell {"command":"cp -h"}          → usage: cp <from> <to>        (help answers before validation)
-shell {"command":"help"}           → all 56 commands
+shell {"command":"help"}           → all 57 commands
 ```
 
 `help` is generated from the command table, so a command that was added is in it, and a
