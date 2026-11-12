@@ -412,7 +412,9 @@ impl Default for Agent {
 /// `tool_progress`, `tool_result`, `usage`, `message_end`, `error`, `run_end`): a
 /// client that reads one console can read the other. The board does not stream token
 /// by token, so a delta carries the whole block; the names and the order are what
-/// stay identical.
+/// stay identical. `retried` is the one addition: it fires at most once per model
+/// call, when the request behind the reply took more than one attempt, so a reader
+/// learns that the answer was slow to arrive instead of seeing each failed attempt.
 #[derive(Clone, Debug)]
 pub struct Event {
     pub seq: u64,
@@ -620,6 +622,14 @@ impl Agent {
                 return AgentStep::Done(Err(e));
             }
         };
+        // A request that needed more than one attempt says so once, here, and `chat` has
+        // already folded the attempts into one line. The failed attempts themselves are
+        // not journaled: a console that shows two 503s before the answer reads as a
+        // broken run even when the retry is exactly what kept it working.
+        if !reply.retry_note.is_empty() {
+            let note = reply.retry_note.clone();
+            self.emit("retried", now_ms(), |ev| ev.text = note);
+        }
         self.turn_steps = self.turn_steps.saturating_add(1);
 
         // Journal in the host agent's order: usage, reasoning, then the visible text,
@@ -766,6 +776,30 @@ impl Agent {
         cfg: &LlmConfig,
         now_ms: fn() -> u64,
     ) -> Result<String, String> {
+        self.run_pending_with(
+            host,
+            transport,
+            cfg,
+            now_ms,
+            &llm::RetryPolicy::default(),
+            &llm::WallClock::new(),
+        )
+    }
+
+    /// [`run_pending`](Self::run_pending) with the retry policy and the clock spelled out.
+    ///
+    /// The seam is public for the same reason [`llm::chat_with`] is: the backoff and the
+    /// deadline are numbers a test has to observe without sleeping, and a platform whose
+    /// socket timeout differs from the default deserves to say what it wants.
+    pub fn run_pending_with(
+        &mut self,
+        host: &mut dyn ToolHost,
+        transport: &mut dyn ChatTransport,
+        cfg: &LlmConfig,
+        now_ms: fn() -> u64,
+        policy: &llm::RetryPolicy,
+        timer: &dyn llm::RetryTimer,
+    ) -> Result<String, String> {
         let mut step = match self.begin(host, now_ms, cfg.max_steps) {
             Some(step) => step,
             None => return Ok(String::new()),
@@ -773,7 +807,7 @@ impl Agent {
         loop {
             match step {
                 AgentStep::Ask { messages, tools } => {
-                    let reply = llm::chat(transport, cfg, &messages, &tools);
+                    let reply = llm::chat_with(transport, cfg, &messages, &tools, policy, timer);
                     step = self.apply(host, reply, now_ms);
                 }
                 AgentStep::Done(result) => return result,
@@ -2240,6 +2274,175 @@ mod tests {
         // The user turn stays, so a retry can answer it.
         assert_eq!(agent.history.len(), 1);
         assert_eq!(agent.history[0].role, Role::User);
+    }
+
+    /// Fails `failures` times with `status` and then answers: the shape of a turn that a
+    /// retry rescued.
+    struct FlakyTransport {
+        failures: usize,
+        status: u16,
+        calls: usize,
+        reply: String,
+    }
+
+    impl ChatTransport for FlakyTransport {
+        fn post_json(
+            &mut self,
+            _url: &str,
+            _headers: &[(&str, &str)],
+            _body: &str,
+        ) -> Result<String, String> {
+            self.calls += 1;
+            if self.calls <= self.failures {
+                return Err(llm::http_error(self.status, "the model is restarting"));
+            }
+            Ok(self.reply.clone())
+        }
+    }
+
+    /// A clock that records the waits instead of taking them.
+    #[derive(Default)]
+    struct FakeClock {
+        now: std::cell::Cell<u64>,
+        sleeps: std::cell::RefCell<Vec<u64>>,
+    }
+    impl llm::RetryTimer for FakeClock {
+        fn now_ms(&self) -> u64 {
+            self.now.get()
+        }
+
+        fn sleep_ms(&self, ms: u64) {
+            self.sleeps.borrow_mut().push(ms);
+            self.now.set(self.now.get().saturating_add(ms));
+        }
+    }
+
+    /// Answers from a script where `Err(status)` is a failure: the shape of a turn whose
+    /// second model request had to be retried.
+    struct ScriptedTransport {
+        script: std::collections::VecDeque<Result<String, u16>>,
+        calls: usize,
+    }
+
+    impl ChatTransport for ScriptedTransport {
+        fn post_json(
+            &mut self,
+            _url: &str,
+            _headers: &[(&str, &str)],
+            _body: &str,
+        ) -> Result<String, String> {
+            self.calls += 1;
+            match self.script.pop_front() {
+                Some(Ok(body)) => Ok(body),
+                Some(Err(status)) => Err(llm::http_error(status, "the model is restarting")),
+                None => Err("script: no reply left".to_string()),
+            }
+        }
+    }
+
+    /// A retried request is one note and one answer. A client reading the journal must not
+    /// see the failed attempts — three failures and one success is what a broken run looks
+    /// like — and the retry must not have run a tool twice.
+    #[test]
+    fn a_retried_model_request_is_said_once_and_still_answers() {
+        let mut agent = Agent::new();
+        let mut host = StubHost::returning("should not run");
+        let mut transport =
+            FlakyTransport { failures: 2, status: 503, calls: 0, reply: answer_reply("it is fine") };
+        let timer = FakeClock::default();
+
+        agent.push_user("is the board ok?", "http", 1);
+        let text = agent
+            .run_pending_with(&mut host, &mut transport, &cfg(), clock, &llm::RetryPolicy::default(), &timer)
+            .expect("the third attempt answers");
+
+        assert_eq!(text, "it is fine");
+        assert_eq!(transport.calls, 3, "the request really was tried three times");
+        assert_eq!(*timer.sleeps.borrow(), vec![llm::BASE_DELAY_MS, llm::BASE_DELAY_MS * 2]);
+        let kinds: Vec<&str> = agent.events.iter().map(|e| e.kind).collect();
+        assert_eq!(kinds.iter().filter(|k| **k == "retried").count(), 1, "one note: {kinds:?}");
+        assert_eq!(kinds.iter().filter(|k| **k == "error").count(), 0, "no failure: {kinds:?}");
+        let note = agent.events.iter().find(|e| e.kind == "retried").expect("the note");
+        assert!(note.text.contains("retried 2 times"), "{}", note.text);
+        assert!(note.text.contains("HTTP 503"), "the cause is named: {}", note.text);
+
+        // One answer in the transcript, and no trace of the attempts the model never saw.
+        let answers: Vec<&str> =
+            agent.history.iter().filter(|m| m.role == Role::Assistant).map(|m| m.text.as_str()).collect();
+        assert_eq!(answers, vec!["it is fine"]);
+        assert!(host.calls.is_empty(), "nothing but the model request was retried");
+    }
+
+    /// Exhausted attempts are one `error`, with the count and the last message, and the
+    /// user's turn stays in the transcript so the next tick can try again.
+    #[test]
+    fn exhausted_attempts_journal_one_error_with_the_count_and_the_last_message() {
+        let mut agent = Agent::new();
+        let mut host = StubHost::returning("{}");
+        let mut transport =
+            FlakyTransport { failures: usize::MAX, status: 503, calls: 0, reply: String::new() };
+        let timer = FakeClock::default();
+
+        agent.push_user("hello", "http", 1);
+        let err = agent
+            .run_pending_with(&mut host, &mut transport, &cfg(), clock, &llm::RetryPolicy::default(), &timer)
+            .expect_err("three failures is a failure");
+
+        assert_eq!(transport.calls, llm::MAX_ATTEMPTS as usize);
+        assert!(err.contains("gave up after 3 attempts"), "{err}");
+        assert!(err.contains("HTTP 503"), "{err}");
+
+        let errors: Vec<&Event> = agent.events.iter().filter(|e| e.kind == "error").collect();
+        assert_eq!(errors.len(), 1, "one error event, not one per attempt");
+        assert!(errors[0].text.contains("3 attempts"), "{}", errors[0].text);
+        assert!(errors[0].text.contains("HTTP 503"), "{}", errors[0].text);
+        assert_eq!(agent.events.iter().filter(|e| e.kind == "retried").count(), 0);
+        assert!(
+            matches!(agent.events.back(), Some(e) if e.kind == "run_end" && e.is_error),
+            "the run is closed as an error"
+        );
+        assert_eq!(agent.last_error, err);
+        assert_eq!(agent.history.len(), 1, "nothing was invented");
+        assert_eq!(agent.history[0].role, Role::User);
+    }
+
+    /// A retry is of the model request, never of a tool call that already succeeded: the
+    /// second attempt sends the same transcript, so the tool runs once and its result is
+    /// carried into the retried request rather than produced again.
+    #[test]
+    fn a_retry_of_a_later_request_does_not_run_the_tool_again() {
+        let mut agent = Agent::new();
+        let mut host = StubHost::returning(r#"{"boot":true}"#);
+        let mut transport = ScriptedTransport {
+            script: vec![
+                Ok(tool_call_reply("c1", "board_status", "{}")),
+                Err(503),
+                Err(503),
+                Ok(answer_reply("the board is up")),
+            ]
+            .into(),
+            calls: 0,
+        };
+        let timer = FakeClock::default();
+
+        agent.push_user("is the board up?", "http", 1);
+        let text = agent
+            .run_pending_with(&mut host, &mut transport, &cfg(), clock, &llm::RetryPolicy::default(), &timer)
+            .expect("the fourth request answers");
+
+        assert_eq!(text, "the board is up");
+        assert_eq!(transport.calls, 4);
+        assert_eq!(host.calls.len(), 1, "the tool ran once, not once per attempt");
+        assert_eq!(host.calls[0].0, "board_status");
+        assert_eq!(
+            agent.events.iter().filter(|e| e.kind == "tool_result").count(),
+            1,
+            "one result, however many attempts the next request took"
+        );
+        assert_eq!(agent.events.iter().filter(|e| e.kind == "retried").count(), 1);
+        // The retried request carries the result that already landed.
+        let roles: Vec<Role> = agent.history.iter().map(|m| m.role).collect();
+        assert_eq!(roles, vec![Role::User, Role::Assistant, Role::Tool, Role::Assistant]);
     }
 
     #[test]

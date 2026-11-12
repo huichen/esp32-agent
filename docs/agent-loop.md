@@ -259,6 +259,35 @@ Agent thread + `EspHttpClient` transport + NVS-backed `Workspace` + the schedule
 tick that turns due tasks and fired rules into `push_user(...)`. Publishes counters
 through `/api/status`.
 
+## Retrying a model request
+
+A transport failure used to end the turn. It now costs a retry, under three numbers, all
+in `crates/agent-core/src/llm.rs`:
+
+| Knob | Value | Why that value |
+|---|---|---|
+| attempts | 3, the first included | a refused connection or a 5xx is usually gone by the second try; the board has one agent thread and a turn already has a token budget, so a fourth copy mostly buys a user watching an empty console |
+| backoff | 250 ms, then 500 ms (doubling, capped at 1 s) | long enough for a gateway restarting a worker, short enough that nobody notices it on a LAN |
+| deadline | 20 s per request, waits included | one attempt may already spend the transport's `timeout_s` (45 s by default). Past the deadline the request is given up with a message that names the budget, instead of a retry quietly doubling the turn |
+
+**What is retried** — a connection refused/reset, a timeout, any 5xx, a body that ended
+short (the firmware's `the reply ended after N of M bytes`), and a missing status line.
+**What is not** — 401/403/400/404/422 (the same request is the same refusal, and each copy
+spends the caller's credits), 429 (it asks for a longer wait than the deadline allows), a
+TLS or DNS failure (250 ms will not fix either), and a 200 whose body did not parse: that
+body *is* the provider's answer to this request, so asking again is a second charge for
+the same answer.
+
+The retry is of the model request and of nothing else. A tool that already ran stays run:
+the second attempt sends the same transcript, tool results included, so no tool can execute
+twice because of a retry. Because the backoff happens between two `AgentStep`s, it holds no
+lock — the portal keeps answering while the board waits.
+
+The transcript is not a retry log. One `retried` event is journaled per rescued call (see
+`docs/agent-stream.md`), and an exhausted request is one `error` carrying the attempt count
+and the last failure. `Agent::run_pending_with` and `llm::chat_with` take the policy and a
+clock so tests observe the backoff and the deadline without sleeping.
+
 ## Surviving a power cut
 
 Two mechanisms, one storage: `config.agent.persist_transcript` (default on) and the
