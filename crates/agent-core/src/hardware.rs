@@ -239,8 +239,16 @@ pub trait Hardware: Send {
     /// Thread stacks and DMA come from here, and PSRAM cannot supply either, so this is
     /// the number that decides whether an https handshake or a new connection thread fits.
     /// The portal reports it next to the total heap for exactly that reason.
+    ///
+    /// Derived from [`Hardware::heap_pools`] by default: a board that can name its pools
+    /// already knows this number, and two sources for it let the one a model reads (the
+    /// status tool) disagree with the one a person reads (`/api/memory`). A board with no
+    /// pools at all reports `None` rather than a zero somebody would take as "no RAM".
     fn heap_internal(&mut self) -> Option<(u32, u32)> {
-        None
+        self.heap_pools()
+            .into_iter()
+            .find(|p| p.pool == "internal_8bit" || p.pool == "internal")
+            .map(|p| (p.free_kb.saturating_mul(1024), p.largest_kb.saturating_mul(1024)))
     }
 
     /// The chip's own temperature sensor, where the part has one. `None` is a real
