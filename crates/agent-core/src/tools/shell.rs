@@ -1056,18 +1056,28 @@ pub fn route(op: &str) -> Option<&'static str> {
 }
 
 /// The one tool definition the model and MCP clients see.
-pub fn spec() -> ToolDef {
-    ToolDef::new(
-        "shell",
-        // The index of 57 commands used to sit here, in every request. It is the same text
-        // `{\"help\": true}` returns on demand, so the declaration keeps the part a model
-        // needs before it decides to call: what kind of thing this is, and how a line is
-        // written.
-        "Run a command on the board, as on a unix shell: one `command` string. Pipes (`|`), \
-         redirection (`>` `<` `>>`) and up to 5 stages work on one line; no `&&`, no `;`, no \
-         `$( )`, no variable expansion, no background job. `{\"help\": true}` prints the command \
-         index with a usage line for each, and `help <command>` prints one.",
+/// What a model is told about `shell` before it calls it.
+///
+/// Two things belong here and one does not. It belongs: what kind of tool this is, how a
+/// line is written, and **which commands exist** — the inventory is board-specific (this is
+/// not bash: there is `jq`, `crc32`, `devices_probe`-adjacent things; and there is no `find`,
+/// no `tar`). It does not belong: how to write each command. `ls`, `grep`, `sed`, `awk` are
+/// in a model's own knowledge; sending 57 usage lines on every step bought nothing that
+/// `{"help": true}` does not return when it is actually needed.
+fn description() -> String {
+    let names: Vec<&str> = OPS.iter().map(|(op, _)| *op).collect();
+    format!(
+        "Run a command on the board, as on a unix shell: one `command` string. Commands: {}. \
+         Pipes (`|`), redirection (`>` `<` `>>`) and up to 5 stages work on one line; no `&&`, \
+         no `;`, no `$( )`, no variable expansion, no background job. Not every shell command \
+         exists — this is the list. `{{\"help\": true}}` prints it with a usage line for each, \
+         and `help <command>` prints one.",
+        names.join(" ")
     )
+}
+
+pub fn spec() -> ToolDef {
+    ToolDef::new("shell", &description())
     .title("Shell")
     .category("system")
     .schema(object_schema(
@@ -1107,6 +1117,24 @@ mod tests {
         let spec = spec();
         assert_eq!(spec.spec.name, "shell");
         assert!(spec.spec.input_schema["properties"]["command"].is_object());
+    }
+
+    /// The declaration names every command and teaches none of them.
+    ///
+    /// The inventory is board-specific — this board has `jq`, `crc32`, `system_prompt` and no
+    /// `find` — so a model cannot infer it. The syntax is not: `ls`, `grep`, `sed`, `awk` are
+    /// in a model's own knowledge, and the board's own additions answer to `help <command>`.
+    #[test]
+    fn the_declaration_names_every_command_and_no_syntax() {
+        let text = spec().spec.description;
+        for (op, _) in OPS {
+            assert!(text.contains(op), "`{op}` is missing from the declaration:\n{text}");
+        }
+        // Two usage lines that used to be in there, and must not come back.
+        for usage in ["sed 's/", "awk '{print", "<from> <to>"] {
+            assert!(!text.contains(usage), "a usage line came back ({usage}):\n{text}");
+        }
+        assert!(text.len() < 1_200, "the declaration is back to {} bytes of prose", text.len());
     }
 
     /// `help` is generated from the table, so a command with no usage line would be a
