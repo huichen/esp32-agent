@@ -6621,6 +6621,121 @@ mod tests {
         assert_eq!(out["pin"], 48);
     }
 
+    /// Every primitive in a manifest runs against the real `Hardware` trait, so each one is
+    /// exercised end to end here: the JSON in the tool result is the only evidence the model
+    /// gets that a pin moved, and it has to come from the board rather than from the tool's
+    /// own arguments.
+    #[test]
+    fn every_manifest_primitive_reaches_the_virtual_board() {
+        let mut app = test_app();
+        let v = app
+            .call_tool(
+                "manifest_apply",
+                &json!({ "manifest": { "tools": [
+                    { "name": "read_pin", "params": [], "exec": { "type": "gpio_read", "pin": 3 } },
+                    { "name": "blink_pin", "params": [],
+                      "exec": { "type": "toggle", "pin": 4, "times": 2, "gap_ms": 10 } },
+                    { "name": "adc_pin", "params": [], "exec": { "type": "adc", "pin": 3 } },
+                    { "name": "read_reg", "params": [],
+                      "exec": { "type": "i2c_read", "addr": 118, "reg": 208, "length": 1, "bus": 0 } },
+                    { "name": "write_reg", "params": [],
+                      "exec": { "type": "i2c_write", "addr": 68, "reg": 36, "data": [0, 0], "bus": 0 } },
+                    { "name": "rgb_led", "params": [],
+                      "exec": { "type": "rgb", "pin": 5, "color": "#102030", "count": 4 } },
+                    { "name": "pause", "params": [], "exec": { "type": "delay", "ms": 5 } },
+                    { "name": "two_step", "params": [], "exec": { "type": "sequence", "steps": [
+                        { "ms": 5, "exec": { "type": "gpio_write", "pin": 6, "level": 1 } },
+                        { "exec": { "type": "gpio_read", "pin": 6 } }] } },
+                    { "name": "servo_pin", "params": [{ "name": "d", "type": "number", "required": true }],
+                      "exec": { "type": "pwm", "pin": 8, "freq_hz": 50, "duty_pct": { "param": "d" } } }
+                ] } }),
+            )
+            .unwrap();
+        assert_eq!(v["applied"], true, "{v}");
+
+        // A pull-up input reads high when nothing pulls it down.
+        let out = app.call_tool("read_pin", &json!({})).unwrap();
+        assert_eq!(out["pin"], 3);
+        assert_eq!(out["level"], 1, "the virtual pin floats high: {out}");
+
+        let out = app.call_tool("blink_pin", &json!({})).unwrap();
+        assert_eq!((out["times"].as_u64(), out["gap_ms"].as_u64()), (Some(2), Some(10)));
+
+        let out = app.call_tool("adc_pin", &json!({})).unwrap();
+        assert_eq!(out["millivolts"], 1650, "the virtual ADC's documented value: {out}");
+
+        // The BME280 the virtual board has at 0x76 answers its id register with 0x60.
+        let out = app.call_tool("read_reg", &json!({})).unwrap();
+        assert_eq!(out["addr"], "0x76");
+        assert_eq!(out["reg"], "0xD0");
+        assert_eq!(out["hex"], "60", "{out}");
+        assert_eq!(out["bytes"], json!([0x60]));
+
+        let out = app.call_tool("write_reg", &json!({})).unwrap();
+        assert_eq!(out["addr"], "0x44");
+        assert_eq!(out["bytes_written"], 2);
+
+        let out = app.call_tool("rgb_led", &json!({})).unwrap();
+        assert_eq!(out["color"], "#102030");
+        assert_eq!(out["pin"], 5);
+
+        let out = app.call_tool("pause", &json!({})).unwrap();
+        assert_eq!(out["slept_ms"], 5);
+
+        // A sequence reports each step's result in order, and the delay belongs to the step
+        // it was declared on.
+        let out = app.call_tool("two_step", &json!({})).unwrap();
+        assert_eq!(out["steps_run"], 2);
+        assert_eq!(out["results"][0]["level"], 1);
+        assert_eq!(out["results"][1]["level"], 1, "the pin written a moment ago reads back high");
+
+        let out = app.call_tool("servo_pin", &json!({ "d": 50 })).unwrap();
+        assert_eq!(out["freq_hz"], 50);
+        assert_eq!(out["duty_pct"], 50.0);
+    }
+
+    /// The exec has its own guard for a duty cycle that arrives through a parameter, because
+    /// a parameter's range is only known at call time. A 150 % duty would otherwise reach
+    /// the PWM driver.
+    #[test]
+    fn a_duty_cycle_out_of_range_is_refused_at_call_time() {
+        let mut app = test_app();
+        let v = app
+            .call_tool(
+                "manifest_apply",
+                &json!({ "manifest": { "tools": [{
+                    "name": "wide_pwm", "params": [{ "name": "d", "type": "number", "required": true }],
+                    "exec": { "type": "pwm", "pin": 8, "freq_hz": 50, "duty_pct": { "param": "d" } }
+                }] } }),
+            )
+            .unwrap();
+        assert_eq!(v["applied"], true, "{v}");
+        let err = app.call_tool("wide_pwm", &json!({ "d": 150 })).unwrap_err();
+        assert_eq!(err.code, code::FORBIDDEN);
+        assert!(err.message.contains("0..=100"), "{}", err.message);
+    }
+
+    /// A manifest tool with a rate limit is the only thing standing between a looping model
+    /// and a relay chattering at the speed of the network.
+    #[test]
+    fn a_manifest_tool_rate_limit_refuses_the_next_call() {
+        let mut app = test_app();
+        let v = app
+            .call_tool(
+                "manifest_apply",
+                &json!({ "manifest": { "tools": [{
+                    "name": "once_a_minute", "params": [], "safety": { "max_calls_per_min": 1 },
+                    "exec": { "type": "gpio_write", "pin": 5, "level": 1 }
+                }] } }),
+            )
+            .unwrap();
+        assert_eq!(v["applied"], true, "{v}");
+        assert!(app.call_tool("once_a_minute", &json!({})).is_ok(), "the first call is allowed");
+        let err = app.call_tool("once_a_minute", &json!({})).unwrap_err();
+        assert_eq!(err.code, code::FORBIDDEN);
+        assert!(err.message.contains("rate limited"), "{}", err.message);
+    }
+
     #[test]
     fn an_invalid_manifest_is_rejected_with_paths_and_changes_nothing() {
         let mut app = test_app();

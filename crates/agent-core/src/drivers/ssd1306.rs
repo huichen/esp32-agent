@@ -515,10 +515,6 @@ mod tests {
             self.log.iter().filter(|(r, _)| *r == Some(CMD)).map(|(_, d)| d.clone()).collect()
         }
 
-        fn all_written(&self) -> Vec<u8> {
-            self.log.iter().filter(|(r, _)| *r == Some(CMD)).flat_map(|(_, d)| d.clone()).collect()
-        }
-
         fn data_writes(&self) -> Vec<Vec<u8>> {
             self.log.iter().filter(|(r, _)| *r == Some(DATA)).map(|(_, d)| d.clone()).collect()
         }
