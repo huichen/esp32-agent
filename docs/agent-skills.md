@@ -56,7 +56,7 @@ hand with `gpio_write` all belong to the procedure, and they are `fs_read` away.
 name: deploy
 description: roll the portal forward without losing the transcript
 ---
-1. Read `/AGENTS.md` and confirm the board is not mid-goal.
+1. Read `/AGENTS.md` and confirm the board is not mid-turn.
 2. `fs_write` a note to `/notes/deploy-<date>.md` first.
 3. Build, flash, then `board_status` and one `bme280_read`.
 The pinout to check after flashing is in `pinout.md` next to this file.
