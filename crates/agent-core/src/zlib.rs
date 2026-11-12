@@ -256,16 +256,270 @@ mod tests {
         0xe7, 0x24, 0x56, 0x55, 0x2a, 0xa4, 0xe4, 0xa7, 0xeb, 0x29, 0x84, 0x0c, 0x0e, 0xc5, 0x00,
     ];
 
+    /// Packs a deflate stream by hand, so a test can say which block type and which
+    /// distance it means instead of hoping a compressor produces that case.
+    #[derive(Default)]
+    struct Writer {
+        bytes: Vec<u8>,
+        bit: u32,
+        count: u32,
+    }
+
+    impl Writer {
+        /// A value in `n` bits, least significant bit first: how deflate stores lengths,
+        /// extra bits and block headers.
+        fn value(&mut self, v: u32, n: u32) {
+            for i in 0..n {
+                self.one((v >> i) & 1 == 1);
+            }
+        }
+
+        /// A Huffman code, most significant bit first: the opposite of a value.
+        fn code(&mut self, code: u32, len: u32) {
+            for i in (0..len).rev() {
+                self.one((code >> i) & 1 == 1);
+            }
+        }
+
+        fn one(&mut self, b: bool) {
+            if b {
+                self.bit |= 1 << self.count;
+            }
+            self.count += 1;
+            if self.count == 8 {
+                self.bytes.push(self.bit as u8);
+                self.bit = 0;
+                self.count = 0;
+            }
+        }
+
+        fn align(&mut self) {
+            if self.count > 0 {
+                self.bytes.push(self.bit as u8);
+                self.bit = 0;
+                self.count = 0;
+            }
+        }
+
+        fn finish(mut self) -> Vec<u8> {
+            self.align();
+            self.bytes
+        }
+
+        fn header(&mut self, last: bool, kind: u32) {
+            self.value(last as u32, 1);
+            self.value(kind, 2);
+        }
+
+        fn stored(&mut self, last: bool, data: &[u8]) {
+            self.header(last, 0);
+            self.align();
+            self.value(data.len() as u32, 16);
+            self.value(!(data.len() as u32) & 0xffff, 16);
+            for b in data {
+                self.value(*b as u32, 8);
+            }
+        }
+
+        /// The fixed literal/length code from RFC 1951 section 3.2.6.
+        fn fixed_literal(&mut self, symbol: u16) {
+            let (code, len) = match symbol {
+                0..=143 => (0x30 + symbol as u32, 8),
+                144..=255 => (0x190 + (symbol as u32 - 144), 9),
+                256..=279 => (symbol as u32 - 256, 7),
+                _ => (0xC0 + (symbol as u32 - 280), 8),
+            };
+            self.code(code, len);
+        }
+
+        /// A fixed-code back-reference: symbol 257 is length 3 with no extra bits, and the
+        /// first four distance symbols are single bytes with none either.
+        fn fixed_match(&mut self, length_symbol: u16, distance_symbol: u32) {
+            self.fixed_literal(length_symbol);
+            self.code(distance_symbol, 5);
+        }
+    }
+
     #[test]
     fn a_real_deflate_stream_decodes() {
         let out = inflate(SAMPLE).expect("inflates");
         let text = String::from_utf8_lossy(&out);
         assert!(text.contains("The quick brown fox"), "{text}");
+        assert_eq!(out.len(), "The quick brown fox jumps over the lazy dog. ".len() * 4);
+    }
+
+    /// A stored block is the simplest legal deflate: a length, its complement, then the
+    /// bytes. Two of them in one stream also prove the last-block flag is what ends the
+    /// loop rather than the end of the input.
+    #[test]
+    fn stored_blocks_decode_in_sequence() {
+        let mut w = Writer::default();
+        w.stored(false, b"hello");
+        w.stored(true, b" world");
+        assert_eq!(inflate(&w.finish()).expect("stored blocks"), b"hello world");
+    }
+
+    #[test]
+    fn a_stored_block_with_the_wrong_length_is_refused() {
+        let mut w = Writer::default();
+        w.header(true, 0);
+        w.align();
+        w.value(5, 16); // LEN
+        w.value(0, 16); // one's complement of 0xFFFF, not of 5
+        for b in b"hello" {
+            w.value(*b as u32, 8);
+        }
+        let err = inflate(&w.finish()).expect_err("LEN and NLEN disagree");
+        assert!(err.contains("length mismatch"), "{err}");
+    }
+
+    /// The fixed table is the one every zlib can decode without a table in the stream, and
+    /// it is where a back-reference has to be handled byte by byte: copying 3 bytes at
+    /// distance 2 from "AB" has to produce "ABA", not a memcpy of a stale region.
+    #[test]
+    fn a_fixed_block_with_a_back_reference_overlaps_correctly() {
+        let mut w = Writer::default();
+        w.header(true, 1);
+        w.fixed_literal(u16::from(b'A'));
+        w.fixed_literal(u16::from(b'B'));
+        w.fixed_match(257, 1); // length 3, distance 2
+        w.fixed_literal(256); // end of block
+        let out = inflate(&w.finish()).expect("fixed block");
+        assert_eq!(out, b"ABABA");
+    }
+
+    /// A distance that reaches further back than there is output would read memory that was
+    /// never produced. That has to be an error, not a wrapped index or a panic.
+    #[test]
+    fn a_distance_past_the_start_of_the_output_is_refused() {
+        let mut w = Writer::default();
+        w.header(true, 1);
+        w.fixed_match(257, 2); // length 3, distance 3 with nothing decoded yet
+        w.fixed_literal(256);
+        let err = inflate(&w.finish()).expect_err("nothing to copy from");
+        assert!(err.contains("past the start"), "{err}");
+    }
+
+    /// Block type 3 is reserved. A decoder that treated it as stored, or ignored it, would
+    /// keep going with the rest of the stream out of step.
+    #[test]
+    fn a_reserved_block_type_is_refused() {
+        let mut w = Writer::default();
+        w.header(true, 3);
+        let err = inflate(&w.finish()).expect_err("type 3 is not defined");
+        assert!(err.contains("reserved"), "{err}");
+    }
+
+    /// Dynamic block: the code-length code itself is Huffman coded, the literal lengths use
+    /// the zero-repeat symbols 17 and 18, and 16 repeats the previous length. The alphabet
+    /// this builds has 'A'-'D' at 3 bits and end-of-block at 1 bit, so "A" is three bits.
+    #[test]
+    fn a_dynamic_block_built_from_repeat_symbols_decodes() {
+        let mut w = Writer::default();
+        w.header(true, 2);
+        w.value(0, 5); // HLIT = 257
+        w.value(0, 5); // HDIST = 1
+        w.value(14, 4); // HCLEN = 18 (all but the last of the 19 length symbols)
+                        // Code-length alphabet: symbols 0, 1, 3, 16, 17, 18 at 3 bits each, written in the
+                        // permuted order the format uses. The gaps (8, 7, 9, ...) are unused and get 0.
+        for len in [3, 3, 3, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 3] {
+            w.value(len, 3);
+        }
+        // Canonical codes for that alphabet, in symbol order: 0=000 1=001 3=010 16=011
+        // 17=100 18=101.
+        w.code(0b101, 3); // 18: 65 zeros
+        w.value(54, 7); // 11 + 54 = 65
+        w.code(0b010, 3); // 3: literal 'A' is 3 bits long
+        w.code(0b011, 3); // 16: repeat the previous length...
+        w.value(0, 2); // ...three more times, so 'A'-'D' are all 3 bits
+        for _ in 0..18 {
+            w.code(0b100, 3); // 17: ten zeros each
+            w.value(7, 3);
+        }
+        w.code(0b100, 3); // 17: the remaining seven zeros
+        w.value(4, 3);
+        w.code(0b001, 3); // symbol 1: end-of-block is 1 bit
+        w.code(0b001, 3); // and the single distance code is 1 bit
+                          // Literal table: 65..68 = 3 bits (100..111), 256 = 1 bit (0).
+        w.code(0b100, 3); // 'A'
+        w.code(0b0, 1); // end of block
+        assert_eq!(inflate(&w.finish()).expect("dynamic block"), b"A");
+    }
+
+    /// Symbol 16 says "repeat the previous length", which means nothing at the first entry.
+    /// Accepting it would take whatever byte was in the buffer before.
+    #[test]
+    fn a_repeat_with_no_previous_length_is_refused() {
+        let mut w = Writer::default();
+        w.header(true, 2);
+        w.value(0, 5);
+        w.value(0, 5);
+        w.value(0, 4); // HCLEN = 4: symbols 16, 17, 18, 0
+        for len in [2, 0, 2, 1] {
+            w.value(len, 3);
+        }
+        // Canonical: 0 = 0, 16 = 10, 18 = 11.
+        w.code(0b10, 2);
+        let err = inflate(&w.finish()).expect_err("nothing to repeat");
+        assert!(err.contains("no previous length"), "{err}");
+    }
+
+    /// A bit pattern that is not in the table has to be an error rather than a symbol
+    /// picked out of the empty slot. An alphabet with only 'A' and 'B' at two bits leaves
+    /// every code starting with a 1 unmatched, and the decoder has to give up after
+    /// fifteen bits.
+    #[test]
+    fn a_code_that_is_not_in_the_table_is_refused() {
+        let mut w = Writer::default();
+        w.header(true, 2);
+        w.value(0, 5); // HLIT = 257
+        w.value(0, 5); // HDIST = 1
+        w.value(14, 4); // HCLEN = 18
+        for len in [3, 3, 3, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 3] {
+            w.value(len, 3);
+        }
+        // Code-length codes: 0=000 1=001 3=010 16=011 17=100 18=101.
+        w.code(0b101, 3); // 18: 65 zeros
+        w.value(54, 7);
+        w.code(0b010, 3); // literal 'A' is 3 bits
+        w.code(0b010, 3); // literal 'B' is 3 bits
+        for _ in 0..19 {
+            w.code(0b100, 3); // 17: ten zeros each, up to symbol 256
+            w.value(7, 3);
+        }
+        w.code(0b001, 3); // the one distance code, 1 bit
+                          // No end-of-block symbol exists in this alphabet, and 11... matches nothing.
+        for _ in 0..8 {
+            w.value(0xFF, 8);
+        }
+        let err = inflate(&w.finish()).expect_err("11 starts no code in that table");
+        assert!(err.contains("bad Huffman code"), "{err}");
+    }
+
+    /// A truncated stream must fail rather than return the half it managed to decode: a
+    /// partial file that looks like a successful extraction is worse than no file.
+    #[test]
+    fn a_truncated_stream_is_refused() {
+        let err = inflate(&[]).expect_err("no input");
+        assert!(err.contains("ran out of input"), "{err}");
+        for cut in [4, 16, SAMPLE.len() - 1] {
+            let err = inflate(&SAMPLE[..cut]).expect_err("cut short");
+            assert!(err.contains("ran out of input"), "at {cut}: {err}");
+        }
+        // The last byte of a stored block's payload is not optional either.
+        let mut w = Writer::default();
+        w.stored(true, b"abcdef");
+        let mut bytes = w.finish();
+        bytes.truncate(bytes.len() - 2);
+        let err = inflate(&bytes).expect_err("short payload");
+        assert!(err.contains("ran out of input"), "{err}");
     }
 
     #[test]
     fn crc32_matches_the_reference() {
         assert_eq!(crc32(b"123456789"), 0xcbf4_3926);
         assert_eq!(crc32(b""), 0);
+        // The check value zlib documents for its own CRC-32.
+        assert_eq!(crc32(b"The quick brown fox jumps over the lazy dog"), 0x414f_a339);
     }
 }

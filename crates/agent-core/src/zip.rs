@@ -188,4 +188,43 @@ mod tests {
         assert_eq!(entries[0].0, "hello.txt");
         assert_eq!(String::from_utf8_lossy(&entries[0].1), "hello hello hello hello\n");
     }
+
+    /// A payload that no longer matches the CRC in the header must not be handed back as if
+    /// it were the file: a silently corrupted extraction is worse than a refused one.
+    #[test]
+    fn a_payload_that_does_not_match_its_crc_is_refused() {
+        let entries = vec![("a.txt".to_string(), b"hello".to_vec())];
+        let archive = write(&entries).expect("writes");
+        let name_len = u16_at(&archive, 26).expect("a name length") as usize;
+        let mut corrupt = archive.clone();
+        corrupt[30 + name_len] = b'j'; // one byte of the stored payload
+        let err = read(&corrupt).err().expect("a corrupted entry is not a file");
+        assert!(err.contains("CRC"), "{err}");
+    }
+
+    /// The same for a deflated entry: the decompressed bytes are what the CRC covers.
+    #[test]
+    fn a_deflated_payload_that_does_not_match_its_crc_is_refused() {
+        const ARCHIVE: &[u8] = &[
+            0x50, 0x4b, 0x03, 0x04, 0x14, 0x00, 0x00, 0x00, 0x08, 0x00, 0xc0, 0x52, 0x6c, 0x5d, 0x00, 0x88,
+            0x59, 0x0b, 0x0b, 0x00, 0x00, 0x00, 0x18, 0x00, 0x00, 0x00, 0x09, 0x00, 0x00, 0x00, 0x68, 0x65,
+            0x6c, 0x6c, 0x6f, 0x2e, 0x74, 0x78, 0x74, 0xcb, 0x48, 0xcd, 0xc9, 0xc9, 0x57, 0xc8, 0x40, 0x27,
+            0xb9, 0x00, 0x50, 0x4b, 0x01, 0x02, 0x14, 0x00, 0x14, 0x00, 0x00, 0x00, 0x08, 0x00, 0xc0, 0x52,
+            0x6c, 0x5d, 0x00, 0x88, 0x59, 0x0b, 0x0b, 0x00, 0x00, 0x00, 0x18, 0x00, 0x00, 0x00, 0x09, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80, 0x01, 0x00, 0x00, 0x00, 0x00,
+            0x68, 0x65, 0x6c, 0x6c, 0x6f, 0x2e, 0x74, 0x78, 0x74, 0x50, 0x4b, 0x05, 0x06, 0x00, 0x00, 0x00,
+            0x00, 0x01, 0x00, 0x01, 0x00, 0x37, 0x00, 0x00, 0x00, 0x32, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ];
+        let mut corrupt = ARCHIVE.to_vec();
+        // The CRC field of the central directory record, changed but the payload left
+        // alone: the entry decompresses, and then the check is the only thing standing
+        // between the caller and a file that is not the one that was archived.
+        let central = corrupt
+            .windows(4)
+            .position(|w| w == CENTRAL_HEADER.to_le_bytes())
+            .expect("a central directory record");
+        corrupt[central + 16] ^= 0xFF;
+        let err = read(&corrupt).err().expect("a wrong CRC is not a file");
+        assert!(err.contains("CRC"), "{err}");
+    }
 }
