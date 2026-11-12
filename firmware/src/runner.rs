@@ -47,10 +47,42 @@ use esp32_agent_core::logbuf::LogBuf;
 
 /// The agent thread's stack. It holds a `TcpStream`, a JSON request body and
 /// `serde_json`'s recursive parser; 32 KB matches the main thread.
-// Internal RAM, not PSRAM: a thread stack cannot live in PSRAM. 32 KB failed to
-// allocate once WiFi and the HTTP server were up (pthread: Failed to create task),
-// and this thread only marshals JSON, so 16 KB is the working size.
+///
+/// 32 KB of internal RAM failed to allocate once WiFi and the HTTP server were up
+/// (`pthread: Failed to create task`), so 16 KB is the working size — and on a boot with the
+/// heap fragmented even 16 KB of *contiguous internal* RAM is not there: the spawn answers
+/// `Not enough space (os error 12)` and the board's own agent never runs. This stack
+/// therefore comes from PSRAM (see [`with_psram_stack`]), which is why its size can stay what
+/// it is and internal RAM pays nothing.
 const STACK_BYTES: usize = 16 * 1024;
+
+/// Run `f` with PSRAM stacks allowed for the threads it creates.
+///
+/// `pthread_create` allocates stacks with `MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT` unless the
+/// calling thread's config says otherwise — even with
+/// `CONFIG_SPIRAM_ALLOW_STACK_EXTERNAL_MEMORY` in the sdkconfig, which only *permits* an
+/// external stack, it does not ask for one. That is the whole reason a board with 8 MB of
+/// PSRAM free can still fail to start a 16 KB thread with `ENOMEM`.
+///
+/// The config is per-thread and inherited by children, so it is set immediately around the
+/// one spawn and restored afterwards: everything else that starts later (a request thread, a
+/// stream) keeps allocating where it used to.
+fn with_psram_stack<T>(create: impl FnOnce() -> T) -> T {
+    use esp_idf_svc::sys;
+    let mut before: sys::esp_pthread_cfg_t = unsafe { std::mem::zeroed() };
+    let have_before = unsafe { sys::esp_pthread_get_cfg(&mut before) } == sys::ESP_OK;
+    let mut cfg = unsafe { sys::esp_pthread_get_default_config() };
+    cfg.stack_alloc_caps = sys::MALLOC_CAP_SPIRAM | sys::MALLOC_CAP_8BIT;
+    unsafe { sys::esp_pthread_set_cfg(&cfg) };
+    let out = create();
+    if have_before {
+        unsafe { sys::esp_pthread_set_cfg(&before) };
+    } else {
+        let back = unsafe { sys::esp_pthread_get_default_config() };
+        unsafe { sys::esp_pthread_set_cfg(&back) };
+    }
+    out
+}
 
 /// Before this instant (2023-11-14) the clock has never been set, so `at_hhmm`
 /// cannot mean a wall-clock time yet.
@@ -531,14 +563,15 @@ pub fn start(
     timeout_s: Arc<AtomicU32>,
     transport: EspHttpTransport,
 ) -> Result<(), String> {
-    std::thread::Builder::new()
-        .name("mcp-agent".into())
-        .stack_size(STACK_BYTES)
-        // The model transport lives on this thread, not in the `App`: a turn is run in
-        // phases precisely so that the model call happens with the app lock released.
-        .spawn(move || run_loop(shared, log, timeout_s, transport))
-        .map(|_| ())
-        .map_err(|e| format!("could not start the agent thread: {e}"))
+    let spawned = with_psram_stack(|| {
+        std::thread::Builder::new()
+            .name("mcp-agent".into())
+            .stack_size(STACK_BYTES)
+            // The model transport lives on this thread, not in the `App`: a turn is run in
+            // phases precisely so that the model call happens with the app lock released.
+            .spawn(move || run_loop(shared, log, timeout_s, transport))
+    });
+    spawned.map(|_| ()).map_err(|e| format!("could not start the agent thread: {e}"))
 }
 
 /// Hand the HTTP transport to the `App` and say what it will talk to.

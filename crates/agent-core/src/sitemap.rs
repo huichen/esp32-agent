@@ -102,7 +102,7 @@ pub const ROUTES: &[Route] = &[
         "/api/status",
         "status",
         Auth::Open,
-        "Board, memory, WiFi, MCP counters, device count",
+        "Board, memory, WiFi, MCP counters, device count, and whether the agent thread is up",
         "",
         "a status object",
     ),
