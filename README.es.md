@@ -23,7 +23,7 @@ marcha.
 | Encuentra su propio hardware | I2C, 1-Wire y los pines declarados se sondean al arrancar; solo lo que responde obtiene herramientas. [Capacidades](docs/capabilities.md) |
 | Un conjunto de herramientas, dos invocadores | El endpoint MCP y el agente de la placa ven las mismas herramientas, desde una sola descripción. [API HTTP y MCP](docs/http-api.md) |
 | Una consola sobre HTTPS | Hablar con el modelo y configurar dispositivos, herramientas, programación, registros, WiFi y el modelo desde un teléfono; la placa emite su propio certificado. [Consola web](#consola-web) |
-| Actúa sin nadie delante | Prompts temporizados y reglas de sensores que lanzan uno al cruzar un umbral. [Trabajo programado](#trabajo-programado) |
+| Actúa sin nadie delante | Prompts temporizados y reglas de sensores que lanzan uno cuando una lectura cruza un umbral. [Trabajo programado](#trabajo-programado) |
 | Un shell y un lenguaje de script | `shell` con 26 comandos con nombres de NuttX, y un intérprete para bucles sobre llamadas a herramientas. [Shell](#shell) · [Script](#script) |
 | Órdenes permanentes | 2 KB en el prompt de sistema para la finalidad de esta placa, escribibles desde la consola, `shell` y HTTP. [Órdenes permanentes](#órdenes-permanentes) |
 | Sin nube en el camino | HTTPS desde la placa, un certificado que genera ella misma, un PIN para tres invocadores. [Autenticación](#autenticación) |
@@ -79,8 +79,9 @@ curl -sS -X POST http://<board>/api/agent/message -H 'Content-Type: application/
   -d '{"text":"write HELLO on the OLED, set the LED blue, then scan I2C"}'
 ```
 
-Tres protocolos: `chat`, `responses`, `anthropic`. Las imágenes de la consola salen como partes
-de contenido. `reasoning` fija el nivel de razonamiento, `max_steps` limita las llamadas al
+Tres protocolos: `chat` (chat completions de OpenAI), `responses` (API Responses de OpenAI) y
+`anthropic` (API Messages). Las imágenes de la consola salen como partes de contenido.
+`reasoning` fija el nivel de razonamiento, `max_steps` limita las llamadas al
 modelo por turno (0 = sin límite), `context_tokens` y `max_output_tokens` fijan la ventana y la
 reserva de respuesta, y la transcripción se compacta al 80% de la ventana. Sin clave, se puede
 apuntar `base_url` al `/selftest/chat/completions` de la propia placa y el bucle sigue
@@ -95,9 +96,10 @@ curl -sS -X POST http://<board>/api/agent/prompt -H 'Content-Type: application/j
   -d '{"action":"set","text":"The pump relay is on GPIO12. Never run it past two minutes."}'
 ```
 
-`action` es `set`, `append` o `clear`; `GET /api/agent/prompt` muestra el prompt que recibirá el
-modelo, incluida la parte personalizada, y el agente llega a él con
-`shell {"command":"system_prompt set …"}`. 2 KB en NVS, así que sobrevive a un reinicio.
+`action` es `set`, `append` o `clear`, y `system_prompt get` lo lee de vuelta desde la placa;
+`GET /api/agent/prompt` muestra el prompt que recibirá el modelo, incluida la parte
+personalizada, y el agente llega a él con `shell {"command":"system_prompt set …"}`. 2 KB en
+NVS, así que sobrevive a un reinicio.
 
 ## Shell
 
@@ -155,8 +157,9 @@ curl -sS -X POST http://<board>/api/sched -H 'Content-Type: application/json' -d
   "rules":[{"id":"r1","tool":"bme280_read","path":"temperature_c","op":"gt","value":30,"prompt":"it is hot"}]}'
 ```
 
-`at_hhmm` ejecuta a una hora de reloj UTC en su lugar. El agente puede programarse a sí mismo
-con `schedule {"action":"add", …}`. Las tareas sobreviven a un reinicio.
+`at_hhmm` ejecuta a una hora de reloj UTC en su lugar, y cada respuesta va a la transcripción
+etiquetada `source: "schedule:t1"`. El agente puede programarse a sí mismo con
+`schedule {"action":"add", …}`. Las tareas sobreviven a un reinicio.
 
 ## Manifiesto
 
@@ -177,8 +180,10 @@ Tres caminos añaden hardware: un manifiesto (sin temporización ni máquina de 
 en caliente), un driver compilado (`drivers/<chip>.rs`, para máquinas de estados y temporización
 estricta), o un perfil de placa (hechos que no se pueden sondear, como qué pines usan el LED y
 los botones). Un driver solo se lista cuando el sondeo encuentra el dispositivo, así que uno a
-medio escribir no puede informar de hardware que no está.
-[docs/adding-a-device.md](docs/adding-a-device.md) cubre ambos.
+medio escribir no puede informar de hardware que no está. La validación se ejecuta en la placa:
+los rangos de los parámetros y un tope por minuto de `safety` se comprueban antes de que se mueva
+un pin, y una llamada fuera de rango devuelve el rango que aceptaría.
+[docs/adding-a-device.md](docs/adding-a-device.md) cubre los tres.
 
 ## Autenticación
 
@@ -213,7 +218,7 @@ Fusionarlos metería el simulador en cada imagen y las dependencias del firmware
 descargado.
 
 ```
-crates/agent-core/    hardware.rs (the trait) · drivers/ (one module per chip) ·
+crates/agent-core/    hardware.rs (the trait) · drivers/ (one module per chip) · boards.rs ·
                       manifest.rs · agent.rs + llm.rs · sched.rs · tools/ ·
                       http.rs · app.rs · sitemap.rs + settings.rs · virtual_board.rs
 crates/agent-sim/     the virtual board behind an HTTP port
