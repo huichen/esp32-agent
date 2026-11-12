@@ -103,6 +103,12 @@ window.__esp32Measure = function () {
   attach(null);
   out.restored = snap();
   out.md = window.__esp32Markdown();
+  // `pretty()` is what makes a tool argument or a result readable: a payload string with
+  // its newlines escaped is the wall of text the console used to show. Three cases, because
+  // leaving non-JSON alone matters as much as laying out JSON.
+  out.prettyJson = pretty('{"a":1,"b":2}');
+  out.prettyBlock = pretty('{"text":"line one\\nline two","bytes":3}');
+  out.prettyPlain = pretty("not json at all");
   return out;
 };
 </script>
@@ -500,6 +506,28 @@ fn a_markdown_table_renders_as_a_table_on_a_phone() {
         assert!(
             !md["text"].as_str().unwrap_or("").contains("|---"),
             "{at}: the delimiter row leaked into the text: {md}"
+        );
+
+        // A tool argument or result is laid out, not printed as one line with `\n` in it:
+        // the payload string becomes a block, the rest of the object trails it as one line.
+        let pretty_json = measured[width]["prettyJson"].as_str().unwrap_or("");
+        assert!(
+            pretty_json.contains("\"a\": 1") && pretty_json.contains('\n'),
+            "{at}: JSON was not indented: {pretty_json:?}"
+        );
+        let pretty_block = measured[width]["prettyBlock"].as_str().unwrap_or("");
+        assert!(
+            pretty_block.contains("line one\nline two"),
+            "{at}: the newline inside the payload stayed escaped: {pretty_block:?}"
+        );
+        assert!(
+            pretty_block.contains("\u{2014} bytes: 3"),
+            "{at}: the other fields were dropped: {pretty_block:?}"
+        );
+        assert_eq!(
+            measured[width]["prettyPlain"].as_str().unwrap_or(""),
+            "not json at all",
+            "{at}: text that is not JSON must be left alone"
         );
 
         // A wide table may scroll inside its wrapper; what it may not do is make the bubble
