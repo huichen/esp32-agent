@@ -19,7 +19,7 @@
 | 一套工具，两个调用方 | MCP 端点与板载智能体看到同一批工具，来自同一份描述。[HTTP 与 MCP API](docs/http-api.md) |
 | 通过 HTTPS 的控制台 | 在手机上对话，并配置设备、工具、定时、日志、WiFi 与模型；证书由板子自己签发。[网页控制台](docs/web-console.md) |
 | 无人值守也会动作 | 定时提示，以及读数越过阈值时触发提示的传感器规则。[定时任务](docs/scheduling.md) |
-| 一个 shell 和一门脚本语言 | `shell` 有 55 个按 NuttX 命名的命令，还有一个对工具调用做循环的解释器。[Shell](docs/shell.md) · [脚本](docs/scripting.md) |
+| 一个 shell 和一门脚本语言 | `shell` 有 57 个按 NuttX 命名的命令，还有一个对工具调用做循环的解释器。[Shell](docs/shell.md) · [脚本](docs/scripting.md) |
 | 它会记住告诉过它的事 | 常驻指令、`/AGENTS.md`、`/MEMORY.md` 索引与技能，每轮组装进提示词。[模型每轮都能看到什么](docs/context.md) |
 | 自带技能 | 固件里带三个流程——写技能、摸清接线、救回一块看起来坏了的板——首次启动就落在 `/skills`；你改过的那份会一直是你的。[技能](docs/agent-skills.md) |
 | 板子自己就是服务器 | 由板子提供 HTTPS，证书由它生成，三类调用方一个 PIN。[认证](docs/security.md) |
@@ -76,7 +76,7 @@ agent 用 `POST /api/agent/config` 写进去——和面板发的是同一个调
 
 | 部分 | 状态 |
 |---|---|
-| `agent-core` | 427 个单元测试与 14 个集成测试通过；`scripts/smoke.ps1` 端到端通过 |
+| `agent-core` | 677 个单元测试与 14 个集成测试通过；`scripts/smoke.ps1` 端到端通过 |
 | 模拟器 | 控制台、MCP 与智能体循环端到端运行 |
 | 固件 | 在 ESP32-S3-DevKitC-1 N16R8（IDF v5.5.2）上烧录：42 个工具、OLED 128×32、I²S 麦克风与功放、WS2812、TLS 控制台、通过 HTTPS 的模型轮次 |
 | 未实现 | OTA、SD 卡、DHT11/22、摄像头。见 `ROADMAP.md` |
