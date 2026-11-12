@@ -91,7 +91,7 @@ espflash write-bin --chip esp32s3 --flash-size 16mb 0x0 esp32-agent-vX.Y.Z.bin
 [HTTP وMCP](docs/http-api.md) · [إضافة جهاز](docs/adding-a-device.md) · [الحرق](docs/flashing.md) ·
 [استكشاف الأخطاء](docs/troubleshooting.md) · [حلقة الوكيل](docs/agent-loop.md) · [التدفق](docs/agent-stream.md) ·
 [المهارات](docs/agent-skills.md) · [الذاكرة](docs/agent-memory.md) · [Scripting](docs/scripting.md) ·
-[Model](docs/model.md) · [Web console](docs/web-console.md) · [Scheduling](docs/scheduling.md) · [Shell](docs/shell.md) · [Context layers](docs/context.md) · [Security](docs/security.md) · [Simulator](docs/simulator.md) · [Performance](docs/performance.md)
+[Model](docs/model.md) · [Web console](docs/web-console.md) · [Scheduling](docs/scheduling.md) · [Shell](docs/shell.md) · [Context layers](docs/context.md) · [Security](docs/security.md) · [Simulator](docs/simulator.md) · [Audio](docs/audio.md)
 
 ## المساهمة
 
