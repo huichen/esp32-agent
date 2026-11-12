@@ -10,7 +10,7 @@
 
 use crate::logbuf::LogBuf;
 use std::collections::BTreeMap;
-use std::io::{Read, Write};
+use std::io::Read;
 use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -302,16 +302,51 @@ impl Response {
 
 pub type Handler = Arc<dyn Fn(&Request) -> Response + Send + Sync>;
 
-struct BufferedReader {
-    stream: TcpStream,
+/// Anything that can carry an HTTP connection.
+///
+/// The server does not care whether the bytes travel over a plain socket or a TLS session:
+/// it reads a request, writes a response, and sets two timeouts. Keeping that in a trait is
+/// what lets HTTPS be a second listener rather than a second server.
+pub trait Stream: std::io::Read + std::io::Write + Send {
+    fn set_read_timeout(&self, d: Option<Duration>) -> std::io::Result<()>;
+    fn set_write_timeout(&self, d: Option<Duration>) -> std::io::Result<()>;
+    fn set_nodelay(&self, on: bool) -> std::io::Result<()>;
+}
+
+impl Stream for TcpStream {
+    fn set_read_timeout(&self, d: Option<Duration>) -> std::io::Result<()> {
+        TcpStream::set_read_timeout(self, d)
+    }
+    fn set_write_timeout(&self, d: Option<Duration>) -> std::io::Result<()> {
+        TcpStream::set_write_timeout(self, d)
+    }
+    fn set_nodelay(&self, on: bool) -> std::io::Result<()> {
+        TcpStream::set_nodelay(self, on)
+    }
+}
+
+impl Stream for Box<dyn Stream> {
+    fn set_read_timeout(&self, d: Option<Duration>) -> std::io::Result<()> {
+        (**self).set_read_timeout(d)
+    }
+    fn set_write_timeout(&self, d: Option<Duration>) -> std::io::Result<()> {
+        (**self).set_write_timeout(d)
+    }
+    fn set_nodelay(&self, on: bool) -> std::io::Result<()> {
+        (**self).set_nodelay(on)
+    }
+}
+
+struct BufferedReader<S> {
+    stream: S,
     buf: Vec<u8>,
     pos: usize,
 }
 
-impl BufferedReader {
+impl<S: Stream> BufferedReader<S> {
     /// A reader that already holds the bytes read while the socket was still in the
     /// waiting list.
-    fn with_prefix(stream: TcpStream, prefix: Vec<u8>) -> std::io::Result<Self> {
+    fn with_prefix(stream: S, prefix: Vec<u8>) -> std::io::Result<Self> {
         stream.set_read_timeout(Some(IDLE_TIMEOUT))?;
         stream.set_write_timeout(Some(IDLE_TIMEOUT))?;
         stream.set_nodelay(true).ok();
@@ -392,7 +427,7 @@ fn find_crlf(hay: &[u8]) -> Option<usize> {
     hay.windows(2).position(|w| w == b"\r\n")
 }
 
-fn parse_request(conn: &mut BufferedReader, peer: &str) -> std::io::Result<Option<Request>> {
+fn parse_request<S: Stream>(conn: &mut BufferedReader<S>, peer: &str) -> std::io::Result<Option<Request>> {
     let request_line = match conn.line(MAX_HEADER_BYTES)? {
         Some(l) => l,
         None => return Ok(None),
@@ -408,8 +443,8 @@ fn parse_request(conn: &mut BufferedReader, peer: &str) -> std::io::Result<Optio
     parse_with_line(conn, peer, &request_line)
 }
 
-fn parse_with_line(
-    conn: &mut BufferedReader,
+fn parse_with_line<S: Stream>(
+    conn: &mut BufferedReader<S>,
     peer: &str,
     request_line: &str,
 ) -> std::io::Result<Option<Request>> {
@@ -518,8 +553,8 @@ fn url_decode(s: &str) -> String {
     String::from_utf8_lossy(&out).to_string()
 }
 
-fn write_response(
-    stream: &mut TcpStream,
+fn write_response<S: std::io::Write>(
+    stream: &mut S,
     resp: &Response,
     keep_alive: bool,
     head_only: bool,
@@ -552,11 +587,11 @@ fn write_response(
 }
 
 /// A socket as an [`EventSink`]: every `send` becomes one chunk.
-struct ChunkedSink<'a> {
-    stream: &'a mut TcpStream,
+struct ChunkedSink<'a, S: std::io::Write> {
+    stream: &'a mut S,
 }
 
-impl EventSink for ChunkedSink<'_> {
+impl<S: std::io::Write> EventSink for ChunkedSink<'_, S> {
     fn send(&mut self, bytes: &[u8]) -> std::io::Result<()> {
         if bytes.is_empty() {
             return Ok(());
@@ -577,8 +612,8 @@ impl EventSink for ChunkedSink<'_> {
 /// to, so the body is chunked and the connection closed afterwards. `EventSource`
 /// reconnects on its own with `after=<last id>`; that is the contract's design, not
 /// a failure mode.
-fn write_stream_response(
-    stream: &mut TcpStream,
+fn write_stream_response<S: std::io::Write>(
+    stream: &mut S,
     resp: &Response,
     body: StreamBody,
     head_only: bool,
@@ -782,35 +817,35 @@ enum Ready {
 }
 
 /// What serving one connection came to.
-enum Serve {
+enum Serve<S> {
     /// Every request was answered; the socket is closed.
     Done,
     /// The socket died mid-request.
     Failed,
     /// The response streams, so the socket moves to a thread of its own.
-    Stream(BufferedReader, Response, StreamBody, bool),
+    Stream(BufferedReader<S>, Response, StreamBody, bool),
     /// One request answered, the client may send another: hand the socket back to the
     /// waiting list instead of parking the accept thread in a second read. Chrome keeps
     /// six warm connections open and would otherwise hold the whole server.
-    KeepAlive(TcpStream, Vec<u8>),
+    KeepAlive(S, Vec<u8>),
 }
 
-impl BufferedReader {
+impl<S: Stream> BufferedReader<S> {
     /// The stream plus any bytes already read past the request that was just answered.
-    fn into_parts(mut self) -> (TcpStream, Vec<u8>) {
+    fn into_parts(mut self) -> (S, Vec<u8>) {
         let rest = self.buf.split_off(self.pos.min(self.buf.len()));
         (self.stream, rest)
     }
 }
 
 /// Serve **one** request. The caller decides what happens to the socket afterwards.
-fn serve_until_stream(
-    stream: TcpStream,
+fn serve_until_stream<S: Stream>(
+    stream: S,
     prefix: Vec<u8>,
     peer: &str,
     handler: &Handler,
     log: &Arc<LogBuf>,
-) -> Serve {
+) -> Serve<S> {
     let mut conn = match BufferedReader::with_prefix(stream, prefix) {
         Ok(c) => c,
         Err(_) => return Serve::Failed,
@@ -867,6 +902,8 @@ fn serve_connection(stream: TcpStream, peer: String, handler: Handler, log: Arc<
 #[cfg(test)]
 mod tests {
     use super::*;
+    // The tests write raw requests; the library itself only needs `Read`.
+    use std::io::Write;
 
     /// The portal's three files must not be cached: an HTML that changed and a script that
     /// did not is a blank page, which reads as "the site is down".
