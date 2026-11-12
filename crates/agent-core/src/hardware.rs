@@ -198,6 +198,14 @@ pub trait Hardware: Send {
         None
     }
 
+    /// Running tasks with their state and remaining stack, for `shell ps`.
+    ///
+    /// Empty means the platform cannot enumerate them; the command says so rather than
+    /// printing an empty table that looks like a board with nothing running.
+    fn tasks(&mut self) -> Vec<serde_json::Value> {
+        Vec::new()
+    }
+
     /// ICMP echo. The default refuses: a platform that cannot send one must say so rather
     /// than report every host as unreachable, which is what a fake reply would mean.
     fn ping(&mut self, _host: &str, _count: u32) -> Result<serde_json::Value> {

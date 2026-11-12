@@ -239,6 +239,51 @@ impl Hardware for EspHw {
         self.chip_temperature()
     }
 
+    /// Running tasks: name, state, priority and the stack high-water mark.
+    ///
+    /// `uxTaskGetSystemState` suspends the scheduler while it copies, so it is a debug aid
+    /// — which is exactly what `ps` is.
+    fn tasks(&mut self) -> Vec<serde_json::Value> {
+        use serde_json::json;
+        unsafe {
+            let count = sys::uxTaskGetNumberOfTasks();
+            if count == 0 || count > 40 {
+                return Vec::new();
+            }
+            let mut items: Vec<sys::TaskStatus_t> = Vec::with_capacity(count as usize);
+            let mut total_runtime: u32 = 0;
+            let filled = sys::uxTaskGetSystemState(items.as_mut_ptr(), count, &mut total_runtime);
+            if filled == 0 {
+                return Vec::new();
+            }
+            items.set_len(filled as usize);
+            items
+                .iter()
+                .map(|t| {
+                    let name = if t.pcTaskName.is_null() {
+                        String::new()
+                    } else {
+                        std::ffi::CStr::from_ptr(t.pcTaskName).to_string_lossy().to_string()
+                    };
+                    let state = match t.eCurrentState {
+                        0 => "running",
+                        1 => "ready",
+                        2 => "blocked",
+                        3 => "suspended",
+                        4 => "deleted",
+                        _ => "?",
+                    };
+                    json!({
+                        "name": name,
+                        "state": state,
+                        "priority": t.uxCurrentPriority,
+                        "stack_free_words": t.usStackHighWaterMark,
+                    })
+                })
+                .collect()
+        }
+    }
+
     /// ICMP echo through ESP-IDF's ping session.
     ///
     /// One session per call: the driver runs its own task and reports through profiles,
@@ -328,11 +373,21 @@ impl Hardware for EspHw {
         // the build (MCU is set in .cargo/config.toml) and the rest from the
         // runtime heap queries that are available.
         let soc = option_env!("MCU").unwrap_or("esp32");
-        let (cores, flash_mb, psram_kb) = match soc {
-            "esp32s3" => (2, 16, 0), // PSRAM size is not queried: the symbol only exists when CONFIG_SPIRAM is on
-            "esp32c3" => (1, 4, 0),
-            "esp32c6" => (1, 8, 0),
-            _ => (2, 4, 0),
+        let (cores, flash_mb) = match soc {
+            "esp32s3" => (2, 16),
+            "esp32c3" => (1, 4),
+            "esp32c6" => (1, 8),
+            _ => (2, 4),
+        };
+        // PSRAM is only mapped when CONFIG_SPIRAM is on, and the getter only exists then.
+        // Reporting 0 on a board with 8 MB was wrong in `/api/status` and in `uname`.
+        let psram_kb = unsafe {
+            let bytes = sys::esp_psram_get_size();
+            if bytes > 0 {
+                (bytes / 1024) as u32
+            } else {
+                0
+            }
         };
         BoardInfo {
             soc: soc.into(),

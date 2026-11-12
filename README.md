@@ -102,6 +102,19 @@ shell  {"op":"zip","name":"t.zip","files":{"a.txt":"hello"}}
 shell  {"op":"unzip","archive_b64":"UEsDB..."}
 ```
 
+The commands a shell has for looking at itself, as NuttX's `nsh` does:
+
+```text
+shell  {"op":"df"}                                   # workspace usage against its 8 KB
+shell  {"op":"free"}                                 # heap, free and minimum
+shell  {"op":"uptime"}                               # uptime and model runs
+shell  {"op":"date"}                                 # clock, and whether SNTP has synced
+shell  {"op":"uname"}                                # soc, cores, flash, PSRAM, IDF, MAC
+shell  {"op":"ps"}                                   # tasks with state and stack headroom
+shell  {"op":"hexdump","path":"/dl/img.bin"}
+shell  {"op":"base64","path":"/notes/a.txt"}          # or --decode / --out <path>
+```
+
 `edit` refuses when `find` occurs zero or several times, so an ambiguous edit cannot rewrite
 the wrong place. `rm` and `mv` need `confirm`. `zip` writes stored entries and returns the
 archive as base64, because a tool result is capped at 2 KB; `unzip` reads stored and
