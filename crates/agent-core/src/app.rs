@@ -2071,6 +2071,39 @@ impl App {
     }
 
     /// Add, update, enable/disable or delete one task or rule by id.
+    /// Fire one task immediately, the way the tick would have at its due moment.
+    ///
+    /// A task either asks the model something or runs a script, exactly as on the timer, so a
+    /// manual run and a scheduled one cannot diverge. `last_run_ms` is deliberately not
+    /// touched: "run it now" must not postpone the run that was scheduled.
+    fn sched_run_now(&mut self, id: &str) -> std::result::Result<Value, String> {
+        let at_ms = now_ms();
+        let index =
+            self.tasks.iter().position(|t| t.id == id).ok_or_else(|| format!("no scheduled task `{id}`"))?;
+        let source = format!("schedule:{}", self.tasks[index].id);
+        if source.len() >= 64 {
+            return Err(format!("the source tag for `{id}` is too long"));
+        }
+        let prompt = self.tasks[index].prompt.clone();
+        let script = self.tasks[index].script.clone();
+        let script = if script.trim().is_empty() { None } else { Some(script) };
+        let mut out = json!({ "id": id, "source": source });
+        if let Some(text) = script {
+            let job = self.submit_script(&text, true);
+            self.log.info("script", format!("{source} ran a script on demand: {}", job.id));
+            out["kind"] = json!("script");
+            out["job"] = json!(job.id);
+        } else if !prompt.trim().is_empty() {
+            self.agent.push_user(&prompt, &source, at_ms);
+            self.log.info("sched", format!("{source} queued on demand"));
+            out["kind"] = json!("prompt");
+            out["queued"] = json!(true);
+        } else {
+            return Err(format!("task `{id}` has neither a prompt nor a script"));
+        }
+        Ok(out)
+    }
+
     fn sched_apply(&mut self, req: &Request) -> Response {
         let body = match req.json() {
             Ok(v) => v,
@@ -2827,6 +2860,22 @@ impl App {
                     return r;
                 }
                 self.sched_apply(req)
+            }
+            // Fire one task now. "Wait until 06:00" is not a test, and an outside caller may
+            // want the report now. It does not move the schedule: `last_run_ms` is left alone,
+            // so a manual run cannot starve the timer that was set for it.
+            ("POST", "/api/sched/run") => {
+                if let Err(r) = self.require_pin(req) {
+                    return r;
+                }
+                let id = match req.json() {
+                    Ok(body) => body.get("id").and_then(|i| i.as_str()).unwrap_or("").trim().to_string(),
+                    Err(e) => return Response::error_json(400, &format!("invalid JSON: {e}")),
+                };
+                match self.sched_run_now(&id) {
+                    Ok(v) => Response::json(&v),
+                    Err(e) => Response::json_status(404, &json!({ "error": e })),
+                }
             }
             ("GET", "/api/wifi/scan") => match self.hw.wifi_scan() {
                 Ok(aps) => Response::json(&json!({ "networks": aps })),
