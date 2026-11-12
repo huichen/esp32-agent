@@ -154,9 +154,12 @@ Two of these report what the build cannot do instead of making something up:
 
 ## The workspace behind them
 
-One writable area, 8 KB of text, persisted. `write` creates parent paths; `edit` refuses when
-`find` matches zero or several times, so an ambiguous edit cannot rewrite the wrong place;
-`rm` and `mv` need `confirm`. `zip` writes stored entries and returns the archive as base64
+One writable area, 8 KB of text, persisted. A file holds 2048 bytes and the whole workspace
+8192; what is *stored* is a JSON blob spread over five NVS values (17 500 bytes), because
+one value cannot exceed about 4000 bytes and a workspace with three skills in it is already
+past that. `write` creates parent paths; `edit` refuses when `find` matches zero or several
+times, so an ambiguous edit cannot rewrite the wrong place; `rm` and `mv` need `confirm`.
+`zip` writes stored entries and returns the archive as base64
 because a tool result is capped at 2 KB — `unzip` reads stored and deflated entries and checks
 each CRC. `du` totals it file by file; there are no directories to total separately.
 

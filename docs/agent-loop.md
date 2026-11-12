@@ -29,8 +29,9 @@ works towards an objective on its own between turns.
   reasoning ≤ 4 KB, tool result ≤ 2 KB (cut with `…(truncated)`), model reply ≤ 8 KB,
   `agent.max_steps` model calls per turn (`0` = no limit, capped at 200 when set),
   `agent.tick_ms` clamped to 200–5000 (default 1000).
-- **No new ESP-IDF components.** The file workspace is an in-RAM map persisted as one JSON
-  blob in NVS, files ≤ 2 KB, whole workspace ≤ 8 KB.
+- **No new ESP-IDF components.** The file workspace is an in-RAM map persisted in NVS over
+  several values, files ≤ 2 KB, whole workspace ≤ 8 KB of text. See §4 for the layout and
+  what a reboot can and cannot lose.
 
 ## 2. The order of the tool list is part of the contract
 
@@ -88,6 +89,55 @@ landed, so the model answers instead of re-issuing the call.
 What a power cut still costs: the model output in flight (the turn is re-asked and paid for
 again), a queue entry that never started, and a cut inside the window between clearing the
 marker and the final save (one turn lost, never duplicated).
+
+### The file workspace, which had the bug the transcript never had
+
+The workspace is the same problem and, until now, the opposite answer. It was one JSON blob
+under `ws`, so once the files passed roughly 4 KB **every save failed** —
+`nvs write 'ws': ESP_ERR_NVS_VALUE_TOO_LONG` in the boot log — while `write` answered
+`ok: true` and `read` served the file out of RAM until the next boot took it away. Three
+seeded `SKILL.md` files are 5.7 KB: the board was in that state every time it booted, and it
+looked healthy from outside.
+
+The layout is the transcript's, with one difference that matters when something goes wrong:
+
+| | |
+|---|---|
+| routing | `ws` holds the header, `ws.1` … `ws.5` the chunks |
+| header | `ws1 <chunks> <bytes> <crc>,<crc>,…` — count, total length, and one FNV-1a checksum per chunk |
+| per value | 3500 bytes of blob, under the ~4000-byte ceiling ESP-IDF enforces |
+| per file | 2048 bytes of text (`tools::fs::MAX_FILE_BYTES`, unchanged) |
+| whole workspace | 8192 bytes of text (`WORKSPACE_TOTAL_MAX`, unchanged), 17 500 bytes of stored JSON |
+| write order | chunks first, header last |
+| read | every chunk is checked against the header; one that is missing, torn or from another write drops the whole workspace, logged with the value that disagreed |
+| migration | a plain JSON value under `ws` is the old format: read, then written back chunked on the same boot |
+
+The count in the header is what makes a stale tail harmless — a workspace that shrinks
+leaves older chunks behind, and they are never read. The per-chunk checksums are what make
+a torn write visible *and nameable*: `ws.2 does not match the checksum in ws` is something a
+person can act on, where "the workspace is empty" is not.
+
+What it costs, stated rather than implied: a power cut inside a save loses the workspace
+instead of the previous version of it. The chunks are overwritten in place, so by the time
+the header could have been left alone the older copy is already gone. Keeping two live
+copies does not fit — the NVS partition is 24 KB and also holds the config, the manifest and
+the transcript — so the narrow guarantee is the one that ships. Everything else is as
+before: what was saved before the cut comes back, nothing is half-adopted, and the boot log
+names the value that failed.
+
+The other half of the fix is at the tool. `write`, `edit`, `rm`, `cp`, `mv`, the `>` and
+`>>` redirect, `tee`, `touch`, `base64 -o` and `wget` all go through one helper that stores
+the workspace and, when that fails, **rolls the change back** and answers with the reason:
+
+```text
+the file workspace was not saved: it is 18001 bytes, one stored value holds at most 3500 bytes
+and the store keeps 5 of them (17500 bytes in total), so it needs 6 values; nothing was written.
+The change was dropped, so `read` shows the file as it was before this call
+```
+
+So a write that cannot be stored no longer looks like one that can: `read` shows the old
+file, the answer carries the numbers, and `du`/`df` report the stored ceiling next to the
+text one.
 
 ## 5. Where the code lives
 
