@@ -307,6 +307,44 @@ pub struct App {
     /// its own handle alive.
     shared: Weak<Mutex<App>>,
     session_counter: u64,
+    /// Whether the platform's agent loop is running. See [`AgentThread`]: a board whose
+    /// loop failed to start still answers the portal, MCP and every tool, so the only
+    /// honest place to see the failure is here.
+    agent_thread: AgentThread,
+}
+
+/// Whether the thread that runs the agent loop is up.
+///
+/// The loop lives on a thread the platform spawns, and that spawn can fail: on this board
+/// it does when 16 KB of contiguous internal RAM is not there ("could not start the agent
+/// thread: Not enough space (os error 12)"). Everything else keeps working — the portal
+/// opens, MCP answers, tools run — which is exactly why a line in the log was not enough:
+/// from outside, a board whose own agent is dead looks like a healthy board.
+///
+/// The platform reports the outcome once, through [`App::agent_thread_running`] or
+/// [`App::agent_thread_failed`], and both the boot log and `/api/status` read that one
+/// value: a decision, not two descriptions of it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum AgentThread {
+    /// No platform has been asked to start one yet (the simulator runs the loop on its
+    /// own thread and says so; a board says so until the spawn is attempted).
+    #[default]
+    NotStarted,
+    /// The loop is up.
+    Running,
+    /// The spawn failed; this is the platform's error, verbatim.
+    Failed(String),
+}
+
+impl AgentThread {
+    /// The string `/api/status` shows: one phrase a person or an agent can branch on.
+    pub fn as_str(&self) -> String {
+        match self {
+            AgentThread::NotStarted => "not started".to_string(),
+            AgentThread::Running => "running".to_string(),
+            AgentThread::Failed(why) => format!("did not start: {why}"),
+        }
+    }
 }
 
 impl App {
@@ -377,6 +415,7 @@ impl App {
             streams: EventStreamGate::new(),
             shared: Weak::new(),
             session_counter: 0,
+            agent_thread: AgentThread::NotStarted,
         };
         app.log.info(
             "boot",
@@ -407,6 +446,29 @@ impl App {
     /// How many event streams hold a pool slot right now.
     pub fn active_event_streams(&self) -> usize {
         self.streams.active()
+    }
+
+    /// The platform's agent loop is up. Logged here, so the log line and
+    /// `/api/status.agent.thread` cannot disagree.
+    pub fn agent_thread_running(&mut self) {
+        self.agent_thread = AgentThread::Running;
+        self.log.info("agent", "agent thread up");
+    }
+
+    /// The platform could not start its agent loop.
+    ///
+    /// Logged here for the same reason: the boot says `did not start: <why>` and
+    /// `/api/status` says exactly that string, so a board whose own agent is dead cannot
+    /// pass for a quiet one.
+    pub fn agent_thread_failed(&mut self, why: impl Into<String>) {
+        let why = why.into();
+        self.log.error("agent", format!("agent thread did not start: {why}"));
+        self.agent_thread = AgentThread::Failed(why);
+    }
+
+    /// What `/api/status` reports as `agent.thread`, for tests and for the portal.
+    pub fn agent_thread(&self) -> &AgentThread {
+        &self.agent_thread
     }
 
     /// Re-run board resolution, manifest device instantiation, detection and the
@@ -1064,6 +1126,9 @@ impl App {
                 "last_error": self.agent.last_error,
                 "configured": !self.llm.base_url.is_empty() && !self.llm.model.is_empty(),
                 "model": self.llm.model,
+                // The one field that says whether the board's own loop exists. A dead
+                // thread and a quiet board are otherwise indistinguishable from here.
+                "thread": self.agent_thread.as_str(),
             },
             "sched": {
                 "tasks": self.tasks.len(),
@@ -7096,6 +7161,29 @@ mod tests {
         // A frame that is neither 128x32 nor 128x64 is not a frame.
         let err = sink.push(b"F\x10\x00aaaaaaaaaaaaaaaa").expect_err("wrong frame size");
         assert!(err.to_string().contains("512"), "{err}");
+    }
+
+    /// A board whose own agent loop is dead looked exactly like a quiet board: the only
+    /// thing that said so was one line in the log, which nobody reads unless they already
+    /// suspect something. `/api/status` now carries the same decision.
+    #[test]
+    fn the_board_says_whether_its_agent_thread_is_up() {
+        let mut app = test_app();
+        assert_eq!(app.status_json()["agent"]["thread"], json!("not started"));
+
+        app.agent_thread_running();
+        assert_eq!(app.status_json()["agent"]["thread"], json!("running"));
+
+        let why = "could not start the agent thread: Not enough space (os error 12)";
+        app.agent_thread_failed(why);
+        assert_eq!(app.status_json()["agent"]["thread"], json!(format!("did not start: {why}")));
+
+        // The same call wrote the boot line, so the two cannot disagree. `tail` returns the
+        // newest last; the failure is the last thing this app logged.
+        let last = app.log.tail(1, 0).pop().expect("a log line");
+        assert_eq!(last.level, "error");
+        assert_eq!(last.target, "agent");
+        assert!(last.message.contains(why), "{}", last.message);
     }
 
     #[test]
