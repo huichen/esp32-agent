@@ -83,6 +83,94 @@ still runs.
 Tool results are capped at 2 KB and replies at 8 KB. The board has 8 MB of PSRAM and a few
 dozen kilobytes of internal SRAM; the limits exist because of the second number.
 
+## Shell
+
+The board has one writable area, 8 KB of text in NVS, and two ways to use it: three tools
+for the common operations, and a `shell` for the rest.
+
+```text
+read   {"path":"/notes/a.txt"}
+write  {"path":"/notes/a.txt","text":"..."}
+edit   {"path":"/notes/a.txt","find":"old","replace":"new"}
+
+shell  {"op":"ls","path":"/notes"}
+shell  {"op":"cp","from":"/a.txt","to":"/b.txt"}
+shell  {"op":"mv","from":"/a.txt","to":"/b.txt","confirm":true}
+shell  {"op":"rm","path":"/a.txt","confirm":true}
+shell  {"op":"grep","pattern":"GPIO","path":"/"}
+shell  {"op":"zip","name":"t.zip","files":{"a.txt":"hello"}}
+shell  {"op":"unzip","archive_b64":"UEsDB..."}
+```
+
+`edit` refuses when `find` occurs zero or several times, so an ambiguous edit cannot rewrite
+the wrong place. `rm` and `mv` need `confirm`. `zip` writes stored entries and returns the
+archive as base64, because a tool result is capped at 2 KB; `unzip` reads stored and
+deflated entries and checks each CRC.
+
+Network commands use the names they have everywhere else:
+
+```text
+curl     {"url":"https://example.com/"}                       # GET, HTML reduced to text
+curl     {"url":"...","data":"{\"a\":1}"}                    # POST
+curl     {"url":"...","format":"raw"}                         # the document as it arrived
+wget     {"url":"https://example.com/","path":"/dl/page.txt"} # save the body
+nslookup {"host":"example.com"}
+nc       {"host":"example.com","port":443}
+ping     {"host":"192.168.3.1","count":3}
+ifconfig {}                                                   # ip, gateway, DNS, SSID, RSSI, MAC
+```
+
+`ifconfig` reports the configured gateway and DNS rather than the lease, which answers
+"did my override take effect". `ping` sends real ICMP echoes through ESP-IDF's ping session.
+
+**When a command is wrong, the error says how to write it:**
+
+```text
+rm without confirm → "`confirm` must be true" ... usage: rm <path> --confirm
+unknown op         → "`sudo` is not a shell command" ... followed by every usage line
+{"op":"rm","help":true} → usage: rm <path> --confirm
+{"help":true} on curl, read, ping, … → the same one-line usage
+```
+
+`shell {"op":"help"}` lists every command. The usage lines come from one table, so the
+error suffix and the help output cannot disagree.
+
+## Script
+
+`script` is a small language for what the fixed tools cannot express: a loop over sensor
+readings, a condition on a result, a sequence that depends on the previous answer.
+
+```text
+let scan = tool("i2c_scan", {})
+let n = len(scan.addresses)
+let i = 0
+while i < n {
+  log("address " + scan.addresses[i])
+  i = i + 1
+}
+if n > 0 { "found " + str(n) } else { "nothing" }
+```
+
+Values are numbers, strings, booleans, nil, lists `[1,2]` and maps `{a: 1}`. Statements are
+`let`, assignment (including `l[0] = 9` and `m.k = 1`), `if`/`else`, `while`, `break` and
+blocks. Operators are `+ - * / %`, `== != < <= > >=`, `and or not`. Built-ins are `len`,
+`str`, `num`, `type`, `log`, and `tool(name, args)`, which calls any board tool with the
+caller's own permissions.
+
+`tool` is the only way out, so a script can do exactly what the caller could do — and
+`tool("script")` is refused. `script {"lint": true, "source": …}` checks syntax and unknown
+function names with line and column, and never executes. `script {"help": true}` returns the
+reference in three sections, each small enough to arrive whole in a 2 KB result.
+
+Bounds: 30 seconds of wall clock, five million steps, 32 nested blocks, 4 KB strings, 64 log
+lines, 8 KB of source. The clock matters because the interpreter runs on the thread that
+answers the portal: a script that does not finish makes the board unreachable, so the time
+limit is what protects it.
+
+A full run on the bench, from a prompt asking for π to twenty decimal places: doubles reach
+15 digits, so the model wrote a fixed-point big-number loop over lists and returned
+`3.141592653589793238462648…` in 22 000 steps.
+
 ## Manifest
 
 A device that needs no timing or calibration is declared, not compiled:
