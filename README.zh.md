@@ -97,7 +97,7 @@ curl -sS -X POST http://<board>/api/agent/prompt -H 'Content-Type: application/j
 curl -sS http://<board>/api/agent/prompt | jq -r .system
 ```
 
-`action` 取 `set`、`append` 或 `clear`；`system_prompt get` 从板上把它读回来，`system_prompt set …` 从 agent 一侧写入。记忆和技能都是普通文件：`fs_write /memory/wiring.md "GPIO18 = 灯带"` 再加 `/memory.md` 里一行，一条记忆就有了；删掉文件就等于忘掉。改完的文件下一轮生效，不必重启、不必重刷、也不必重写会话记录。
+`action` 取 `set`、`append` 或 `clear`；`system_prompt get` 从板上把它读回来，`system_prompt set …` 从 agent 一侧写入。记忆和技能都是普通文件：`fs_write /memory/wiring.md "GPIO18 = LED 灯带"` 再加 `/memory.md` 里一行，一条记忆就有了；删掉文件就等于忘掉。改完的文件下一轮生效，不必重启、不必重刷、也不必重写会话记录。
 
 之所以分成四层，是因为尺寸：内部 SRAM 只有几 KB 的板子，不可能把“它知道的一切”塞进每个请求，所以每层要么是索引、要么是前缀，真正贵的内容等这一轮用得上时再用 `fs_read` 取。[docs/agent-memory.md](docs/agent-memory.md) 和 [docs/agent-skills.md](docs/agent-skills.md) 写了细节，包括索引如何限长。
 
@@ -218,7 +218,7 @@ firmware/             main.rs (boot order) · runner.rs (agent thread, TLS) ·
 
 | 部分 | 状态 |
 |---|---|
-| `agent-core` | 424 个单元测试与 14 个集成测试通过；`scripts/smoke.ps1` 端到端通过 |
+| `agent-core` | 427 个单元测试与 14 个集成测试通过；`scripts/smoke.ps1` 端到端通过 |
 | 模拟器 | 控制台、MCP 与智能体循环端到端运行 |
 | 固件 | 在 ESP32-S3-DevKitC-1 N16R8（IDF v5.5.2）上烧录：42 个工具、OLED 128×32、I²S 麦克风与功放、WS2812、TLS 控制台、通过 HTTPS 的模型轮次 |
 | 未实现 | OTA、SD 卡、DHT11/22、摄像头。见 `ROADMAP.md` |

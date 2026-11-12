@@ -23,7 +23,7 @@ marcha.
 | Encuentra su propio hardware | I2C, 1-Wire y los pines declarados se sondean al arrancar; solo lo que responde obtiene herramientas. [Capacidades](docs/capabilities.md) |
 | Un conjunto de herramientas, dos invocadores | El endpoint MCP y el agente de la placa ven las mismas herramientas, desde una sola descripción. [API HTTP y MCP](docs/http-api.md) |
 | Una consola sobre HTTPS | Hablar con el modelo y configurar dispositivos, herramientas, programación, registros, WiFi y el modelo desde un teléfono; la placa emite su propio certificado. [Consola web](#consola-web) |
-| Actúa sin nadie delante | Prompts temporizados y reglas de sensores que lanzan uno cuando una lectura cruza un umbral. [Trabajo programado](#trabajo-programado) |
+| Actúa sin nadie delante | Prompts temporizados y reglas de sensores que lanzan un prompt cuando una lectura cruza un umbral. [Trabajo programado](#trabajo-programado) |
 | Un shell y un lenguaje de script | `shell` con 26 comandos con nombres de NuttX, y un intérprete para bucles sobre llamadas a herramientas. [Shell](#shell) · [Script](#script) |
 | Recuerda lo que se le dijo | Órdenes permanentes, `/AGENTS.md`, un índice `/memory.md` y habilidades, ensamblados en el prompt en cada turno. [Lo que el modelo ve en cada turno](#lo-que-el-modelo-ve-en-cada-turno) |
 | Sin nube en el camino | HTTPS desde la placa, un certificado que genera ella misma, un PIN para tres invocadores. [Autenticación](#autenticación) |
@@ -240,7 +240,7 @@ firmware/             main.rs (boot order) · runner.rs (agent thread, TLS) ·
 
 | Parte | Estado |
 |---|---|
-| `agent-core` | 424 pruebas unitarias y 14 de integración pasan; `scripts/smoke.ps1` pasa de extremo a extremo |
+| `agent-core` | 427 pruebas unitarias y 14 de integración pasan; `scripts/smoke.ps1` pasa de extremo a extremo |
 | Simulador | la consola, MCP y el bucle de agente funcionan de extremo a extremo |
 | Firmware | grabado en una ESP32-S3-DevKitC-1 N16R8 (IDF v5.5.2): 42 herramientas, OLED 128×32, micrófono y amplificador I²S, WS2812, consola TLS, turnos del modelo por HTTPS |
 | No implementado | OTA, tarjeta SD, DHT11/22, cámara. Ver `ROADMAP.md` |
