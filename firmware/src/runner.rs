@@ -303,9 +303,11 @@ impl Conn {
 fn tls_code_meaning(code: i32) -> &'static str {
     match code {
         -0x6800 => "MBEDTLS_ERR_SSL_TIMEOUT — nothing arrived within the socket timeout",
-        -0x7280 => {
-            "MBEDTLS_ERR_SSL_BUFFER_TOO_SMALL — a TLS record larger than CONFIG_MBEDTLS_SSL_IN_CONTENT_LEN"
+        -0x7200 => {
+            "MBEDTLS_ERR_SSL_INVALID_RECORD — a record larger than CONFIG_MBEDTLS_SSL_IN_CONTENT_LEN, or not a record"
         }
+        -0x7180 => "MBEDTLS_ERR_SSL_INVALID_MAC — the record failed authentication",
+        -0x7280 => "MBEDTLS_ERR_SSL_BUFFER_TOO_SMALL — the inbound record buffer ran out",
         -0x7880 => "MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY — the peer closed the session",
         -0x7100 => "MBEDTLS_ERR_SSL_BAD_INPUT_DATA — the stream no longer parses",
         -0x0044 => "MBEDTLS_ERR_NET_CONN_RESET — the peer reset the connection",
