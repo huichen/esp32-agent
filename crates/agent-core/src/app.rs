@@ -3424,6 +3424,22 @@ impl App {
         if line.trim().is_empty() {
             return Err(format!("`command` is required.\n\n{}", crate::tools::shell::help_text()));
         }
+        // `a; b` runs two commands in order, which is what "write a file, then read it back"
+        // needs. The split ignores semicolons inside quotes, and stops at four: a line is a
+        // shorthand, not a program.
+        if let Some(parts) = crate::tools::shell::split_sequence(line)? {
+            let mut answers = Vec::new();
+            for part in parts {
+                let mut inner = args.clone();
+                inner["command"] = json!(part);
+                answers.push(json!({
+                    "command": part,
+                    "result": serde_json::from_str::<Value>(&self.run_shell(&inner)?)
+                        .unwrap_or(Value::Null),
+                }));
+            }
+            return Ok(json!({ "commands": answers }).to_string());
+        }
         let pipeline = crate::tools::shell::parse_pipeline(line)?;
         // `help`, `-h` and `--help` answer before anything is validated, so `cp -h` does not
         // fail for a missing argument on the way to its own usage line. In a pipeline the
