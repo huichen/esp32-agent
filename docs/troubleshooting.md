@@ -142,6 +142,11 @@ heaviest endpoint the portal calls, so if it answers, the page will load.
 - A quiet room on this bench reads about -65 dBFS after the alignment is right; a 1 kHz tone
   from the amplifier puts it around -25 dBFS.
 
+`mic_record` returns a **WAV** (`format: "wav"`, `wav_b64`: a 44-byte RIFF header over the same
+16-bit mono PCM), because that is the format this board can produce honestly. There is no Opus
+encoder and there will not be one: [Audio](audio.md) has the flash and RAM arithmetic that
+says why, and what would have to change for that to stop being true.
+
 ## A tone keeps playing after the caller is gone
 
 - The I2S DMA descriptor is replayed, so a `speaker_tone` whose HTTP connection drops mid-way

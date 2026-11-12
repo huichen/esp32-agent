@@ -153,6 +153,14 @@ pub struct ToolCall {
 pub struct ModelReply {
     /// The assistant's visible answer. Empty on a pure tool-call turn.
     pub content: String,
+    /// One line saying the request behind this reply was retried, or empty when it was
+    /// answered on the first attempt.
+    ///
+    /// One note per reply, not one event per attempt: a client reading the journal
+    /// should see "this answer took two tries", never three failures and one success.
+    /// The agent turns it into a single `retried` entry. Attempts that run out never
+    /// reach a reply; they are reported as one `error` instead.
+    pub retry_note: String,
     /// The model's reasoning, when the provider exposes it (DeepSeek sends
     /// `reasoning_content`, some gateways send `reasoning`). It is kept as its own
     /// block rather than folded into `content`, and echoed back on the next request
@@ -175,24 +183,250 @@ impl Usage {
     }
 }
 
+/// Attempts one model request may make, the first included.
+///
+/// Three, and not more: the failures worth retrying (a refused connection, a 5xx, a body
+/// that arrived short) are usually gone by the second try, while the board has a single
+/// agent thread and a turn with a token budget of its own — a fourth copy of the same
+/// request mostly buys a user staring at an empty console. Two retries also bound a
+/// request at three times one attempt's cost, which [`RETRY_DEADLINE_MS`] caps in wall
+/// time from the other side.
+pub const MAX_ATTEMPTS: u8 = 3;
+
+/// First wait between attempts, doubled per retry: 250 ms, then 500 ms.
+pub const BASE_DELAY_MS: u64 = 250;
+
+/// Ceiling on a single wait, so a longer ladder cannot park the agent thread.
+pub const MAX_DELAY_MS: u64 = 1_000;
+
+/// Hard ceiling on one model request: every attempt and every wait inside it.
+///
+/// Without it a retry silently doubles a turn's latency, because one attempt already
+/// spends up to the transport's `timeout_s` (45 s by default). Once this much wall time
+/// has gone the request is abandoned whether or not it looks retryable, and the error
+/// says the budget ran out instead of blaming the model. 20 s is about how long a person
+/// waits at a console before deciding the board is wedged.
+pub const RETRY_DEADLINE_MS: u64 = 20_000;
+
+/// How hard `chat` retries one request.
+///
+/// `Default` is the constants above. Tests — and a platform whose socket timeout is
+/// configured very differently from the default 45 s — pass their own.
+#[derive(Clone, Copy, Debug)]
+pub struct RetryPolicy {
+    /// Attempts in total, the first included. `1` disables retrying.
+    pub max_attempts: u8,
+    /// Wait after the first failure, doubled per further failure.
+    pub base_delay_ms: u64,
+    /// Ceiling on one wait.
+    pub max_delay_ms: u64,
+    /// Ceiling on the whole request, waits included.
+    pub deadline_ms: u64,
+}
+
+impl Default for RetryPolicy {
+    fn default() -> Self {
+        Self {
+            max_attempts: MAX_ATTEMPTS,
+            base_delay_ms: BASE_DELAY_MS,
+            max_delay_ms: MAX_DELAY_MS,
+            deadline_ms: RETRY_DEADLINE_MS,
+        }
+    }
+}
+
+impl RetryPolicy {
+    /// The wait after `failed` unsuccessful attempts: the base doubled per retry, capped.
+    pub fn delay_after(&self, failed: u8) -> u64 {
+        let shift = failed.saturating_sub(1).min(8) as u32;
+        self.base_delay_ms.saturating_mul(1u64 << shift).min(self.max_delay_ms)
+    }
+}
+
+/// The clock and the wait one request needs.
+///
+/// Injected for two reasons: a test has to watch the backoff without sleeping, and the
+/// board's own clock is not the host's. Only differences of [`now_ms`](Self::now_ms)
+/// mean anything.
+pub trait RetryTimer {
+    fn now_ms(&self) -> u64;
+    fn sleep_ms(&self, ms: u64);
+}
+
+/// The real clock: a monotonic `Instant`, and a real sleep.
+pub struct WallClock {
+    origin: std::time::Instant,
+}
+
+impl WallClock {
+    pub fn new() -> Self {
+        Self { origin: std::time::Instant::now() }
+    }
+}
+
+impl Default for WallClock {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl RetryTimer for WallClock {
+    fn now_ms(&self) -> u64 {
+        self.origin.elapsed().as_millis().min(u64::MAX as u128) as u64
+    }
+
+    fn sleep_ms(&self, ms: u64) {
+        std::thread::sleep(std::time::Duration::from_millis(ms));
+    }
+}
+
 /// One request/response round trip. `messages` and `tools` are already serialised
 /// by the caller as OpenAI `messages` / `tools` arrays.
+///
+/// A failure that another copy of the request could survive is retried under
+/// [`RetryPolicy::default`]; [`chat_with`] takes the policy and the clock instead.
 pub fn chat(
     transport: &mut dyn ChatTransport,
     cfg: &LlmConfig,
     messages: &Value,
     tools: &Value,
 ) -> Result<ModelReply, String> {
+    chat_with(transport, cfg, messages, tools, &RetryPolicy::default(), &WallClock::new())
+}
+
+/// [`chat`] with the retry policy and the clock spelled out.
+///
+/// One attempt is one HTTP request, and nothing else is repeated: a tool that already
+/// ran stays run, because the second attempt sends the same transcript — tool results
+/// included — rather than re-executing anything.
+pub fn chat_with(
+    transport: &mut dyn ChatTransport,
+    cfg: &LlmConfig,
+    messages: &Value,
+    tools: &Value,
+    policy: &RetryPolicy,
+    timer: &dyn RetryTimer,
+) -> Result<ModelReply, String> {
     let url = cfg.base_url.trim();
+    // Decided before the first byte leaves: a wrong scheme or a missing model name is the
+    // caller's mistake, so it costs no attempt and no wait.
     check_url(url)?;
     if cfg.model.trim().is_empty() {
         return Err("llm: model is empty; set one in the agent config".to_string());
     }
+
+    let max_attempts = policy.max_attempts.max(1);
+    let started = timer.now_ms();
+    let mut attempt: u8 = 0;
+    let mut last = String::new();
+    let mut waits = String::new();
+    loop {
+        attempt = attempt.saturating_add(1);
+        match send_once(transport, cfg, messages, tools, url) {
+            Ok(mut reply) => {
+                if attempt > 1 {
+                    reply.retry_note = format!(
+                        "the model request was retried {} time{} (waited {waits} ms); the last \
+                         failure was {last}",
+                        attempt - 1,
+                        if attempt == 2 { "" } else { "s" }
+                    );
+                }
+                return Ok(reply);
+            }
+            Err(e) => last = e,
+        }
+
+        // A second copy of the same request cannot fix a rejected key or a body that
+        // arrived and did not parse; it only spends the user's credits again.
+        if !retryable_failure(&last) {
+            return Err(last);
+        }
+        if attempt >= max_attempts {
+            return Err(format!("{last} (gave up after {attempt} attempts)"));
+        }
+        let delay = policy.delay_after(attempt);
+        let spent = timer.now_ms().saturating_sub(started);
+        if spent.saturating_add(delay) > policy.deadline_ms {
+            return Err(format!(
+                "{last} (gave up after {} attempt{}: {spent} ms of the {} ms retry deadline was \
+                 already spent)",
+                attempt,
+                if attempt == 1 { "" } else { "s" },
+                policy.deadline_ms
+            ));
+        }
+        timer.sleep_ms(delay);
+        if !waits.is_empty() {
+            waits.push_str(", ");
+        }
+        waits.push_str(&delay.to_string());
+    }
+}
+
+/// One request, in the dialect the configuration names.
+fn send_once(
+    transport: &mut dyn ChatTransport,
+    cfg: &LlmConfig,
+    messages: &Value,
+    tools: &Value,
+    url: &str,
+) -> Result<ModelReply, String> {
     match Protocol::parse(&cfg.protocol) {
         Protocol::Chat => chat_completions(transport, cfg, messages, tools, url),
         Protocol::Responses => responses(transport, cfg, messages, tools, url),
         Protocol::Anthropic => anthropic(transport, cfg, messages, tools, url),
     }
+}
+
+/// Whether another copy of the same request could succeed where this one failed.
+///
+/// The transport speaks `String`, so this reads the wording [`http_error`] and the two
+/// transports already produce — pinned by
+/// `the_retry_decision_matches_what_the_transports_report`. Two families are worth
+/// another try:
+///
+/// * a status: 5xx is the endpoint's problem and usually transient, and a missing status
+///   line (`HTTP 0`) means the reply was not HTTP at all, which is what a half-closed
+///   connection looks like. 401/403/400/404/422 are the caller's mistake: the same
+///   request is the same refusal, and the copy costs credits for nothing. 429 asks for a
+///   wait longer than [`RETRY_DEADLINE_MS`] allows, so a sub-second retry only adds noise;
+/// * a transport-level failure: refused, reset, timed out, or a connection closed in the
+///   middle of the body. A 200 whose body did not parse is *not* retried — that body is
+///   the provider's answer to this exact request, and asking again is a second charge for
+///   the same answer.
+pub fn retryable_failure(err: &str) -> bool {
+    if let Some(status) = http_status(err) {
+        return status == 0 || (500..=599).contains(&status);
+    }
+    // Everything `chat` itself can complain about returned before the first attempt; what
+    // is left under this prefix is the transport's own report.
+    let Some(detail) =
+        err.strip_prefix("llm: POST ").and_then(|rest| rest.split_once(" failed: ")).map(|(_, d)| d)
+    else {
+        return false;
+    };
+    let detail = detail.to_ascii_lowercase();
+    const MARKERS: [&str; 10] = [
+        "connection refused",
+        "connecting to",
+        "connect ",
+        "closed the connection mid-reply",
+        "the reply ended after",
+        "did not answer within",
+        "timed out",
+        "connection reset",
+        "broken pipe",
+        "read failed",
+    ];
+    MARKERS.iter().any(|m| detail.contains(m))
+}
+
+/// The status in an error text built by [`http_error`], if it carries one.
+fn http_status(err: &str) -> Option<u16> {
+    let start = err.find("HTTP ")? + "HTTP ".len();
+    let digits: String = err[start..].chars().take_while(char::is_ascii_digit).take(3).collect();
+    digits.parse().ok()
 }
 
 /// The three wire dialects. Named the way the host agent names them; a value that is
@@ -386,7 +620,13 @@ fn parse_responses_reply(body: &str) -> Result<ModelReply, String> {
     if text.is_empty() && calls.is_empty() {
         return Err(format!("llm: no output items in reply: {}", body_prefix(body, 200)));
     }
-    Ok(ModelReply { content: text, reasoning: String::new(), tool_calls: calls, usage })
+    Ok(ModelReply {
+        content: text,
+        reasoning: String::new(),
+        tool_calls: calls,
+        usage,
+        retry_note: String::new(),
+    })
 }
 
 /// Anthropic's Messages API.
@@ -561,7 +801,7 @@ fn parse_anthropic_reply(body: &str) -> Result<ModelReply, String> {
     if text.is_empty() && calls.is_empty() {
         return Err(format!("llm: no content blocks in reply: {}", body_prefix(body, 200)));
     }
-    Ok(ModelReply { content: text, reasoning, tool_calls: calls, usage })
+    Ok(ModelReply { content: text, reasoning, tool_calls: calls, usage, retry_note: String::new() })
 }
 
 /// Split a reply body into the fields the loop needs.
@@ -630,7 +870,7 @@ fn parse_reply(body: &str) -> Result<ModelReply, String> {
         }
     }
 
-    Ok(ModelReply { content, reasoning, tool_calls, usage })
+    Ok(ModelReply { content, reasoning, tool_calls, usage, retry_note: String::new() })
 }
 
 /// The argument-parse error of `tc`, if `chat` degraded its arguments.
@@ -994,10 +1234,237 @@ mod tests {
     fn a_non_2xx_from_the_transport_keeps_the_status_and_a_short_body() {
         let long = "upstream exploded ".repeat(60);
         let mut t = StubTransport::failing(503, &long);
-        let err = chat(&mut t, &cfg(), &wire_messages(), &wire_tools()).expect_err("must fail");
+        // On the injected clock: a 503 is retryable, so the real one would spend three
+        // quarters of a second asleep to prove a point about error text.
+        let clock = FakeClock::default();
+        let err = chat_with(&mut t, &cfg(), &wire_messages(), &wire_tools(), &RetryPolicy::default(), &clock)
+            .expect_err("must fail");
         assert!(err.contains("HTTP 503"), "unexpected error text: {err}");
         assert!(err.chars().count() <= 400, "error text is not bounded: {} chars", err.chars().count());
         assert!(!err.contains('\n'), "error text spans lines: {err:?}");
+    }
+
+    // ---------------------------------------------------------------- retry policy
+
+    /// A clock that does not sleep: every wait is recorded and moves time forward, so a
+    /// test can assert the backoff and the deadline without spending wall time.
+    #[derive(Default)]
+    struct FakeClock {
+        now: std::cell::Cell<u64>,
+        sleeps: std::cell::RefCell<Vec<u64>>,
+    }
+
+    impl FakeClock {
+        fn advance(&self, ms: u64) {
+            self.now.set(self.now.get().saturating_add(ms));
+        }
+
+        fn slept(&self) -> Vec<u64> {
+            self.sleeps.borrow().clone()
+        }
+
+        fn total_slept(&self) -> u64 {
+            self.sleeps.borrow().iter().sum()
+        }
+    }
+
+    impl RetryTimer for FakeClock {
+        fn now_ms(&self) -> u64 {
+            self.now.get()
+        }
+
+        fn sleep_ms(&self, ms: u64) {
+            self.sleeps.borrow_mut().push(ms);
+            self.advance(ms);
+        }
+    }
+
+    /// Fails `failures` times with `status`, then answers. Every attempt costs `cost_ms`
+    /// on the fake clock, which is how a test says "the socket timeout ate the budget".
+    struct Flaky<'a> {
+        failures: usize,
+        status: u16,
+        cost_ms: u64,
+        calls: usize,
+        clock: &'a FakeClock,
+        reply: String,
+    }
+
+    impl<'a> Flaky<'a> {
+        fn new(failures: usize, status: u16, cost_ms: u64, clock: &'a FakeClock, reply: String) -> Self {
+            Self { failures, status, cost_ms, calls: 0, clock, reply }
+        }
+    }
+
+    impl ChatTransport for Flaky<'_> {
+        fn post_json(
+            &mut self,
+            _url: &str,
+            _headers: &[(&str, &str)],
+            _body: &str,
+        ) -> Result<String, String> {
+            self.calls += 1;
+            self.clock.advance(self.cost_ms);
+            if self.calls <= self.failures {
+                return Err(http_error(self.status, "the model is restarting"));
+            }
+            Ok(self.reply.clone())
+        }
+    }
+
+    #[test]
+    fn a_request_that_fails_twice_is_retried_once_more_and_answers_with_one_note() {
+        let clock = FakeClock::default();
+        let mut t = Flaky::new(2, 503, 0, &clock, reply_body(json!({ "content": "hello" })));
+        let reply = chat_with(&mut t, &cfg(), &messages(), &tools(), &RetryPolicy::default(), &clock)
+            .expect("the third attempt answers");
+
+        assert_eq!(reply.content, "hello");
+        assert_eq!(t.calls, 3);
+        assert_eq!(clock.slept(), vec![BASE_DELAY_MS, BASE_DELAY_MS * 2], "the wait doubles per retry");
+        assert!(reply.retry_note.contains("retried 2 times"), "{}", reply.retry_note);
+        assert_eq!(
+            reply.retry_note.matches("250, 500").count(),
+            1,
+            "the waits are named in ms, in the order they happened: {}",
+            reply.retry_note
+        );
+        assert!(reply.retry_note.contains("HTTP 503"), "the last failure survives: {}", reply.retry_note);
+        assert!(reply.retry_note.chars().count() <= 512, "the note stays inside a journal entry");
+    }
+
+    #[test]
+    fn a_first_try_success_carries_no_note() {
+        let clock = FakeClock::default();
+        let mut t = Flaky::new(0, 503, 0, &clock, reply_body(json!({ "content": "hello" })));
+        let reply =
+            chat_with(&mut t, &cfg(), &messages(), &tools(), &RetryPolicy::default(), &clock).expect("reply");
+        assert!(reply.retry_note.is_empty());
+        assert!(clock.slept().is_empty());
+    }
+
+    /// A rejected key, a wrong model name or a malformed body is the caller's mistake:
+    /// the same request is the same refusal, and every copy spends credits for nothing.
+    #[test]
+    fn a_failure_the_request_caused_is_not_retried() {
+        for status in [400u16, 401, 403, 404, 408, 422, 429] {
+            let clock = FakeClock::default();
+            let mut t = Flaky::new(usize::MAX, status, 0, &clock, String::new());
+            let err = chat_with(&mut t, &cfg(), &messages(), &tools(), &RetryPolicy::default(), &clock)
+                .expect_err("must fail");
+            assert!(err.contains(&format!("HTTP {status}")), "{err}");
+            assert_eq!(t.calls, 1, "HTTP {status} must not be retried");
+            assert!(clock.slept().is_empty(), "HTTP {status} must not wait");
+            assert!(!err.contains("attempts"), "a final failure names no attempts: {err}");
+        }
+    }
+
+    #[test]
+    fn exhausted_attempts_report_how_many_and_the_last_message() {
+        let clock = FakeClock::default();
+        let mut t = Flaky::new(usize::MAX, 503, 0, &clock, String::new());
+        let err = chat_with(&mut t, &cfg(), &messages(), &tools(), &RetryPolicy::default(), &clock)
+            .expect_err("three failures is a failure");
+
+        assert_eq!(t.calls, MAX_ATTEMPTS as usize, "the ladder stops at the policy's count");
+        assert!(err.contains("gave up after 3 attempts"), "{err}");
+        assert!(err.contains("HTTP 503"), "the last message survives: {err}");
+        assert!(err.contains("the model is restarting"), "{err}");
+        assert!(err.chars().count() <= 400, "still bounded: {} chars", err.chars().count());
+        assert_eq!(clock.slept(), vec![BASE_DELAY_MS, BASE_DELAY_MS * 2]);
+    }
+
+    /// A transport cannot be made to wait for seconds in a unit test, so the budget is
+    /// spent through the waits: a deadline that cannot afford the second backoff stops
+    /// the ladder before the attempt count does.
+    #[test]
+    fn the_deadline_stops_the_ladder_before_the_attempts_run_out() {
+        let clock = FakeClock::default();
+        let mut t = Flaky::new(usize::MAX, 503, 0, &clock, String::new());
+        let policy = RetryPolicy { deadline_ms: 300, ..RetryPolicy::default() };
+        let err = chat_with(&mut t, &cfg(), &messages(), &tools(), &policy, &clock).expect_err("must fail");
+
+        assert_eq!(t.calls, 2, "the 500 ms wait would overrun a 300 ms deadline: {err}");
+        assert!(err.contains("retry deadline"), "{err}");
+        assert!(err.contains("300"), "the budget that ran out is named: {err}");
+        assert!(clock.total_slept() <= policy.deadline_ms, "slept {} of 300 ms", clock.total_slept());
+    }
+
+    /// The case that matters on the board: one attempt that spent nearly the whole budget
+    /// (a 45 s socket timeout is the default) leaves no room for a second, so the request
+    /// is given up instead of quietly doubling the turn's latency.
+    #[test]
+    fn a_slow_first_attempt_that_used_the_budget_is_not_retried() {
+        let clock = FakeClock::default();
+        let mut t = Flaky::new(usize::MAX, 503, 19_900, &clock, String::new());
+        let err = chat_with(&mut t, &cfg(), &messages(), &tools(), &RetryPolicy::default(), &clock)
+            .expect_err("must fail");
+
+        assert_eq!(t.calls, 1, "a retry here would double a 19.9 s turn: {err}");
+        assert!(err.contains("retry deadline"), "{err}");
+        assert!(err.contains("19900"), "the time already spent is reported: {err}");
+        assert!(clock.slept().is_empty());
+    }
+
+    #[test]
+    fn a_policy_of_one_attempt_does_not_retry_at_all() {
+        let clock = FakeClock::default();
+        let mut t = Flaky::new(usize::MAX, 503, 0, &clock, String::new());
+        let policy = RetryPolicy { max_attempts: 1, ..RetryPolicy::default() };
+        let err = chat_with(&mut t, &cfg(), &messages(), &tools(), &policy, &clock).expect_err("must fail");
+        assert_eq!(t.calls, 1);
+        assert!(err.contains("gave up after 1 attempts"), "{err}");
+        assert!(clock.slept().is_empty());
+    }
+
+    /// The decision is made from the wording the two transports and `http_error` produce,
+    /// because a `String` is the only channel the trait has. Every phrase below is one the
+    /// firmware's transport or the simulator's actually emits.
+    #[test]
+    fn the_retry_decision_matches_what_the_transports_report() {
+        for status in [500u16, 502, 503, 504, 0] {
+            assert!(retryable_failure(&http_error(status, "")), "HTTP {status} is worth a retry");
+        }
+        for status in [400u16, 401, 403, 404, 408, 422, 429] {
+            assert!(!retryable_failure(&http_error(status, "")), "HTTP {status} is not");
+        }
+
+        let wrapped = |detail: &str| format!("llm: POST http://h/v1/chat/completions failed: {detail}");
+        for detail in [
+            "connecting to 192.0.2.10:80 failed: connection refused",
+            "connect 127.0.0.1:8899 failed: Connection refused (os error 10061)",
+            "the endpoint did not answer within 45 s",
+            "reading the reply failed: timed out",
+            "the server closed the connection mid-reply",
+            "the reply ended after 12 of 900 bytes",
+            "read failed: An existing connection was forcibly closed by the remote host. (os error 10054)",
+        ] {
+            assert!(retryable_failure(&wrapped(detail)), "should retry: {detail}");
+        }
+        for detail in [
+            "the TLS handshake with api.example.com failed: mbedtls error -0x2700",
+            "TLS setup for api.example.com failed: invalid server name",
+            "could not resolve `api.example.com`: ESP_ERR_ESP_TLS_CANNOT_RESOLVE_HOSTNAME",
+        ] {
+            assert!(!retryable_failure(&wrapped(detail)), "should not retry: {detail}");
+        }
+
+        // A 200 whose body did not parse arrived: that body is the answer to this exact
+        // request, so asking again is a second charge for the same answer.
+        assert!(!retryable_failure("llm: reply is not JSON (expected value at line 1): boom"));
+        assert!(!retryable_failure("llm: no choices[0].message in reply: {\"error\":\"timeout\"}"));
+        assert!(!retryable_failure("llm: model is empty; set one in the agent config"));
+    }
+
+    #[test]
+    fn a_2xx_body_that_does_not_parse_is_not_resent() {
+        let clock = FakeClock::default();
+        let mut t = StubTransport::answering("not json at all".to_string());
+        let err = chat_with(&mut t, &cfg(), &messages(), &tools(), &RetryPolicy::default(), &clock)
+            .expect_err("must fail");
+        assert!(err.contains("not JSON"), "{err}");
+        assert_eq!(t.urls.len(), 1, "the body arrived, so there is nothing to ask again");
+        assert!(clock.slept().is_empty());
     }
 
     #[test]
