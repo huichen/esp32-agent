@@ -21,6 +21,7 @@
 | 无人值守也会动作 | 定时提示，以及读数越过阈值时触发提示的传感器规则。[定时任务](docs/scheduling.md) |
 | 一个 shell 和一门脚本语言 | `shell` 有 55 个按 NuttX 命名的命令，还有一个对工具调用做循环的解释器。[Shell](docs/shell.md) · [脚本](docs/scripting.md) |
 | 它会记住告诉过它的事 | 常驻指令、`/AGENTS.md`、`/MEMORY.md` 索引与技能，每轮组装进提示词。[模型每轮都能看到什么](docs/context.md) |
+| 自带技能 | 固件里带三个流程——写技能、摸清接线、救回一块看起来坏了的板——首次启动就落在 `/skills`；你改过的那份会一直是你的。[技能](docs/agent-skills.md) |
 | 路径中没有云端 | 由板子提供 HTTPS，证书由它生成，三类调用方一个 PIN。[认证](docs/security.md) |
 | 无需硬件即可测试 | 模拟器把同一份 `agent-core` 跑在虚拟板上。[模拟器](docs/simulator.md) |
 
@@ -42,6 +43,8 @@ espflash write-bin --chip esp32s3 --flash-size 16mb 0x0 esp32-agent-vX.Y.Z.bin
 **在 agent 里**：`GET http://<board>/agent.json` 返回接口本身，JSON 形式——每条路由的方法、
 请求体、鉴权，MCP 那一块，带类型和默认值的设置表，以及各项上限。能取一个 URL 的 agent
 不需要别的东西。
+
+**一块新板子已经会三件事。** `/skills/create-skill` 讲 agent 怎么写下一个流程，`/skills/pinout` 讲怎么摸清接线并记进 `/MEMORY.md`，`/skills/recover-board` 讲板子看起来坏了时怎么办。它们就是普通的工作区文件，首次启动时哪条路径空就装哪条；恢复出厂会重新装回，`skills.seed_defaults=false` 可以阻止。所以刚刷好的板子，第一句有用的话可以是「把你的接线写下来」。
 
 ## 给它一个模型
 
