@@ -995,9 +995,13 @@ impl App {
                 self.app.call_tool(name, arguments).map_err(|e| e.message)
             }
         }
+        // Arguments for the script: `{"source": …, "args": {"pin": 12}}`. They land in the
+        // global scope as `args` (a map) and `argv` (its values, in order), which is what
+        // makes one script usable for several pins.
+        let args = args.get("args").cloned().unwrap_or(serde_json::Value::Null);
         let mut host = Host { app: self };
         let started = now_ms();
-        match crate::script::run(&source, &mut host) {
+        match crate::script::run_with(&source, &mut host, &args) {
             Ok(outcome) => {
                 self.log.info(
                     "script",

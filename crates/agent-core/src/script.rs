@@ -214,7 +214,7 @@ pub fn lint(source: &str) -> Lint {
 }
 
 /// The functions a script may call, other than `tool`.
-pub const BUILTINS_NAMES: &[&str] = &["len", "str", "num", "type", "log", "tool"];
+pub const BUILTINS_NAMES: &[&str] = &["len", "str", "num", "type", "log", "print", "echo", "tool"];
 
 fn collect_calls(stmts: &[Stmt], out: &mut Vec<String>) {
     for stmt in stmts {
@@ -1056,16 +1056,38 @@ struct Run<'a> {
 }
 
 /// Run `source`, returning its last expression value.
-pub fn run(source: &str, host: &mut dyn ScriptHost) -> Result<Outcome, String> {
+/// Run with the arguments a caller passed in.
+///
+/// `args` lands in the global scope as a map (`args.pin`) and as `argv`, a list of its
+/// values (`argv[0]`), so a script can be written once and called with different pins
+/// without being rewritten. `Value::Null` is the same as no arguments: `args` is then an
+/// empty map and `argv` an empty list, and a script that reads a missing key gets nil
+/// rather than an error — the same rule as any other absent field.
+pub fn run_with(
+    source: &str,
+    host: &mut dyn ScriptHost,
+    args: &serde_json::Value,
+) -> Result<Outcome, String> {
     if source.len() > MAX_SOURCE {
         return Err(format!("script is larger than {MAX_SOURCE} bytes"));
     }
     let toks = lex(source)?;
     let mut parser = Parser { toks, pos: 0 };
     let program = parser.program()?;
+    let mut globals: BTreeMap<String, Val> = BTreeMap::new();
+    let map = match args {
+        serde_json::Value::Object(m) => {
+            m.iter().map(|(k, v)| (k.clone(), Val::from_json(v))).collect::<BTreeMap<String, Val>>()
+        }
+        _ => BTreeMap::new(),
+    };
+    let list = map.values().cloned().collect::<Vec<Val>>();
+    globals.insert("args".into(), Val::Map(map));
+    globals.insert("argv".into(), Val::List(list));
+
     let mut runner = Run {
         host,
-        scopes: vec![BTreeMap::new()],
+        scopes: vec![globals],
         fns: BTreeMap::new(),
         calls: 0,
         steps: 0,
@@ -1073,38 +1095,43 @@ pub fn run(source: &str, host: &mut dyn ScriptHost) -> Result<Outcome, String> {
         output: Vec::new(),
         started_ms: now_ms(),
     };
-    // Hoist the definitions first: a script may call a function on the line before the one
-    // that defines it, which is what makes mutual recursion usable.
-    for stmt in &program {
-        if let Stmt::Fn(name, params, body) = stmt {
-            runner.fns.insert(name.clone(), (params.clone(), body.clone()));
-        }
-    }
-    let mut last = Val::Nil;
-    for stmt in &program {
-        match runner.stmt(stmt)? {
-            Flow::Break => break,
-            Flow::Return(v) => {
-                last = v;
-                break;
-            }
-            Flow::Normal => {}
-        }
-        if let Stmt::Expr(e) = stmt {
-            let _ = &e;
-        }
-    }
-    // The value of the last expression statement, so `script` has something to return.
-    for stmt in program.iter().rev() {
-        if let Stmt::Expr(e) = stmt {
-            last = runner.expr_quiet(e)?;
-            break;
-        }
-    }
-    Ok(Outcome { result: last.to_json(), output: runner.output, steps: runner.steps })
+    runner.execute(program)
+}
+
+pub fn run(source: &str, host: &mut dyn ScriptHost) -> Result<Outcome, String> {
+    run_with(source, host, &serde_json::Value::Null)
 }
 
 impl<'a> Run<'a> {
+    /// Run a parsed program: hoist definitions, then walk the statements.
+    fn execute(&mut self, program: Vec<Stmt>) -> Result<Outcome, String> {
+        for stmt in &program {
+            if let Stmt::Fn(name, params, body) = stmt {
+                self.fns.insert(name.clone(), (params.clone(), body.clone()));
+            }
+        }
+        // The value of the last expression statement is the script's result, taken while the
+        // statement runs. Re-evaluating it afterwards (the obvious way) ran its side effects
+        // twice — `log("done")` printed twice — which is exactly the kind of bug a language
+        // should not have.
+        let mut last = Val::Nil;
+        for stmt in &program {
+            if let Stmt::Expr(e) = stmt {
+                last = self.expr_quiet(e)?;
+                continue;
+            }
+            match self.stmt(stmt)? {
+                Flow::Break => break,
+                Flow::Return(v) => {
+                    last = v;
+                    break;
+                }
+                Flow::Normal => {}
+            }
+        }
+        Ok(Outcome { result: last.to_json(), output: std::mem::take(&mut self.output), steps: self.steps })
+    }
+
     fn tick(&mut self) -> Result<(), String> {
         self.steps += 1;
         if self.steps > MAX_STEPS {
@@ -1485,10 +1512,14 @@ impl<'a> Run<'a> {
                 _ => Ok(Val::Num(0.0)),
             },
             "type" => Ok(Val::Str(values.first().map(|v| v.type_name()).unwrap_or("nil").to_string())),
-            "log" => {
+            "log" | "print" | "echo" => {
+                // Three names, one stdout: `log` is what the first version of the language
+                // called it, `print` and `echo` are what everyone writes first. The lines go
+                // to the same place — the `output` array a caller reads back — and the cap
+                // protects the 2 KB result more than it protects the heap.
                 let line = values.iter().map(|v| v.display()).collect::<Vec<_>>().join(" ");
                 if self.output.len() >= 64 {
-                    return Err("script logged more than 64 lines".into());
+                    return Err("script printed more than 64 lines".into());
                 }
                 self.output.push(clip(line));
                 Ok(Val::Nil)
@@ -1661,6 +1692,34 @@ len(r.issues)"#),
         assert_eq!(host.calls[0].0, "i2c_scan");
         assert_eq!(outcome.result, json!("0x3C"));
         assert_eq!(outcome.output, vec!["found 1".to_string()]);
+    }
+
+    #[test]
+    fn a_script_reads_its_arguments_and_writes_to_stdout() {
+        let mut host = NoHost;
+
+        // `args` is a map and `argv` its values in order: one script, several pins.
+        let args = serde_json::json!({"pin": 12, "level": 0});
+        let out = run_with("args.pin", &mut host, &args).expect("runs");
+        assert_eq!(out.result, json!(12));
+
+        let out = run_with("let t = 0\nfor v in argv { t = t + v }\nt", &mut host, &args).expect("runs");
+        assert_eq!(out.result, json!(12), "argv carries the values");
+
+        // No arguments is the same as empty: a missing key is nil, not an error.
+        let out = run("len(args)", &mut host).expect("runs");
+        assert_eq!(out.result, json!(0));
+        let out = run("args.missing", &mut host).expect("runs");
+        assert_eq!(out.result, json!(null));
+
+        // stdout: print and echo are the same stream as log, and a caller reads it back.
+        let out = run("print(\"hello\")\necho(2 + 3)\nlog(\"done\")", &mut host).expect("runs");
+        assert_eq!(out.output, vec!["hello".to_string(), "5".to_string(), "done".to_string()]);
+
+        // The stdout cap is a fact, not a surprise: 64 lines then a message.
+        let err = run("let i = 0\nwhile i < 70 { print(i)  i = i + 1 }", &mut host).expect_err("refused");
+        assert!(err.contains("64 lines"), "{err}");
+        let _ = host;
     }
 
     #[test]
