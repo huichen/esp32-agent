@@ -543,7 +543,12 @@ impl App {
     /// is a device tool.
     fn extra_mcp_specs(&self) -> Vec<Value> {
         let mut out = Vec::new();
-        for group in [fs_tools::specs(), net_tools::specs(), board_tools::script_specs()] {
+        for group in [
+            fs_tools::specs(),
+            net_tools::specs(),
+            board_tools::script_specs(),
+            board_tools::agent_extra_specs(),
+        ] {
             for tool in openai_tools(&group) {
                 let name = tool["function"]["name"].as_str().unwrap_or_default().to_string();
                 if self.cfg.mcp.disabled_tools.iter().any(|d| d == &name) {
@@ -606,7 +611,12 @@ impl App {
         // The agent's own tools are not in the registry (they need the workspace and the
         // HTTP client), so they never appeared here — which is why the portal could show
         // 40 tools while the model had 49 and `script` looked missing.
-        for group in [fs_tools::specs(), net_tools::specs(), board_tools::script_specs()] {
+        for group in [
+            fs_tools::specs(),
+            net_tools::specs(),
+            board_tools::script_specs(),
+            board_tools::agent_extra_specs(),
+        ] {
             for entry in group.as_array().into_iter().flatten() {
                 let f = &entry["function"];
                 let name = f["name"].as_str().unwrap_or("");
@@ -884,6 +894,69 @@ impl App {
         }
     }
 
+    /// Ask the configured model about an attached image.
+    ///
+    /// This is a **second** model call, made inside a tool: the board has no OCR engine and
+    /// no image pipeline, so the only reader it has is the model the user configured. That
+    /// costs a round trip and tokens, which is why the tool description says so.
+    ///
+    /// It always uses the chat-completions shape: image parts are OpenAI's
+    /// `image_url` blocks there, Anthropic's `image` blocks in the Messages API, and the
+    /// Responses API wants input items — three shapes for one question, and this tool
+    /// answers only the shape it can be sure of.
+    fn image_read(&mut self, args: &Value) -> Result<Value> {
+        let prompt = args
+            .get("prompt")
+            .and_then(|v| v.as_str())
+            .unwrap_or("Transcribe every piece of text in this image exactly, then describe what it shows.")
+            .to_string();
+        let wanted = args.get("name").and_then(|v| v.as_str()).unwrap_or("");
+
+        let attachment = match self.attachments.iter().find(|a| wanted.is_empty() || a.name == wanted) {
+            Some(a) => a.clone(),
+            None => {
+                return Err(McpError::invalid_params(if self.attachments.is_empty() {
+                    "no image attached to the last message; attach one in the portal first".to_string()
+                } else {
+                    format!(
+                        "no attachment named `{wanted}`; the last message carried: {}",
+                        self.attachments.iter().map(|a| a.name.clone()).collect::<Vec<_>>().join(", ")
+                    )
+                }))
+            }
+        };
+        if self.llm.base_url.trim().is_empty() || self.llm.model.trim().is_empty() {
+            return Err(McpError::unsupported(
+                "no model configured, and this tool needs one to read an image",
+            ));
+        }
+        let Some(transport) = self.tool_transport.as_mut() else {
+            return Err(McpError::unsupported("no HTTP transport attached"));
+        };
+
+        let mut cfg = self.llm.clone();
+        cfg.protocol = "chat".into();
+        cfg.vision = true;
+        let messages = json!([{
+            "role": "user",
+            "content": [
+                { "type": "text", "text": prompt },
+                { "type": "image_url", "image_url": { "url": format!("data:{};base64,{}", attachment.mime, attachment.data_b64) } }
+            ]
+        }]);
+        // No tools: this is a question about a picture, not a turn.
+        let reply = crate::llm::chat(transport.as_mut(), &cfg, &messages, &json!([]))
+            .map_err(|e| McpError::hardware(format!("image_read: {e}")))?;
+        let text = crate::llm::truncate_bytes(&reply.content, 1800);
+        Ok(json!({
+            "name": attachment.name,
+            "model": cfg.model,
+            "text": text,
+            "prompt_tokens": reply.usage.prompt_tokens,
+            "completion_tokens": reply.usage.completion_tokens,
+        }))
+    }
+
     /// If this `net_*` call points at the board itself, the method, path and body to serve.
     ///
     /// Recognised hosts are loopback, the station address and the setup-AP address — that
@@ -959,6 +1032,11 @@ impl App {
         // only see a `ToolCtx`.
         if name == "script" {
             return self.run_script(args);
+        }
+        // `image_read` asks the model about an attachment, which means it needs the model
+        // config and the transport — neither of which a `ToolCtx` carries.
+        if name == "image_read" {
+            return self.image_read(args);
         }
         if !self.is_visible(name) {
             let missing =
@@ -2737,7 +2815,12 @@ impl ToolHost for App {
         let mut tools: Vec<Value> = visible.iter().map(|d| load(d)).collect();
         // File, HTTP and script tools gate on nothing the hardware must provide, so they
         // are not MCP tools; the model still gets them, in the same sorted list.
-        for group in [fs_tools::specs(), net_tools::specs(), board_tools::script_specs()] {
+        for group in [
+            fs_tools::specs(),
+            net_tools::specs(),
+            board_tools::script_specs(),
+            board_tools::agent_extra_specs(),
+        ] {
             tools.extend(openai_tools(&group));
         }
         tools.sort_by_key(|t| t["function"]["name"].as_str().unwrap_or("").to_string());
@@ -2901,6 +2984,7 @@ fn llm_json(cfg: &LlmConfig, with_key: bool) -> Value {
         "timeout_s": cfg.timeout_s,
         "reasoning": cfg.reasoning,
         "vision": cfg.vision,
+        "protocol": cfg.protocol,
     });
     if with_key {
         v["api_key"] = json!(cfg.api_key);
@@ -2945,6 +3029,9 @@ fn llm_apply_json(cfg: &mut LlmConfig, v: &Value) {
     }
     if let Some(b) = v.get("vision").and_then(|x| x.as_bool()) {
         cfg.vision = b;
+    }
+    if let Some(p) = v.get("protocol").and_then(|x| x.as_str()) {
+        cfg.protocol = crate::llm::Protocol::parse(p).as_str().to_string();
     }
 }
 

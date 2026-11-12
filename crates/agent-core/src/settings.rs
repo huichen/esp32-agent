@@ -50,6 +50,12 @@ const MODEL: &[Field] = &[
         "off | low | medium | high; empty sends nothing and leaves it to the provider (sent as `reasoning_effort`)",
     ),
     f(
+        "protocol",
+        "string",
+        "\"chat\"",
+        "chat (OpenAI chat completions) | responses (OpenAI Responses API) | anthropic (Messages API)",
+    ),
+    f(
         "vision",
         "boolean",
         "true",
