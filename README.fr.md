@@ -93,7 +93,7 @@ L’agent de la carte peut aussi s’ajouter du matériel (`manifest_apply`), un
   toutes les écritures et les lectures qui exposent le transcript, le prompt, la configuration
   et les journaux.
 - **Comparez le certificat.** Celui de la carte est auto-signé ; son empreinte est sur
-  `GET /api/tls`. Le port 80 reste ouvert exprès : un mauvais certificat coûte une URL, pas la carte.
+  `GET /api/tls`. Le port 80 est ouvert par défaut : un mauvais certificat coûte une URL, pas la carte ; `mcp.plain_http: false` le ferme, et le câble USB devient alors la seule voie de retour.
 - **`shell`, `script` et les outils du manifeste bougent des broches.** C’est le but de la carte ;
   le PIN sépare l’agent qui fait son travail d’un passant qui le ferait.
 
