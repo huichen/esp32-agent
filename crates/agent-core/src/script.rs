@@ -119,7 +119,12 @@ Only these, plus `tool`:
   num(x)        "12" -> 12, true -> 1
   type(x)       "number" | "string" | "bool" | "nil" | "list" | "map"
   log(x, ...)   one line into the run output (64 lines max)
+  sleep(ms)     wait, at most 2 s per call and 5 s per script
   tool(name, args)   call any board tool; args is a map; returns its JSON
+
+`sleep` really waits: the thread is in the scheduler's hands, not spinning,
+but the portal still answers only after the script returns. A script that
+needs to wait longer than 5 s is a scheduled task, not a loop.
 
 `tool` is the only way out: same permissions as the caller, and
 `tool("script", ...)` is refused.
@@ -211,7 +216,7 @@ pub fn lint(source: &str) -> Lint {
 }
 
 /// The functions a script may call, other than `tool`.
-pub const BUILTINS_NAMES: &[&str] = &["len", "str", "num", "type", "log", "print", "echo", "tool"];
+pub const BUILTINS_NAMES: &[&str] = &["len", "str", "num", "type", "log", "print", "echo", "sleep", "tool"];
 
 fn collect_calls(stmts: &[Stmt], out: &mut Vec<String>) {
     for stmt in stmts {
@@ -1050,7 +1055,22 @@ struct Run<'a> {
     /// When the script started, so the loop can be stopped by the clock as well as by
     /// the step count.
     started_ms: u64,
+    /// How long this script has slept in total. `sleep()` is capped so a script cannot turn
+    /// into an outage: it runs on the thread that also answers the portal.
+    slept_ms: u64,
 }
+
+/// The longest one `sleep(ms)` call will actually wait.
+///
+/// The script runs on the thread that answers the portal — a 5 s tool call already shows up
+/// as a portal that does not respond (measured: 5 103 ms for a `sleep 5` tool). A two second
+/// nap is the most that stays in the same range as a slow tool result.
+pub const SLEEP_MAX_MS: u64 = 2_000;
+/// The most a whole script may sleep, across every call.
+///
+/// Short enough to stay inside the 30 s wall clock with room to work, and short enough that
+/// a script which sleeps in a loop hits the ceiling rather than the portal's patience.
+pub const SLEEP_TOTAL_MS: u64 = 5_000;
 
 /// Run `source`, returning its last expression value.
 /// Run with the arguments a caller passed in.
@@ -1104,6 +1124,7 @@ pub fn run_with(
         depth: 0,
         output: Vec::new(),
         started_ms: now_ms(),
+        slept_ms: 0,
     };
     runner.execute(program)
 }
@@ -1534,6 +1555,35 @@ impl<'a> Run<'a> {
                 self.output.push(clip(line));
                 Ok(Val::Nil)
             }
+            "sleep" => {
+                // A real wait, not a busy one: the interpreter may not spin, and the board's
+                // scheduler is free to run other tasks while this thread is in vTaskDelay.
+                let ms = match values.first() {
+                    Some(Val::Num(n)) if *n > 0.0 => *n as u64,
+                    Some(Val::Num(_)) => 0,
+                    Some(other) => {
+                        return Err(format!("sleep() needs milliseconds, got a {}", other.type_name()))
+                    }
+                    None => return Err("sleep() needs milliseconds".into()),
+                };
+                let left = SLEEP_TOTAL_MS.saturating_sub(self.slept_ms);
+                if left == 0 {
+                    return Err(format!(
+                        "this script already slept its {SLEEP_TOTAL_MS} ms (a script holds the \
+                         portal while it waits)"
+                    ));
+                }
+                // Never past the wall clock either: the loop that checks it only runs
+                // between statements, and a script that sleeps may have few of them left.
+                let spent = now_ms().saturating_sub(self.started_ms);
+                let budget = MAX_MS.saturating_sub(spent).saturating_sub(1);
+                let nap = ms.min(SLEEP_MAX_MS).min(left).min(budget);
+                if nap > 0 {
+                    std::thread::sleep(std::time::Duration::from_millis(nap));
+                    self.slept_ms += nap;
+                }
+                Ok(Val::Nil)
+            }
             "tool" => {
                 let name = match values.first() {
                     Some(Val::Str(s)) => s.clone(),
@@ -1547,7 +1597,9 @@ impl<'a> Run<'a> {
                 let out = self.host.call_tool(&name, &args)?;
                 Ok(Val::from_json(&out))
             }
-            other => Err(format!("unknown function `{other}` (builtins: len, str, num, type, log, tool)")),
+            other => {
+                Err(format!("unknown function `{other}` (builtins: len, str, num, type, log, sleep, tool)"))
+            }
         }
     }
 }
@@ -1582,6 +1634,47 @@ mod tests {
         fn call_tool(&mut self, name: &str, _args: &Value) -> Result<Value, String> {
             Err(format!("no tool `{name}`"))
         }
+    }
+
+    /// `sleep` is a real wait, and a bounded one: a script runs on the thread that answers
+    /// the portal, so a script that naps in a loop must hit a ceiling rather than an outage.
+    #[test]
+    fn sleep_waits_and_is_capped() {
+        use std::time::Instant;
+
+        let t0 = Instant::now();
+        let out = run("sleep(30)\n1", &mut NoHost).expect("a nap is not an error");
+        let waited = t0.elapsed().as_millis();
+        assert_eq!(out.result, json!(1), "sleep returns nil and the script continues");
+        assert!(waited >= 25, "sleep(30) waited {waited} ms");
+        assert!(waited < 1_000, "sleep(30) must not wait a second: {waited} ms");
+
+        // Zero and negative are free, and a non-number is refused with a sentence.
+        let t0 = Instant::now();
+        run("sleep(0)\nsleep(-5)\n1", &mut NoHost).expect("zero is not a wait");
+        assert!(t0.elapsed().as_millis() < 500);
+        let err = run("sleep(\"soon\")", &mut NoHost).unwrap_err();
+        assert!(err.contains("needs milliseconds"), "{err}");
+
+        // The total budget is a check on the interpreter's own counter, not on the clock:
+        // the runner starts with the counter already spent, which is what a script that
+        // slept in a loop looks like at the end.
+        let toks = lex("sleep(1)").expect("lex");
+        let mut parser = Parser { toks, pos: 0 };
+        let program = parser.program().expect("parse");
+        let mut runner = Run {
+            host: &mut NoHost,
+            scopes: vec![BTreeMap::new()],
+            fns: BTreeMap::new(),
+            calls: 0,
+            steps: 0,
+            depth: 0,
+            output: Vec::new(),
+            started_ms: now_ms(),
+            slept_ms: SLEEP_TOTAL_MS,
+        };
+        let err = runner.execute(program).unwrap_err();
+        assert!(err.contains("already slept"), "{err}");
     }
 
     /// 50 000 steps stopped honest loops (about 0.2 s of work); the bound is now the clock.
