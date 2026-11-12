@@ -79,3 +79,14 @@ CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
 # unless the trace facility is on, and with it off the linker fails on the symbol.
 # It costs a few bytes per task.
 CONFIG_FREERTOS_USE_TRACE_FACILITY=y
+
+# Thread stacks on this board must be allowed to come from PSRAM: internal SRAM is down
+# to a few kB after TLS, and a request thread that cannot get a stack turns a slow request
+# into no requests at all.
+CONFIG_SPIRAM_ALLOW_STACK_EXTERNAL_MEMORY=y
+
+# A TLS record buffer is 16 KB by default in each direction; the board answers with a
+# few kilobytes at a time and handshakes while internal SRAM is nearly gone. 4 KB is the
+# smallest that still carries a normal response, and it frees ~24 KB in one step.
+CONFIG_MBEDTLS_SSL_IN_CONTENT_LEN=4096
+CONFIG_MBEDTLS_SSL_OUT_CONTENT_LEN=4096
