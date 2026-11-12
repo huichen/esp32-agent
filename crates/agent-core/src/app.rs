@@ -504,14 +504,17 @@ impl App {
         tools.register_all(board_tools::always_tools());
         tools.register_all(board_tools::manifest_tools());
         tools.register(board_tools::board_family());
+        tools.register(board_tools::bus_family());
         // A family is one tool with several commands; the members are still registered under
         // their old names, so a stored script keeps calling the same handler. Remembering
         // which is which is what lets the listing say "reachable as `board status`" instead
         // of dropping nine names without a word.
         let mut members: std::collections::BTreeMap<String, String> = Default::default();
-        for (family, names) in
-            [("manifest", board_tools::manifest_members()), ("board", board_tools::board_members())]
-        {
+        for (family, names) in [
+            ("manifest", board_tools::manifest_members()),
+            ("board", board_tools::board_members()),
+            ("bus", board_tools::bus_members()),
+        ] {
             let prefix = format!("{family}_");
             for name in names {
                 let command = name.strip_prefix(&prefix).unwrap_or(&name).to_string();
@@ -6660,7 +6663,7 @@ mod tests {
             assert!(!app.is_visible(hidden), "{hidden} should be hidden in minimal");
         }
         // The bootstrap survives: discovery, manifest, GPIO and the file tools.
-        for kept in ["board", "devices_list", "devices_probe", "i2c_scan", "manifest", "gpio_write"] {
+        for kept in ["board", "devices_list", "devices_probe", "bus", "manifest"] {
             assert!(app.is_visible(kept), "{kept} must survive the minimal profile");
         }
         // `fs_*`, `net_*` and `script` live outside the registry, so they are checked in the
@@ -8444,8 +8447,11 @@ mod tests {
         let names = |v: &Value| -> Vec<String> {
             v.as_array().unwrap().iter().map(|s| s.as_str().unwrap().to_string()).collect()
         };
-        let families =
-            [("manifest", crate::tools::manifest_members()), ("board", crate::tools::board_members())];
+        let families = [
+            ("manifest", crate::tools::manifest_members()),
+            ("board", crate::tools::board_members()),
+            ("bus", crate::tools::bus_members()),
+        ];
         for (family, members) in families {
             let spec = ToolHost::tool_specs(&app)
                 .as_array()
@@ -9381,7 +9387,7 @@ mod tests {
         for gone in ["led_set", "led_blink", "buttons_read", "button_wait"] {
             assert!(!app.is_visible(gone), "{gone} survived a minimal start");
         }
-        assert!(app.is_visible("gpio_write"), "the primitives must stay");
+        assert!(app.is_visible("bus"), "the primitives must stay");
         assert!(app.is_visible("manifest"), "self-configuration must stay");
 
         // Declaring them in the manifest brings the tools back — the whole point.

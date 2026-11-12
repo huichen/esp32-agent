@@ -42,7 +42,7 @@ At boot (and on every `devices_probe` / `/api/devices/probe`):
    On the read side the driver judges by `bytes_read`, not by the return code: this
    board's `i2s_channel_read` answers `ESP_ERR_TIMEOUT` while already holding samples, and
    counting only `ESP_OK` makes a working microphone read as silence.
-6. An address no driver claims goes into `unidentified`; `i2c_identify` then reads the
+6. An address no driver claims goes into `unidentified`; `bus i2c_identify` then reads the
    common id registers to suggest candidates.
 
 ## 2. Implemented drivers
@@ -132,8 +132,7 @@ authoritative when this table and a firmware disagree.
 |---|---|
 | `board` | the board about itself, in nine commands: `status` (chip, firmware, uptime, die temperature, heap, WiFi, device count, tool counters), `inventory` (profile, buses scanned, every device with pins and address, addresses nothing claimed), `config_get`/`config_set`, `chip_temp` (the die's own sensor, not a board thermometer), `logs_tail`, `reboot`, `factory_reset`, `delay`; `command: help` lists each |
 | `devices_list`, `devices_probe` | the detected devices and their capabilities; re-scan the buses |
-| `i2c_scan`, `i2c_read`, `i2c_write`, `i2c_identify` | bus access for chips without a driver, and "what answers at this address" |
-| `gpio_mode`, `gpio_read`, `gpio_write`, `adc_read` | the pins a manifest composes, as tools of their own |
+| `bus` | raw access for chips without a driver, in eight commands: `i2c_scan`, `i2c_read`, `i2c_write`, `i2c_identify`, `gpio_mode`, `gpio_read`, `gpio_write`, `adc_read` — the command names are exactly the `exec` primitives they wrap; `command: help` lists what each takes |
 | `device_invoke` | one detected device's tool, by id — what `tools_mode: generic` collapses the device tools into |
 
 The `manifest` (five commands) and `board` (nine) families are in [manifest](manifest.md) and here above; `shell`, `read`,

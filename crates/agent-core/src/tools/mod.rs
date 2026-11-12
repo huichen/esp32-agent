@@ -672,13 +672,7 @@ const BOARD_COMMANDS: &[&str] = &[
 pub fn board_commands() -> Vec<ToolDef> {
     let mut pool = always_tools();
     pool.extend(manifest_tools::board_extra_tools());
-    let mut picked: Vec<ToolDef> = Vec::with_capacity(BOARD_COMMANDS.len());
-    for name in BOARD_COMMANDS {
-        if let Some(at) = pool.iter().position(|d| d.spec.name == *name) {
-            picked.push(pool.remove(at));
-        }
-    }
-    picked
+    pick(&mut pool, BOARD_COMMANDS)
 }
 
 /// The `board` family: one tool, nine commands.
@@ -694,6 +688,57 @@ pub fn board_family() -> ToolDef {
 /// The names the family takes over, derived from the commands themselves.
 pub fn board_members() -> Vec<String> {
     board_commands().into_iter().map(|d| d.spec.name).collect()
+}
+
+/// The commands of the `bus` family: the pins and the buses, with no driver in between.
+///
+/// Names stay whole inside the family (`bus i2c_read`). These are the names the manifest's
+/// `exec` primitives, the shell's usage text and every document already use; shortening
+/// them would save a few bytes in `help` and cost the one thing a model is likely to have
+/// learned before the family existed.
+const BUS_COMMANDS: &[&str] = &[
+    "i2c_scan",
+    "i2c_read",
+    "i2c_write",
+    "i2c_identify",
+    "gpio_mode",
+    "gpio_read",
+    "gpio_write",
+    "adc_read",
+];
+
+/// The `bus` family: one tool, eight commands.
+pub fn bus_family() -> ToolDef {
+    Family::new(
+        "bus",
+        "Raw access to the pins and buses: I2C scan/read/write/identify, GPIO mode/read/write, one ADC pin. For chips without a driver; `command: help` lists what each takes",
+        bus_commands(),
+    )
+    .into_tool()
+}
+
+pub fn bus_commands() -> Vec<ToolDef> {
+    let mut pool = always_tools();
+    pool.extend(manifest_tools::board_extra_tools());
+    pick(&mut pool, BUS_COMMANDS)
+}
+
+pub fn bus_members() -> Vec<String> {
+    bus_commands().into_iter().map(|d| d.spec.name).collect()
+}
+
+/// Take the named tools out of `pool`, in the order `names` gives them.
+///
+/// A family's command order is the order a person reads; deriving it from one list means
+/// the declaration, `help` and dispatch order agree without a second place to edit.
+fn pick(pool: &mut Vec<ToolDef>, names: &[&str]) -> Vec<ToolDef> {
+    let mut picked = Vec::with_capacity(names.len());
+    for name in names {
+        if let Some(at) = pool.iter().position(|d| d.spec.name == *name) {
+            picked.push(pool.remove(at));
+        }
+    }
+    picked
 }
 
 /// Capabilities satisfied by the board rather than by a device, exposed for the
