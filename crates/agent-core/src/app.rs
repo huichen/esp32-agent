@@ -1043,6 +1043,11 @@ impl App {
         }
         // Familiar names, same handlers. `curl`/`wget`/`nslookup`/`nc` are what people
         // already type; the fs_*/net_* names stay reachable from `script`.
+        if let Some(usage) = crate::tools::shell::usage(name) {
+            if args.get("help").and_then(|v| v.as_bool()).unwrap_or(false) {
+                return Ok(json!({ "help": format!("usage: {usage}") }));
+            }
+        }
         if let Some(inner) = match name {
             "read" => Some("fs_read"),
             "write" => Some("fs_write"),
@@ -1051,11 +1056,14 @@ impl App {
             "nc" => Some("net_tcp"),
             _ => None,
         } {
-            let text = self.fs_or_net_call(inner, args).map_err(McpError::invalid_params)?;
+            let text = self
+                .fs_or_net_call(inner, args)
+                .map_err(|e| McpError::invalid_params(with_usage(name, e)))?;
             return Ok(serde_json::from_str(&text).unwrap_or_else(|_| json!({ "text": text })));
         }
         if name == "curl" || name == "wget" {
-            let text = self.run_curl(name, args).map_err(McpError::invalid_params)?;
+            let text =
+                self.run_curl(name, args).map_err(|e| McpError::invalid_params(with_usage(name, e)))?;
             return Ok(serde_json::from_str(&text).unwrap_or_else(|_| json!({ "text": text })));
         }
         if name == "ifconfig" {
@@ -1069,7 +1077,7 @@ impl App {
             let count = args.get("count").and_then(|v| v.as_u64()).unwrap_or(3).clamp(1, 5) as u32;
             return match self.hw.ping(&host, count) {
                 Ok(v) => Ok(v),
-                Err(e) => Err(McpError::unsupported(format!("ping: {}", e.message))),
+                Err(e) => Err(McpError::unsupported(with_usage("ping", format!("ping: {}", e.message)))),
             };
         }
         // `image_read` asks the model about an attachment, which means it needs the model
@@ -2933,18 +2941,40 @@ impl App {
     /// `shell {op, …}`: pick the command, hand the rest of the arguments to the handler.
     fn run_shell(&mut self, args: &Value) -> std::result::Result<String, String> {
         let op = args.get("op").and_then(|v| v.as_str()).unwrap_or("").trim().to_ascii_lowercase();
-        let tool = crate::tools::shell::route(&op)
-            .ok_or_else(|| format!("`{op}` is not a shell command; try ls, cat, get, dns, zip…"))?;
+        // `shell help`, `shell {"op":"rm","help":true}` and a bare unknown op all answer
+        // with the usage lines: a model that guessed the flags should not have to guess
+        // again to find out what they are.
+        let wants_help = op == "help" || args.get("help").and_then(|v| v.as_bool()).unwrap_or(false);
+        if wants_help {
+            let text = match crate::tools::shell::usage(&op) {
+                Some(line) if op != "help" => {
+                    format!("usage: {line}\n\n{}", crate::tools::shell::help_text())
+                }
+                _ => crate::tools::shell::help_text(),
+            };
+            return Ok(json!({ "help": text }).to_string());
+        }
+        let tool = crate::tools::shell::route(&op).ok_or_else(|| {
+            format!("`{op}` is not a shell command.\n\n{}", crate::tools::shell::help_text())
+        })?;
         // The command's own arguments are the same object minus `op`.
         let mut inner = args.clone();
         if let Some(map) = inner.as_object_mut() {
             map.remove("op");
         }
-        match tool {
+        let usage = crate::tools::shell::usage(&op).unwrap_or("");
+        let result = match tool {
             "shell_zip" => self.shell_zip(&inner),
             "shell_unzip" => self.shell_unzip(&inner),
             other => self.fs_or_net_call(other, &inner),
-        }
+        };
+        result.map_err(|e| {
+            if usage.is_empty() || e.contains("usage:") {
+                e
+            } else {
+                format!("{e}\n\nusage: {usage}")
+            }
+        })
     }
 
     /// `curl`: GET (with HTML reduced to text) or POST when `data` is given.
@@ -3081,6 +3111,17 @@ impl App {
             }));
         }
         Ok(json!({ "entries": out, "count": out.len() }).to_string())
+    }
+}
+
+/// Put the command's usage line under an error, once.
+///
+/// A model that passed the wrong argument reads the correction where it happened; making
+/// it call `--help` afterwards costs a whole turn to learn one line.
+fn with_usage(name: &str, error: String) -> String {
+    match crate::tools::shell::usage(name) {
+        Some(line) if !error.contains("usage:") => format!("{error}\n\nusage: {line}"),
+        _ => error,
     }
 }
 
@@ -4218,6 +4259,35 @@ mod tests {
             &json!({"text":"x","attachments":[{"name":"big.bin","mime":"x/y","data_b64":big}]}).to_string(),
         ));
         assert_eq!(resp.status, 413);
+    }
+
+    /// A model that gets a command wrong should read the correction in the error, and
+    /// `--help` should answer the same lines without running anything.
+    #[test]
+    fn shell_errors_carry_the_usage_line() {
+        let mut app = test_app();
+        let queued = |app: &mut App, args: Value| ToolHost::call_tool(app, "shell", &args);
+
+        // Missing `confirm`: the error says how to write it.
+        let err = queued(&mut app, json!({"op":"rm","path":"/x"})).unwrap_err();
+        assert!(err.contains("usage: rm <path> --confirm"), "{err}");
+
+        // An operator nobody has lists the ones that exist.
+        let err = queued(&mut app, json!({"op":"sudo"})).unwrap_err();
+        assert!(err.contains("ls [path]"), "{err}");
+
+        // `help` answers without doing anything.
+        let help: Value = serde_json::from_str(&queued(&mut app, json!({"op":"help"})).unwrap()).unwrap();
+        assert!(help["help"].as_str().unwrap().contains("unzip --archive_b64"), "{help}");
+        let one: Value =
+            serde_json::from_str(&queued(&mut app, json!({"op":"cp","help":true})).unwrap()).unwrap();
+        assert!(one["help"].as_str().unwrap().starts_with("usage: cp <from> <to>"), "{one}");
+
+        // A standalone tool does the same.
+        let err = app.call_tool("read", &json!({"path":"/nope.txt"})).unwrap_err();
+        assert!(err.message.contains("usage: read <path>"), "{}", err.message);
+        let help = app.call_tool("ping", &json!({"help":true})).unwrap();
+        assert_eq!(help["help"], json!("usage: ping <host> [--count n]"));
     }
 
     // ---- the live journal stream (docs/agent-stream.md §1) ----

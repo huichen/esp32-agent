@@ -28,6 +28,53 @@ pub const OPS: &[(&str, &str)] = &[
     ("unzip", "shell_unzip"),
 ];
 
+/// How each command is written, in the order it takes its arguments.
+///
+/// This exists because a model that gets a command wrong needs the correction in the
+/// error, not in a document it must go and fetch: `rm` without `confirm` answers with
+/// `usage: rm <path> --confirm`, and `shell help` lists every line.
+pub fn usage(op: &str) -> Option<&'static str> {
+    Some(match op {
+        "ls" => "ls [path]",
+        "rm" => "rm <path> --confirm",
+        "cp" => "cp <from> <to>",
+        "mv" => "mv <from> <to> --confirm",
+        "grep" => "grep <pattern> [path]",
+        "zip" => "zip --name <archive> [--files {name: text}] [--paths [path]]",
+        "unzip" => "unzip --archive_b64 <base64>",
+        // The commands that are tools of their own. They share the table so `--help` and
+        // the error suffix say the same thing wherever the model reaches them.
+        "read" => "read <path>",
+        "write" => "write <path> <text>",
+        "edit" => "edit <path> <find> <replace>",
+        "curl" => "curl <url> [--data <body>] [--format text|raw]",
+        "wget" => "wget <url> [--path <path>] [--format text|raw]",
+        "nslookup" => "nslookup <host> [--port n]",
+        "nc" => "nc <host> [--port n] [--timeout_ms n]",
+        "ping" => "ping <host> [--count n]",
+        "ifconfig" => "ifconfig",
+        _ => return None,
+    })
+}
+
+/// Every command with its usage, for `shell {"op":"help"}`.
+pub fn help_text() -> String {
+    let mut out = String::from("shell commands (op + arguments):\n");
+    for (op, _) in OPS {
+        if let Some(line) = usage(op) {
+            out.push_str("  ");
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    out.push_str(
+        "Separate tools with their own names: read <path> · write <path> <text> · edit <path> <find> <replace> · \
+         curl <url> [--data <body>] [--format text|raw] · wget <url> [--path <path>] · nslookup <host> [--port n] · \
+         nc <host> [--port n] [--timeout_ms n] · ping <host> [--count n] · ifconfig",
+    );
+    out
+}
+
 /// The handler a command maps to, or `None` for an operator nobody has.
 pub fn route(op: &str) -> Option<&'static str> {
     let op = op.trim().to_ascii_lowercase();
@@ -55,6 +102,7 @@ pub fn spec() -> ToolDef {
             ("name", string("archive name, for zip")),
             ("files", json!({ "type": "object", "description": "for zip: {name: text} entries to pack" })),
             ("archive_b64", string("for unzip: the archive, base64")),
+            ("help", json!({ "type": "boolean", "description": "return the usage lines instead of running anything" })),
         ],
         &["op"],
     ))
