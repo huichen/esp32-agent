@@ -76,7 +76,7 @@ agent 用 `POST /api/agent/config` 写进去——和面板发的是同一个调
 
 | 部分 | 状态 |
 |---|---|
-| `agent-core` | 734 个单元测试与 4 个集成测试通过；`scripts/smoke.ps1` 端到端通过 |
+| `agent-core` | 734 个单元测试与 5 个集成测试通过；`scripts/smoke.ps1` 端到端通过 |
 | 模拟器 | 控制台、MCP 与智能体循环端到端运行 |
 | 固件 | 在 ESP32-S3-DevKitC-1 N16R8（IDF v5.5.2）上烧录：42 个工具、OLED 128×32、I²S 麦克风与功放、WS2812、TLS 控制台、通过 HTTPS 的模型轮次 |
 | 未实现 | OTA、SD 卡、DHT11/22、摄像头。见 `ROADMAP.md` |
