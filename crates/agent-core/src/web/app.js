@@ -952,6 +952,26 @@ function autosize() {
   const el = $("#input");
   el.style.height = "auto";
   el.style.height = Math.min(el.scrollHeight, 132) + "px";
+  fitChatToComposer();
+}
+
+/** How far the composer was lifted off the bottom, by the keyboard listener below. */
+let composerLift = 0;
+
+/** Reserve exactly what the composer covers at the bottom of the transcript.
+ *
+ * The chat's own `padding-bottom` is what keeps the last message from disappearing behind
+ * the composer, and it used to be a flat 84 px — right only for a one-line field at `bottom:
+ * 0`. A field that has grown to two or three rows, or a composer lifted above the keyboard
+ * by `composerLift`, is taller than that, and the last bubble is then cut off by the bar.
+ * Measuring the composer costs a `getBoundingClientRect` and cannot drift from it. */
+function fitChatToComposer() {
+  const composer = $("#composer");
+  const chat = $("#chat");
+  if (!composer || !chat) return 0;
+  const pad = Math.ceil(composer.getBoundingClientRect().height + composerLift + 10);
+  chat.style.paddingBottom = pad + "px";
+  return pad;
 }
 
 /** Keep the composer above the on-screen keyboard.
@@ -968,8 +988,10 @@ function trackViewport() {
     const composer = $("#composer");
     if (vv && composer) {
       const gap = Math.max(0, window.innerHeight - (vv.height + vv.offsetTop));
+      composerLift = gap;
       composer.style.transform = `translateY(-${gap}px)`;
     }
+    fitChatToComposer();
     if (document.activeElement === $("#input")) scrollToEnd();
   };
   if (vv) {
@@ -977,6 +999,11 @@ function trackViewport() {
     vv.addEventListener("scroll", apply);
   }
   window.addEventListener("orientationchange", () => setTimeout(apply, 250));
+  // The field grows on its own (up to 132 px) while it is typed into; the transcript's
+  // padding has to follow that, not a number chosen for an empty composer.
+  if (window.ResizeObserver) {
+    new ResizeObserver(() => fitChatToComposer()).observe($("#composer"));
+  }
   apply();
 }
 
