@@ -344,6 +344,10 @@ pub struct Agent {
     pub archive: Vec<String>,
     /// How many earlier answers were reduced to a line, so the prompt can say so.
     pub demoted_answers: usize,
+    /// Bumped by every mutation of `history`, so the token estimate can be cached.
+    history_version: u64,
+    /// `(version, message count, tokens)`; `None` until the first estimate.
+    token_cache: Option<(u64, usize, u32)>,
     /// How many of the newest messages a restored transcript had to leave out, because
     /// the stored tail is capped at [`MAX_SAVED_BYTES`]. Non-zero only on the boot that
     /// read it back, and stated in the prompt: a model that does not know the beginning
@@ -381,6 +385,8 @@ impl Default for Agent {
             history: Vec::new(),
             archive: Vec::new(),
             demoted_answers: 0,
+            history_version: 0,
+            token_cache: None,
             saved_dropped: 0,
             pending: None,
             last_error: String::new(),
@@ -587,6 +593,7 @@ impl Agent {
         let user = self.pending.take()?;
         self.runs = self.runs.saturating_add(1);
         self.history.push(user);
+        self.history_version += 1;
         self.trim();
         self.usage_run = llm::Usage::default();
         self.turn_steps = 0;
@@ -643,6 +650,7 @@ impl Agent {
 
         if reply.tool_calls.is_empty() {
             let text = llm::truncate_bytes(&reply.content, MAX_REPLY_BYTES);
+            self.history_version += 1;
             self.history.push(Message::assistant_with_reasoning(
                 &text,
                 &reply.reasoning,
@@ -717,6 +725,7 @@ impl Agent {
             // `Message::tool_result` owns the 2 KB cut; the marker tells the model
             // the result it sees is incomplete.
             self.history.push(Message::tool_result(&call.id, &result, is_error, at));
+            self.history_version += 1;
         }
         self.trim();
 
@@ -803,13 +812,16 @@ impl Agent {
         }
         while self.history.len() > MAX_HISTORY_MESSAGES {
             self.history.remove(0);
+            self.history_version += 1;
         }
         while self.history_bytes() > MAX_HISTORY_BYTES && self.history.len() > 1 {
             let dropped = self.history.remove(0);
+            self.history_version += 1;
             self.archive_message(&dropped);
         }
         while matches!(self.history.first().map(|m| m.role), Some(Role::Tool)) {
             let dropped = self.history.remove(0);
+            self.history_version += 1;
             self.archive_message(&dropped);
         }
         while self.archive.len() > ARCHIVE_MAX_LINES {
@@ -830,6 +842,9 @@ impl Agent {
             return;
         }
         let dropped: Vec<Message> = self.history.drain(..cut).collect();
+        if !dropped.is_empty() {
+            self.history_version += 1;
+        }
         for message in &dropped {
             self.archive_message(message);
         }
@@ -881,6 +896,9 @@ impl Agent {
     pub fn forget(&mut self, keep_turns: usize) -> (usize, usize) {
         let cut = turn_start(&self.history, keep_turns.min(self.history.len()));
         let removed = self.history.drain(..cut).count();
+        if removed > 0 {
+            self.history_version += 1;
+        }
         self.archive.clear();
         self.demoted_answers = 0;
         self.saved_dropped = 0;
@@ -894,7 +912,7 @@ impl Agent {
     /// Public because it is the whole answer to "when does this fire": the three bounds
     /// are the token budget from the configured window, the hard byte ceiling that keeps
     /// the ring buffer inside the board's RAM, and the message count.
-    pub fn needs_compaction(&self) -> bool {
+    pub fn needs_compaction(&mut self) -> bool {
         self.history_tokens() > trigger_tokens(self.context_tokens)
             || self.history_bytes() > MAX_HISTORY_BYTES
             || self.history.len() > MAX_HISTORY_MESSAGES
@@ -904,7 +922,22 @@ impl Agent {
     ///
     /// Tool arguments count too: a `write` of two kilobytes is the largest thing a single
     /// message can carry, and leaving it out would let a run of them look free.
-    pub fn history_tokens(&self) -> u32 {
+    ///
+    /// Memoised on `history_version`: a 512 KB transcript is half a million character
+    /// classifications, and `needs_compaction` used to pay for that on every step.
+    pub fn history_tokens(&mut self) -> u32 {
+        if let Some((version, len, tokens)) = self.token_cache {
+            if version == self.history_version && len == self.history.len() {
+                return tokens;
+            }
+        }
+        let tokens = self.history_tokens_uncached();
+        self.token_cache = Some((self.history_version, self.history.len(), tokens));
+        tokens
+    }
+
+    /// The same number, always recomputed. Tests use it to prove the cache is not lying.
+    pub fn history_tokens_uncached(&self) -> u32 {
         self.history
             .iter()
             .map(|m| {
