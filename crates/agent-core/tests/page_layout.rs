@@ -135,6 +135,14 @@ window.__esp32Measure = function () {
 </script>
 "##;
 
+/// The ports the headless browser will not connect to, so the harness never picks one.
+///
+/// The list is Chromium's `kRestrictedPorts` for the ranges an ephemeral port can land in;
+/// the well-known ones below 1024 never come back from `bind(0)` and are left out.
+fn chrome_allows_port(port: u16) -> bool {
+    !matches!(port, 2049 | 3659 | 4045 | 5060 | 5061 | 6000 | 6566 | 6665..=6669 | 6697 | 10080)
+}
+
 /// The page under measurement, served so that `app.js` and the stylesheet are the shipped
 /// files and the origin is a normal one (`localStorage`, `fetch` and the module-scope
 /// helpers behind `showAttach` all behave as they do on the board).
@@ -189,7 +197,16 @@ fn serve() -> String {
         ("/assets/style.css".into(), STYLE_CSS.to_string()),
         ("/assets/app.js".into(), APP_JS.to_string()),
     ];
-    let listener = TcpListener::bind("127.0.0.1:0").expect("a loopback port for the harness");
+    let listener = loop {
+        // Chrome refuses a list of ports outright (`ERR_UNSAFE_PORT`: 6000 for X11, 6665-6669
+        // for IRC, 10080, ...). An ephemeral port lands on one now and then, which shows up as
+        // "app.js did not run" in a test that has nothing to do with ports.
+        let candidate = TcpListener::bind("127.0.0.1:0").expect("a loopback port for the harness");
+        let port = candidate.local_addr().expect("the harness address").port();
+        if chrome_allows_port(port) {
+            break candidate;
+        }
+    };
     let address = listener.local_addr().expect("the harness address");
     let routes = Arc::new(routes);
     thread::spawn(move || {
