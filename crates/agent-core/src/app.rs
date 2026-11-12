@@ -119,6 +119,12 @@ pub struct FwMeta {
     pub name: String,
     pub version: String,
     pub build: String,
+    /// The git commit the image was built from, as the build script saw it. Empty when the
+    /// build did not provide one; the point is that two images differ here, which is the
+    /// only cheap way to answer "is the board running what I just flashed".
+    pub commit: String,
+    /// When it was built, UTC, from the same source.
+    pub built_at: String,
 }
 
 /// Two images of ~24 kB each is what a phone screenshot downscaled in the browser comes
@@ -160,6 +166,8 @@ impl Default for FwMeta {
         Self {
             name: protocol::SERVER_NAME.into(),
             version: env!("CARGO_PKG_VERSION").into(),
+            commit: String::new(),
+            built_at: String::new(),
             build: "host".into(),
         }
     }
@@ -665,7 +673,7 @@ impl App {
         let tool_count = self.tool_specs().as_array().map(|a| a.len()).unwrap_or(0);
         crate::sitemap::document(json!({
             "base_url": format!("{}://{host}", req.scheme),
-            "firmware": { "name": "esp32-agent", "version": crate::VERSION },
+            "firmware": { "name": "esp32-agent", "version": crate::VERSION, "build": self.firmware.build, "commit": self.firmware.commit, "built_at": self.firmware.built_at },
             "board": { "profile": self.cfg.board, "devices": self.devices.len() },
             "mcp": crate::sitemap::mcp_json(
                 &self.cfg.mcp.path,
