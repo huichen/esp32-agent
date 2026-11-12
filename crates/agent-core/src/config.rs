@@ -115,7 +115,19 @@ pub struct WifiCfg {
 pub struct McpCfg {
     /// Master switch for the HTTP/MCP service.
     pub enabled: bool,
+    /// Plaintext port. Unused when `plain_http` is false.
     pub port: u16,
+    /// Whether the board also answers over plain HTTP.
+    ///
+    /// Turning it off leaves only https on 443. Two consequences are deliberate and worth
+    /// knowing before you turn it off: the console's way back in when a certificate is wrong
+    /// disappears with it, and a board whose clock is not yet synced cannot validate
+    /// outbound TLS (SNTP needs the link up, not this port). Recovery without HTTP is the
+    /// USB cable: `provision` over USB-Serial-JTAG, or a factory reset.
+    ///
+    /// The board refuses to run with both this and TLS unavailable: a device that answers on
+    /// no port at all is not more secure, only bricked.
+    pub plain_http: bool,
     /// Path the Streamable HTTP endpoint answers on.
     pub path: String,
     /// `auto` = only tools whose hardware was detected, `all` = every built-in
@@ -271,6 +283,7 @@ impl Default for McpCfg {
         Self {
             enabled: true,
             port: DEFAULT_PORT,
+            plain_http: true,
             path: DEFAULT_PATH.into(),
             tools_mode: "auto".into(),
             disabled_tools: Vec::new(),
@@ -337,6 +350,13 @@ impl Config {
     /// Apply a partial JSON object (as posted by the portal) on top of `self`.
     /// Unknown keys are ignored; secrets sent as `__set__` or `""` keep the
     /// stored value unless `clear_secrets` is set.
+    /// Why `plain_http: false` would leave this board unreachable, when that is knowable from
+    /// the configuration alone. The firmware keeps the last TLS failure, so `None` here means
+    /// "the config cannot tell", not "a certificate definitely exists".
+    pub fn tls_error_hint(&self) -> Option<&'static str> {
+        None
+    }
+
     pub fn apply_patch(&mut self, patch: &Value) -> crate::error::Result<Vec<String>> {
         let mut touched = Vec::new();
         if !patch.is_object() {
@@ -439,6 +459,17 @@ impl Config {
             if let Some(n) = m.get("port").and_then(|v| v.as_u64()) {
                 self.mcp.port = n.min(65535) as u16;
                 touched.push("mcp.port".into());
+            }
+            if let Some(b) = m.get("plain_http").and_then(|v| v.as_bool()) {
+                self.mcp.plain_http = b;
+                touched.push("mcp.plain_http".into());
+                // Switching it on is checked where the listeners are opened (the board
+                // knows whether a certificate exists there, not here), but a patch that
+                // asks for https-only on a board without a certificate is worth a note in
+                // the reply rather than a silent no-op at boot.
+                if !b && self.tls_error_hint().is_some() {
+                    touched.push("mcp.plain_http:no-certificate".into());
+                }
             }
             if let Some(s) = m.get("path").and_then(|v| v.as_str()) {
                 self.mcp.path = normalize_path(s);

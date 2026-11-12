@@ -10,8 +10,7 @@ becomes MCP tools. The agent on the board sees those same tools and answers with
 sensor can be declared in JSON while the board runs.
 
 > The agent loop follows [FutureOS](https://github.com/futuregene/future-os): transcript,
-> tool journal, stream events, protocol adapters, memory index. Where the firmware differs
-> (kilobytes instead of gigabytes of RAM, no model-written summaries) the code says why.
+> tool journal, stream events, protocol adapters, memory index. 
 
 | What | In detail |
 |---|---|
@@ -22,7 +21,7 @@ sensor can be declared in JSON while the board runs.
 | A console over HTTPS | Chat with the model and configure devices, tools, schedule, logs, WiFi and the model, from a phone; the board issues its own certificate. [Web console](docs/web-console.md) |
 | It acts unattended | Timed prompts, and sensor rules that fire a prompt when a reading crosses a threshold. [Scheduling](docs/scheduling.md) |
 | A shell and a script language | `shell` with 26 NuttX-named commands, and an interpreter for loops over tool calls. [Shell](docs/shell.md) · [Script](docs/scripting.md) |
-| It remembers what it was told | Standing orders, `/AGENTS.md`, a `/memory.md` index and skills, assembled into the prompt on every turn. [Context layers](docs/context.md) |
+| It remembers what it was told | Standing orders, `/AGENTS.md`, a `/MEMORY.md` index and skills, assembled into the prompt on every turn. [Context layers](docs/context.md) |
 | No cloud in the path | HTTPS from the board, a certificate it generates, one PIN for three callers. [Security](docs/security.md) |
 | Testable without hardware | The simulator runs the same `agent-core` against a virtual board. [Simulator](docs/simulator.md) |
 
@@ -50,172 +49,53 @@ warn, so compare the fingerprint. Port 80 stays open, so a bad certificate costs
 than the board. `GET /agent.json` is the whole interface as data: 40 routes with method, body,
 return and auth, plus every writable setting with its type and default.
 
-## Web console
-
-| Where | What you do there |
-|---|---|
-| Chat (the page) | talk to the model; tool calls and reasoning fold into one line per turn |
-| Devices | what the probe found, pins, addresses, `Probe devices`, adoptable candidates |
-| Tools | every tool with its input schema, and why one is hidden |
-| Agent | endpoint, model, key, protocol, thinking level, temperature, context and output size |
-| Schedule | timed prompts and sensor rules |
-| Logs, Settings | the ring buffer; WiFi with gateway/DNS overrides, the PIN, reboot |
-
-No build step and nothing loaded from the internet: about 58 KB of HTML, CSS and JavaScript
-compiled in and served with `Cache-Control: no-store`, so a reflash shows on the next reload.
-
 ## Give it a model
+
+The model is a setting, not a build:
 
 ```bash
 curl -sS -X POST http://<board>/api/agent/config -H 'Content-Type: application/json' \
-  -d '{"base_url":"https://future-os.cn/api/v1/chat/completions",
-       "model":"deepseek-flash","api_key":"<key>"}'
+  -d '{"base_url":"https://your-provider/v1/chat/completions","model":"…","api_key":"…"}'
 curl -sS -X POST http://<board>/api/agent/message -H 'Content-Type: application/json' \
-  -d '{"text":"write HELLO on the OLED, set the LED blue, then scan I2C"}'
+  -d '{"text":"write HELLO on the OLED and set the LED blue"}'
 ```
 
-Three protocols: `chat` (OpenAI chat completions), `responses` (OpenAI Responses API) and
-`anthropic` (Messages API). Images from the console go out as content
-parts. `reasoning` sets the thinking level, `max_steps` caps model calls per turn (0 = no
-cap), `context_tokens` and `max_output_tokens` set the window and the reply reserve, and the
-transcript compacts at 80% of the window. Without a key, point `base_url` at the board's own
-`/selftest/chat/completions` and the loop still runs.
+Three wire protocols (`chat`, `responses`, `anthropic`), a thinking level, a context window and
+an output ceiling — all in the console's Agent panel or the same `POST`. Without a key, point
+`base_url` at `http://127.0.0.1/selftest/chat/completions` and the loop still runs.
+[Model](docs/model.md) has the field list and the three protocols side by side.
 
-## What the model always sees
+## Use it
 
-Four layers go into the system prompt, in this order, on **every** turn: what an owner wrote
-once, and what the agent has learned since. None of it is in the transcript, so it costs the
-same whether the conversation is one message long or a thousand.
-
-| Layer | Where it lives | How much reaches the model | Written by |
-|---|---|---|---|
-| Standing orders | `agent.system_prompt` (NVS) | all of it, 2 KB cap | the owner, over HTTP or `shell` |
-| Project instructions | `/AGENTS.md` | the first 1 KB, then a marker saying the rest is there | the owner, by `fs_write` |
-| Long-term memory | `/memory.md`, an index pointing at `/memory/<topic>.md` | the index only, 24 lines / 2 KB | the agent itself, as it learns |
-| Skills | `/skills/<name>/SKILL.md` plus whatever sits beside it | one line each, name and description | either |
-
-```bash
-# The owner's standing orders: why this board exists, and the rules that come first.
-curl -sS -X POST http://<board>/api/agent/prompt -H 'Content-Type: application/json' \
-  -d '{"action":"set","text":"The pump relay is on GPIO12. Never run it past two minutes."}'
-
-# What the model will actually receive, layers and all — the only way to check this.
-curl -sS http://<board>/api/agent/prompt | jq -r .system
-```
-
-`action` is `set`, `append` or `clear`; `system_prompt get` reads it back from the board and
-`system_prompt set …` writes it from the agent's side. Memory and skills are ordinary files:
-`fs_write /memory/wiring.md "GPIO18 = LED strip"` plus one line in `/memory.md` is all a
-memory is, and deleting the file forgets it. An edited file takes effect on the next turn —
-no restart, no reflash, no transcript rewrite.
-
-The sizes are the reason the split exists. A board with kilobytes of internal SRAM cannot
-afford to carry the whole of what it knows in every request, so each layer is an index or a
-prefix, and the expensive part is fetched with `fs_read` when a turn actually needs it.
-[docs/agent-memory.md](docs/agent-memory.md) and [docs/agent-skills.md](docs/agent-skills.md)
-have the details, including how the index is bounded.
-
-## Shell
-
-Every driver in the catalogue is documented in [docs/capabilities.md](docs/capabilities.md):
-GPIO, ADC, PWM, I2C, 1-Wire, WS2812, SSD1306, BME280, SHT3x, INA219/226, MPU6050, ADS1115,
-PCF8574, DS18B20, HC-SR04, servo, relay, I²S mic and amp.
-
-One writable area, 8 KB of text in NVS. `read`, `write` and `edit` cover the common cases;
-everything else is one `shell` command line, parsed with words, quotes and `--flags`. A tool
-result is capped at 2 KB and a reply at 8 KB: the board has 8 MB of PSRAM and a few kilobytes
-of internal SRAM, and the second number is the one that binds:
-
-```text
-shell {"command":"ls /notes"}            shell {"command":"grep GPIO /"}
-shell {"command":"cp /a.txt /b.txt"}     shell {"command":"rm /a.txt --confirm"}
-shell {"command":"curl https://example.com/"}          # GET, HTML reduced to text
-shell {"command":"wget -o /dl/page.txt https://example.com/"}
-shell {"command":"ping -c 3 192.168.3.1"}   shell {"command":"nslookup example.com"}
-shell {"command":"ifconfig"}                # configured gateway and DNS, not the lease
-shell {"command":"df | free | uptime | date | uname | ps"}
-shell {"command":"sha256sum /notes/a.txt"}  shell {"command":"zip t.zip /a.txt"}
-```
-
-`edit` refuses an ambiguous match rather than rewriting the wrong place; `rm` and `mv` need
-`confirm`. A wrong command answers with its usage line, taken from the same table the help
-text comes from, so the two cannot disagree: `rm` without `--confirm` returns
-`usage: rm <path> --confirm`. `shell {"command":"help"}` lists all 26.
-
-## Script
-
-For what fixed tools cannot express: a loop over readings, a branch on a result.
-
-```text
-let scan = tool("i2c_scan", {})
-let i = 0
-while i < len(scan.addresses) { log(scan.addresses[i])  i = i + 1 }
-if i > 0 { "found " + str(i) } else { "nothing" }
-```
-
-Numbers, strings, booleans, nil, lists, maps; `let`, assignment, `if`/`else`, `while`,
-`break`; built-ins `len`, `str`, `num`, `type`, `log` and `tool(name, args)`, which calls any
-board tool with the caller's own permissions (`tool("script")` aside). `{"lint":true}` checks
-syntax and unknown names with line and column and never executes; `{"help":true}` returns the
-reference. Bounds: 30 s, five million steps, 32 nested blocks, 4 KB strings, 8 KB of source.
-The clock is the real bound: the interpreter runs on the thread that answers the console.
-
-## Scheduled work
-
-```bash
-curl -sS -X POST http://<board>/api/sched -H 'Content-Type: application/json' -d '{
-  "tasks":[{"id":"t1","prompt":"read the BME280","every_s":300}],
-  "rules":[{"id":"r1","tool":"bme280_read","path":"temperature_c","op":"gt","value":30,"prompt":"it is hot"}]}'
-```
-
-`at_hhmm` runs at a UTC wall-clock time instead, and every answer lands in the transcript
-tagged `source: "schedule:t1"`. The agent can schedule itself with
-`schedule {"action":"add", …}`. Tasks survive a reboot.
-
-## Manifest
-
-A device that needs no timing or calibration is declared, not compiled:
-
-```json
-{"devices":[{"id":"pump","kind":"actuator","pins":{"out":12},"note":"active-low relay"}],
- "tools":[{"name":"pump_pulse","description":"Energise the relay for `ms` ms",
-   "params":[{"name":"ms","type":"integer","min":10,"max":5000,"required":true}],
-   "exec":{"type":"sequence","steps":[
-     {"ms":0,"exec":{"type":"gpio_write","pin":12,"level":0}},
-     {"ms":0,"exec":{"type":"delay","ms":{"param":"ms"}}},
-     {"ms":0,"exec":{"type":"gpio_write","pin":12,"level":1}}]},
-   "safety":{"max_calls_per_min":20,"confirm":true}}]}
-```
-
-Three paths add hardware: a manifest (no timing or state machine, applies live), a compiled
-driver (`drivers/<chip>.rs`, for state machines and strict timing), or a board profile (facts
-that cannot be probed, such as which pins the LED and buttons use). A driver is listed only
-when the probe finds the device, so a half-written one cannot report hardware that is not
-there. Validation runs on the board: parameter ranges and a `safety` per-minute cap are checked
-before a pin moves, and an out-of-range call returns the range it would accept.
-[docs/adding-a-device.md](docs/adding-a-device.md) covers all three.
-
-## Authentication
-
-| Caller | Credential |
+| From | What you get |
 |---|---|
-| Console | `POST /api/auth {"pin":"…"}` returns a bearer token the page keeps |
-| Script | `X-Portal-Pin: <pin>`, or the same token |
-| MCP client | `Authorization: Bearer <mcp.token>`; the PIN is accepted when no token is set |
-
-With `auth.portal_pin` set, writes and the reads that expose transcript, prompt, config and
-logs need it; status, devices, tools and `/agent.json` stay open. Tokens live in RAM, so a
-reboot revokes them. The default is no PIN, and `/agent.json` says so in its `security` block.
-
-## Simulator
+| `http://<board>/` on a phone | chat with the model, see devices and tools, change anything |
+| `POST /mcp` from an MCP client | the same tools the board's own agent uses |
+| `POST /api/script`, `POST /api/sched` | run a script now, or have one run on a timer |
+| `GET /agent.json` | the whole interface as data: routes, settings, limits |
 
 ```bash
-cargo run -p esp32-agent-sim
+curl -sS -X POST http://<board>/mcp -H 'Content-Type: application/json' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/call",
+       "params":{"name":"shell","arguments":{"command":"ls /"}}}'
 ```
 
-The same `agent-core` against a virtual board on a real port. Only the `Hardware`
-implementation differs, so the console, the MCP endpoint, the drivers, the manifest engine and
-the agent loop are the code that runs on the chip.
+The board's own agent can also give itself hardware (`manifest_apply`), a memory
+(`write /memory/…`) and shell access — the same calls, with the same PIN.
+
+## Safety notes
+
+- **Credentials stay on the board.** WiFi goes to NVS through `provision`, never into the
+  image; `api_key` is write-only and reads back as `__set__`.
+- **Set a PIN before the board leaves your desk.** `auth.portal_pin` guards every write and the
+  reads that expose the transcript, the prompt, the config and the logs.
+- **Compare the certificate.** The board's TLS certificate is self-signed; its fingerprint is at
+  `GET /api/tls`. Port 80 stays open by default so a bad certificate costs a URL and not the
+  board; `mcp.plain_http: false` closes it, and the USB cable is then the way back in.
+- **`shell`, `script` and manifest tools move pins.** That is the point of the board; the PIN is
+  what separates the agent doing its job from a passer-by doing it.
+
+[Security](docs/security.md) states what is deliberately not defended.
 
 ## Repository layout
 
@@ -251,7 +131,8 @@ Bench numbers: a four-tool turn in 13.7 s; console over TLS in 0.55 s; I²C scan
 [Architecture](docs/architecture.md) · [Manifest](docs/manifest.md) · [Capabilities](docs/capabilities.md) ·
 [HTTP and MCP](docs/http-api.md) · [Adding a device](docs/adding-a-device.md) · [Flashing](docs/flashing.md) ·
 [Troubleshooting](docs/troubleshooting.md) · [Agent loop](docs/agent-loop.md) · [Stream](docs/agent-stream.md) ·
-[Skills](docs/agent-skills.md) · [Memory](docs/agent-memory.md) · [Scripting](docs/scripting.md)
+[Skills](docs/agent-skills.md) · [Memory](docs/agent-memory.md) · [Scripting](docs/scripting.md) ·
+[Model](docs/model.md) · [Web console](docs/web-console.md) · [Scheduling](docs/scheduling.md) · [Shell](docs/shell.md) · [Context layers](docs/context.md) · [Security](docs/security.md) · [Simulator](docs/simulator.md) · [Performance](docs/performance.md)
 
 ## Contributing
 
