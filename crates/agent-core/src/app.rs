@@ -3143,6 +3143,11 @@ impl App {
                 501,
                 "this server has no streaming body route: /audio/pcm needs `make_routes`, not `make_handler`",
             ),
+            // The same for the sound-and-picture route; see `av_route`.
+            ("POST", AV_STREAM_PATH) => Response::error_json(
+                501,
+                "this server has no streaming body route: /av needs `make_routes`, not `make_handler`",
+            ),
             _ => {
                 if path.starts_with("/api/") {
                     Response::error_json(404, &format!("no route {method} {path}"))
@@ -5890,16 +5895,292 @@ fn audio_route(app: &Shared, req: &Request) -> crate::http::BodyRoute {
     BodyRoute::Sink(Box::new(AudioSink::new(Arc::clone(app))))
 }
 
-/// The routes this firmware answers with: the request handler, plus the one route whose
-/// body is streamed instead of buffered.
+/// The routes this firmware answers with: the request handler, plus the routes whose
+/// bodies are streamed instead of buffered.
 ///
 /// One composition root for both, so a platform cannot wire the request handler and forget
-/// that `/audio/pcm` exists — with no body router the route falls through to the normal
-/// handler and answers 404, which is a quieter failure than a wrong one.
+/// that `/audio/pcm` or `/av` exists — with no body router those routes fall through to the
+/// normal handler, which answers plainly that this build does not stream.
 pub fn make_routes(app: Shared) -> crate::http::Routes {
-    let for_body = Arc::clone(&app);
-    crate::http::Routes::new(make_handler(app))
-        .with_body(Arc::new(move |req: &Request| audio_route(&for_body, req)))
+    let audition = Arc::clone(&app);
+    let picture = Arc::clone(&app);
+    crate::http::Routes::new(make_handler(app)).with_body(Arc::new(move |req: &Request| {
+        match audio_route(&audition, req) {
+            crate::http::BodyRoute::Buffer => av_route(&picture, req),
+            decided => decided,
+        }
+    }))
+}
+
+// ------------------------------------------------ POST /av: sound and picture together
+
+/// Where a host streams a soundtrack and its animation in one body: `POST /av`
+/// (docs/audio.md §8).
+///
+/// The bench probe drove these from two places — a raw PCM socket for the speaker and one
+/// MCP tool call per frame for the OLED — because its speaker sat on a task of its own.
+/// Here HTTP is a single thread, so a second connection would wait for the song to end, and
+/// the alternative (a thread per stream) is the internal RAM this board does not have. One
+/// body, consumed in order, keeps them in step without either: an `A` record blocks in the
+/// I2S write for exactly as long as its audio lasts, so the `F` record written in front of
+/// it is drawn at the right moment by construction.
+pub const AV_STREAM_PATH: &str = "/av";
+
+/// PCM bytes one `/av` body may carry: the same 30 s as `/audio/pcm`.
+pub const AV_MAX_AUDIO_BYTES: usize = AUDIO_STREAM_MAX_BYTES;
+
+/// The whole body, frames included: 30 s of audio plus half a megabyte of bitmaps, which is
+/// 30 s of 128x32 at 12 fps (186 KB) with room to spare.
+pub const AV_MAX_BODY_BYTES: usize = AV_MAX_AUDIO_BYTES + 512 * 1024;
+
+/// Bytes of a record header: `tag` and a little-endian `u16` length.
+pub const AV_RECORD_HEADER: usize = 3;
+
+/// Splits an `/av` body into records: `tag (1 byte) | length (u16, little endian) | payload`.
+///
+/// Three tags, and nothing above three bytes of framing, so a host writes this with a
+/// `sendall` loop and a struct pack rather than a JSON encoder:
+///
+/// * `A` — PCM16LE mono at 24 kHz, played now (the write blocks for its own duration);
+/// * `F` — a 1-bpp page-format bitmap, 512 bytes for 128x32 or 1024 for 128x64, drawn now;
+/// * `E` — end of stream, length 0.
+///
+/// The reader is separate from what the records *do* so the framing can be tested on the
+/// host, split at every awkward boundary, without an `App` or a board.
+struct AvReader {
+    /// The record header being assembled (at most [`AV_RECORD_HEADER`] bytes).
+    head: Vec<u8>,
+    tag: u8,
+    /// Payload bytes still to come.
+    need: usize,
+    payload: Vec<u8>,
+    done: bool,
+}
+
+impl AvReader {
+    fn new() -> Self {
+        Self { head: Vec::with_capacity(AV_RECORD_HEADER), tag: 0, need: 0, payload: Vec::new(), done: false }
+    }
+
+    /// Take the bytes as they arrive; `on` is called once per complete record, in order.
+    fn feed(
+        &mut self,
+        bytes: &[u8],
+        on: &mut dyn FnMut(u8, &[u8]) -> std::io::Result<()>,
+    ) -> std::io::Result<()> {
+        let mut rest = bytes;
+        while !rest.is_empty() {
+            if self.done {
+                // Anything after `E` is a host bug that costs nothing to ignore.
+                return Ok(());
+            }
+            if self.need == 0 {
+                let take = (AV_RECORD_HEADER - self.head.len()).min(rest.len());
+                self.head.extend_from_slice(&rest[..take]);
+                rest = &rest[take..];
+                if self.head.len() < AV_RECORD_HEADER {
+                    return Ok(());
+                }
+                self.tag = self.head[0];
+                self.need = u16::from_le_bytes([self.head[1], self.head[2]]) as usize;
+                self.head.clear();
+                if !matches!(self.tag, b'A' | b'F' | b'E') {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("unknown record tag 0x{:02x}", self.tag),
+                    ));
+                }
+                if self.need == 0 {
+                    if self.tag != b'E' {
+                        // An empty audio or frame record is a host bug, not a pause.
+                        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "empty record"));
+                    }
+                    self.done = true;
+                    on(b'E', &[])?;
+                    return Ok(());
+                }
+                self.payload.clear();
+                continue;
+            }
+            let take = self.need.min(rest.len());
+            self.payload.extend_from_slice(&rest[..take]);
+            rest = &rest[take..];
+            self.need -= take;
+            if self.need == 0 {
+                let tag = self.tag;
+                on(tag, &self.payload)?;
+                self.payload.clear();
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The sink behind `POST /av`: records in, speaker and screen out, in the order written.
+struct AvSink {
+    app: Shared,
+    reader: AvReader,
+    /// Reused across records, like the audio sink's, so playback does not churn the heap.
+    audio: Vec<i16>,
+    audio_bytes: usize,
+    samples: usize,
+    frames: usize,
+    received: usize,
+    failed: Option<String>,
+}
+
+impl AvSink {
+    fn new(app: Shared) -> Self {
+        Self {
+            app,
+            reader: AvReader::new(),
+            // 1/12 s of audio: the largest record a 12 fps host writes.
+            audio: Vec::with_capacity(4_000),
+            audio_bytes: 0,
+            samples: 0,
+            frames: 0,
+            received: 0,
+            failed: None,
+        }
+    }
+}
+
+impl crate::http::BodySink for AvSink {
+    fn push(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+        if self.received + bytes.len() > AV_MAX_BODY_BYTES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("more than {AV_MAX_BODY_BYTES} bytes in one body"),
+            ));
+        }
+        self.received += bytes.len();
+        // Split the borrow: the reader needs `&mut self.reader` while the callback writes
+        // to the other fields.
+        let shared = Arc::clone(&self.app);
+        let AvSink { reader, audio, audio_bytes, samples, frames, failed, .. } = self;
+        let mut on = |tag: u8, payload: &[u8]| -> std::io::Result<()> {
+            match tag {
+                b'E' => Ok(()),
+                b'A' => {
+                    if payload.len() % 2 != 0 {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "an audio record with an odd number of bytes",
+                        ));
+                    }
+                    if *audio_bytes + payload.len() > AV_MAX_AUDIO_BYTES {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!("more than {AUDIO_STREAM_MAX_SECONDS} s of audio in one body"),
+                        ));
+                    }
+                    *audio_bytes += payload.len();
+                    audio.clear();
+                    audio.extend(payload.chunks_exact(2).map(|c| i16::from_le_bytes([c[0], c[1]])));
+                    // One lock per record, released before the next: a song must not hold
+                    // the portal, `/api/status` or the agent thread for its whole length.
+                    let mut state = app_lock(&shared);
+                    if let Err(e) = state.hw.i2s_out_write(audio) {
+                        *failed = Some(e.message.clone());
+                        return Err(std::io::Error::other(e.message));
+                    }
+                    *samples += audio.len();
+                    Ok(())
+                }
+                b'F' => {
+                    if payload.len() != 512 && payload.len() != 1024 {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!("a frame is 512 (128x32) or 1024 (128x64) bytes, not {}", payload.len()),
+                        ));
+                    }
+                    let height = (payload.len() * 8 / 128) as i64;
+                    let b64 = crate::util::b64_encode(payload);
+                    // Through the tool, not around it: `oled_bitmap` is the one place that
+                    // knows how a 512-byte frame lands on a 64-row panel and how the bus is
+                    // addressed, and a second copy of that would drift.
+                    let mut state = app_lock(&shared);
+                    match state
+                        .call_tool("oled_bitmap", &json!({ "data_b64": b64, "width": 128, "height": height }))
+                    {
+                        Ok(_) => {
+                            *frames += 1;
+                            Ok(())
+                        }
+                        Err(e) => {
+                            *failed = Some(e.message.clone());
+                            Err(std::io::Error::other(e.message))
+                        }
+                    }
+                }
+                other => Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("unknown record tag 0x{other:02x}"),
+                )),
+            }
+        };
+        reader.feed(bytes, &mut on)
+    }
+
+    fn finish(self: Box<Self>, complete: bool) -> Response {
+        let rate_hz = crate::drivers::audio::AMP_RATE_HZ as u64;
+        let mut body = json!({
+            "format": "av1",
+            "rate_hz": rate_hz,
+            "channels": 1,
+            "bits": 16,
+            "bytes": self.received,
+            "audio_bytes": self.audio_bytes,
+            "samples": self.samples,
+            "ms": self.samples as u64 * 1000 / rate_hz,
+            "frames": self.frames,
+            "ended": self.reader.done,
+            "limit_audio_bytes": AV_MAX_AUDIO_BYTES,
+            "limit_bytes": AV_MAX_BODY_BYTES,
+            "ok": true,
+        });
+        if let Some(e) = self.failed {
+            body["ok"] = json!(false);
+            body["error"] = json!(e);
+            return Response::json_status(500, &body);
+        }
+        if !complete {
+            body["ok"] = json!(false);
+            body["error"] = json!("the upload ended before its body did: the rest was not played");
+            return Response::json_status(400, &body);
+        }
+        Response::json(&body)
+    }
+}
+
+/// Decide what `POST /av` does with a body nobody has read yet — the same rule as
+/// `/audio/pcm`: method, content type and PIN from the headers, then the sink.
+fn av_route(app: &Shared, req: &Request) -> crate::http::BodyRoute {
+    use crate::http::BodyRoute;
+    if req.path != AV_STREAM_PATH {
+        return BodyRoute::Buffer;
+    }
+    if req.method != "POST" {
+        return BodyRoute::Answer(Response::error_json(
+            405,
+            "POST an AV1 body of audio and frame records here; there is nothing to GET",
+        ));
+    }
+    let content_type = req.header("content-type").unwrap_or("").to_ascii_lowercase();
+    if !(content_type.starts_with("application/x-esp32-av")
+        || content_type.starts_with("application/octet-stream"))
+    {
+        return BodyRoute::Answer(Response::error_json(
+            415,
+            "Content-Type must be application/x-esp32-av (or application/octet-stream); the body is `tag|u16le len|payload` records (docs/audio.md)",
+        ));
+    }
+    let mut state = app_lock(app);
+    if let Err(r) = state.require_pin(req) {
+        return BodyRoute::Answer(r);
+    }
+    state.runtime.counters.http_requests += 1;
+    BodyRoute::Sink(Box::new(AvSink::new(Arc::clone(app))))
 }
 
 #[cfg(test)]
@@ -6548,6 +6829,154 @@ mod tests {
         assert!(too_much.is_err(), "a 31st second must be refused");
         let resp = sink.finish(false);
         assert_eq!(resp.status, 400, "a cut-off upload must not read as done");
+    }
+
+    /// The framing has to survive whatever a socket hands over: a header split across three
+    /// reads, a payload split across two, and two records arriving together.
+    #[test]
+    fn the_av_reader_reassembles_records_whatever_the_split() {
+        let body = [
+            b'A', 0x04, 0x00, 1, 2, 3, 4, //
+            b'F', 0x02, 0x00, 9, 8, //
+            b'E', 0x00, 0x00,
+        ];
+        for split in 0..=body.len() {
+            let mut reader = AvReader::new();
+            let mut got: Vec<(u8, Vec<u8>)> = Vec::new();
+            let mut on = |tag: u8, payload: &[u8]| -> std::io::Result<()> {
+                got.push((tag, payload.to_vec()));
+                Ok(())
+            };
+            reader.feed(&body[..split], &mut on).expect("first half");
+            reader.feed(&body[split..], &mut on).expect("second half");
+            assert_eq!(got.len(), 3, "split at {split}: {got:?}");
+            assert_eq!(got[0], (b'A', vec![1, 2, 3, 4]), "split at {split}");
+            assert_eq!(got[1], (b'F', vec![9, 8]), "split at {split}");
+            assert_eq!(got[2].0, b'E', "split at {split}");
+            assert!(reader.done, "split at {split}");
+        }
+
+        // One byte at a time is the case the running header exists for.
+        let mut reader = AvReader::new();
+        let mut tags = Vec::new();
+        let mut on = |tag: u8, _p: &[u8]| -> std::io::Result<()> {
+            tags.push(tag);
+            Ok(())
+        };
+        for b in body {
+            reader.feed(&[b], &mut on).expect("one byte");
+        }
+        assert_eq!(tags, vec![b'A', b'F', b'E']);
+    }
+
+    #[test]
+    fn the_av_reader_refuses_what_a_host_cannot_have_meant() {
+        let mut reader = AvReader::new();
+        let mut on = |_t: u8, _p: &[u8]| -> std::io::Result<()> { Ok(()) };
+        // 0x41 is `A`; thankyou, ASCII. A JSON body starts with `{`.
+        let err = reader.feed(b"{\"json\": true}", &mut on).expect_err("unknown tag");
+        assert!(err.to_string().contains("unknown record tag"), "{err}");
+
+        let mut reader = AvReader::new();
+        let err = reader.feed(b"A\x00\x00", &mut on).expect_err("empty audio record");
+        assert!(err.to_string().contains("empty record"), "{err}");
+    }
+
+    /// `/av` plays the audio and draws the frame written in front of it — one body, one
+    /// thread, no second connection, and 512-byte frames on a panel the board calls 128x64.
+    #[test]
+    fn the_av_route_plays_audio_and_draws_frames_in_order() {
+        use crate::http::BodyRoute;
+
+        let pins = crate::boards::I2sPins { bclk: 15, ws: 16, din: -1, dout: 7 };
+        let shared: Shared = Arc::new(Mutex::new(test_app()));
+        {
+            let mut app = shared.lock().unwrap();
+            app.hw.i2s_setup(None, Some(pins)).expect("amplifier");
+        }
+        // The virtual bench has an SSD1306, so `oled_bitmap` is a real tool here.
+        assert!(shared.lock().unwrap().tools.get("oled_bitmap").is_some(), "no OLED on the test bench");
+
+        let routes = make_routes(Arc::clone(&shared));
+        let router = routes.body.as_ref().expect("a body router");
+
+        let mut req = post(AV_STREAM_PATH, "");
+        req.headers.insert("content-type".into(), "application/x-esp32-av".into());
+        let mut sink = match router(&req) {
+            BodyRoute::Sink(s) => s,
+            _ => panic!("an AV body must be streamed, never buffered"),
+        };
+
+        // Two 1/12 s intervals: the frame first (so it is on screen while its audio plays),
+        // then 8000 bytes = 4000 samples of silence.
+        let mut body = Vec::new();
+        for _ in 0..2 {
+            body.push(b'F');
+            body.extend_from_slice(&512u16.to_le_bytes());
+            body.extend_from_slice(&[0u8; 512]);
+            body.push(b'A');
+            body.extend_from_slice(&8000u16.to_le_bytes());
+            body.extend_from_slice(&[0u8; 8000]);
+        }
+        body.push(b'E');
+        body.extend_from_slice(&0u16.to_le_bytes());
+
+        // A socket hands over whatever it has; 1000-byte pieces cut every record in half.
+        for piece in body.chunks(1000) {
+            sink.push(piece).expect("a piece");
+        }
+        let resp = sink.finish(true);
+        assert_eq!(resp.status, 200, "{:?}", resp.body);
+        let done: Value = serde_json::from_slice(&resp.body).expect("json");
+        assert_eq!(done["frames"], json!(2));
+        assert_eq!(done["samples"], json!(8000));
+        assert_eq!(done["ms"], json!(333));
+        assert_eq!(done["ended"], json!(true));
+        assert_eq!(done["ok"], json!(true));
+    }
+
+    /// The same rule as `/audio/pcm`: refused from the headers alone, and an odd audio
+    /// record is a host bug the answer names.
+    #[test]
+    fn the_av_route_refuses_what_it_cannot_play() {
+        use crate::http::BodyRoute;
+
+        let shared: Shared = Arc::new(Mutex::new(test_app()));
+        let routes = make_routes(Arc::clone(&shared));
+        let router = routes.body.as_ref().expect("a body router");
+
+        let mut get = post(AV_STREAM_PATH, "");
+        get.method = "GET".into();
+        get.headers.insert("content-type".into(), "application/x-esp32-av".into());
+        match router(&get) {
+            BodyRoute::Answer(r) => assert_eq!(r.status, 405),
+            _ => panic!("GET has no body to stream"),
+        }
+
+        let mut json = post(AV_STREAM_PATH, "");
+        json.headers.insert("content-type".into(), "application/json".into());
+        match router(&json) {
+            BodyRoute::Answer(r) => assert_eq!(r.status, 415),
+            _ => panic!("a JSON body is not records"),
+        }
+
+        let mut req = post(AV_STREAM_PATH, "");
+        req.headers.insert("content-type".into(), "application/octet-stream".into());
+        let mut sink = match router(&req) {
+            BodyRoute::Sink(s) => s,
+            _ => panic!("octet-stream is the body every CLI sends"),
+        };
+        // Three bytes of audio is one sample and a half: refused, not rounded.
+        let err = sink.push(b"A\x03\x00abc").expect_err("odd audio record");
+        assert!(err.to_string().contains("odd number of bytes"), "{err}");
+
+        let mut sink = match router(&req) {
+            BodyRoute::Sink(s) => s,
+            _ => panic!("a fresh sink"),
+        };
+        // A frame that is neither 128x32 nor 128x64 is not a frame.
+        let err = sink.push(b"F\x10\x00aaaaaaaaaaaaaaaa").expect_err("wrong frame size");
+        assert!(err.to_string().contains("512"), "{err}");
     }
 
     #[test]

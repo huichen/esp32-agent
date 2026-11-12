@@ -286,7 +286,14 @@ impl crate::device::Device for Speaker {
                 let ms = j::opt_i64(args, "ms").unwrap_or(200).clamp(10, 2000) as u32;
                 let volume = j::opt_i64(args, "volume").unwrap_or(30).clamp(0, 100) as f32 / 100.0;
                 let samples = tone(freq, ms, volume);
-                hw.i2s_out_write(&samples)?;
+                // In pieces the size of a ring's worth plus change, not one block for the whole
+                // tone: a 2 s tone is 192 KB, which one `i2s_channel_write` can only part with
+                // inside its 1000 ms timeout, and the part it does not send is silence in the
+                // middle of the tone. Piecewise is also how a stream writes, so the pacing a
+                // tone shows is the pacing a song gets.
+                for piece in samples.chunks(4_096) {
+                    hw.i2s_out_write(piece)?;
+                }
                 Ok(json!({
                     "ok": true,
                     "freq_hz": freq as i64,
@@ -534,6 +541,22 @@ fn round1(v: f64) -> f64 {
 mod tests {
     use super::*;
     use crate::device::Device;
+
+    /// The whole tone reaches the hardware: it goes out in pieces now, and the sum must still
+    /// be exactly 24 kHz x ms, or a chunk boundary would shorten the note.
+    #[test]
+    fn a_played_tone_writes_every_sample_in_pieces() {
+        use crate::device::Device;
+        let mut hw = crate::virtual_board::VirtualBoard::new();
+        hw.i2s_setup(None, Some(crate::boards::I2sPins { bclk: 15, ws: 16, din: -1, dout: 7 }))
+            .expect("amplifier");
+        let mut spk = Speaker { id: "speaker".into() };
+        let out = spk
+            .call("speaker_tone", &json!({ "freq_hz": 440, "ms": 2000, "volume": 10 }), &mut hw)
+            .expect("a tone");
+        assert_eq!(out["samples"], json!(48_000));
+        assert_eq!(hw.i2s_written, 48_000, "every sample of the note, and only those");
+    }
 
     #[test]
     fn a_tone_is_bounded_and_shaped() {
