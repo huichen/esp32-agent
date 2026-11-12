@@ -199,7 +199,7 @@ pub fn arguments(parsed: &Parsed) -> Result<serde_json::Value, String> {
         }
         "ping" => json!({ "host": need(0, "<host>")?, "count": flag("count", "c") }),
         "ifconfig" | "df" | "free" | "uptime" | "date" | "uname" | "ps" | "help" => json!({}),
-        other => return Err(format!("`{other}` is not a shell command")),
+        other => return Err(format!("`{other}` is not a shell command.\n\n{}", help_text())),
     })
 }
 
@@ -245,7 +245,7 @@ pub fn usage(op: &str) -> Option<&'static str> {
     })
 }
 
-/// Every command with its usage, for `shell {"op":"help"}`.
+/// Every command with its usage, for `nsh {"command":"help"}`.
 pub fn help_text() -> String {
     let mut out = String::from("shell commands:\n");
     for (op, _) in OPS {
