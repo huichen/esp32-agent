@@ -19,7 +19,7 @@ use crate::llm::{self, ChatTransport, LlmConfig, ToolCall};
 use serde_json::{json, Value};
 
 /// Oldest messages are dropped above this count.
-pub const MAX_HISTORY_MESSAGES: usize = 48;
+pub const MAX_HISTORY_MESSAGES: usize = 256;
 /// Oldest messages are dropped above this much text.
 ///
 /// Not a physical limit of the chip: the transcript and the request built from it live
@@ -29,11 +29,11 @@ pub const MAX_HISTORY_MESSAGES: usize = 48;
 /// out in one POST, and the board has to build and send that body while its internal
 /// SRAM is down to a few kilobytes after TLS.
 ///
-/// Measured on the bench (see `docs/troubleshooting.md`): 30 KB bodies go out, a 22 KB
-/// body failed only when internal heap had collapsed to 1 kB. Raised from 24 KB to 64 KB
-/// after that measurement; the reading that made it safe is `mem.internal_kb` in
-/// `/api/status`, not a guess.
-pub const MAX_HISTORY_BYTES: usize = 64 * 1024;
+/// Measured on the bench, and then measured again at a larger size (see
+/// `docs/troubleshooting.md`): 507 KB of transcript still served turns, and the board
+/// rebooted somewhere below 1 MB with the cause not yet captured. 512 KB is therefore the
+/// highest size with a measurement behind it, not a wish.
+pub const MAX_HISTORY_BYTES: usize = 512 * 1024;
 /// How many question-and-answer exchanges survive compression verbatim.
 ///
 /// Four is enough to keep the thread of a task (what was asked, what the last tools did)

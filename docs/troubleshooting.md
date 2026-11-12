@@ -162,37 +162,44 @@ heaviest endpoint the portal calls, so if it answers, the page will load.
 ## How much conversation the board can carry
 
 `MAX_HISTORY_BYTES` bounds the transcript. It started at 24 KB, which was a guess made
-before anything was measured; it is 64 KB today. What follows is the measurement that
-justified the change, taken on the bench board (ESP32-S3, `/api/status` read between
-turns, one long reply per turn so the transcript grew predictably).
+before anything was measured; it is 512 KB today. Two measurements got it there, and the
+second one stopped short of where the asking went.
+
+**First ladder, against a real model.** One long reply per turn, `/api/status` read between
+turns:
 
 | Turn | Messages | History | Request body (history + ~18 KB of tool schemas) | Internal SRAM | Result |
 |---|---|---|---|---|---|
 | 3 | 5 | 4.7 KB | ~23 KB | 6 kB | ok |
-| 6 | 11 | 16.8 KB | ~35 KB | 6 kB | ok |
 | 9 | 17 | 35.3 KB | ~53 KB | 6 kB | ok |
 | 12 | 23 | 59.8 KB | ~78 KB | 6 kB | ok |
-| 13 | 21 | 63.5 KB | ~82 KB | 6 kB | **compacted**, then ok |
-| 14 | 17 | 59.6 KB | ~78 KB | 6 kB | **compacted**, then ok |
-| 15 | 17 | 62.5 KB | ~80 KB | 6 kB | send ok, reply timed out at 45 s |
+| 13 | 21 | 63.5 KB | ~82 KB | 6 kB | compacted, then ok |
 
-Read it as three facts:
+**Second ladder, against a local stub** (a stand-in chat endpoint on the LAN, so the run cost
+no tokens; same transport, same serialisation, 8 KB replies):
 
-1. **Internal SRAM does not move.** It sat at 6 kB free throughout, because the transcript,
-   the JSON body and the mbedTLS buffers all live in PSRAM. A bigger transcript does not
-   cost internal RAM, which is the resource that actually runs out on this chip.
-2. **The cap engages and the run continues.** Turns 13 and 14 crossed 64 KB and were
-   compressed: history went 23 messages to 21, the index appeared in the prompt
-   (`/api/agent/prompt` grew by the lines it kept), and the next turn still went out.
-3. **The failure that eventually appeared was not memory.** It was
-   `reading the reply over TLS failed: ERROR (the session times out after 45 s)` — the model
-   was asked for thousands of characters and took longer than `timeout_s`. If you drive long
-   answers, raise `llm.timeout_s` before you raise the history cap.
+| Turn | Messages | History | PSRAM free | Internal SRAM | Result |
+|---|---|---|---|---|---|
+| 60 | 119 | 249 KB | 7 111 kB | 6 kB | ok |
+| 120 | 240 | 507 KB | 6 593 kB | 6 kB | ok |
+| ~180 | — | — | — | — | **board rebooted**, cause not captured |
 
-The ceiling is therefore not 24 KB and not 64 KB; above ~80 KB of request body nothing has
-been measured yet. Raise `MAX_HISTORY_BYTES` again only with this table extended, and watch
-`mem.internal_kb` rather than `free_heap_kb`: PSRAM is the number that looks comfortable and
-hides the one that matters.
+What that says:
+
+1. **Internal SRAM never moves** (6 kB free throughout): transcript, JSON body and mbedTLS
+   buffers are all in PSRAM, so a bigger transcript costs the resource that does not run out.
+2. **Each turn costs about four times its text.** PSRAM fell ~95 kB per ten 4 KB turns: the
+   message, a copy in the event journal, and the serialised request all exist at once.
+3. **The 48-message cap was the first thing to bind**, not the byte cap: at 2 messages a turn
+   it stopped at ~101 KB. Both caps have to move together, which is why
+   `MAX_HISTORY_MESSAGES` is 256 now.
+4. **1 MB has not been proved.** The board survived 507 KB and rebooted somewhere below 1 MB.
+   The panic was not captured because nothing was holding the serial port. That capture is the
+   next step, and until it exists 512 KB is the highest figure with evidence behind it.
+
+The one failure in the first ladder was not memory: it was
+`reading the reply over TLS failed: ERROR (the session times out after 45 s)` on a deliberately
+long reply. Raise `llm.timeout_s` before raising the history cap.
 
 ## Performance and stability
 
