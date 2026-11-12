@@ -426,6 +426,7 @@ impl<S: Stream> BufferedReader<S> {
             if body.len() + size > MAX_BODY_BYTES {
                 return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "chunked body too large"));
             }
+            body.reserve(size.min(MAX_BODY_BYTES));
             body.extend_from_slice(&self.exact(size)?);
             let _ = self.line(2)?; // trailing CRLF
         }

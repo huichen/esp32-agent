@@ -227,6 +227,11 @@ pub struct App {
     /// Script runs submitted over HTTP, newest last. Bounded: this is a queue for a
     /// person or an external agent, not for anything that retries in a loop.
     pub scripts: Vec<ScriptJob>,
+    /// The model-facing tool array. 51 schemas is the largest thing a step used to build,
+    /// and it changes only when the manifest, the profile, the disabled set or the probe
+    /// does. `RefCell` because `ToolHost::tool_specs` takes `&self`; the whole `App` is
+    /// already behind a mutex, so there is no second borrow to lose.
+    pub tool_specs_cache: std::cell::RefCell<Option<(u64, Value)>>,
     /// Monotonic counter for job ids; not persisted, because the queue is not either.
     pub script_seq: u64,
     /// The objective the board is working towards on its own, and how far it got.
@@ -314,6 +319,7 @@ impl App {
             tasks: Vec::new(),
             rules: Vec::new(),
             scripts: Vec::new(),
+            tool_specs_cache: std::cell::RefCell::new(None),
             script_seq: 0,
             workspace: AppWorkspace::default(),
             goal: idle_goal(),
@@ -1275,6 +1281,7 @@ impl App {
 
     /// Work owed after a call or a request: persist, rebuild, notice a restart.
     pub fn settle(&mut self) {
+        self.invalidate_tool_specs();
         let manifest_changed = self.runtime.manifest_dirty;
         if manifest_changed {
             self.runtime.manifest_dirty = false;
@@ -3179,6 +3186,9 @@ impl App {
             Err(e) => return Response::error_json(400, &format!("invalid JSON: {e}")),
         };
         let before = self.cfg.clone();
+        // A patch can change the profile, `tools_mode`, `disabled_tools` or `discovery`,
+        // all of which decide what `tool_specs` answers — so the cached array goes first.
+        self.invalidate_tool_specs();
         match self.cfg.apply_patch(&patch) {
             Ok(touched) => {
                 self.runtime.config_dirty = true;
@@ -3307,39 +3317,19 @@ impl App {
 /// two views cannot drift apart.
 impl ToolHost for App {
     fn tool_specs(&self) -> Value {
-        let visible: Vec<&ToolDef> = self.tools.iter().filter(|d| self.is_visible(&d.spec.name)).collect();
-        let load = |def: &ToolDef| {
-            json!({
-                "type": "function",
-                "function": {
-                    "name": def.spec.name,
-                    "description": def.spec.description,
-                    "parameters": def.spec.input_schema,
-                }
-            })
-        };
-
-        // Order is part of the contract: a provider caches the request by its prefix, so
-        // one reordered entry and every token after it is reprocessed. The list is
-        // therefore sorted by name across every source — board tools, manifest tools and
-        // the agent-only fs_*/net_*/script group — which is both stable for a given board
-        // and the order a person expects to read. A manifest edit now moves the entries it
-        // touches instead of everything after them, because the manifest tools are no
-        // longer kept in a block at the end.
-        let mut tools: Vec<Value> = visible.iter().map(|d| load(d)).collect();
-        // File, HTTP and script tools gate on nothing the hardware must provide, so they
-        // are not MCP tools; the model still gets them, in the same sorted list.
-        for group in [
-            // One `shell` instead of the twelve fs_*/net_* tools: same handlers, one
-            // schema, one name to remember.
-            json!([crate::tools::shell::openai_spec()]),
-            board_tools::script_specs(),
-            board_tools::agent_extra_specs(),
-        ] {
-            tools.extend(openai_tools(&group));
+        // Keyed on the settings that decide the answer, not only on an explicit
+        // invalidation: `profile`, `tools_mode` and `disabled_tools` are plain fields, and
+        // anything that writes them directly (a test, a future caller) must not get a stale
+        // array back. The fingerprint is three short hashes against an 18 KB rebuild.
+        let key = self.specs_fingerprint();
+        if let Some((cached_key, cached)) = self.tool_specs_cache.borrow().as_ref() {
+            if *cached_key == key {
+                return cached.clone();
+            }
         }
-        tools.sort_by_key(|t| t["function"]["name"].as_str().unwrap_or("").to_string());
-        Value::Array(tools)
+        let built = self.tool_specs_uncached();
+        *self.tool_specs_cache.borrow_mut() = Some((key, built.clone()));
+        built
     }
 
     /// `/AGENTS.md`, bounded to what a small prompt can carry.
@@ -3374,6 +3364,84 @@ impl ToolHost for App {
 }
 
 impl App {
+    /// A cheap hash of the settings that decide which tools are visible.
+    fn specs_fingerprint(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        self.cfg.mcp.profile.hash(&mut h);
+        self.cfg.mcp.tools_mode.hash(&mut h);
+        for name in &self.cfg.mcp.disabled_tools {
+            name.hash(&mut h);
+        }
+        self.tools.len().hash(&mut h);
+        h.finish()
+    }
+
+    /// Drop the cached tool array. Everything that can change which tools exist calls this:
+    /// a manifest apply, a config change, a probe, a reboot.
+    pub fn invalidate_tool_specs(&mut self) {
+        *self.tool_specs_cache.borrow_mut() = None;
+    }
+
+    /// The array built from scratch: one pass over the disabled names, not 51.
+    fn tool_specs_uncached(&self) -> Value {
+        let disabled: std::collections::BTreeSet<&str> =
+            self.cfg.mcp.disabled_tools.iter().map(|d| d.as_str()).collect();
+        let generic = self.cfg.mcp.tools_mode == "generic";
+        let visible: Vec<&ToolDef> =
+            self.tools.iter().filter(|d| self.visible_given(&d.spec.name, &disabled, generic)).collect();
+        let load = |def: &ToolDef| {
+            json!({
+                "type": "function",
+                "function": {
+                    "name": def.spec.name,
+                    "description": def.spec.description,
+                    "parameters": def.spec.input_schema,
+                }
+            })
+        };
+
+        // Order is part of the contract: a provider caches the request by its prefix, so
+        // one reordered entry and every token after it is reprocessed. The list is
+        // therefore sorted by name across every source — board tools, manifest tools and
+        // the agent-only fs_*/net_*/script group — which is both stable for a given board
+        // and the order a person expects to read. A manifest edit now moves the entries it
+        // touches instead of everything after them, because the manifest tools are no
+        // longer kept in a block at the end.
+        let mut tools: Vec<Value> = visible.iter().map(|d| load(d)).collect();
+        // File, HTTP and script tools gate on nothing the hardware must provide, so they
+        // are not MCP tools; the model still gets them, in the same sorted list.
+        for group in [
+            // One `shell` instead of the twelve fs_*/net_* tools: same handlers, one
+            // schema, one name to remember.
+            json!([crate::tools::shell::openai_spec()]),
+            board_tools::script_specs(),
+            board_tools::agent_extra_specs(),
+        ] {
+            tools.extend(openai_tools(&group));
+        }
+        tools.sort_by_key(|t| t["function"]["name"].as_str().unwrap_or("").to_string());
+        Value::Array(tools)
+    }
+
+    /// `is_visible` with the disabled set and the mode already resolved, for the one caller
+    /// that asks about every tool at once: same rules, one scan of the names.
+    fn visible_given(&self, name: &str, disabled: &std::collections::BTreeSet<&str>, generic: bool) -> bool {
+        let Some(def) = self.tools.get(name) else {
+            return false;
+        };
+        if disabled.contains(name) {
+            return false;
+        }
+        if self.cfg.mcp.profile == "minimal" && Self::MINIMAL_HIDDEN.contains(&name) {
+            return false;
+        }
+        if generic && def.spec.device_tool {
+            return false;
+        }
+        !def.spec.requires.iter().any(|cap| !self.caps.contains(cap))
+    }
+
     /// The `fs_*` and `net_*` handlers by name, shared by the tool host and `shell`.
     fn fs_or_net_call(&mut self, name: &str, arguments: &Value) -> std::result::Result<String, String> {
         if name.starts_with("fs_") {
