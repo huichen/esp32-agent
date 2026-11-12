@@ -315,8 +315,7 @@ impl Manifest {
                     "device id is empty",
                     "Use a short id like `led` or `bme0`.",
                 ));
-            }
-            if !is_ident(&dev.id) {
+            } else if !is_ident(&dev.id) {
                 issues.push(Issue::new(
                     &format!("{p}/id"),
                     format!("`{}` is not a valid id", dev.id),
@@ -1261,5 +1260,420 @@ mod tests {
         assert_eq!(pin.resolve(&json!({ "pin": 7 })).unwrap(), 7.0);
         assert_eq!(pin.resolve(&json!({ "pin": "7" })).unwrap(), 7.0);
         assert!(pin.resolve(&json!({})).is_err());
+    }
+
+    // ---------------------------------------------------------------- validation rules
+    //
+    // One fixture per rule, each tripping that rule and nothing else: a case that fails
+    // for two reasons cannot tell whether the rule under test works at all.
+
+    fn issue_paths(v: Value) -> Vec<String> {
+        let m = Manifest::from_json_str(&v.to_string()).expect("the fixture parses");
+        m.validate(&ctx()).into_iter().map(|i| i.path).collect()
+    }
+
+    fn one_issue(v: Value, path: &str) {
+        assert_eq!(issue_paths(v.clone()), vec![path.to_string()], "{v}");
+    }
+
+    /// A tool with one valid name and nothing else, so only `exec` can be at fault.
+    fn tool(exec: Value) -> Value {
+        json!({ "tools": [{ "name": "t", "params": [], "exec": exec }] })
+    }
+
+    fn tool_with(params: Value) -> Value {
+        json!({ "tools": [{ "name": "t", "params": params, "exec": { "type": "delay", "ms": 1 } }] })
+    }
+
+    #[test]
+    fn a_manifest_with_more_tools_than_the_limit_is_refused() {
+        let tools: Vec<Value> = (0..=MAX_TOOLS)
+            .map(|i| json!({ "name": format!("t{i}"), "params": [], "exec": { "type": "delay", "ms": 1 } }))
+            .collect();
+        // The limit is what stops one request from carrying a tool list too large for the
+        // model call, so it is checked before anything else.
+        assert_eq!(issue_paths(json!({ "tools": tools })), vec!["/tools".to_string()]);
+        let tools: Vec<Value> = (0..MAX_TOOLS)
+            .map(|i| json!({ "name": format!("t{i}"), "params": [], "exec": { "type": "delay", "ms": 1 } }))
+            .collect();
+        assert!(issue_paths(json!({ "tools": tools })).is_empty(), "the limit itself is allowed");
+    }
+
+    #[test]
+    fn device_ids_buses_addresses_and_pins_are_checked() {
+        one_issue(json!({ "devices": [{ "id": "" }] }), "/devices/0/id");
+        one_issue(json!({ "devices": [{ "id": "bad id" }] }), "/devices/0/id");
+        one_issue(json!({ "devices": [{ "id": "d", "bus": 3, "address": 60 }] }), "/devices/0/bus");
+        one_issue(json!({ "devices": [{ "id": "d", "bus": 0, "address": 0 }] }), "/devices/0/address");
+        one_issue(json!({ "devices": [{ "id": "d", "pins": { "out": 99 } }] }), "/devices/0/pins/out");
+        one_issue(json!({ "devices": [{ "id": "d", "driver": "nope" }] }), "/devices/0/driver");
+        // Bus and address are only address-checked as a pair: an address without a bus is a
+        // device whose wiring is not stated, and that is checked by the driver instead.
+        assert!(issue_paths(json!({ "devices": [{ "id": "d", "address": 60 }] })).is_empty());
+        assert!(issue_paths(json!({ "devices": [{ "id": "d", "bus": 0, "address": 60 }] })).is_empty());
+    }
+
+    #[test]
+    fn parameter_names_types_ranges_and_defaults_are_checked() {
+        one_issue(tool_with(json!([{ "name": "bad name", "type": "integer" }])), "/tools/0/params/0/name");
+        one_issue(tool_with(json!([{ "name": "p", "type": "date" }])), "/tools/0/params/0/type");
+        one_issue(
+            tool_with(json!([{ "name": "p", "type": "integer", "min": 10, "max": 1 }])),
+            "/tools/0/params/0/min",
+        );
+        one_issue(
+            tool_with(json!([{ "name": "p", "type": "integer", "min": 5, "default": 1 }])),
+            "/tools/0/params/0",
+        );
+        one_issue(
+            tool_with(json!([{ "name": "p", "type": "integer", "max": 5, "default": 9 }])),
+            "/tools/0/params/0",
+        );
+        one_issue(
+            tool_with(json!([{ "name": "p", "type": "integer", "default": "many" }])),
+            "/tools/0/params/0",
+        );
+        one_issue(tool_with(json!([{ "name": "p", "type": "boolean", "default": 1 }])), "/tools/0/params/0");
+        one_issue(tool_with(json!([{ "name": "p", "type": "string", "default": 1 }])), "/tools/0/params/0");
+        let m = json!({ "tools": [{
+            "name": "t", "params": [{ "name": "p", "type": "integer", "min": 0, "max": 10, "default": 5 }],
+            "exec": { "type": "delay", "ms": 1 }
+        }] });
+        assert!(issue_paths(m).is_empty(), "a default inside the range is fine");
+        one_issue(
+            json!({ "tools": [{
+                "name": "t", "params": [], "safety": { "min": 10, "max": 1 },
+                "exec": { "type": "delay", "ms": 1 }
+            }] }),
+            "/tools/0/safety/min",
+        );
+    }
+
+    #[test]
+    fn every_primitive_checks_its_own_limits() {
+        one_issue(tool(json!({ "type": "gpio_write", "pin": 99, "level": 1 })), "/tools/0/exec/pin");
+        one_issue(tool(json!({ "type": "gpio_read", "pin": 99 })), "/tools/0/exec/pin");
+        one_issue(tool(json!({ "type": "adc", "pin": 99 })), "/tools/0/exec/pin");
+        one_issue(
+            tool(json!({ "type": "toggle", "pin": 2, "times": 30, "gap_ms": 100 })),
+            "/tools/0/exec/times",
+        );
+        one_issue(
+            tool(json!({ "type": "toggle", "pin": 2, "times": 0, "gap_ms": 100 })),
+            "/tools/0/exec/times",
+        );
+        one_issue(
+            tool(json!({ "type": "toggle", "pin": 2, "times": 2, "gap_ms": 5 })),
+            "/tools/0/exec/gap_ms",
+        );
+        one_issue(
+            tool(json!({ "type": "toggle", "pin": 2, "times": 2, "gap_ms": 5_000 })),
+            "/tools/0/exec/gap_ms",
+        );
+        one_issue(
+            tool(json!({ "type": "pwm", "pin": 2, "freq_hz": 0, "duty_pct": 50 })),
+            "/tools/0/exec/freq_hz",
+        );
+        one_issue(
+            tool(json!({ "type": "pwm", "pin": 2, "freq_hz": 50_000, "duty_pct": 50 })),
+            "/tools/0/exec/freq_hz",
+        );
+        one_issue(
+            tool(json!({ "type": "pwm", "pin": 2, "freq_hz": 50, "duty_pct": 101 })),
+            "/tools/0/exec/duty_pct",
+        );
+        one_issue(
+            tool(json!({ "type": "pwm", "pin": 2, "freq_hz": 50, "duty_pct": -1 })),
+            "/tools/0/exec/duty_pct",
+        );
+        one_issue(
+            tool(json!({ "type": "i2c_read", "addr": 0, "reg": 1, "length": 1 })),
+            "/tools/0/exec/addr",
+        );
+        one_issue(
+            tool(json!({ "type": "i2c_read", "addr": 60, "reg": 300, "length": 1 })),
+            "/tools/0/exec/reg",
+        );
+        one_issue(
+            tool(json!({ "type": "i2c_read", "addr": 60, "reg": 1, "length": 65 })),
+            "/tools/0/exec/length",
+        );
+        one_issue(
+            tool(json!({ "type": "i2c_read", "addr": 60, "reg": 1, "length": 1, "bus": 3 })),
+            "/tools/0/exec/bus",
+        );
+        one_issue(
+            tool(json!({ "type": "i2c_write", "addr": 60, "reg": 1, "data": "nope" })),
+            "/tools/0/exec/data",
+        );
+        one_issue(tool(json!({ "type": "rgb", "pin": 2, "color": "red" })), "/tools/0/exec/color");
+        one_issue(tool(json!({ "type": "delay", "ms": 6_000 })), "/tools/0/exec/ms");
+        // The same rules accept the boundary values, so the check is a range and not a
+        // blanket refusal.
+        for exec in [
+            json!({ "type": "toggle", "pin": 0, "times": 20, "gap_ms": 10 }),
+            json!({ "type": "pwm", "pin": 48, "freq_hz": 40_000, "duty_pct": 0 }),
+            json!({ "type": "i2c_read", "addr": 127, "reg": 255, "length": 64, "bus": 0 }),
+            json!({ "type": "i2c_write", "addr": 1, "reg": 0, "data": [1, 2] }),
+            json!({ "type": "rgb", "pin": 2, "color": "#20ff80", "count": 8 }),
+            json!({ "type": "delay", "ms": MAX_TOTAL_DELAY_MS }),
+        ] {
+            assert!(issue_paths(tool(exec.clone())).is_empty(), "{exec}");
+        }
+    }
+
+    #[test]
+    fn driver_and_sequence_tools_are_checked() {
+        one_issue(
+            tool(json!({ "type": "driver", "driver": "nope", "action": "read" })),
+            "/tools/0/exec/driver",
+        );
+        one_issue(
+            tool(json!({ "type": "driver", "driver": "bme280", "action": "  " })),
+            "/tools/0/exec/action",
+        );
+        // A tool bound to a device that is not on the board is a tool that can never work,
+        // and the hint has to say how to make it appear.
+        let m = Manifest::from_json_str(
+            r#"{"tools":[{"name":"t","device":"mpu6050","params":[],
+                 "exec":{"type":"driver","driver":"bme280","action":"bme280_read"}}]}"#,
+        )
+        .unwrap();
+        let issues = m.validate(&ctx());
+        assert_eq!(issues.len(), 1, "{issues:?}");
+        assert_eq!(issues[0].path, "/tools/0/exec");
+        assert!(issues[0].message.contains("mpu6050"), "{}", issues[0].message);
+
+        one_issue(tool(json!({ "type": "sequence", "steps": [] })), "/tools/0/exec/steps");
+        // A step's own exec is validated in place, so the path points inside the step.
+        one_issue(
+            tool(
+                json!({ "type": "sequence", "steps": [{ "exec": { "type": "gpio_write", "pin": 99, "level": 1 } }] }),
+            ),
+            "/tools/0/exec/steps/0/exec/pin",
+        );
+    }
+
+    #[test]
+    fn a_pin_or_a_colour_may_come_from_a_parameter() {
+        // Nothing can be checked statically: the value only exists at call time.
+        let pin = json!({ "tools": [{
+            "name": "t", "params": [{ "name": "v", "type": "number" }],
+            "exec": { "type": "gpio_write", "pin": { "param": "v" }, "level": { "param": "v" } }
+        }] });
+        assert!(issue_paths(pin).is_empty());
+        let colour = json!({ "tools": [{
+            "name": "t", "params": [{ "name": "c", "type": "string" }],
+            "exec": { "type": "rgb", "pin": 2, "color": { "param": "c" } }
+        }] });
+        assert!(issue_paths(colour).is_empty());
+    }
+
+    // ------------------------------------------------------------ arguments and merging
+
+    #[test]
+    fn numbers_come_from_a_literal_a_number_a_boolean_or_a_numeric_string() {
+        assert_eq!(Num::lit(3).resolve(&json!({})).unwrap(), 3.0);
+        let p = Num::Param { param: "v".into() };
+        assert_eq!(p.resolve(&json!({ "v": true })).unwrap(), 1.0, "a boolean is a level");
+        assert_eq!(p.resolve(&json!({ "v": false })).unwrap(), 0.0);
+        assert_eq!(p.resolve(&json!({ "v": " 2.5 " })).unwrap(), 2.5);
+        let err = p.resolve(&json!({ "v": "tall" })).unwrap_err();
+        assert!(err.message.contains("must be a number"), "{}", err.message);
+        let err = p.resolve(&json!({ "v": [1] })).unwrap_err();
+        assert!(err.message.contains("must be a number"), "{}", err.message);
+        let err = p.resolve(&json!({})).unwrap_err();
+        assert!(err.message.contains("required"), "{}", err.message);
+
+        assert_eq!(Num::lit(7).resolve_i32(&json!({})).unwrap(), 7);
+        assert_eq!(Num::lit(9).resolve_u32(&json!({})).unwrap(), 9);
+        let err = Num::lit(-1).resolve_u32(&json!({})).unwrap_err();
+        assert!(err.message.contains("out of range"), "{}", err.message);
+    }
+
+    #[test]
+    fn text_arguments_are_literal_or_taken_from_the_call() {
+        assert_eq!(Text::Lit("x".into()).resolve(&json!({})).unwrap(), "x");
+        let p = Text::Param { param: "s".into() };
+        assert_eq!(p.resolve(&json!({ "s": "y" })).unwrap(), "y");
+        assert_eq!(p.resolve(&json!({ "s": 7 })).unwrap(), "7", "a number is stringified, not refused");
+        assert!(p.resolve(&json!({})).is_err());
+    }
+
+    #[test]
+    fn arguments_are_coerced_and_refused_by_type() {
+        let m = Manifest::from_json_str(
+            r#"{"tools":[{"name":"t","params":[
+                {"name":"n","type":"integer","required":true},
+                {"name":"b","type":"boolean"},
+                {"name":"s","type":"string","enum":["a","b"]},
+                {"name":"free","type":"string"},
+                {"name":"odd","type":"colour"}],
+                "exec":{"type":"delay","ms":1}}]}"#,
+        )
+        .unwrap();
+        let t = &m.tools[0];
+        assert!(check_args(t, &json!({ "n": 2, "b": "yes", "s": "a" })).is_ok());
+        assert!(
+            check_args(t, &json!({ "n": "3", "free": "anything" })).is_ok(),
+            "a numeric string is a number"
+        );
+        // A parameter type this build does not know is not a reason to refuse the call.
+        assert!(check_args(t, &json!({ "n": 1, "odd": { "x": 1 } })).is_ok());
+
+        let err = check_args(t, &json!({ "b": true })).unwrap_err();
+        assert!(err.message.contains("`n` is required"), "{}", err.message);
+        let err = check_args(t, &json!({ "n": true })).unwrap_err();
+        assert!(err.message.contains("must be a number"), "{}", err.message);
+        let err = check_args(t, &json!({ "n": 1, "b": { "x": 1 } })).unwrap_err();
+        assert!(err.message.contains("must be a boolean"), "{}", err.message);
+        let err = check_args(t, &json!({ "n": 1, "s": 2 })).unwrap_err();
+        assert!(err.message.contains("must be a string"), "{}", err.message);
+        let err = check_args(t, &json!({ "n": 1, "s": "c" })).unwrap_err();
+        assert!(err.message.contains("must be one of a, b"), "{}", err.message);
+        // A parameter that is not required and not present is not an error.
+        assert!(check_args(t, &json!({ "n": 1 })).is_ok());
+    }
+
+    #[test]
+    fn a_one_sided_range_says_which_side_it_is() {
+        let min_only = Manifest::from_json_str(
+            r#"{"tools":[{"name":"t","params":[{"name":"v","type":"number","required":true,"min":5}],
+                 "exec":{"type":"delay","ms":1}}]}"#,
+        )
+        .unwrap();
+        let err = check_args(&min_only.tools[0], &json!({ "v": 1 })).unwrap_err();
+        assert!(err.message.contains(">= 5"), "{}", err.message);
+
+        let max_only = Manifest::from_json_str(
+            r#"{"tools":[{"name":"t","params":[{"name":"v","type":"number","required":true,"max":5}],
+                 "exec":{"type":"delay","ms":1}}]}"#,
+        )
+        .unwrap();
+        let err = check_args(&max_only.tools[0], &json!({ "v": 9 })).unwrap_err();
+        assert!(err.message.contains("<= 5"), "{}", err.message);
+
+        let safety_min = Manifest::from_json_str(
+            r#"{"tools":[{"name":"t","params":[{"name":"v","type":"number","required":true}],
+                 "safety":{"min":1},"exec":{"type":"delay","ms":1}}]}"#,
+        )
+        .unwrap();
+        let err = check_args(&safety_min.tools[0], &json!({ "v": 0 })).unwrap_err();
+        assert_eq!(err.code, code::FORBIDDEN);
+        assert!(err.message.contains(">= 1"), "{}", err.message);
+
+        let safety_max = Manifest::from_json_str(
+            r#"{"tools":[{"name":"t","params":[{"name":"v","type":"number","required":true}],
+                 "safety":{"max":1},"exec":{"type":"delay","ms":1}}]}"#,
+        )
+        .unwrap();
+        let err = check_args(&safety_max.tools[0], &json!({ "v": 2 })).unwrap_err();
+        assert!(err.message.contains("<= 1"), "{}", err.message);
+    }
+
+    #[test]
+    fn data_can_be_bytes_hex_or_a_single_number_and_nothing_else() {
+        assert_eq!(resolve_bytes(&json!(7), &json!({})).unwrap(), vec![7]);
+        assert_eq!(resolve_bytes(&json!("aabb"), &json!({})).unwrap(), vec![0xaa, 0xbb]);
+        assert_eq!(resolve_bytes(&json!("01:02 03"), &json!({})).unwrap(), vec![1, 2, 3]);
+        let err = resolve_bytes(&json!({ "nested": true }), &json!({})).unwrap_err();
+        assert_eq!(err.code, code::INVALID_PARAMS);
+        let err = resolve_bytes(&json!("1g"), &json!({})).unwrap_err();
+        assert!(err.message.contains("hex"), "{}", err.message);
+        let err = resolve_bytes(&json!({ "param": "bytes" }), &json!({})).unwrap_err();
+        assert!(err.message.contains("bytes"), "{}", err.message);
+    }
+
+    #[test]
+    fn tool_defs_skip_disabled_and_unnamed_tools_and_keep_driver_requirements() {
+        let m = Manifest::from_json_str(
+            r#"{"tools":[
+                {"name":"on","exec":{"type":"gpio_write","pin":2,"level":1}},
+                {"name":"off","enabled":false,"exec":{"type":"gpio_write","pin":2,"level":0}},
+                {"name":"  ","exec":{"type":"delay","ms":1}},
+                {"name":"read","title":"Climate","exec":{"type":"driver","driver":"bme280","action":"bme280_read"}}]}"#,
+        )
+        .unwrap();
+        let defs = m.tool_defs();
+        let names: Vec<&str> = defs.iter().map(|d| d.spec.name.as_str()).collect();
+        assert_eq!(names, vec!["on", "read"], "a disabled or unnamed tool must not reach the wire");
+        assert!(defs[0].spec.mutating, "a gpio write changes hardware state");
+        assert!(
+            defs[1].spec.mutating,
+            "a driver action is treated as mutating: it may write, and a manifest cannot tell"
+        );
+        assert_eq!(defs[1].spec.requires, vec!["bme280".to_string()], "the tool follows its device");
+        assert_eq!(defs[1].spec.title, "Climate");
+        assert_eq!(defs[0].spec.title, "on", "an untitled tool is named after itself");
+        assert!(defs.iter().all(|d| d.spec.from_manifest), "manifest tools sort as a group");
+    }
+
+    #[test]
+    fn tools_whose_names_the_wire_cannot_carry_are_dropped_at_load() {
+        let mut m = Manifest::from_json_str(
+            r#"{"tools":[{"name":"ok","exec":{"type":"delay","ms":1}},
+                          {"name":"pump.pulse","exec":{"type":"delay","ms":1}}]}"#,
+        )
+        .unwrap();
+        assert_eq!(m.drop_tools_with_unusable_names(), vec!["pump.pulse".to_string()]);
+        assert_eq!(m.tool_names(), vec!["ok".to_string()]);
+        assert!(m.drop_tools_with_unusable_names().is_empty(), "nothing left to drop");
+    }
+
+    #[test]
+    fn merge_replaces_a_device_and_a_tool_it_already_has() {
+        let base = sample();
+        let patch = Manifest::from_json_str(
+            r#"{"devices":[{"id":"led","kind":"actuator","pins":{"out":4}}],
+                "tools":[{"name":"led_on","params":[],"exec":{"type":"gpio_write","pin":4,"level":1}}]}"#,
+        )
+        .unwrap();
+        let merged = base.merged_with(&patch);
+        assert_eq!(merged.devices.len(), base.devices.len(), "a device is replaced, not duplicated");
+        assert_eq!(merged.devices[0].pins["out"], 4);
+        assert_eq!(merged.tools.len(), base.tools.len(), "and so is a tool");
+        assert_eq!(merged.tools[0].exec, Exec::GpioWrite { pin: Num::lit(4), level: Num::lit(1) });
+        assert_eq!(merged.version, MANIFEST_VERSION);
+    }
+
+    #[test]
+    fn driver_tool_ignores_tools_that_are_disabled_or_are_not_driver_tools() {
+        let m = sample();
+        assert!(m.driver_tool("bme280", "bme280_read").is_some());
+        assert!(m.driver_tool("bme280", "other_action").is_none());
+        assert!(m.driver_tool("led", "led_on").is_none(), "a gpio tool is not a driver tool");
+        let mut disabled = m.clone();
+        for t in disabled.tools.iter_mut() {
+            if t.name == "climate_read" {
+                t.enabled = false;
+            }
+        }
+        assert!(disabled.driver_tool("bme280", "bme280_read").is_none());
+    }
+
+    #[test]
+    fn a_default_inside_the_range_reaches_the_schema() {
+        let m = Manifest::from_json_str(
+            r#"{"tools":[{"name":"t","params":[
+                {"name":"n","type":"integer","min":0,"max":10,"default":5,"description":"count"},
+                {"name":"b","type":"boolean","default":true},
+                {"name":"s","type":"string","default":"auto","enum":["auto","manual"]}],
+                "exec":{"type":"delay","ms":1}}]}"#,
+        )
+        .unwrap();
+        assert!(m.validate(&ctx()).is_empty());
+        let schema = tool_schema(&m.tools[0]);
+        assert_eq!(schema["properties"]["n"]["default"], 5);
+        assert_eq!(schema["properties"]["n"]["description"], "count");
+        assert_eq!(schema["properties"]["b"]["default"], true);
+        assert_eq!(schema["properties"]["s"]["default"], "auto");
+        assert_eq!(schema["properties"]["s"]["enum"], json!(["auto", "manual"]));
+    }
+
+    #[test]
+    fn a_device_is_enabled_unless_it_says_otherwise() {
+        let m = Manifest::from_json_str(r#"{"devices":[{"id":"a"},{"id":"b","enabled":false}]}"#).unwrap();
+        assert!(m.devices[0].is_enabled(), "a device is on by default");
+        assert!(!m.devices[1].is_enabled());
     }
 }
