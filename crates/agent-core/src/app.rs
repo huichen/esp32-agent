@@ -739,10 +739,8 @@ impl App {
                 // One tool is not a family: the declaration would cost more than the tool.
                 continue;
             }
-            let summary = format!(
-                "The {family} this board detected, in {} commands under one name; `command: help` lists what each takes",
-                subs.len()
-            );
+            let summary =
+                format!("The {family} this board detected, in {} commands under one name", subs.len());
             for name in subs.iter().map(|d| d.spec.name.clone()).collect::<Vec<String>>() {
                 self.family_members.insert(name.clone(), format!("{family} {name}"));
             }
@@ -11840,6 +11838,48 @@ mod tests {
     /// The portal's Files tab reads the workspace through two routes, and reports the budget
     /// the `write` tool enforces. A listing without the total would leave "the write was
     /// refused" with nothing to compare against.
+    /// A family used to say only "`command: help` lists what each takes", so every turn began
+    /// with a `help` call: one request, one round trip, before the call the model meant to make.
+    /// The description now names the commands, generated from the same list `help` prints.
+    #[test]
+    fn every_family_names_its_commands_in_its_description() {
+        let app = test_app();
+        let mut families: std::collections::BTreeMap<String, Vec<String>> = Default::default();
+        for label in app.family_members.values() {
+            let Some((family, command)) = label.split_once(' ') else { continue };
+            families.entry(family.to_string()).or_default().push(command.to_string());
+        }
+        assert!(families.len() >= 3, "the board and its families: {families:?}");
+
+        let specs = app.tool_specs();
+        let specs = specs.as_array().cloned().unwrap_or_default();
+        let mut checked = 0;
+        for (family, commands) in families {
+            // Only what the model is actually offered: the declarative side is the one that
+            // costs a round trip.
+            let Some(spec) = specs.iter().find(|t| t["function"]["name"] == family.as_str()).cloned() else {
+                continue;
+            };
+            checked += 1;
+            let description = spec["function"]["description"].as_str().unwrap_or("");
+            assert!(
+                description.contains("Commands: "),
+                "`{family}` does not name its commands: {description}"
+            );
+            for command in commands {
+                assert!(
+                    description.contains(&command),
+                    "`{family}` hides `{command}` from its description: {description}"
+                );
+            }
+            assert!(
+                !description.contains("lists what each takes"),
+                "`{family}` still asks the model to spend a call on `help`: {description}"
+            );
+        }
+        assert!(checked >= 3, "only {checked} families were visible to check");
+    }
+
     #[test]
     fn the_files_routes_list_and_read_the_workspace() {
         use crate::tools::fs::Workspace as _;
