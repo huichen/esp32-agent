@@ -8,6 +8,13 @@
 //!
 //! The commands themselves are unchanged: `shell` is a router in front of the handlers that
 //! already existed, so a script that calls `tool("fs_read", …)` directly still works.
+//!
+//! There are no pipes, no redirection and no `&&`: one call is one command. That is not a
+//! shortcut, it is the shape of the thing — the parser here splits *a* command line, and a
+//! grammar with a pipeline would need a process model the board does not have. A filter that
+//! would read from a pipe takes its input as a file instead (`sort <path>`), and `tee` takes
+//! the text with `-i`. NuttX's `nsh` has the same commands and the same missing pipeline, so
+//! the names are the ones a person already types.
 
 use crate::tool::{object_schema, string, ToolDef};
 use serde_json::{json, Value};
@@ -47,6 +54,43 @@ pub const OPS: &[(&str, &str)] = &[
     ("sha256sum", "shell_sha256sum"),
     ("md5sum", "shell_md5sum"),
     ("system_prompt", "shell_system_prompt"),
+    // Reading and slicing text. `nsh` carries all of these and a person's fingers already
+    // know them; none of them needs a directory tree, only a file and a few arguments.
+    // `cat` is `read` under the other name — NuttX has both, and both get typed.
+    ("cat", "fs_read"),
+    ("wc", "shell_wc"),
+    ("head", "shell_head"),
+    ("tail", "shell_head"),
+    ("cut", "shell_cut"),
+    ("sort", "shell_sort"),
+    ("uniq", "shell_uniq"),
+    ("tr", "shell_tr"),
+    ("tee", "shell_tee"),
+    ("touch", "shell_touch"),
+    ("du", "shell_du"),
+    ("strings", "shell_strings"),
+    ("od", "shell_hexdump"),
+    // Numbers and time. The board has one clock and one loop, so `sleep` is capped; `jot`
+    // is how a shell produces a sequence without a `for`.
+    ("sleep", "shell_sleep"),
+    ("usleep", "shell_sleep"),
+    ("jot", "shell_jot"),
+    ("crc32", "shell_crc32"),
+    // The board looking at itself. These answer from what the `App` already knows; none of
+    // them invents a table it does not have.
+    ("hostname", "shell_hostname"),
+    ("whoami", "shell_whoami"),
+    ("id", "shell_id"),
+    ("env", "shell_env"),
+    ("setenv", "shell_env"),
+    ("unsetenv", "shell_env"),
+    ("netstat", "shell_netstat"),
+    ("route", "shell_route"),
+    ("arp", "shell_arp"),
+    // The registry: what a name means on this board.
+    ("type", "shell_type"),
+    ("which", "shell_type"),
+    ("help", "shell_help"),
 ];
 
 /// One command line, split the way a shell splits it: words, with quotes respected.
@@ -104,7 +148,12 @@ pub fn parse(line: &str) -> Result<Parsed, String> {
     let mut index = 0;
     while index < rest.len() {
         let word = &rest[index];
-        if let Some(stripped) = word.strip_prefix("--") {
+        // A negative number is an argument, not a flag: `jot 5 10 -1` counts down. Nothing
+        // in the table has a short flag made of digits, so there is nothing to shadow.
+        let negative_number = word.len() > 1 && word.starts_with('-') && looks_numeric(&word[1..]);
+        if negative_number {
+            args.push(word.clone());
+        } else if let Some(stripped) = word.strip_prefix("--") {
             match stripped.split_once('=') {
                 Some((key, value)) => {
                     flags.insert(key.to_ascii_lowercase(), value.to_string());
@@ -125,9 +174,9 @@ pub fn parse(line: &str) -> Result<Parsed, String> {
                 }
             }
         } else if word.len() > 1 && word.starts_with('-') && word != "-" {
-            // Short flags: `-d`, and `-o value` for the ones that take one.
+            // Short flags: `-r`, and `-o value` for the ones that take one.
             let key = word[1..].to_ascii_lowercase();
-            let takes_value = matches!(key.as_str(), "o" | "p" | "c" | "w" | "f");
+            let takes_value = matches!(key.as_str(), "o" | "p" | "c" | "w" | "f" | "d" | "n" | "i");
             if takes_value {
                 if let Some(next) = rest.get(index + 1) {
                     flags.insert(key, next.clone());
@@ -142,6 +191,13 @@ pub fn parse(line: &str) -> Result<Parsed, String> {
         index += 1;
     }
     Ok(Parsed { name, args, flags })
+}
+
+/// Digits and dots: what a negative number looks like once its sign is off.
+fn looks_numeric(text: &str) -> bool {
+    !text.is_empty()
+        && text.chars().all(|c| c.is_ascii_digit() || c == '.')
+        && text.chars().any(|c| c.is_ascii_digit())
 }
 
 /// Turn a parsed line into the argument object the handler for that command takes.
@@ -198,7 +254,60 @@ pub fn arguments(parsed: &Parsed) -> Result<serde_json::Value, String> {
             json!({ "host": need(0, "<host>")?, "port": flag("port", "p"), "timeout_ms": flag("timeout", "t") })
         }
         "ping" => json!({ "host": need(0, "<host>")?, "count": flag("count", "c") }),
-        "ifconfig" | "df" | "free" | "uptime" | "date" | "uname" | "ps" | "help" => json!({}),
+        "ifconfig" | "df" | "free" | "uptime" | "date" | "uname" | "ps" | "help" | "du" | "whoami" | "id"
+        | "netstat" | "route" | "arp" => json!({}),
+        "env" => json!({ "action": "list" }),
+        "cat" | "uniq" | "crc32" | "touch" => json!({ "path": need(0, "<path>")? }),
+        "wc" => {
+            // `-w` and `-c` mean a value to other commands in this shared flag table
+            // (`hexdump -w 8`, `ping -c 3`), so the parser reads the word after them as
+            // their value: `wc -c /f` arrives as `c=/f`. A flag holding something that is
+            // not `true` is therefore the path, and the flag itself is the mode. One mode
+            // per call, as the usage line says.
+            let mut path = arg(0);
+            let mut mode = String::new();
+            for (key, name) in [("l", "lines"), ("w", "words"), ("c", "bytes")] {
+                if let Some(value) = parsed.flags.get(key) {
+                    if value != "true" {
+                        path = Some(value.clone());
+                    }
+                    if mode.is_empty() {
+                        mode = name.to_string();
+                    }
+                }
+            }
+            json!({ "path": path.ok_or_else(|| format!("{}: missing <path>", parsed.name))?, "mode": mode })
+        }
+        "head" | "tail" => json!({
+            "path": need(0, "<path>")?,
+            "lines": parsed.flags.get("n").cloned(),
+            "tail": parsed.name == "tail",
+        }),
+        "cut" => json!({
+            "path": need(0, "<path>")?,
+            "delimiter": parsed.flags.get("d").cloned(),
+            "field": parsed.flags.get("f").cloned(),
+        }),
+        "sort" => json!({
+            "path": need(0, "<path>")?,
+            "reverse": flag_bool("r", "r"),
+            "unique": flag_bool("u", "u"),
+        }),
+        "tr" => json!({
+            "from": need(0, "<from>")?,
+            "to": need(1, "<to>")?,
+            "path": need(2, "<path>")?,
+        }),
+        "tee" => json!({ "path": need(0, "<path>")?, "input": parsed.flags.get("i").cloned() }),
+        "strings" => json!({ "path": need(0, "<path>")?, "min": parsed.flags.get("n").cloned() }),
+        "od" => json!({ "path": need(0, "<path>")?, "width": flag("width", "w"), "octal": true }),
+        "sleep" => json!({ "unit": "s", "value": need(0, "<seconds>")? }),
+        "usleep" => json!({ "unit": "ms", "value": need(0, "<milliseconds>")? }),
+        "jot" => json!({ "count": need(0, "<count>")?, "start": arg(1), "step": arg(2) }),
+        "hostname" => json!({ "name": arg(0) }),
+        "setenv" => json!({ "action": "set", "key": need(0, "<key>")?, "value": need(1, "<value>")? }),
+        "unsetenv" => json!({ "action": "unset", "key": need(0, "<key>")? }),
+        "type" | "which" => json!({ "name": need(0, "<name>")?, "which": parsed.name == "which" }),
         other => return Err(format!("`{other}` is not a shell command.\n\n{}", help_text())),
     })
 }
@@ -230,6 +339,39 @@ pub fn usage(op: &str) -> Option<&'static str> {
         "sha256sum" => "sha256sum <path>",
         "md5sum" => "md5sum <path>",
         "system_prompt" => "system_prompt get | set <text> | append <text> | clear",
+        // Reading and slicing text. Each takes its input as a path: there is no pipe.
+        "cat" => "cat <path>  (same as read)",
+        "wc" => "wc [-l|-w|-c] <path>",
+        "head" => "head [-n <lines>] <path>",
+        "tail" => "tail [-n <lines>] <path>",
+        "cut" => "cut [-d <delimiter>] [-f <field>] <path>  (defaults: tab, field 1)",
+        "sort" => "sort [-r] [-u] <path>",
+        "uniq" => "uniq <path>",
+        "tr" => "tr <from> <to> <path>",
+        "tee" => "tee <path> -i <text>  (no pipes: the input is an argument)",
+        "touch" => "touch <path>",
+        "du" => "du",
+        "strings" => "strings <path> [-n <min run>]",
+        "od" => "od <path> [-w <bytes per line>]  (octal, where hexdump is hexadecimal)",
+        // Numbers and time.
+        "sleep" => "sleep <seconds>",
+        "usleep" => "usleep <milliseconds>",
+        "jot" => "jot <count> [start [step]]",
+        "crc32" => "crc32 <path>",
+        // The board looking at itself.
+        "hostname" => "hostname [name]",
+        "whoami" => "whoami",
+        "id" => "id",
+        "env" => "env  (session variables only; they are not saved)",
+        "setenv" => "setenv <key> <value>  (session only, not saved to NVS)",
+        "unsetenv" => "unsetenv <key>  (session only)",
+        "netstat" => "netstat",
+        "route" => "route",
+        "arp" => "arp",
+        // The registry.
+        "type" => "type <name>",
+        "which" => "which <name>  (same answer as type)",
+        "help" => "help",
         // The commands that are tools of their own. They share the table so `--help` and
         // the error suffix say the same thing wherever the model reaches them.
         "read" => "read <path>",
@@ -272,8 +414,12 @@ pub fn spec() -> ToolDef {
         "Run a command on the board, as on any unix shell: one `command` string.\n\
          ls [path] · rm <path> --confirm · cp <from> <to> · mv <from> <to> --confirm · grep <pattern> [path]\n\
          curl <url> [-d body] [-f text|raw] · wget <url> [-o path] · nslookup <host> · nc <host> [-p port] · ping <host> [-c n] · ifconfig\n\
-         zip <archive> <path...> · unzip <archive_b64> · hexdump <path> [-w n] · base64 <path> [-d] [-o out]\n\
+         zip <archive> <path...> · unzip <archive_b64> · hexdump <path> [-w n] · od <path> (octal) · base64 <path> [-d] [-o out]\n\
+         cat <path> · wc [-l|-w|-c] <path> · head/tail [-n n] <path> · cut -d c -f n <path> · sort [-r] [-u] <path> · uniq <path> · tr <from> <to> <path> · tee <path> -i text\n\
+         touch <path> · du · strings <path> · sleep <s> · usleep <ms> · jot <count> [start [step]] · crc32 <path>\n\
+         hostname [name] · whoami · id · env · setenv <k> <v> · unsetenv <k> · netstat · route · arp · type <name> · which <name>\n\
          df · free · uptime · date · uname · ps · help\n\
+         No pipes, no redirection, no `&&`: one command per call, and a filter reads a file.\n\
          `curl` reduces an HTML page to its text unless -f raw. A wrong command answers with its usage; `shell help` lists everything.",
     )
     .title("Shell")
@@ -326,5 +472,99 @@ mod tests {
         let spec = spec();
         assert_eq!(spec.spec.name, "shell");
         assert!(spec.spec.input_schema["properties"]["command"].is_object());
+    }
+
+    /// `help` is generated from the table, so a command with no usage line would be a
+    /// command nobody can find out how to write. One line per entry, in table order.
+    #[test]
+    fn every_command_has_a_usage_line_and_help_prints_it() {
+        assert!(OPS.len() >= 45, "the board's shell has {} commands", OPS.len());
+        let text = help_text();
+        let printed: Vec<&str> = text.lines().filter(|line| line.starts_with("  ")).collect();
+        assert_eq!(printed.len(), OPS.len(), "help must print one line per command:\n{text}");
+        for (op, _) in OPS {
+            let line = usage(op).unwrap_or_else(|| panic!("`{op}` has no usage line"));
+            assert!(printed.contains(&format!("  {line}").as_str()), "`{op}` is missing from help:\n{text}");
+        }
+        // The three tools that stayed separate are named in the same text.
+        for tool in ["read", "write", "edit"] {
+            assert!(text.contains(&format!("{tool} ")), "{tool} is missing from help");
+        }
+    }
+
+    /// A filter has to name its file, and the flags that take a value have to survive the
+    /// shared flag table: `-c` is ping's count and `-w` is hexdump's width, so `wc -c /f`
+    /// reaches the handler as `c=/f`.
+    #[test]
+    fn the_new_commands_parse_the_way_a_shell_writes_them() {
+        let cut = arguments(&parse("cut -d , -f 2 /notes.csv").unwrap()).unwrap();
+        assert_eq!(cut["delimiter"], json!(","));
+        assert_eq!(cut["field"], json!("2"));
+        assert_eq!(cut["path"], json!("/notes.csv"));
+
+        let wc = arguments(&parse("wc -c /f").unwrap()).unwrap();
+        assert_eq!(wc["path"], json!("/f"), "the value of -c is the path");
+        assert_eq!(wc["mode"], json!("bytes"));
+        let wc = arguments(&parse("wc -l /f").unwrap()).unwrap();
+        assert_eq!(wc["mode"], json!("lines"));
+        assert_eq!(wc["path"], json!("/f"));
+
+        let head = arguments(&parse("head -n 2 /f").unwrap()).unwrap();
+        assert_eq!(head["lines"], json!("2"));
+        assert_eq!(head["tail"], json!(false));
+        let tail = arguments(&parse("tail /f").unwrap()).unwrap();
+        assert_eq!(tail["tail"], json!(true));
+
+        let tee = arguments(&parse("tee /out.txt -i hello there").unwrap()).unwrap();
+        assert_eq!(tee["path"], json!("/out.txt"));
+        assert_eq!(tee["input"], json!("hello"));
+
+        let sort = arguments(&parse("sort -r -u /f").unwrap()).unwrap();
+        assert_eq!(sort["reverse"], json!(true));
+        assert_eq!(sort["unique"], json!(true));
+
+        let tr = arguments(&parse("tr a b /f").unwrap()).unwrap();
+        assert_eq!(tr["from"], json!("a"));
+        assert_eq!(tr["to"], json!("b"));
+        assert_eq!(tr["path"], json!("/f"));
+
+        let od = arguments(&parse("od /f").unwrap()).unwrap();
+        assert_eq!(od["octal"], json!(true));
+
+        let env = arguments(&parse("setenv MODE test").unwrap()).unwrap();
+        assert_eq!(env["action"], json!("set"));
+        assert_eq!(env["key"], json!("MODE"));
+        assert_eq!(env["value"], json!("test"));
+        let list = arguments(&parse("env").unwrap()).unwrap();
+        assert_eq!(list["action"], json!("list"));
+
+        // A negative number is an argument, not a flag: `jot` counts down.
+        let jot = arguments(&parse("jot 5 10 -1").unwrap()).unwrap();
+        assert_eq!(jot["count"], json!("5"));
+        assert_eq!(jot["start"], json!("10"));
+        assert_eq!(jot["step"], json!("-1"));
+
+        let which = arguments(&parse("which ls").unwrap()).unwrap();
+        assert_eq!(which["name"], json!("ls"));
+        assert_eq!(which["which"], json!(true));
+    }
+
+    /// Every command a person would type is in the table under the NuttX name, and the
+    /// ones that are aliases share a handler instead of copying it.
+    #[test]
+    fn the_table_names_the_commands_nuttx_has() {
+        for op in [
+            "cat", "wc", "head", "tail", "cut", "sort", "uniq", "tr", "tee", "touch", "du", "strings", "od",
+            "sleep", "usleep", "jot", "crc32", "hostname", "whoami", "id", "env", "setenv", "unsetenv",
+            "netstat", "route", "arp", "type", "which", "help",
+        ] {
+            assert!(route(op).is_some(), "`{op}` is not a shell command");
+        }
+        assert_eq!(route("cat"), Some("fs_read"), "cat is read under the other name");
+        assert_eq!(route("head"), route("tail"), "one handler, two directions");
+        assert_eq!(route("sleep"), route("usleep"));
+        assert_eq!(route("env"), route("setenv"));
+        assert_eq!(route("type"), route("which"));
+        assert_eq!(route("od"), route("xd"), "od is the octal half of hexdump");
     }
 }
