@@ -10,11 +10,12 @@
 //! * For that reason the stack the write runs on has to be in internal RAM, and ESP-IDF
 //!   asserts exactly that: `assert(esp_task_stack_is_sane_cache_disabled())` in
 //!   `spi_flash_disable_interrupts_caches_and_other_cpu`.
-//! * The agent thread does *not* reliably get an internal stack. Measured on this bench
-//!   (2026-11-12): `mcp-agent` ran with an `sp` of `0x3c2e…`, i.e. in PSRAM, and the first
-//!   scheduled task that came due killed the board — `nvs_erase_key` ← `NvsStore::set` ←
-//!   `App::persist_sched` ← the agent thread — on that assertion, roughly every 8 s,
-//!   because the task was still due after every reboot.
+//! * The agent thread was *given* a PSRAM stack on purpose (`runner.rs`, to survive a boot
+//!   where 16 KB of contiguous internal RAM was gone). Measured on this bench (2026-11-12):
+//!   `mcp-agent` ran with an `sp` of `0x3c2e…`, and the first scheduled task that came due
+//!   killed the board — `nvs_erase_key` ← `NvsStore::set` ← `App::persist_sched` ← the agent
+//!   thread — on that assertion, roughly every 8 s, because the task was still due after
+//!   every reboot. `runner.rs` now asks for internal RAM first and only falls back to PSRAM.
 //!
 //! So this task is not left to a default: it is spawned with
 //! `esp_pthread_set_cfg(stack_alloc_caps = MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)`, which
@@ -134,11 +135,10 @@ pub fn flush_now(shared: &Shared, log: &LogBuf, who: &str) -> bool {
 ///
 /// `pxTaskGetStackStart(NULL)` is the current task's lowest stack address, and the DRAM
 /// window comes from the SoC headers, so this cannot drift from what IDF's own
-/// `esp_ptr_in_dram` decides.
-fn on_internal_stack() -> bool {
+/// `esp_ptr_in_dram` decides. Shared with `runner.rs`, which reports it for the agent thread.
+pub(crate) fn on_internal_stack() -> bool {
     let base = unsafe { sys::pxTaskGetStackStart(ptr::null_mut()) } as usize;
-    let inside = (sys::SOC_DRAM_LOW as usize..sys::SOC_DRAM_HIGH as usize).contains(&base);
-    inside
+    (sys::SOC_DRAM_LOW as usize..sys::SOC_DRAM_HIGH as usize).contains(&base)
 }
 
 /// Run `f` under the app lock, tolerating a poisoned one: a thread that panicked mid-update

@@ -49,14 +49,19 @@ use esp32_agent_core::logbuf::LogBuf;
 /// `serde_json`'s recursive parser; 32 KB matches the main thread.
 ///
 /// 32 KB of internal RAM failed to allocate once WiFi and the HTTP server were up
-/// (`pthread: Failed to create task`), so 16 KB is the working size — and on a boot with the
-/// heap fragmented even 16 KB of *contiguous internal* RAM is not there: the spawn answers
-/// `Not enough space (os error 12)` and the board's own agent never runs. This stack
-/// therefore comes from PSRAM (see [`with_psram_stack`]), which is why its size can stay what
-/// it is and internal RAM pays nothing.
+/// (`pthread: Failed to create task`), so 16 KB is the working size. Measured on the bench, a
+/// whole turn peaks at 8.3 kB of it (2026-11-12), so 16 KB is twice the head-room the thread
+/// actually uses.
+///
+/// It is asked for in **internal RAM** first, which is what a thread that touches flash
+/// needs: an NVS write or a partition read runs with both caches off, and at that moment a
+/// stack in PSRAM is not there at all (IDF asserts exactly this). PSRAM is the fallback for a
+/// boot where 16 KB contiguous internal RAM is gone — see [`with_stack_caps`] — and it is a
+/// safe fallback because no NVS write happens on this thread any more: they are queued and
+/// performed by `firmware/src/nvs_writer.rs`.
 const STACK_BYTES: usize = 16 * 1024;
 
-/// Run `f` with PSRAM stacks allowed for the threads it creates.
+/// Run `f` with thread stacks allocated from `caps`.
 ///
 /// `pthread_create` allocates stacks with `MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT` unless the
 /// calling thread's config says otherwise — even with
@@ -64,15 +69,15 @@ const STACK_BYTES: usize = 16 * 1024;
 /// external stack, it does not ask for one. That is the whole reason a board with 8 MB of
 /// PSRAM free can still fail to start a 16 KB thread with `ENOMEM`.
 ///
-/// The config is per-thread and inherited by children, so it is set immediately around the
-/// one spawn and restored afterwards: everything else that starts later (a request thread, a
-/// stream) keeps allocating where it used to.
-fn with_psram_stack<T>(create: impl FnOnce() -> T) -> T {
+/// The config is per-thread and read by `pthread_create` from the *creating* thread, so it is
+/// set immediately around the one spawn and restored afterwards: everything else that starts
+/// later (a request thread, a stream, the store writer) keeps allocating where it used to.
+fn with_stack_caps<T>(caps: u32, create: impl FnOnce() -> T) -> T {
     use esp_idf_svc::sys;
     let mut before: sys::esp_pthread_cfg_t = unsafe { std::mem::zeroed() };
     let have_before = unsafe { sys::esp_pthread_get_cfg(&mut before) } == sys::ESP_OK;
     let mut cfg = unsafe { sys::esp_pthread_get_default_config() };
-    cfg.stack_alloc_caps = sys::MALLOC_CAP_SPIRAM | sys::MALLOC_CAP_8BIT;
+    cfg.stack_alloc_caps = caps;
     unsafe { sys::esp_pthread_set_cfg(&cfg) };
     let out = create();
     if have_before {
@@ -127,6 +132,12 @@ impl Default for EspHttpTransport {
 impl EspHttpTransport {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A second client on the same timeout handle: the first `spawn` attempt may fail after
+    /// the closure has taken the transport with it, and a retry needs one of its own.
+    pub fn with_timeout(timeout_s: Arc<AtomicU32>) -> Self {
+        Self { timeout_s }
     }
 
     /// The handle the agent thread writes `LlmConfig::timeout_s` into.
@@ -243,9 +254,10 @@ impl Conn {
 
     fn write_all(&mut self, data: &[u8]) -> Result<(), String> {
         match self {
-            Conn::Plain(stream) => {
-                stream.write_all(data).and_then(|()| stream.flush()).map_err(|e| format!("sending the request failed: {e}"))
-            }
+            Conn::Plain(stream) => stream
+                .write_all(data)
+                .and_then(|()| stream.flush())
+                .map_err(|e| format!("sending the request failed: {e}")),
             Conn::Tls(tls) => tls.write_all(data).map_err(|e| {
                 // A bare ESP_FAIL here says nothing: the request is routinely 20-30 kB
                 // (51 tool definitions plus the tool results), and the board has a few kB
@@ -280,7 +292,10 @@ impl Conn {
                 }
             },
             Conn::Tls(tls) => tls.read(buf).map_err(|e| {
-                format!("reading the reply over TLS failed: {e} (the session times out after {} s)", timeout.as_secs())
+                format!(
+                    "reading the reply over TLS failed: {e} (the session times out after {} s)",
+                    timeout.as_secs()
+                )
             }),
         }
     }
@@ -563,15 +578,44 @@ pub fn start(
     timeout_s: Arc<AtomicU32>,
     transport: EspHttpTransport,
 ) -> Result<(), String> {
-    let spawned = with_psram_stack(|| {
-        std::thread::Builder::new()
-            .name("mcp-agent".into())
-            .stack_size(STACK_BYTES)
-            // The model transport lives on this thread, not in the `App`: a turn is run in
-            // phases precisely so that the model call happens with the app lock released.
-            .spawn(move || run_loop(shared, log, timeout_s, transport))
-    });
-    spawned.map(|_| ()).map_err(|e| format!("could not start the agent thread: {e}"))
+    use esp_idf_svc::sys;
+
+    let spawn =
+        |transport: EspHttpTransport, shared: &Shared, log: &Arc<LogBuf>, timeout_s: &Arc<AtomicU32>| {
+            let shared = shared.clone();
+            let log = log.clone();
+            let timeout_s = timeout_s.clone();
+            std::thread::Builder::new()
+                .name("mcp-agent".into())
+                .stack_size(STACK_BYTES)
+                // The model transport lives on this thread, not in the `App`: a turn is run in
+                // phases precisely so that the model call happens with the app lock released.
+                .spawn(move || run_loop(shared, log, timeout_s, transport))
+        };
+
+    // Internal RAM first: this thread is where a turn runs, and a turn can reach flash (a
+    // `net_*` tool, a script that reads NVS). A PSRAM stack cannot survive those, so PSRAM is
+    // the second choice and only because the writes themselves now happen on the store
+    // writer. Say which one happened: the choice was invisible for two sessions, and the
+    // answer was "PSRAM" both times.
+    let internal = (sys::MALLOC_CAP_INTERNAL | sys::MALLOC_CAP_8BIT) as u32;
+    let psram = (sys::MALLOC_CAP_SPIRAM | sys::MALLOC_CAP_8BIT) as u32;
+    match with_stack_caps(internal, || spawn(transport, &shared, &log, &timeout_s)) {
+        Ok(_) => Ok(()),
+        Err(first) => {
+            log.warn(
+                "agent",
+                format!(
+                    "no {STACK_BYTES} byte internal stack for the agent thread ({first}); retrying on a PSRAM stack, which cannot touch flash"
+                ),
+            );
+            with_stack_caps(psram, || {
+                spawn(EspHttpTransport::with_timeout(timeout_s.clone()), &shared, &log, &timeout_s)
+            })
+            .map(|_| ())
+            .map_err(|e| format!("could not start the agent thread: {e} (no internal stack either: {first})"))
+        }
+    }
 }
 
 /// Hand the HTTP transport to the `App` and say what it will talk to.
@@ -604,16 +648,18 @@ pub fn attach(shared: &Shared, log: &LogBuf) -> (Arc<AtomicU32>, EspHttpTranspor
 
 // ---------------------------------------------------------------- the thread
 
-fn run_loop(
-    shared: Shared,
-    log: Arc<LogBuf>,
-    timeout_s: Arc<AtomicU32>,
-    mut transport: EspHttpTransport,
-) {
+fn run_loop(shared: Shared, log: Arc<LogBuf>, timeout_s: Arc<AtomicU32>, mut transport: EspHttpTransport) {
     // The interval is config, not a constant: it is the queue-drain latency, so the
     // portal is allowed to trade latency against scheduling overhead without a reflash.
     let mut tick_ms = tick_interval(&shared);
-    log.info("agent", format!("agent thread up: tick {tick_ms} ms, scheduler clock {}", clock_note()));
+    log.info(
+        "agent",
+        format!(
+            "agent thread up: tick {tick_ms} ms, stack in internal RAM: {}, scheduler clock {}",
+            if crate::nvs_writer::on_internal_stack() { "yes" } else { "no (PSRAM)" },
+            clock_note()
+        ),
+    );
     if now_ms() / 1000 < CLOCK_SET_AFTER_S {
         log.warn(
             "agent",
@@ -705,13 +751,10 @@ fn tick(
             );
         }
 
-        app.agent.pending.as_ref().map(|pending| {
-            (
-                pending.source.clone(),
-                app.llm.max_steps,
-                clamp_timeout(app.llm.timeout_s),
-            )
-        })
+        app.agent
+            .pending
+            .as_ref()
+            .map(|pending| (pending.source.clone(), app.llm.max_steps, clamp_timeout(app.llm.timeout_s)))
     };
 
     let Some((source, steps, timeout)) = queued else {
