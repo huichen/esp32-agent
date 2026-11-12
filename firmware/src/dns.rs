@@ -9,6 +9,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use esp_idf_svc::sys;
+
 pub struct MiniDns {
     stop: Arc<AtomicBool>,
 }
@@ -21,18 +23,45 @@ impl MiniDns {
         socket.set_read_timeout(Some(Duration::from_millis(500)))?;
         let stop = Arc::new(AtomicBool::new(false));
         let stop_thread = stop.clone();
-        std::thread::Builder::new()
-            .name("dns".into())
-            .stack_size(4 * 1024)
-            .spawn(move || {
-                let mut buf = [0u8; 512];
-                while !stop_thread.load(Ordering::SeqCst) {
-                    let Ok((n, peer)) = socket.recv_from(&mut buf) else { continue };
-                    if let Some(reply) = answer(&buf[..n], ip) {
-                        let _ = socket.send_to(&reply, peer);
+        // The one thread in this firmware whose stack can live in PSRAM, and the reason is
+        // narrow: its whole body is `recvfrom`, an A-record reply and `send_to`, so it can
+        // never be running while the flash cache is off. That is IDF's condition for an
+        // external stack — with the cache off, PSRAM is not addressable, and a thread that
+        // commits to NVS with its stack there asserts in
+        // `esp_task_stack_is_sane_cache_disabled` and reboots the board. Every other
+        // thread here writes NVS somewhere (config, manifest, transcript, provisioning),
+        // which is why their stacks stay internal (`docs/troubleshooting.md`).
+        //
+        // `esp_pthread_set_cfg` is configured per *calling* thread and applies to whatever
+        // it spawns next, so it is restored before anything else is created from here: the
+        // HTTP listener is later, and a PSRAM stack for that one would be a crash waiting
+        // for the next config save.
+        let spawned = unsafe {
+            let mut cfg = sys::esp_pthread_get_default_config();
+            cfg.stack_alloc_caps = sys::MALLOC_CAP_SPIRAM | sys::MALLOC_CAP_8BIT;
+            cfg.stack_size = 4 * 1024;
+            let asked = sys::esp_pthread_set_cfg(&cfg) == 0;
+            let spawned = std::thread::Builder::new().name("dns".into()).stack_size(4 * 1024).spawn(
+                move || {
+                    let mut buf = [0u8; 512];
+                    while !stop_thread.load(Ordering::SeqCst) {
+                        let Ok((n, peer)) = socket.recv_from(&mut buf) else { continue };
+                        if let Some(reply) = answer(&buf[..n], ip) {
+                            let _ = socket.send_to(&reply, peer);
+                        }
                     }
-                }
-            })?;
+                },
+            );
+            // Restore unconditionally: a failed spawn must not leave the next thread with
+            // caps PSRAM cannot keep.
+            let back = sys::esp_pthread_get_default_config();
+            sys::esp_pthread_set_cfg(&back);
+            if !asked {
+                log::warn!("dns: the stack could not be put in PSRAM; using internal RAM");
+            }
+            spawned
+        }?;
+        drop(spawned);
         Ok(Self { stop })
     }
 

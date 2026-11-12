@@ -21,10 +21,14 @@
 //! Two consequences of the core design are visible here and are deliberate, not
 //! accidents:
 //!
-//! * A run happens under the `App` mutex, because the loop needs the `App` as its
-//!   `ToolHost`. A model call therefore blocks the portal for as long as the
-//!   endpoint takes to answer — the thread logs when a run starts so the bench does
-//!   not read that as a hang.
+//! * A run is a sequence of **phases**, each taking the `App` mutex for as long as that
+//!   phase's work; the model call between two phases holds no lock at all. That is why
+//!   `/api/status` answered in ≤ 253 ms while a 2.5 s model call was in flight
+//!   (`ROADMAP.md`, measured on the board): the thread that would otherwise hold the
+//!   lock is blocked on the socket. A *tool* call is the opposite case — it runs inside
+//!   a phase, under the lock — so a slow tool really does stall the portal for its
+//!   duration, which is why `sleep` is capped at 10 s. The thread logs when a run
+//!   starts so the bench does not read that as a hang.
 //! * The scheduler's clock is [`esp32_agent_core::app::now_ms`], the same clock the
 //!   rest of the firmware stamps things with. Before SNTP syncs it starts at the
 //!   epoch, so `every_s` tasks work immediately while `at_hhmm` tasks only mean a
@@ -692,9 +696,10 @@ fn tick(
         static LAST_WARN_S: AtomicU32 = AtomicU32::new(0);
         let now_s = (now / 1000) as u32;
         let last = LAST_WARN_S.load(Ordering::Relaxed);
-        // 20 kB is the normal steady state on this board (a TLS page costs ~11 kB of it
-        // once), so warning above 8 kB only taught people to ignore the log. Below 8 kB a
-        // stream thread (6 kB of stack) or a handshake really does start failing.
+        // The threshold is about what a *new* thread needs, not about the steady state:
+        // a console stream asks for 6 kB of contiguous stack, and below that a stream or
+        // a TLS handshake is what starts failing. The steady state today is 160+ kB free
+        // (`docs/troubleshooting.md`), so this is a floor to catch a leak, not a trend.
         if internal_kb < 8 && now_s.saturating_sub(last) > 600 {
             LAST_WARN_S.store(now_s, Ordering::Relaxed);
             log.warn(
