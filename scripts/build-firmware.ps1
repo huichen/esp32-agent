@@ -26,13 +26,15 @@ param(
 
 # Which commit this image came from, and when. Read back from /api/status so "did the
 # flash take" is a comparison of two strings instead of an inference from the tool list.
-$env:ESP32_AGENT_COMMIT = (git -C $repo rev-parse --short HEAD 2>$null)
-if (-not $env:ESP32_AGENT_COMMIT) { $env:ESP32_AGENT_COMMIT = 'unknown' }
-$env:ESP32_AGENT_BUILT_AT = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
-
 $ErrorActionPreference = 'Stop'
 $repo = Split-Path -Parent $PSScriptRoot
 $fw = Join-Path $repo 'firmware'
+
+# Pinned after $repo exists: `git -C $null` answers nothing, and an image that says
+# "unknown" is exactly the situation this field was added to end.
+$env:ESP32_AGENT_COMMIT = (git -C $repo rev-parse --short HEAD 2>$null)
+if (-not $env:ESP32_AGENT_COMMIT) { $env:ESP32_AGENT_COMMIT = 'unknown' }
+$env:ESP32_AGENT_BUILT_AT = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
 
 function Need($cmd, $hint) {
   if (-not (Get-Command $cmd -ErrorAction SilentlyContinue)) {
