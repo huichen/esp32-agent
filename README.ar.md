@@ -46,24 +46,20 @@ espflash write-bin --chip esp32s3 --flash-size 16mb 0x0 esp32-agent-vX.Y.Z.bin
 
 ## أعطه نموذجا
 
-افتح `http://<board>/`، ولوحة **Agent**، واملأ ثلاثة حقول، واحفظ:
+افتح `http://<board>/`، ولوحة **Agent**، واكتب العنوان ومعرّف النموذج والمفتاح، ثم احفظ.
+المفتاح للكتابة فقط: يذهب إلى NVS ويُقرأ كـ`__set__`. وفي اللوحة نفسها `protocol`
+(`chat` أو `responses` أو `anthropic`) و`reasoning` و`context_tokens` و`max_output_tokens`.
 
-| الحقل | القيمة |
-|---|---|
-| `base_url` | عنوان chat-completions الكامل |
-| `model` | معرّف النموذج عند المزود |
-| `api_key` | المفتاح؛ للكتابة فقط، ويُقرأ كـ`__set__` |
+**أو اتركها لوكيل.** بعد أن يجلب الوكيل `agent.json` يعرف هذه الإعدادات وأنواعها وقيمها
+الافتراضية، فتكفي عبارة واحدة:
 
-الحقول الثلاثة نفسها عبر HTTP:
+> وجّه اللوحة إلى `https://your-provider/v1/chat/completions`، والنموذج `…`، والمفتاح `sk-…`،
+> والتفكير `low`، والسياق `64000`، والمخرجات `4096`
 
-```bash
-curl -sS -X POST http://<board>/api/agent/config -H 'Content-Type: application/json' \
-  -d '{"base_url":"https://your-provider/v1/chat/completions","model":"…","api_key":"…"}'
-```
-
-`protocol` يختار `chat` أو `responses` أو `anthropic`؛ و`reasoning` و`context_tokens`
-و`max_output_tokens` في اللوحة نفسها والمسار نفسه. وبلا أي مفتاح، اجعل `base_url` هو
-`http://127.0.0.1/selftest/chat/completions` وستعمل الحلقة كما هي.
+يطبقها الوكيل بـ`POST /api/agent/config` — نفس النداء الذي تصدره اللوحة — ثم يعيد قراءة
+الإعدادات للتأكيد. لا تحتاج إلى سطر أوامر من جهتك، والعبارة نفسها تصلح لكل لوحة يستطيع الوصول
+إليها. وبلا أي مفتاح، اجعل `base_url` هو `http://127.0.0.1/selftest/chat/completions` لتدور
+الحلقة على اللوحة نفسها.
 
 ## ملاحظات أمنية
 

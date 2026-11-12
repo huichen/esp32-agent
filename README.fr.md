@@ -50,24 +50,21 @@ n'a besoin de rien d'autre.
 
 ## Donnez-lui un modèle
 
-Ouvrez `http://<board>/`, panneau **Agent**, remplissez trois champs, enregistrez :
+Ouvrez `http://<board>/`, panneau **Agent**, saisissez le point d'entrée, l'identifiant du
+modèle et la clé, enregistrez. La clé est en écriture seule : elle va en NVS et se relit
+`__set__`. Le même panneau porte `protocol` (`chat`, `responses` ou `anthropic`), `reasoning`,
+`context_tokens` et `max_output_tokens`.
 
-| Champ | Valeur |
-|---|---|
-| `base_url` | l'URL complète de chat-completions |
-| `model` | l'identifiant du modèle chez le fournisseur |
-| `api_key` | la clé ; en écriture seule, se relit `__set__` |
+**Ou laissez un agent le faire.** Une fois qu'un agent a récupéré `agent.json`, il connaît ces
+réglages, leurs types et leurs valeurs par défaut, donc une consigne suffit :
 
-Les mêmes trois champs par HTTP :
+> configure la carte sur `https://your-provider/v1/chat/completions`, modèle `…`, clé `sk-…`,
+> réflexion `low`, contexte `64000`, sortie `4096`
 
-```bash
-curl -sS -X POST http://<board>/api/agent/config -H 'Content-Type: application/json' \
-  -d '{"base_url":"https://your-provider/v1/chat/completions","model":"…","api_key":"…"}'
-```
-
-`protocol` choisit `chat`, `responses` ou `anthropic` ; `reasoning`, `context_tokens` et
-`max_output_tokens` sont sur le même panneau et la même route. Sans aucune clé, mettez
-`base_url` sur `http://127.0.0.1/selftest/chat/completions` : la boucle tourne quand même.
+L'agent les applique par `POST /api/agent/config` — le même appel que le panneau — puis relit la
+configuration pour confirmer. Aucune ligne de commande de votre côté, et la même consigne vaut
+pour chaque carte qu'il peut joindre. Sans aucune clé, `base_url` sur
+`http://127.0.0.1/selftest/chat/completions` fait tourner la boucle sur la carte elle-même.
 
 ## Notes de sécurité
 
