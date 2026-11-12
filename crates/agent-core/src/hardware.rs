@@ -51,6 +51,28 @@ pub struct WifiAp {
     pub auth: String,
 }
 
+/// One heap pool: what a capability asks for, and how much of it is left.
+///
+/// A pool is a set of capability flags, not an address range — `internal_8bit` and `dma`
+/// overlap on every chip — so the numbers here are answers to "how much RAM satisfies this
+/// request", which is the question a new stack or a DMA buffer actually asks.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct HeapPool {
+    /// The name of the pool, as the board spells it: `internal_8bit`, `dma`, `iram_8bit`,
+    /// `spiram`, ...
+    pub pool: String,
+    /// One clause on what the pool is for, so a reader who has never seen a heap_caps flag
+    /// knows which number applies to the change they are making.
+    pub note: String,
+    pub total_kb: u32,
+    pub free_kb: u32,
+    /// The largest single allocation that fits. `free_kb` cannot answer this, and this is
+    /// the number a thread stack or a TLS buffer has to fit in.
+    pub largest_kb: u32,
+    /// The lowest `free_kb` since boot: the peak this pool has already been through.
+    pub min_free_kb: u32,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PinMode {
     Input,
@@ -232,7 +254,20 @@ pub trait Hardware: Send {
     ///
     /// Empty means the platform cannot enumerate them; the command says so rather than
     /// printing an empty table that looks like a board with nothing running.
+    ///
+    /// Each entry carries `stack_free_bytes`: the *lowest* free stack the task has had
+    /// since it started, which is what FreeRTOS calls its high-water mark. It is the
+    /// reading a stack constant is judged by — the stack size itself lives in the source,
+    /// because FreeRTOS reports what is left of a stack, never how big it is.
     fn tasks(&mut self) -> Vec<serde_json::Value> {
+        Vec::new()
+    }
+
+    /// Every heap pool the platform can describe, for `/api/memory`.
+    ///
+    /// Empty means "one heap, which cannot be split": that is the truth on the host, and
+    /// the route says so rather than printing an empty table that reads like zero RAM.
+    fn heap_pools(&mut self) -> Vec<HeapPool> {
         Vec::new()
     }
 
