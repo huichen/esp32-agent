@@ -24,7 +24,7 @@ fn u32_at(data: &[u8], at: usize) -> Option<u32> {
 
 /// Build a ZIP from `(name, bytes)` pairs, stored.
 pub fn write(entries: &[(String, Vec<u8>)]) -> Result<Vec<u8>, String> {
-    let mut out = Vec::new();
+    let mut out = Vec::with_capacity(4096);
     let mut central: Vec<(String, u32, u32, u32)> = Vec::new(); // name, crc, size, offset
     for (name, bytes) in entries {
         if name.is_empty() || name.starts_with('/') || name.contains("..") {
