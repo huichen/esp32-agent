@@ -117,6 +117,16 @@ fn main() {
     };
     let mut transport = HostTransport::new(Duration::from_secs(45));
 
+    // The simulator runs the same loop on this thread rather than spawning one, and says so:
+    // `/api/status.agent.thread` and the board's field mean the same thing there.
+    {
+        let mut guard = match app.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        guard.agent_thread_running();
+    }
+
     loop {
         std::thread::sleep(Duration::from_millis(tick_ms));
         let (reboot, due) = {

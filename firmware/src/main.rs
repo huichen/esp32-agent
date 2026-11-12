@@ -404,11 +404,20 @@ fn run() -> anyhow::Result<()> {
     // because both the model call and the `net_*` tools draw on it.
     let (agent_timeout, agent_transport) = runner::attach(&app, &log);
     // A board that cannot start the agent thread is still a working board: the
-    // portal, the MCP endpoint and the tools do not depend on it. Say so on the
-    // serial console instead of taking the whole firmware down with it.
-    if let Err(e) = runner::start(app.clone(), log.clone(), agent_timeout, agent_transport) {
-        log::error!("agent thread did not start: {e}");
-        log.error("agent", format!("agent thread did not start: {e}"));
+    // portal, the MCP endpoint and the tools do not depend on it. Say so where it can be
+    // *seen* as well as read: `App::agent_thread_*` writes the boot log line and the value
+    // `/api/status.agent.thread` reports, so the two cannot drift apart.
+    match runner::start(app.clone(), log.clone(), agent_timeout, agent_transport) {
+        Ok(()) => {
+            if let Ok(mut guard) = app.lock() {
+                guard.agent_thread_running();
+            }
+        }
+        Err(e) => {
+            if let Ok(mut guard) = app.lock() {
+                guard.agent_thread_failed(e);
+            }
+        }
     }
 
     loop {

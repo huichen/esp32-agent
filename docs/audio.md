@@ -339,3 +339,9 @@ wrong (see `docs/adding-a-device.md`, or set `pins: {"oled.height": 32}`).
   how many records and bytes a clip becomes; a real run answers with `frames` equal to the
   strip's count and `ms` equal to the audio's length. If the OLED snows, its `height` is
   wrong for the panel — `GET /api/devices` reports what the firmware thinks it is.
+- The panel itself, with no media at all: `python tools/av_push.py --test-pattern --seconds 4`
+  draws a one-pixel border, a filled block at (8,8) and a diagonal from (40,4) to (80,28)
+  over four seconds of silence. A complete border, the block top-left and a diagonal that
+  runs down-right means the driver and the panel agree; a pattern repeated or torn in
+  stripes means addressing or row count, and half of it means `oled.height`. This needs no
+  file on the bench, so it still works after a reflash or a wipe.
