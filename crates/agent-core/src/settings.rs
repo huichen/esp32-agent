@@ -97,7 +97,13 @@ const BOARD: &[Field] = &[
     f("wifi.ap_after_s", "integer", "30", "start the setup AP after this long without a station"),
     f("wifi.ap_password", "string", "\"\"", "write-only; empty means an open setup AP"),
     f("mcp.enabled", "boolean", "true", "serve the MCP endpoint"),
-    f("mcp.port", "integer", "8080", "needs a restart"),
+    f("mcp.port", "integer", "80", "needs a restart"),
+    f(
+        "mcp.plain_http",
+        "boolean",
+        "true",
+        "false closes port 80 and leaves only https on 443; needs a restart, and is refused when no certificate exists",
+    ),
     f("mcp.path", "string", "/mcp", "endpoint path"),
     f("mcp.tools_mode", "string", "auto", "auto | generic | all"),
     f(
