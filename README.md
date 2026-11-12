@@ -74,7 +74,8 @@ curl -sS -X POST http://<board>/api/agent/message -H 'Content-Type: application/
   -d '{"text":"write HELLO on the OLED, set the LED blue, then scan I2C"}'
 ```
 
-Three protocols: `chat`, `responses`, `anthropic`. Images from the console go out as content
+Three protocols: `chat` (OpenAI chat completions), `responses` (OpenAI Responses API) and
+`anthropic` (Messages API). Images from the console go out as content
 parts. `reasoning` sets the thinking level, `max_steps` caps model calls per turn (0 = no
 cap), `context_tokens` and `max_output_tokens` set the window and the reply reserve, and the
 transcript compacts at 80% of the window. Without a key, point `base_url` at the board's own
@@ -89,7 +90,8 @@ curl -sS -X POST http://<board>/api/agent/prompt -H 'Content-Type: application/j
   -d '{"action":"set","text":"The pump relay is on GPIO12. Never run it past two minutes."}'
 ```
 
-`action` is `set`, `append` or `clear`; `GET /api/agent/prompt` shows the prompt the model
+`action` is `set`, `append` or `clear`, and `system_prompt get` reads it back from the board;
+`GET /api/agent/prompt` shows the prompt the model
 will receive, custom part included, and the agent reaches it with
 `shell {"command":"system_prompt set …"}`. 2 KB in NVS, so it survives a reboot.
 
@@ -146,7 +148,8 @@ curl -sS -X POST http://<board>/api/sched -H 'Content-Type: application/json' -d
   "rules":[{"id":"r1","tool":"bme280_read","path":"temperature_c","op":"gt","value":30,"prompt":"it is hot"}]}'
 ```
 
-`at_hhmm` runs at a UTC wall-clock time instead. The agent can schedule itself with
+`at_hhmm` runs at a UTC wall-clock time instead, and every answer lands in the transcript
+tagged `source: "schedule:t1"`. The agent can schedule itself with
 `schedule {"action":"add", …}`. Tasks survive a reboot.
 
 ## Manifest
@@ -168,7 +171,9 @@ Three paths add hardware: a manifest (no timing or state machine, applies live),
 driver (`drivers/<chip>.rs`, for state machines and strict timing), or a board profile (facts
 that cannot be probed, such as which pins the LED and buttons use). A driver is listed only
 when the probe finds the device, so a half-written one cannot report hardware that is not
-there. [docs/adding-a-device.md](docs/adding-a-device.md) covers all three.
+there. Validation runs on the board: parameter ranges and a `safety` per-minute cap are checked
+before a pin moves, and an out-of-range call returns the range it would accept.
+[docs/adding-a-device.md](docs/adding-a-device.md) covers all three.
 
 ## Authentication
 
@@ -201,7 +206,7 @@ simulator in every image and the firmware's dependencies in every test. `firmwar
 the workspace because it needs `cargo +esp`, `-Zbuild-std` and a checked-out ESP-IDF.
 
 ```
-crates/agent-core/    hardware.rs (the trait) · drivers/ (one module per chip) ·
+crates/agent-core/    hardware.rs (the trait) · drivers/ (one module per chip) · boards.rs ·
                       manifest.rs · agent.rs + llm.rs · sched.rs · tools/ ·
                       http.rs · app.rs · sitemap.rs + settings.rs · virtual_board.rs
 crates/agent-sim/     the virtual board behind an HTTP port
