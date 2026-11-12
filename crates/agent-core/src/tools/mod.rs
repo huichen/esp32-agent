@@ -422,6 +422,7 @@ pub fn system_tools() -> Vec<ToolDef> {
                     ctx.tasks.push(crate::sched::ScheduledTask {
                         id: id.clone(),
                         prompt,
+                        script: j::opt_str(args, "script").unwrap_or_default(),
                         every_s,
                         at_hhmm,
                         enabled: j::opt_bool(args, "enabled").unwrap_or(true),
