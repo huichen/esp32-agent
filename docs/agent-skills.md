@@ -48,7 +48,7 @@ write {"path":"/skills/pulse_pump.md",
 A skill is a **directory** (`/skills/<name>/`) with a `SKILL.md`, and whatever else it
 needs next to it. That is the shape the host uses, and it is the reason a skill is not
 just a paragraph: a pinout, a table of registers, an acceptance script the model runs by
-hand with `gpio_write` all belong to the procedure, and they are `read` away.
+hand with `bus gpio_write` all belong to the procedure, and they are `read` away.
 
 ```markdown
 /skills/deploy/SKILL.md

@@ -24,11 +24,11 @@ Start with `GET /api/logs` (or the console's log tab). Every boot-time line carr
 ## A device is invisible
 
 1. `POST /api/devices/probe`, or from the model call `devices_probe` then `devices_list`.
-2. `i2c_scan` to see whether the address answers at all:
+2. `bus i2c_scan` to see whether the address answers at all:
    - Nothing at all → wiring, pull-ups or power; are SDA/SCL swapped; is a 5 V module
      driving a 3.3 V logic board.
    - An address appears but is `unidentified` → `i2c_identify {addr}` for candidates, or
-     read the ID register yourself with `i2c_read`.
+     read the ID register yourself with `bus i2c_read`.
 3. Right address, wrong driver: address collisions are common (0x76/0x77, 0x3C/0x3D,
    0x44/0x45). The log carries the reason the driver gave.
 4. A 1-Wire device never appears: 1-Wire is probed only on the pins listed in
