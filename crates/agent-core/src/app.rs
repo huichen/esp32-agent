@@ -641,6 +641,71 @@ impl App {
 
     // ---------------------------------------------------------------- queries
 
+    /// Tool names that still answer but must not be advertised anywhere a model reads.
+    ///
+    /// They were the interface once. `board_status` and its siblings became commands of the
+    /// `board` family, `i2c_*`/`gpio_*`/`adc_read` of `bus`, the manifest five of `manifest`,
+    /// the device tools of `display`/`audio`/`indicators`, and `fs_read`/`net_get` were
+    /// folded into `read` and `shell`. A stored script, an old transcript and an owner's
+    /// habit all still use the old names, so they keep working — the prompt, `help` and
+    /// `tools/list` do not mention them. This list is the compatibility column, and the test
+    /// below fails if one of them turns up backticked in the prompt.
+    pub const ALIASES_ACCEPTED_BUT_NOT_ADVERTISED: &'static [&'static str] = &[
+        // the board family's members
+        "board_status",
+        "board_config_get",
+        "config_set",
+        "chip_temp",
+        "logs_tail",
+        "reboot",
+        "factory_reset",
+        "delay",
+        "inventory",
+        // the bus family's
+        "i2c_scan",
+        "i2c_read",
+        "i2c_write",
+        "i2c_identify",
+        "gpio_mode",
+        "gpio_read",
+        "gpio_write",
+        "adc_read",
+        // the manifest family's
+        "manifest_get",
+        "manifest_describe",
+        "manifest_validate",
+        "manifest_apply",
+        "manifest_reset",
+        // the device families'
+        "oled_text",
+        "oled_read",
+        "oled_clear",
+        "oled_rect",
+        "oled_bitmap",
+        "oled_contrast",
+        "led_set",
+        "led_blink",
+        "buttons_read",
+        "button_wait",
+        "mic_level",
+        "mic_record",
+        "speaker_tone",
+        "speaker_play",
+        // what `read` and `shell` absorbed
+        "fs_read",
+        "fs_write",
+        "fs_edit",
+        "fs_ls",
+        "fs_grep",
+        "fs_rm",
+        "fs_cp",
+        "fs_mv",
+        "net_get",
+        "net_post",
+        "net_dns",
+        "net_tcp",
+    ];
+
     /// Device tools that belong together, by the kind of device the board detected.
     ///
     /// A driver names its own kind, so this is the board's vocabulary rather than a list of
@@ -6183,6 +6248,45 @@ fn av_route(app: &Shared, req: &Request) -> crate::http::BodyRoute {
     BodyRoute::Sink(Box::new(AvSink::new(Arc::clone(app))))
 }
 
+/// The tool-shaped, backticked tokens in `text`.
+///
+/// Deliberately a small rule, not a parser: a token between backticks that is entirely
+/// lowercase letters, digits and underscores, starts with a letter and is at most 32
+/// characters. That is the shape a tool name has (`board`, `read`, `shell`); a path, a JSON
+/// snippet, `name: description` and prose are not it. A rule that tried to be cleverer would
+/// be the thing that silently stops matching.
+#[cfg(test)]
+fn backticked_tool_tokens(text: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut rest = text;
+    while let Some(open) = rest.find('`') {
+        let after = &rest[open + 1..];
+        let Some(close) = after.find('`') else { break };
+        let token = &after[..close];
+        rest = &after[close + 1..];
+        let shaped = token.len() <= 32
+            && token.chars().next().map(|c| c.is_ascii_lowercase()).unwrap_or(false)
+            && token.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_');
+        if shaped && !out.iter().any(|seen| seen == token) {
+            out.push(token.to_string());
+        }
+    }
+    out
+}
+
+/// Backticked tool names in `text` that the model is neither offered nor allowed to use as a
+/// legacy alias. Empty means the prompt and the tool list agree.
+#[cfg(test)]
+fn unadvertised_tool_names(text: &str, offered: &[String]) -> Vec<String> {
+    backticked_tool_tokens(text)
+        .into_iter()
+        .filter(|token| {
+            !offered.iter().any(|name| name == token)
+                && !App::ALIASES_ACCEPTED_BUT_NOT_ADVERTISED.contains(&token.as_str())
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -7721,6 +7825,46 @@ mod tests {
             assert!(text.contains(op), "`{op}` is missing from the index help returns");
         }
         assert!(text.len() > 1_000, "the index is still the whole index: {} bytes", text.len());
+    }
+
+    /// The prompt may only name tools the model is offered, and may not advertise an alias.
+    ///
+    /// This is the fourth of its family — the portal listing a tool the model did not have,
+    /// an image claiming a commit it was not built from, a status route reporting a tool
+    /// count nobody could reconcile — and the answer each time is the same: pin the two
+    /// things together and let a test be the one that notices. The prompt told a model to
+    /// call `board_status`, `fs_read` and `net_get` while the list offered `board`, `read`
+    /// and `shell`.
+    ///
+    /// Both halves are reverse-provable: a name that is not offered makes the first
+    /// assertion fail, and so does putting a deprecated alias back in backticks.
+    #[test]
+    fn the_prompt_names_only_tools_the_model_is_offered() {
+        let mut app = test_app();
+        let prompt = app.agent.prompt_text(&app).clone();
+        let offered: Vec<String> = ToolHost::tool_specs(&app)
+            .as_array()
+            .expect("array")
+            .iter()
+            .map(|t| t["function"]["name"].as_str().expect("a name").to_string())
+            .collect();
+
+        let stray = unadvertised_tool_names(&prompt, &offered);
+        assert!(stray.is_empty(), "the prompt names {stray:?}, which the model is not offered");
+
+        // The aliases still answer; they are just not advertised. `reboot` in the sentence
+        // "you cannot reboot the board" is prose, so only backticked tokens count.
+        for token in backticked_tool_tokens(&prompt) {
+            assert!(
+                !App::ALIASES_ACCEPTED_BUT_NOT_ADVERTISED.contains(&token.as_str()),
+                "`{token}` is a deprecated alias and must not be advertised in the prompt"
+            );
+        }
+
+        // Reverse proof, without touching the build: one invented name is caught.
+        let mut injected = prompt.clone();
+        injected.push_str(" Then call `frobnicate`.");
+        assert_eq!(unadvertised_tool_names(&injected, &offered), vec!["frobnicate".to_string()]);
     }
 
     #[test]
@@ -9855,14 +9999,14 @@ mod tests {
         assert!(system.contains("Pin 12 is the pump relay"), "the instructions are missing: {system}");
         assert!(system.contains("roll the portal forward safely"), "the skill index is missing: {system}");
         assert!(!system.contains("1. snapshot"), "the skill *body* must not be in the prompt: {system}");
-        assert!(system.contains("fs_read"), "the prompt does not say how to load a skill: {system}");
+        assert!(system.contains("`read`"), "the prompt does not say how to load a skill: {system}");
         assert!(
             system.contains("/skills/deploy/SKILL.md"),
             "the index must carry the path to open, not just a name: {system}"
         );
     }
 
-    /// A long file is carried as its head: the rest stays readable with `fs_read`.
+    /// A long file is carried as its head: the rest stays readable with `read`.
     #[test]
     fn a_long_agents_md_is_cut_in_the_prompt_but_still_readable() {
         let mut app = test_app();
