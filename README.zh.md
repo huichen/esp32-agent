@@ -9,8 +9,7 @@
 体看到同一批工具并用它们作答；新的传感器可以在板子运行期间用 JSON 声明。
 
 > 智能体循环遵循 [FutureOS](https://github.com/futuregene/future-os)：会话记录、工具
-> 日志、流事件、协议适配器、记忆索引。凡固件与它不同之处（RAM 以千字节而非千兆字节计，
-> 没有由模型撰写的摘要），代码中说明了原因。
+> 日志、流事件、协议适配器、记忆索引。
 
 | 要点 | 细节 |
 |---|---|
@@ -46,6 +45,49 @@ curl -k -sS https://<board>/api/tls | jq -r .fingerprint
 443 端口以 TLS 提供同样的路由，证书在首次启动时生成；浏览器会报警告，因此要比较指纹。80
 端口保持开放，因此证书有问题只损失一个 URL，而不是整块板子。`GET /agent.json` 把整个接口
 作为数据给出：40 条路由及其方法、请求体、返回值与认证，外加每个可写设置及其类型与默认值。
+
+## 给它一个模型
+
+模型是一项配置，不是一次编译：
+
+```bash
+curl -sS -X POST http://<board>/api/agent/config -H 'Content-Type: application/json' \
+  -d '{"base_url":"https://your-provider/v1/chat/completions","model":"…","api_key":"…"}'
+curl -sS -X POST http://<board>/api/agent/message -H 'Content-Type: application/json' \
+  -d '{"text":"在 OLED 上写 HELLO，把灯设成蓝色"}'
+```
+
+三种协议（`chat`、`responses`、`anthropic`）、思考等级、上下文窗口与输出上限，都在控制台的
+Agent 面板或同一个 `POST` 里。没有 key 时把 `base_url` 指向 `http://127.0.0.1/selftest/chat/completions`，
+循环照样能跑。字段表与三种协议的并排对比见 [Model](docs/model.md)。
+
+## 使用
+
+| 从哪里 | 能得到什么 |
+|---|---|
+| 手机打开 `http://<board>/` | 与模型对话、查看设备与工具、改任何设置 |
+| MCP 客户端发 `POST /mcp` | 与板上 agent 完全相同的工具 |
+| `POST /api/script`、`POST /api/sched` | 立刻跑一个脚本，或让它按时间跑 |
+| `GET /agent.json` | 整个接口即数据：路由、设置、上限 |
+
+```bash
+curl -sS -X POST http://<board>/mcp -H 'Content-Type: application/json' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/call",
+       "params":{"name":"shell","arguments":{"command":"ls /"}}}'
+```
+
+板上的 agent 也能给自己加硬件（`manifest_apply`）、加记忆（`write /memory/…`）和 shell 权限——
+用的是同一批调用，同一个 PIN。
+
+## 安全须知
+
+- **凭据只留在板上。** WiFi 通过 `provision` 写进 NVS，不烧进镜像；`api_key` 只写，读回来是 `__set__`。
+- **板子离开你的桌子之前先设 PIN。** `auth.portal_pin` 守住所有写操作，以及会暴露会话记录、提示词、
+  配置与日志的读操作。
+- **核对证书。** 板子的 TLS 证书是自签的，指纹在 `GET /api/tls`。80 端口故意保持开着，证书坏了只损失一个 URL，不是整块板。
+- **`shell`、`script` 与清单工具会动引脚。** 这正是这块板的意义；PIN 是“agent 在干活”和“路人顺手”之间的界线。
+
+[Security](docs/security.md) 写了哪些东西是故意不设防的。
 
 ## 仓库结构
 
