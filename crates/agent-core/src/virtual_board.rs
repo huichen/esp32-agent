@@ -307,6 +307,21 @@ impl Hardware for VirtualBoard {
         Some(41.5)
     }
 
+    /// The virtual board answers for every host it is asked about: there is no stack
+    /// underneath it to be unreachable.
+    fn ping(&mut self, host: &str, count: u32) -> crate::error::Result<serde_json::Value> {
+        let count = count.clamp(1, 5);
+        Ok(json!({
+            "host": host,
+            "address": "203.0.113.10",
+            "sent": count,
+            "received": count,
+            "last_rtt_ms": 1,
+            "reachable": true,
+            "note": "virtual board: every host answers",
+        }))
+    }
+
     fn i2c_scan(&mut self, _bus: u8) -> Result<Vec<u8>> {
         let mut addrs: Vec<u8> = self.i2c.iter().map(|d| d.addr).collect();
         addrs.sort_unstable();

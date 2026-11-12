@@ -16,6 +16,7 @@ use esp32_agent_core::hardware::{BoardInfo, Hardware, PinMode, WifiAp, WifiStatu
 use esp_idf_sys as sys;
 use serde_json::{json, Value};
 use std::collections::HashMap;
+use std::net::ToSocketAddrs;
 
 use crate::wifi;
 
@@ -236,6 +237,90 @@ fn read_mac() -> String {
 impl Hardware for EspHw {
     fn chip_temp_c(&mut self) -> Option<f32> {
         self.chip_temperature()
+    }
+
+    /// ICMP echo through ESP-IDF's ping session.
+    ///
+    /// One session per call: the driver runs its own task and reports through profiles,
+    /// so this side polls `esp_ping_get_profile` until the echoes arrive or the bound runs
+    /// out. Three echoes half a second apart is what a tool result can afford.
+    fn ping(&mut self, host: &str, count: u32) -> Result<serde_json::Value> {
+        use esp32_agent_core::error::McpError;
+        use serde_json::json;
+
+        // Resolve first: the config wants an address, and a name that does not resolve
+        // should say so instead of timing out and looking like an unreachable host.
+        let mut addrs = (host, 0u16)
+            .to_socket_addrs()
+            .map_err(|e| McpError::hardware(format!("could not resolve `{host}`: {e}")))?;
+        let addr =
+            addrs.next().ok_or_else(|| McpError::hardware(format!("`{host}` resolved to nothing")))?;
+        let ip = match addr.ip() {
+            std::net::IpAddr::V4(v4) => v4,
+            std::net::IpAddr::V6(_) => return Err(McpError::unsupported("ping supports IPv4 targets only")),
+        };
+        let count = count.clamp(1, 5);
+
+        unsafe {
+            let mut target: sys::ip_addr_t = std::mem::zeroed();
+            target.u_addr.ip4.addr = u32::from_ne_bytes(ip.octets());
+            let config = sys::esp_ping_config_t {
+                count,
+                interval_ms: 500,
+                timeout_ms: 900,
+                data_size: 32,
+                tos: 0,
+                ttl: 64,
+                target_addr: target,
+                interface: 0,
+                task_stack_size: 4096,
+                task_prio: 2,
+            };
+            let callbacks: sys::esp_ping_callbacks_t = std::mem::zeroed();
+            let mut handle: sys::esp_ping_handle_t = std::ptr::null_mut();
+            esp_idf_svc::sys::esp!(sys::esp_ping_new_session(&config, &callbacks, &mut handle))
+                .map_err(|e| McpError::hardware(format!("esp_ping_new_session: {e}")))?;
+            esp_idf_svc::sys::esp!(sys::esp_ping_start(handle))
+                .map_err(|e| McpError::hardware(format!("esp_ping_start: {e}")))?;
+
+            let read_profile = |handle: sys::esp_ping_handle_t, which: sys::esp_ping_profile_t| -> u32 {
+                let mut value = 0u32;
+                let rc = sys::esp_ping_get_profile(
+                    handle,
+                    which,
+                    &mut value as *mut u32 as *mut core::ffi::c_void,
+                    std::mem::size_of::<u32>() as u32,
+                );
+                if rc == 0 {
+                    value
+                } else {
+                    0
+                }
+            };
+
+            let mut received = 0u32;
+            for _ in 0..(count * 4) {
+                std::thread::sleep(std::time::Duration::from_millis(250));
+                received = read_profile(handle, sys::esp_ping_profile_t_ESP_PING_PROF_REPLY);
+                if received >= count {
+                    break;
+                }
+            }
+            let sent = read_profile(handle, sys::esp_ping_profile_t_ESP_PING_PROF_REQUEST);
+            let last_rtt = read_profile(handle, sys::esp_ping_profile_t_ESP_PING_PROF_TIMEGAP);
+
+            let _ = sys::esp_ping_stop(handle);
+            let _ = sys::esp_ping_delete_session(handle);
+
+            Ok(json!({
+                "host": host,
+                "address": ip.to_string(),
+                "sent": sent.max(count),
+                "received": received,
+                "last_rtt_ms": last_rtt,
+                "reachable": received > 0,
+            }))
+        }
     }
 
     fn board_info(&mut self) -> BoardInfo {

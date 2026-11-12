@@ -12,20 +12,18 @@
 use crate::tool::{object_schema, string, ToolDef};
 use serde_json::{json, Value};
 
-/// Every `op`, in the order the description lists them, with the tool it stands for.
+/// Every `op`, with the handler it stands for.
+///
+/// Reading, writing and editing a file are their own tools, and the network commands are
+/// `curl`/`wget`/`nslookup`/`nc`: those are the names people already use, and a model
+/// knows what they mean without reading a description. What stays here is what has no
+/// familiar single-command equivalent on a board with one storage area.
 pub const OPS: &[(&str, &str)] = &[
     ("ls", "fs_ls"),
-    ("cat", "fs_read"),
-    ("write", "fs_write"),
-    ("edit", "fs_edit"),
     ("rm", "fs_rm"),
     ("cp", "fs_cp"),
     ("mv", "fs_mv"),
     ("grep", "fs_grep"),
-    ("get", "net_get"),
-    ("post", "net_post"),
-    ("dns", "net_dns"),
-    ("tcp", "net_tcp"),
     ("zip", "shell_zip"),
     ("unzip", "shell_unzip"),
 ];
@@ -40,31 +38,20 @@ pub fn route(op: &str) -> Option<&'static str> {
 pub fn spec() -> ToolDef {
     ToolDef::new(
         "shell",
-        "The board's command line, as one tool. `op` picks the command and the other fields are its arguments:\n\
-         ls{path} · cat{path} · write{path,text} · edit{path,find,replace} · rm{path,confirm} · cp{from,to} · mv{from,to,confirm}\n\
-         grep{pattern,path} · get{url,format} · post{url,body} · dns{host,port} · tcp{host,port,timeout_ms}\n\
-         zip{name,files} · unzip{archive_b64}\n\
-         `get` reduces an HTML page to its text unless format=raw. `zip` writes a stored archive and returns it as base64; `unzip` reads stored or deflated archives.",
+        "Workspace commands that have no tool of their own. `op` picks the command and the other fields are its arguments:\n\
+         ls{path} · rm{path,confirm} · cp{from,to} · mv{from,to,confirm} · grep{pattern,path} · zip{name,files} · unzip{archive_b64}\n\
+         Read, write and edit a file with the `read`, `write` and `edit` tools; fetch a URL with `curl` or `wget`. `zip` writes a stored archive and returns it as base64; `unzip` reads stored or deflated archives.",
     )
     .title("Shell")
     .category("system")
     .schema(object_schema(
         &[
-            ("op", string("the command: ls, cat, write, edit, rm, cp, mv, grep, get, post, dns, tcp, zip, unzip")),
-            ("path", string("file or directory, for ls/cat/write/edit/rm/grep")),
-            ("text", string("contents, for write")),
-            ("find", string("literal text, must occur exactly once, for edit")),
-            ("replace", string("replacement, for edit")),
+            ("op", string("the command: ls, rm, cp, mv, grep, zip, unzip")),
+            ("path", string("file or directory, for ls/rm/grep")),
             ("from", string("source path, for cp/mv")),
             ("to", string("destination path, for cp/mv")),
             ("confirm", json!({ "type": "boolean", "description": "must be true for rm and mv" })),
             ("pattern", string("literal substring, for grep")),
-            ("url", string("http:// or https:// URL, for get/post")),
-            ("format", string("text (default) or raw, for get")),
-            ("body", string("request body, for post")),
-            ("host", string("hostname or address, for dns/tcp")),
-            ("port", json!({ "type": "integer", "minimum": 1, "maximum": 65535, "description": "port, for dns/tcp" })),
-            ("timeout_ms", json!({ "type": "integer", "minimum": 100, "maximum": 20000, "description": "for tcp, default 3000" })),
             ("name", string("archive name, for zip")),
             ("files", json!({ "type": "object", "description": "for zip: {name: text} entries to pack" })),
             ("archive_b64", string("for unzip: the archive, base64")),
