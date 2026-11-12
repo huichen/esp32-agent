@@ -19,71 +19,52 @@
 | 一套工具，两个调用方 | MCP 端点与板载智能体看到同一批工具，来自同一份描述。[HTTP 与 MCP API](docs/http-api.md) |
 | 通过 HTTPS 的控制台 | 在手机上对话，并配置设备、工具、定时、日志、WiFi 与模型；证书由板子自己签发。[网页控制台](docs/web-console.md) |
 | 无人值守也会动作 | 定时提示，以及读数越过阈值时触发提示的传感器规则。[定时任务](docs/scheduling.md) |
-| 一个 shell 和一门脚本语言 | `shell` 有 26 个按 NuttX 命名的命令，还有一个对工具调用做循环的解释器。[Shell](docs/shell.md) · [脚本](docs/scripting.md) |
+| 一个 shell 和一门脚本语言 | `shell` 有 55 个按 NuttX 命名的命令，还有一个对工具调用做循环的解释器。[Shell](docs/shell.md) · [脚本](docs/scripting.md) |
 | 它会记住告诉过它的事 | 常驻指令、`/AGENTS.md`、`/MEMORY.md` 索引与技能，每轮组装进提示词。[模型每轮都能看到什么](docs/context.md) |
 | 路径中没有云端 | 由板子提供 HTTPS，证书由它生成，三类调用方一个 PIN。[认证](docs/security.md) |
 | 无需硬件即可测试 | 模拟器把同一份 `agent-core` 跑在虚拟板上。[模拟器](docs/simulator.md) |
 
 ## 烧录与连接
 
-```bash
-cargo install espup espflash ldproxy
-espup install
-powershell scripts/build-firmware.ps1 -Flash -Port COM3
-```
-
-**不想装工具链？** 每个 tag 的 release 都附带用该 tag 源码构建好的合并镜像：
-`espflash write-bin --chip esp32s3 --flash-size 16mb 0x0 esp32-agent-vX.Y.Z.bin`。
-`scripts/` 下的脚本是 PowerShell；macOS 或 Linux 上对应的是 `. $HOME/export-esp.sh`，
-然后在 `firmware/` 里 `cargo build --release --target xtensa-esp32s3-espidf`
-（[细节](docs/flashing.md)）。
-
-没有已保存的凭据时，板子会自己起一个接入点。用手机接入它并打开 `http://192.168.4.1/`，
-或者通过 USB 发送 `provision <ssid> <password>`。凭据写入 NVS，绝不进镜像。
+把 release 里的合并镜像写到偏移 0（或自己编译，见 [docs/flashing.md](docs/flashing.md)）：
 
 ```bash
-curl -sS http://<board>/agent.json | jq '.endpoints | length'
-curl -sS -X POST http://<board>/mcp -H 'Content-Type: application/json' \
-  -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' | jq '.result.tools | length'
-curl -k -sS https://<board>/api/tls | jq -r .fingerprint
+espflash write-bin --chip esp32s3 --flash-size 16mb 0x0 esp32-agent-vX.Y.Z.bin
 ```
 
-443 端口以 TLS 提供同样的路由，证书在首次启动时生成；浏览器会报警告，因此要比较指纹。80
-端口保持开放，因此证书有问题只损失一个 URL，而不是整块板子。`GET /agent.json` 把整个接口
-作为数据给出：40 条路由及其方法、请求体、返回值与认证，外加每个可写设置及其类型与默认值。
+板子里没有凭据时会开一个叫 `esp32-agent-setup` 的热点。用手机连上它，打开
+**http://192.168.4.1/**，填入 WiFi 名称和密码。它们存进 NVS，不烧进镜像；而板子要连到
+局域网之外的东西（大模型、软件源、别人桌上的 `/agent.json`）就必须先有它们。
+
+## 使用
+
+它只服务两件事。
+
+**人在手机上用。** 打开 `http://<board>/`（或 443 上的 https）：和模型对话、看探测到的设备、
+关掉某个工具、翻日志、设 PIN。
+
+**把 `http://<board>/agent.json` 交给一个 agent。** 那份文档就是接口本身：每条路由的方法、
+请求体、鉴权，MCP 那一块，流式端点，带类型和默认值的设置表，以及各项上限。一个能取一个
+URL 的 agent，不需要读这份 README 的任何一行就能用这块板——这个端点就是为此存在的。
 
 ## 给它一个模型
 
-模型是一项配置，不是一次编译：
+两种方式，同样三个字段。
+
+**在网页上。** 打开页面，Agent 面板，填端点、模型、key，保存。key 只写不读：进 NVS，
+读回来是 `__set__`。
+
+**让 agent 填。** 用同样的字段 `POST /api/agent/config`：
 
 ```bash
 curl -sS -X POST http://<board>/api/agent/config -H 'Content-Type: application/json' \
   -d '{"base_url":"https://your-provider/v1/chat/completions","model":"…","api_key":"…"}'
-curl -sS -X POST http://<board>/api/agent/message -H 'Content-Type: application/json' \
-  -d '{"text":"在 OLED 上写 HELLO，把灯设成蓝色"}'
 ```
 
-三种协议（`chat`、`responses`、`anthropic`）、思考等级、上下文窗口与输出上限，都在控制台的
-Agent 面板或同一个 `POST` 里。没有 key 时把 `base_url` 指向 `http://127.0.0.1/selftest/chat/completions`，
-循环照样能跑。字段表与三种协议的并排对比见 [Model](docs/model.md)。
-
-## 使用
-
-| 从哪里 | 能得到什么 |
-|---|---|
-| 手机打开 `http://<board>/` | 与模型对话、查看设备与工具、改任何设置 |
-| MCP 客户端发 `POST /mcp` | 与板上 agent 完全相同的工具 |
-| `POST /api/script`、`POST /api/sched` | 立刻跑一个脚本，或让它按时间跑 |
-| `GET /agent.json` | 整个接口即数据：路由、设置、上限 |
-
-```bash
-curl -sS -X POST http://<board>/mcp -H 'Content-Type: application/json' \
-  -d '{"jsonrpc":"2.0","id":1,"method":"tools/call",
-       "params":{"name":"shell","arguments":{"command":"ls /"}}}'
-```
-
-板上的 agent 也能给自己加硬件（`manifest_apply`）、加记忆（`write /memory/…`）和 shell 权限——
-用的是同一批调用，同一个 PIN。
+三种协议（`chat`、`responses`、`anthropic`）、思考等级、上下文窗口与输出上限，都在同一个面板
+和同一个路由上。完全没有 key 时，把 `base_url` 指向
+`http://127.0.0.1/selftest/chat/completions`，循环照样跑，所以没账号也能先验板子。字段表见
+[Model](docs/model.md)。
 
 ## 安全须知
 
@@ -94,23 +75,6 @@ curl -sS -X POST http://<board>/mcp -H 'Content-Type: application/json' \
 - **`shell`、`script` 与清单工具会动引脚。** 这正是这块板的意义；PIN 是“agent 在干活”和“路人顺手”之间的界线。
 
 [Security](docs/security.md) 写了哪些东西是故意不设防的。
-
-## 仓库结构
-
-`crates/` 在主机上构建并测试；`firmware/` 是 ESP-IDF 后端。`agent-core` 是这块板，藏在一
-个 `Hardware` trait 之后，没有芯片相关代码，因此 `cargo test` 能在笔记本上运行它；
-`agent-sim` 针对寄存器文件实现该 trait。合并两者会把模拟器塞进每个镜像，也会把固件的依
-赖塞进每个测试。`firmware/` 退出 workspace，因为它需要 `cargo +esp`、`-Zbuild-std`，以
-及检出好的 ESP-IDF。
-
-```
-crates/agent-core/    hardware.rs (the trait) · drivers/ (one module per chip) · boards.rs ·
-                      manifest.rs · agent.rs + llm.rs · sched.rs · tools/ ·
-                      http.rs · app.rs · sitemap.rs + settings.rs · virtual_board.rs
-crates/agent-sim/     the virtual board behind an HTTP port
-firmware/             main.rs (boot order) · runner.rs (agent thread, TLS) ·
-                      esp_hw.rs (GPIO/I2C/PWM/ADC/RMT/I2S) · console.rs · wifi.rs
-```
 
 ## 状态
 

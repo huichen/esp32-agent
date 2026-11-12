@@ -20,74 +20,55 @@ sensor can be declared in JSON while the board runs.
 | One tool set, two callers | The MCP endpoint and the on-board agent see the same tools, from one description. [HTTP and MCP API](docs/http-api.md) |
 | A console over HTTPS | Chat with the model and configure devices, tools, schedule, logs, WiFi and the model, from a phone; the board issues its own certificate. [Web console](docs/web-console.md) |
 | It acts unattended | Timed prompts, and sensor rules that fire a prompt when a reading crosses a threshold. [Scheduling](docs/scheduling.md) |
-| A shell and a script language | `shell` with 26 NuttX-named commands, and an interpreter for loops over tool calls. [Shell](docs/shell.md) · [Script](docs/scripting.md) |
+| A shell and a script language | `shell` with 55 NuttX-named commands, and an interpreter for loops over tool calls. [Shell](docs/shell.md) · [Script](docs/scripting.md) |
 | It remembers what it was told | Standing orders, `/AGENTS.md`, a `/MEMORY.md` index and skills, assembled into the prompt on every turn. [Context layers](docs/context.md) |
 | No cloud in the path | HTTPS from the board, a certificate it generates, one PIN for three callers. [Security](docs/security.md) |
 | Testable without hardware | The simulator runs the same `agent-core` against a virtual board. [Simulator](docs/simulator.md) |
 
 ## Flash and connect
 
-```bash
-cargo install espup espflash ldproxy
-espup install
-powershell scripts/build-firmware.ps1 -Flash -Port COM3
-```
-
-**No toolchain?** Every tagged release ships a merged image built from that tag:
-`espflash write-bin --chip esp32s3 --flash-size 16mb 0x0 esp32-agent-vX.Y.Z.bin`. The
-`scripts/` helpers are PowerShell; on macOS or Linux the same steps are
-`. $HOME/export-esp.sh` and then `cargo build --release --target xtensa-esp32s3-espidf` in
-`firmware/` ([details](docs/flashing.md)).
-
-With no stored credentials the board raises its own access point. Join it from a phone and
-open `http://192.168.4.1/`, or send `provision <ssid> <password>` over USB. Credentials go
-to NVS, never into the image.
+Write the merged image from a [release](https://github.com/huichen/esp32-agent/releases) at offset 0 (or build it, see
+[docs/flashing.md](docs/flashing.md)):
 
 ```bash
-curl -sS http://<board>/agent.json | jq '.endpoints | length'
-curl -sS -X POST http://<board>/mcp -H 'Content-Type: application/json' \
-  -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' | jq '.result.tools | length'
-curl -k -sS https://<board>/api/tls | jq -r .fingerprint
+espflash write-bin --chip esp32s3 --flash-size 16mb 0x0 esp32-agent-vX.Y.Z.bin
 ```
 
-Port 443 serves the same routes over TLS with a certificate generated on first boot; browsers
-warn, so compare the fingerprint. Port 80 stays open, so a bad certificate costs a URL rather
-than the board. `GET /agent.json` is the whole interface as data: 40 routes with method, body,
-return and auth, plus every writable setting with its type and default.
+With no credentials stored the board starts an access point called `esp32-agent-setup`. Join
+it from a phone, open **http://192.168.4.1/** and enter your WiFi name and password. They are
+kept in NVS, never in the image, and they are what the board needs to reach anything beyond
+the LAN — the model, a package mirror, `/agent.json` on someone else's desk.
+
+## Use it
+
+Two things it is for.
+
+**A person with a phone.** Open `http://<board>/` (or the same over https on 443): chat with
+the model, look at the devices the probe found, switch a tool off, read the log, set the PIN.
+
+**An agent that was handed `http://<board>/agent.json`.** That document is the interface as
+data — every route with method, body and auth, the MCP surface, the streaming endpoints, the
+settings table with types and defaults, and the limits. An agent that can fetch one URL can
+use this board without reading a line of this README; that is what the endpoint is for.
 
 ## Give it a model
 
-The model is a setting, not a build:
+Two ways, same three fields.
+
+**In the console.** Open the page, Agent panel, fill in endpoint, model and key, save. The key
+is write-only: it goes to NVS and reads back as `__set__`.
+
+**By an agent.** `POST /api/agent/config` with the same fields:
 
 ```bash
 curl -sS -X POST http://<board>/api/agent/config -H 'Content-Type: application/json' \
   -d '{"base_url":"https://your-provider/v1/chat/completions","model":"…","api_key":"…"}'
-curl -sS -X POST http://<board>/api/agent/message -H 'Content-Type: application/json' \
-  -d '{"text":"write HELLO on the OLED and set the LED blue"}'
 ```
 
 Three wire protocols (`chat`, `responses`, `anthropic`), a thinking level, a context window and
-an output ceiling — all in the console's Agent panel or the same `POST`. Without a key, point
-`base_url` at `http://127.0.0.1/selftest/chat/completions` and the loop still runs.
-[Model](docs/model.md) has the field list and the three protocols side by side.
-
-## Use it
-
-| From | What you get |
-|---|---|
-| `http://<board>/` on a phone | chat with the model, see devices and tools, change anything |
-| `POST /mcp` from an MCP client | the same tools the board's own agent uses |
-| `POST /api/script`, `POST /api/sched` | run a script now, or have one run on a timer |
-| `GET /agent.json` | the whole interface as data: routes, settings, limits |
-
-```bash
-curl -sS -X POST http://<board>/mcp -H 'Content-Type: application/json' \
-  -d '{"jsonrpc":"2.0","id":1,"method":"tools/call",
-       "params":{"name":"shell","arguments":{"command":"ls /"}}}'
-```
-
-The board's own agent can also give itself hardware (`manifest_apply`), a memory
-(`write /memory/…`) and shell access — the same calls, with the same PIN.
+an output ceiling are on the same panel and the same route. With no key at all, point
+`base_url` at `http://127.0.0.1/selftest/chat/completions` and the loop still runs, so a board
+can be tested before an account exists. [Model](docs/model.md) has the field list.
 
 ## Safety notes
 
@@ -102,23 +83,6 @@ The board's own agent can also give itself hardware (`manifest_apply`), a memory
   what separates the agent doing its job from a passer-by doing it.
 
 [Security](docs/security.md) states what is deliberately not defended.
-
-## Repository layout
-
-`crates/` builds and is tested on a host; `firmware/` is the ESP-IDF backend. `agent-core` is
-the board behind one `Hardware` trait with no chip-specific code, so `cargo test` runs it on a
-laptop; `agent-sim` implements that trait against a register file. Merging them would put the
-simulator in every image and the firmware's dependencies in every test. `firmware/` opts out of
-the workspace because it needs `cargo +esp`, `-Zbuild-std` and a checked-out ESP-IDF.
-
-```
-crates/agent-core/    hardware.rs (the trait) · drivers/ (one module per chip) · boards.rs ·
-                      manifest.rs · agent.rs + llm.rs · sched.rs · tools/ ·
-                      http.rs · app.rs · sitemap.rs + settings.rs · virtual_board.rs
-crates/agent-sim/     the virtual board behind an HTTP port
-firmware/             main.rs (boot order) · runner.rs (agent thread, TLS) ·
-                      esp_hw.rs (GPIO/I2C/PWM/ADC/RMT/I2S) · console.rs · wifi.rs
-```
 
 ## Status
 
