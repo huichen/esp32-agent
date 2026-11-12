@@ -3080,6 +3080,14 @@ impl App {
             // on the board itself. It only ever returns a canned reply, so it cannot
             // be mistaken for a model, and nothing else depends on it.
             ("POST", "/selftest/chat/completions") => Response::json(&selftest_completion(req)),
+            // `/audio/pcm` is consumed before the handler whenever the server was built with
+            // `make_routes`, because its body must not be buffered. Reaching this arm means
+            // that composition root was not used (a unit test, say); 501 says so, where the
+            // redirect a browser-only path would get would say nothing.
+            ("POST", AUDIO_STREAM_PATH) => Response::error_json(
+                501,
+                "this server has no streaming body route: /audio/pcm needs `make_routes`, not `make_handler`",
+            ),
             _ => {
                 if path.starts_with("/api/") {
                     Response::error_json(404, &format!("no route {method} {path}"))
@@ -5600,6 +5608,174 @@ pub fn make_handler(app: Shared) -> Handler {
     })
 }
 
+/// Where a host streams PCM into the speaker: `POST /audio/pcm` (docs/audio.md §6).
+///
+/// The alternative the board had was a tool argument, and a tool result is capped at 2 KB,
+/// so `speaker_play` carries 43 ms — a note, never a song. A request body has no such cap
+/// and, with [`crate::http::BodySink`], no buffer either: the bytes go to the amplifier as
+/// they arrive, and the speaker's own pacing is what throttles the socket.
+pub const AUDIO_STREAM_PATH: &str = "/audio/pcm";
+
+/// How much audio one upload may carry: 30 s at 24 kHz, 16-bit mono.
+///
+/// Not a memory budget — nothing is held — but a bound on how long one request may hold
+/// the speaker, and on how long a client that never stops sending can keep it. Longer audio
+/// is a second request, which is also the honest shape for a retry.
+pub const AUDIO_STREAM_MAX_SECONDS: u32 = 30;
+pub const AUDIO_STREAM_MAX_BYTES: usize = 24_000 * 2 * AUDIO_STREAM_MAX_SECONDS as usize;
+
+/// The sink behind `POST /audio/pcm`: PCM16LE mono, 24 kHz, straight into I2S.
+struct AudioSink {
+    app: Shared,
+    /// Reused across pieces. A fresh `Vec` per socket read would be heap churn on the one
+    /// resource this board is short of (`docs/audio.md` §3).
+    bytes: Vec<u8>,
+    samples: Vec<i16>,
+    /// An odd byte can end a piece; it is carried into the next one rather than played as
+    /// half a sample.
+    carry: Option<u8>,
+    received: usize,
+    played: usize,
+    failed: Option<String>,
+}
+
+impl AudioSink {
+    fn new(app: Shared) -> Self {
+        // One second of audio of headroom on the reused buffers: the socket hands over
+        // whatever it has (up to 1 KB), and a chunk never grows past that plus one byte.
+        Self {
+            app,
+            bytes: Vec::with_capacity(1025),
+            samples: Vec::with_capacity(512),
+            carry: None,
+            received: 0,
+            played: 0,
+            failed: None,
+        }
+    }
+}
+
+impl crate::http::BodySink for AudioSink {
+    fn push(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+        if self.received + bytes.len() > AUDIO_STREAM_MAX_BYTES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("more than {AUDIO_STREAM_MAX_SECONDS} s of audio in one request"),
+            ));
+        }
+        self.received += bytes.len();
+        self.bytes.clear();
+        if let Some(b) = self.carry.take() {
+            self.bytes.push(b);
+        }
+        self.bytes.extend_from_slice(bytes);
+        if self.bytes.len() % 2 == 1 {
+            self.carry = self.bytes.pop();
+        }
+        self.samples.clear();
+        self.samples.extend(self.bytes.chunks_exact(2).map(|c| i16::from_le_bytes([c[0], c[1]])));
+        if self.samples.is_empty() {
+            return Ok(());
+        }
+        // The one `App` mutex is taken per piece and released again. Holding it for the
+        // song would stop the portal, `/api/status` and the board's own agent thread for
+        // thirty seconds; taking it per piece keeps the stall to one I2S write.
+        let mut state = app_lock(&self.app);
+        if let Err(e) = state.hw.i2s_out_write(&self.samples) {
+            let message = e.message.clone();
+            self.failed = Some(message.clone());
+            return Err(std::io::Error::other(message));
+        }
+        self.played += self.samples.len();
+        Ok(())
+    }
+
+    fn finish(self: Box<Self>, complete: bool) -> Response {
+        let rate_hz = crate::drivers::audio::AMP_RATE_HZ as u64;
+        let mut body = json!({
+            "format": "pcm_s16le",
+            "rate_hz": rate_hz,
+            "channels": 1,
+            "bits": 16,
+            "bytes": self.received,
+            "samples": self.played,
+            "ms": self.played as u64 * 1000 / rate_hz,
+            "limit_bytes": AUDIO_STREAM_MAX_BYTES,
+            "ok": true,
+        });
+        if let Some(e) = self.failed {
+            body["ok"] = json!(false);
+            body["error"] = json!(e);
+            return Response::json_status(500, &body);
+        }
+        if !complete {
+            body["ok"] = json!(false);
+            body["error"] = json!("the upload ended before its body did: the rest was not played");
+            return Response::json_status(400, &body);
+        }
+        if self.carry.is_some() {
+            body["ok"] = json!(false);
+            body["error"] =
+                json!("an odd number of bytes: the last byte was dropped, not played as half a sample");
+            return Response::json_status(400, &body);
+        }
+        Response::json(&body)
+    }
+}
+
+/// Decide what `POST /audio/pcm` does with a body that has not been read yet.
+///
+/// Everything here is answerable from the request line and the headers, which is the point:
+/// a wrong content type or a missing PIN costs one exchange instead of 1.4 MB of audio, and
+/// the client never has to upload a song to be told no.
+fn audio_route(app: &Shared, req: &Request) -> crate::http::BodyRoute {
+    use crate::http::BodyRoute;
+    if req.path != AUDIO_STREAM_PATH {
+        return BodyRoute::Buffer;
+    }
+    if req.method != "POST" {
+        return BodyRoute::Answer(Response::error_json(
+            405,
+            "POST a body of PCM16LE mono at 24000 Hz here; there is nothing to GET",
+        ));
+    }
+    // The bytes are played at the amplitude they carry, so the content type has to say what
+    // they are: a misdirected JSON POST would otherwise be screamed into the speaker.
+    let content_type = req.header("content-type").unwrap_or("").to_ascii_lowercase();
+    if !content_type.starts_with("audio/pcm") {
+        return BodyRoute::Answer(Response::error_json(
+            415,
+            "Content-Type must be audio/pcm; the body is raw PCM16LE mono at 24000 Hz (docs/audio.md)",
+        ));
+    }
+    if let Some(rate) = req.query_get("rate") {
+        if rate != "24000" {
+            return BodyRoute::Answer(Response::error_json(
+                400,
+                "only 24000 Hz is wired: the amplifier's I2S clock is a constant (docs/audio.md)",
+            ));
+        }
+    }
+    let mut state = app_lock(app);
+    if let Err(r) = state.require_pin(req) {
+        return BodyRoute::Answer(r);
+    }
+    state.runtime.counters.http_requests += 1;
+    BodyRoute::Sink(Box::new(AudioSink::new(Arc::clone(app))))
+}
+
+/// The routes this firmware answers with: the request handler, plus the one route whose
+/// body is streamed instead of buffered.
+///
+/// One composition root for both, so a platform cannot wire the request handler and forget
+/// that `/audio/pcm` exists — with no body router the route falls through to the normal
+/// handler and answers 404, which is a quieter failure than a wrong one.
+pub fn make_routes(app: Shared) -> crate::http::Routes {
+    let for_body = Arc::clone(&app);
+    crate::http::Routes::new(make_handler(app))
+        .with_body(Arc::new(move |req: &Request| audio_route(&for_body, req)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -6170,6 +6346,84 @@ mod tests {
     /// Every documented route is called here on a real `App`; a 404 means the document
     /// promises something the router does not serve. Mutations are included on purpose —
     /// this is a throwaway app, and a route that answers is exactly what is being asserted.
+    /// The stream route decides on the headers, plays what arrives, and says what it
+    /// refused. No buffer, no second thread, no half sample.
+    #[test]
+    fn the_audio_route_refuses_before_the_body_and_then_plays_it() {
+        use crate::http::BodyRoute;
+
+        let pins = crate::boards::I2sPins { bclk: 15, ws: 16, din: -1, dout: 7 };
+        let shared: Shared = Arc::new(Mutex::new(test_app()));
+        {
+            let mut app = shared.lock().unwrap();
+            // The virtual board grows a speaker only when the channels are brought up.
+            app.hw.i2s_setup(None, Some(pins)).expect("amplifier");
+        }
+        let routes = make_routes(Arc::clone(&shared));
+        let router = routes.body.as_ref().expect("a body router");
+
+        // A JSON POST is refused from its content type alone: the body is never read, so a
+        // misdirected call cannot be played as noise.
+        let mut req = post(AUDIO_STREAM_PATH, "");
+        req.headers.insert("content-type".into(), "application/json".into());
+        match router(&req) {
+            BodyRoute::Answer(r) => assert_eq!(r.status, 415),
+            _ => panic!("content type must be checked before the body"),
+        }
+
+        // The rate is a constant on this board, and saying so costs nothing.
+        let mut req = post(AUDIO_STREAM_PATH, "");
+        req.headers.insert("content-type".into(), "audio/pcm".into());
+        req.query.insert("rate".into(), "16000".into());
+        match router(&req) {
+            BodyRoute::Answer(r) => assert_eq!(r.status, 400),
+            _ => panic!("a rate the amplifier cannot run must be refused"),
+        }
+
+        let mut req = post(AUDIO_STREAM_PATH, "");
+        req.headers.insert("content-type".into(), "audio/pcm".into());
+        let mut sink = match router(&req) {
+            BodyRoute::Sink(s) => s,
+            _ => panic!("audio/pcm must be streamed"),
+        };
+        // Two samples, then one byte short of a third: the odd byte is carried.
+        sink.push(&[0x00, 0x10, 0x00, 0xF0]).expect("a piece");
+        sink.push(&[0x7f]).expect("an odd byte is carried, not played");
+        let resp = sink.finish(true);
+        assert_eq!(resp.status, 400, "a body that ends mid-sample is not a song: {:?}", resp.body);
+        let body: Value = serde_json::from_slice(&resp.body).expect("json");
+        assert_eq!(body["samples"], json!(2), "the odd byte must not be played");
+        assert_eq!(body["ok"], json!(false));
+
+        // A whole body answers 200 and reports what was played.
+        let mut req = post(AUDIO_STREAM_PATH, "");
+        req.headers.insert("content-type".into(), "audio/pcm".into());
+        let mut sink = match router(&req) {
+            BodyRoute::Sink(s) => s,
+            _ => panic!("audio/pcm must be streamed"),
+        };
+        sink.push(&[0u8; 4800]).expect("100 ms of silence");
+        let resp = sink.finish(true);
+        assert_eq!(resp.status, 200, "{:?}", resp.body);
+        let body: Value = serde_json::from_slice(&resp.body).expect("json");
+        assert_eq!(body["samples"], json!(2400));
+        assert_eq!(body["ms"], json!(100));
+
+        // The cap is the request's budget, and past it the upload stops rather than being
+        // silently truncated.
+        let mut req = post(AUDIO_STREAM_PATH, "");
+        req.headers.insert("content-type".into(), "audio/pcm".into());
+        let mut sink = match router(&req) {
+            BodyRoute::Sink(s) => s,
+            _ => panic!("audio/pcm must be streamed"),
+        };
+        assert!(sink.push(&vec![0u8; AUDIO_STREAM_MAX_BYTES]).is_ok());
+        let too_much = sink.push(&[0u8; 2]);
+        assert!(too_much.is_err(), "a 31st second must be refused");
+        let resp = sink.finish(false);
+        assert_eq!(resp.status, 400, "a cut-off upload must not read as done");
+    }
+
     #[test]
     fn every_documented_route_actually_answers() {
         let mut app = test_app();
@@ -7398,7 +7652,7 @@ mod tests {
         let shared: Shared = Arc::new(Mutex::new(app));
         App::attach_shared(&shared);
         let server =
-            crate::http::Server::start("127.0.0.1:0", make_handler(shared.clone()), log).expect("bind");
+            crate::http::Server::start("127.0.0.1:0", make_routes(shared.clone()), log).expect("bind");
         let addr = server.local_addr();
 
         let mut first = std::net::TcpStream::connect(addr).unwrap();

@@ -91,6 +91,7 @@ CORS is on by default (`mcp.cors`), so a browser MCP client can connect directly
 | GET | `/api/clients` | Client configuration, ready to copy |
 | POST | `/api/script` | Run a script: `{source, async?}`; the answer carries `result`/`output`/`steps`, or `{id, poll}` with `async: true` ([scripting](scripting.md)) |
 | GET | `/api/script/<id>` | One script job: `state` (`queued`/`running`/`done`/`failed`), `result`, `output`, `error` |
+| POST | `/audio/pcm` | Play PCM as it arrives: raw PCM16LE mono at 24000 Hz, chunked or with `Content-Length`, at most 30 s, never buffered ([streaming playback](audio.md#6-streaming-playback-post-audiopcm)) |
 | GET | `/api/attachment/<name>` | The file attached to the last message, with its own mime type ([attachments](#5-attachments)) |
 | POST | `/api/auth` | `{pin}`, check the console PIN |
 | POST | `/api/reboot` | Reboot |
@@ -123,6 +124,30 @@ deadlock. It exists so the loop can be verified without an API key.
 
 Write operations require `X-Portal-Pin` (or `?pin=`) when `auth.portal_pin` is set; reads
 do not.
+
+### Streaming audio
+
+`POST /audio/pcm` is the one route whose body is read as it arrives instead of being
+buffered: a request body is capped at 128 KB, which is 1.3 s of audio, and a tool result at
+2 KB, which is 43 ms — neither can carry a song
+([audio](audio.md#6-streaming-playback-post-audiopcm)). The body is raw PCM, so the headers
+say what it is and how long it may last:
+
+```bash
+# 16-bit mono at 24 kHz: the board plays it while it arrives and answers when it ends
+sox song.mp3 -t raw -e signed -b 16 -c 1 -r 24000 - | \
+  curl -sS -X POST 'http://<ip>:80/audio/pcm' \
+    -H 'Content-Type: audio/pcm;rate=24000' \
+    -H 'Transfer-Encoding: chunked' \
+    --data-binary @-
+# {"ok":true,"rate_hz":24000,"channels":1,"bits":16,"bytes":491520,"samples":245760,"ms":10240,...}
+```
+
+`Content-Type` must start with `audio/pcm` (`415` otherwise), the PIN is required when one
+is configured, and only 24000 Hz is wired, so `?rate=` accepts that value alone (`400`
+otherwise). Past 30 s the upload is refused rather than truncated: send the next piece as a
+second request. There is one speaker, so one upload at a time — a second waits in the
+listen backlog like any other request.
 
 ## 3. Resources (`resources/*`)
 
