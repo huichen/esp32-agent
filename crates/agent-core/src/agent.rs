@@ -45,7 +45,7 @@ pub const COMPACT_KEEP_TURNS: usize = 4;
 /// limit would take the budget back through the system prompt.
 pub const ARCHIVE_MAX_LINES: usize = 40;
 /// A tool result larger than this is cut with [`llm::TRUNCATED_MARK`].
-pub const MAX_TOOL_RESULT_BYTES: usize = 2048;
+pub const MAX_TOOL_RESULT_BYTES: usize = 8192;
 /// Assistant text larger than this is cut with [`llm::TRUNCATED_MARK`].
 pub const MAX_REPLY_BYTES: usize = 8 * 1024;
 /// A queued user message larger than this is cut before it enters the history.
@@ -1847,14 +1847,14 @@ mod tests {
     }
 
     #[test]
-    fn a_tool_result_is_truncated_to_two_kilobytes_with_a_marker() {
+    fn a_tool_result_is_truncated_at_the_result_budget_with_a_marker() {
         let mut agent = Agent::new();
-        let mut host = StubHost::returning(&"y".repeat(3000));
+        let mut stomp = StubHost::returning(&"y".repeat(MAX_TOOL_RESULT_BYTES + 1000));
         let mut transport =
             StubTransport::new(vec![tool_call_reply("call_big", "board_status", "{}"), answer_reply("ok")]);
 
         agent.push_user("read everything", "http", 1);
-        agent.run_pending(&mut host, &mut transport, &cfg(), clock).expect("answer");
+        agent.run_pending(&mut stomp, &mut transport, &cfg(), clock).expect("answer");
 
         let tool_message = agent.history.iter().find(|m| m.role == Role::Tool).expect("a tool message");
         assert!(tool_message.text.ends_with(llm::TRUNCATED_MARK));
@@ -1864,7 +1864,7 @@ mod tests {
             tool_message.text.len()
         );
         // The truncated text is what the next request carries.
-        assert!(!transport.bodies[1].contains(&"y".repeat(2100)));
+        assert!(!transport.bodies[1].contains(&"y".repeat(MAX_TOOL_RESULT_BYTES + 1)));
     }
 
     #[test]

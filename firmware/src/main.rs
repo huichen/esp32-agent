@@ -254,6 +254,10 @@ fn run() -> anyhow::Result<()> {
         name: "esp32-agent".into(),
         version: esp32_agent_core::VERSION.into(),
         build: option_env!("ESP32_AGENT_BUILD").unwrap_or("idf").into(),
+        // Written by the build scripts; empty when someone builds by hand without them,
+        // which is itself information.
+        commit: option_env!("ESP32_AGENT_COMMIT").unwrap_or("unknown").into(),
+        built_at: option_env!("ESP32_AGENT_BUILT_AT").unwrap_or("unknown").into(),
     };
     let app: Shared = Arc::new(Mutex::new(App::new(hw, Box::new(store), log.clone(), firmware)));
     mem("after devices");

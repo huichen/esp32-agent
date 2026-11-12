@@ -76,6 +76,8 @@ fn main() {
         name: "esp32-agent".into(),
         version: esp32_agent_core::VERSION.into(),
         build: format!("sim {}", env!("CARGO_PKG_VERSION")),
+        commit: "sim".into(),
+        built_at: "sim".into(),
     };
     let app: Shared = Arc::new(Mutex::new(App::new(Box::new(board), Box::new(store), log.clone(), firmware)));
 
