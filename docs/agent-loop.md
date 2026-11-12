@@ -230,34 +230,6 @@ Both functions must be pure (no clock access) — the caller passes time in.
 - Routes (all under the existing pin/token gate where they mutate):
   - `POST /api/agent/message {"text"}` -> `202 {"queued":true,"seq":n}`
   - `GET /api/agent/history?after=N` -> transcript JSON
-
-## Surviving a power cut
-
-Two mechanisms, one storage: `config.agent.persist_transcript` (default on) and the
-`agent.run_in_flight` marker.
-
-The transcript is written as JSON Lines behind a header under `agent.transcript`,
-`agent.transcript.1`, ... Each chunk is 3500 bytes with an FNV-1a checksum in its header,
-because ESP-IDF refuses a string value above about 4000 bytes and the firmware's NVS
-adapter reads through a fixed 4096-byte buffer. A single 16 KB key would pass every host
-test and persist nothing on the board.
-
-The stored copy is lossy on purpose: text over 300 bytes, reasoning over 200 and tool
-arguments over 256 are cut with the truncation marker, images are not stored at all, and
-only the newest messages that fit 16 KB are kept (`dropped: N` in the header, repeated in
-the prompt as "Recovered after a reboot"). A blob with a bad checksum, an unknown version,
-an edited body or an orphan tool result at the tail is discarded whole and logged, so a
-torn write loses the transcript rather than half-adopting it.
-
-Resume works at step granularity. The marker is written before a run and removed when it
-ends, before the final save, so a crash can lose a reply but never repeat one. At boot a
-marker that survived is consumed and the transcript's last user message is queued again
-with `source: "resume"`; the request then carries the tool call and the result that already
-landed, so the model answers instead of re-issuing the call.
-
-What a power cut still costs: the model output in flight (the turn is re-asked and paid for
-again), a queue entry that never started, and a cut inside the window between clearing the
-marker and the final save (one turn lost, never duplicated).
   - `POST /api/agent/reset` -> `{"reset":true}`
   - `GET /api/agent/config` / `POST /api/agent/config` (api_key never echoed)
   - `GET /api/sched` / `POST /api/sched` (add/update/delete one task or rule by id)
@@ -286,6 +258,34 @@ hard-coding an endpoint has to be a deliberate act with a failing test to justif
 Agent thread + `EspHttpClient` transport + NVS-backed `Workspace` + the scheduler
 tick that turns due tasks and fired rules into `push_user(...)`. Publishes counters
 through `/api/status`.
+
+## Surviving a power cut
+
+Two mechanisms, one storage: `config.agent.persist_transcript` (default on) and the
+`agent.run_in_flight` marker.
+
+The transcript is written as JSON Lines behind a header under `agent.transcript`,
+`agent.transcript.1`, ... Each chunk is 3500 bytes with an FNV-1a checksum in its header,
+because ESP-IDF refuses a string value above about 4000 bytes and the firmware's NVS
+adapter reads through a fixed 4096-byte buffer. A single 16 KB key would pass every host
+test and persist nothing on the board.
+
+The stored copy is lossy on purpose: text over 300 bytes, reasoning over 200 and tool
+arguments over 256 are cut with the truncation marker, images are not stored at all, and
+only the newest messages that fit 16 KB are kept (`dropped: N` in the header, repeated in
+the prompt as "Recovered after a reboot"). A blob with a bad checksum, an unknown version,
+an edited body or an orphan tool result at the tail is discarded whole and logged, so a
+torn write loses the transcript rather than half-adopting it.
+
+Resume works at step granularity. The marker is written before a run and removed when it
+ends, before the final save, so a crash can lose a reply but never repeat one. At boot a
+marker that survived is consumed and the transcript's last user message is queued again
+with `source: "resume"`; the request then carries the tool call and the result that already
+landed, so the model answers instead of re-issuing the call.
+
+What a power cut still costs: the model output in flight (the turn is re-asked and paid for
+again), a queue entry that never started, and a cut inside the window between clearing the
+marker and the final save (one turn lost, never duplicated).
 
 ## 4. Acceptance for the whole feature
 
