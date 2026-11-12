@@ -32,7 +32,7 @@ runs — and the same document drives both the MCP endpoint and the board's own 
 |---|---|
 | **Hardware it can find** | Built-in drivers probe I2C, 1-Wire and pins at boot; only what answered gets tools. Nothing is listed that the board cannot actually do. |
 | **A tool surface it can rewrite** | `manifest_apply` validates and rebuilds the tool list **without a restart or a reflash**; a device the agent just discovered is callable in the same turn. |
-| **Two kinds of caller, one surface** | 51 tools on the MCP endpoint — and the on-board agent sees that same list, `fs_*`/`net_*` included. No second description of the hardware to drift. |
+| **Two kinds of caller, one surface** | 45 tools on the MCP endpoint — and the on-board agent sees that same list, `shell` included. No second description of the hardware to drift. |
 | **A body, not just hands** | Pins and buses, the manifest, runtime configuration, `/AGENTS.md`, `/skills/*`, the memory index, the file workspace, timers, sensor rules and goals are all operations the agent can perform on itself. |
 | **It can start with nothing and build its surface** | With `discovery: manual` the drivers probe but adopt nothing: the board boots with an empty device list and a candidate list that carries the exact `manifest_apply` body for each. A script — loops, conditions, `tool()` calls — finds the hardware and declares it, and a re-probe after a hot-plug follows reality. |
 | **It acts while you are not looking** | `POST /api/sched` runs prompts on a clock or a sensor threshold; `POST /api/goal` gives it an objective and lets it iterate, one step per round, with notes that survive reboots. |
@@ -121,8 +121,7 @@ Everything below is an operation, not a fixed menu:
 | Hardware | GPIO, ADC, PWM, RGB, I2C, 1-Wire, OLED, sensors, servo, relay, I2S mic/amp | MCP tools |
 | Discovery | `inventory`, `devices_list`, `i2c_scan`, `i2c_identify`, `devices_probe` | MCP tools |
 | Manifest | `manifest_get/describe/validate/apply/reset` — live, no reboot | MCP tools |
-| Files | `fs_ls/read/write/edit/rm/cp/mv/grep` over an NVS workspace | MCP tools |
-| Network | `net_get`, `net_post` over `http://` and `https://` | MCP tools |
+| Shell | one tool, fourteen commands: `ls` `cat` `write` `edit` `rm` `cp` `mv` `grep` over an NVS workspace; `get` `post` `dns` `tcp` over the network; `zip` `unzip` on archives. `get` reduces an HTML page to its text | MCP tool and model tool |
 | Inbound TLS | `https://` on 443, self-signed certificate generated on the board (EC P-256, fingerprint in `/api/tls`); http on 80 stays | both ports |
 | Config | WiFi, MCP, buses, pins, auth, log, UI, tick, discovery | `POST /api/config` |
 | Scripts | loops, conditions and `tool()` calls over every tool above | `script` tool |

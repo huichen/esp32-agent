@@ -45,6 +45,8 @@ pub mod tools;
 pub mod util;
 pub mod virtual_board;
 pub mod web;
+pub mod zip;
+pub mod zlib;
 
 pub use app::{App, FwMeta, Shared};
 pub use config::Config;
