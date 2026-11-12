@@ -22,6 +22,7 @@ sensor can be declared in JSON while the board runs.
 | It acts unattended | Timed prompts, and sensor rules that fire a prompt when a reading crosses a threshold. [Scheduling](docs/scheduling.md) |
 | A shell and a script language | `shell` with 55 NuttX-named commands, and an interpreter for loops over tool calls. [Shell](docs/shell.md) · [Script](docs/scripting.md) |
 | It remembers what it was told | Standing orders, `/AGENTS.md`, a `/MEMORY.md` index and skills, assembled into the prompt on every turn. [Context layers](docs/context.md) |
+| It starts with skills | Three procedures ship in the firmware — write a skill, find the pinout, recover a broken board — and land in `/skills` on the first boot; edit one and it stays yours. [Skills](docs/agent-skills.md) |
 | No cloud in the path | HTTPS from the board, a certificate it generates, one PIN for three callers. [Security](docs/security.md) |
 | Testable without hardware | The simulator runs the same `agent-core` against a virtual board. [Simulator](docs/simulator.md) |
 
@@ -44,6 +45,8 @@ model, list the devices the probe found, turn tools on and off, read the log, se
 **From an agent**: `GET http://<board>/agent.json` returns the interface as JSON — every
 route with its method, body and auth, the MCP surface, the settings table with types and
 defaults, and the limits. An agent that can fetch a URL needs nothing else.
+
+**A new board already knows three things.** `/skills/create-skill` says how the agent writes its next procedure, `/skills/pinout` how to find out what is wired and record it in `/MEMORY.md`, `/skills/recover-board` what to do when the board looks broken. They are ordinary workspace files, installed on the first boot wherever the path is empty; a factory reset restores them and `skills.seed_defaults=false` stops that. The first useful sentence to a freshly flashed board can be "write down your own pinout".
 
 ## Give it a model
 
