@@ -102,7 +102,7 @@ pub const ROUTES: &[Route] = &[
         "/api/status",
         "status",
         Auth::Open,
-        "Board, memory, WiFi, MCP counters, device count, goal state",
+        "Board, memory, WiFi, MCP counters, device count",
         "",
         "a status object",
     ),
@@ -274,7 +274,7 @@ pub const ROUTES: &[Route] = &[
         "",
         "{system, bytes, archive_lines, history}",
     ),
-    // --- scheduling and goals ------------------------------------------------------
+    // --- scheduling ----------------------------------------------------------------
     r("GET", "/api/sched", "sched", Auth::Open, "Scheduled tasks and sensor rules", "", "{tasks, rules}"),
     r(
         "POST",
@@ -294,26 +294,6 @@ pub const ROUTES: &[Route] = &[
         "{tasks, rules}",
         "the stored schedule",
     ),
-    r(
-        "GET",
-        "/api/goal",
-        "goal",
-        Auth::Open,
-        "The self-directed goal loop: status, iteration, notes",
-        "",
-        "{goal}",
-    ),
-    r(
-        "POST",
-        "/api/goal",
-        "goal",
-        Auth::Pin,
-        "Start a goal the board works on across runs",
-        "{goal, max_iterations?}",
-        "{ok}",
-    ),
-    r("POST", "/api/goal/stop", "goal", Auth::Pin, "Stop the goal loop", "", "{ok}"),
-    r("DELETE", "/api/goal", "goal", Auth::Pin, "Stop and clear the goal", "", "{ok}"),
     // --- diagnostics and recovery --------------------------------------------------
     r(
         "GET",

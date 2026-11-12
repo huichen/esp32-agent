@@ -76,9 +76,6 @@ mod tests {
             vec!["devices", "tools", "agent", "schedule", "logs", "settings"],
             "the sheet is ordered by importance and nothing else is in it"
         );
-        // Goal mode was removed from the portal: it read as a second, unexplained agent.
-        assert!(!INDEX_HTML.contains("goal-"), "the goal panel is gone");
-        assert!(!APP_JS.contains("/api/goal"), "and its calls with it");
         assert!(!INDEX_HTML.contains("manifest-"), "the manifest editor moved to the agent's job");
     }
 

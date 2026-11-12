@@ -819,7 +819,7 @@ function init() {
 
   // One image per message. It is downscaled in the browser, because what crosses the LAN
   // has to fit the request the board can send and the heap it can spare.
-  // A run can start without this page — a schedule, a goal, another client — and the event
+  // A run can start without this page — a schedule, another client — and the event
 // stream only follows the run this page asked for. So look every 20 s, and only redraw
 // when the transcript actually changed: a phone should not spend its battery on a page
 // that has nothing new to say.

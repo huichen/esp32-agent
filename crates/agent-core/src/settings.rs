@@ -151,11 +151,6 @@ const SCHEDULE: &[Field] = &[
     f("rules[].min_interval_s", "integer", "", "rate limit"),
 ];
 
-const GOAL: &[Field] = &[
-    f("goal", "string", "", "the objective; POST starts the loop"),
-    f("max_iterations", "integer", "10", "iterations before it stops"),
-];
-
 const MEMORY: &[Field] = &[f("keep", "integer", "0", "exchanges to keep; 0 drops the whole conversation")];
 
 const TOOLS: &[Field] = &[
@@ -182,12 +177,6 @@ pub const GROUPS: &[Group] = &[
         endpoint: "POST /api/sched",
         summary: "Recurring prompts and sensor-triggered rules; the board runs them itself",
         fields: SCHEDULE,
-    },
-    Group {
-        group: "goal",
-        endpoint: "POST /api/goal",
-        summary: "A long-running objective the board works on across runs",
-        fields: GOAL,
     },
     Group {
         group: "conversation",

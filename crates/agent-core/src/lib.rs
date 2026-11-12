@@ -8,7 +8,6 @@
 //! manifest.rs      devices + tools as JSON, validated and applied without a reflash
 //! tool.rs          ToolDef/ToolCtx/ToolRegistry, capability gating
 //! tools/           board, system and manifest-facing tools
-//! goal.rs          one objective, iterated by the agent until met/blocked/exhausted
 //! protocol.rs      JSON-RPC 2.0 / MCP framing
 //! http.rs          a small blocking HTTP/1.1 server (std only)
 //! app.rs           state, dispatch, routes for /mcp and the HTML portal
@@ -25,7 +24,6 @@ pub mod device;
 pub mod drivers;
 pub mod error;
 pub mod font6x8;
-pub mod goal;
 pub mod hardware;
 pub mod hash;
 pub mod http;
