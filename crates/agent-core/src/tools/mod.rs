@@ -70,6 +70,7 @@ pub fn board_tools() -> Vec<ToolDef> {
             let info = ctx.hw.board_info();
             let wifi = ctx.hw.wifi_status();
             let now = now_ms(ctx);
+            let internal = ctx.hw.heap_internal();
             Ok(json!({
                 "device_name": ctx.cfg.device_name,
                 "board_profile": ctx.profile.id,
@@ -82,8 +83,15 @@ pub fn board_tools() -> Vec<ToolDef> {
                 "build": ctx.runtime.build,
                 "uptime_s": ctx.runtime.uptime_s(now),
                 "temperature_c": info.temp_c,
+                // `free_heap_kb` is the whole heap with PSRAM in it, which on this board
+                // reads in the megabytes; the internal SRAM that sockets, TLS records and
+                // thread stacks come from is a different and much smaller number. Asked
+                // "how much RAM is free", a model reads the first and is wrong by three
+                // orders of magnitude, so both are reported and named.
                 "free_heap_kb": info.free_heap_kb,
                 "min_free_heap_kb": info.min_free_heap_kb,
+                "internal_kb": internal.map(|(free, _)| free / 1024),
+                "largest_internal_kb": internal.map(|(_, largest)| largest / 1024),
                 "wifi": {
                     "state": wifi.state,
                     "ssid": wifi.ssid,
