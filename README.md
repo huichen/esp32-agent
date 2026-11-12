@@ -1,5 +1,10 @@
 # esp32-agent
 
+**English** · [简体中文](README.zh.md) · [Français](README.fr.md) · [Español](README.es.md) · [Русский](README.ru.md) · [العربية](README.ar.md)
+
+> Translations are kept in step with this file: a change to the English README is made in
+> all six in the same commit. If one has drifted, the English text is the one that is true.
+
 Firmware for an ESP32 that runs its own agent loop and serves an MCP endpoint, so one model
 can drive the board directly and any external agent can use the same tools over HTTP.
 
