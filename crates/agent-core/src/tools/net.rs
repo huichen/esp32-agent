@@ -19,7 +19,7 @@ use std::net::ToSocketAddrs;
 /// Response bodies larger than this are cut, with [`TRUNCATED_MARK`] appended.
 /// The agent truncates tool results at the same size; doing it here keeps the
 /// marker and the byte count honest instead of losing the tail silently.
-pub const MAX_BODY_BYTES: usize = 32768;
+pub const MAX_BODY_BYTES: usize = 65536;
 
 /// Longest URL a tool call may pass. The board's header buffer is small, and a
 /// model pasting a data: URI must fail fast.
@@ -53,7 +53,7 @@ pub fn specs() -> Value {
     json!([
         function(
             "net_get",
-            "Fetch a URL from the board's network and return up to 32768 bytes. An HTML page is reduced to its text (title, headings, list items, paragraphs) so the bytes are content rather than markup; send format=\"raw\" for the document itself. http:// and https:// are both carried; the certificate chain is checked against the board's bundle.",
+            "Fetch a URL from the board's network and return up to 65536 bytes. An HTML page is reduced to its text (title, headings, list items, paragraphs) so the bytes are content rather than markup; send format=\"raw\" for the document itself. http:// and https:// are both carried; the certificate chain is checked against the board's bundle.",
             params(
                 json!({
                     "url": { "type": "string", "description": "http:// URL" },
@@ -91,7 +91,7 @@ pub fn specs() -> Value {
         ),
         function(
             "net_post",
-            "POST a JSON body to a URL from the board's network and return up to 32768 bytes of the response body. http:// and https:// are both carried.",
+            "POST a JSON body to a URL from the board's network and return up to 65536 bytes of the response body. http:// and https:// are both carried.",
             params(
                 json!({
                     "url": { "type": "string", "description": "http:// URL" },

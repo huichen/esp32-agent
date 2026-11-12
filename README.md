@@ -15,7 +15,7 @@ sensor can be declared in JSON while the board runs.
 | What | In detail |
 |---|---|
 | A model runs on the board | Loop, tools, memory and transcript are firmware; the model is any OpenAI-compatible or Anthropic endpoint. [Model](docs/model.md) |
-| The tool set is a document | `manifest_apply` validates a JSON manifest, compiles it into tools, live in the same turn. [Manifest](docs/manifest.md) |
+| The tool set is a document | `manifest` (`command: apply`) validates a JSON manifest, compiles it into tools, live in the same turn. [Manifest](docs/manifest.md) |
 | It finds its own hardware | I2C, 1-Wire and declared pins are probed at boot; only what answers gets tools. [Capabilities](docs/capabilities.md) |
 | One tool set, two callers | The MCP endpoint and the on-board agent see the same tools, from one description. [HTTP and MCP API](docs/http-api.md) |
 | A console over HTTPS | Chat with the model and configure devices, tools, schedule, logs, WiFi and the model, from a phone; the board issues its own certificate. [Web console](docs/web-console.md) |
@@ -23,7 +23,7 @@ sensor can be declared in JSON while the board runs.
 | A shell and a script language | `shell` with 55 NuttX-named commands, and an interpreter for loops over tool calls. [Shell](docs/shell.md) · [Script](docs/scripting.md) |
 | It remembers what it was told | Standing orders, `/AGENTS.md`, a `/MEMORY.md` index and skills, assembled into the prompt on every turn. [Context layers](docs/context.md) |
 | It starts with skills | Three procedures ship in the firmware — write a skill, find the pinout, recover a broken board — and land in `/skills` on the first boot; edit one and it stays yours. [Skills](docs/agent-skills.md) |
-| No cloud in the path | HTTPS from the board, a certificate it generates, one PIN for three callers. [Security](docs/security.md) |
+| The board is the server | HTTPS from the board, a certificate it generates, one PIN for three callers. [Security](docs/security.md) |
 | Testable without hardware | The simulator runs the same `agent-core` against a virtual board. [Simulator](docs/simulator.md) |
 
 ## Flash and connect

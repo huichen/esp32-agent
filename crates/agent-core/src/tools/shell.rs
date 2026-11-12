@@ -290,6 +290,72 @@ pub fn parse(line: &str) -> Result<Parsed, String> {
 /// -l < /log` — because the point of a shell is that the model does not have to learn a new
 /// calling convention to use it. Quotes group a word; a backslash escapes the next
 /// character; operators only count outside quotes.
+/// `a; b` split into its commands, or `None` when the line is one command.
+///
+/// A semicolon is a character when it is inside a sentence — `system_prompt set the pump is
+/// on GPIO12; never past it` is one argument, and the quoting rule already keeps it that
+/// way. Four parts is the ceiling: beyond that the caller wants a script, and the script
+/// language is where a real sequence belongs.
+/// Is the text after a `;` the start of a command?
+///
+/// This is what keeps `system_prompt set the pump is on GPIO12; never past it` one argument
+/// while `echo a > /f; cat /f` is two commands: `never` is not a command, `cat` is. A
+/// semicolon that introduces a word the shell does not know is a character, which is the
+/// behaviour the standing-orders sentence has relied on since it was written.
+fn starts_a_command(after: &str) -> bool {
+    let word = after.trim_start();
+    let word: String = word.chars().take_while(|c| !c.is_whitespace() && *c != ';').collect();
+    if word.is_empty() {
+        return false;
+    }
+    route(&word).is_some()
+}
+
+pub fn split_sequence(line: &str) -> Result<Option<Vec<String>>, String> {
+    let mut parts: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let mut quote: Option<char> = None;
+    for (at, ch) in line.char_indices() {
+        let rest_after: &str = &line[at + ch.len_utf8()..];
+        if let Some(q) = quote {
+            current.push(ch);
+            if ch == q {
+                quote = None;
+            }
+            continue;
+        }
+        if ch == '"' || ch == '\'' {
+            quote = Some(ch);
+            current.push(ch);
+        } else if ch == ';' && starts_a_command(rest_after) {
+            if current.trim().is_empty() {
+                return Err("`;` needs a command on both sides\n\n".to_string() + PIPE_USAGE);
+            }
+            parts.push(current.trim().to_string());
+            current.clear();
+        } else {
+            current.push(ch);
+        }
+    }
+    if quote.is_some() {
+        return Err("a quote is not closed\n\n".to_string() + PIPE_USAGE);
+    }
+    if parts.is_empty() {
+        return Ok(None);
+    }
+    if current.trim().is_empty() {
+        return Err("`;` needs a command on both sides\n\n".to_string() + PIPE_USAGE);
+    }
+    parts.push(current.trim().to_string());
+    if parts.len() > 4 {
+        return Err(format!(
+            "at most 4 commands on one line with `;` (got {}): use a script for a sequence",
+            parts.len()
+        ));
+    }
+    Ok(Some(parts))
+}
+
 pub fn parse_pipeline(line: &str) -> Result<Pipeline, String> {
     let mut stages: Vec<Stage> = Vec::new();
     let mut words: Vec<String> = Vec::new();

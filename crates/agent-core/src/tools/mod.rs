@@ -4,6 +4,7 @@
 //! WiFi) plus the ones that manage the config. Device-specific tools live with
 //! their driver in [`crate::drivers`].
 
+pub mod family;
 pub mod fs;
 pub mod knowledge;
 pub mod net;
@@ -19,7 +20,7 @@ use serde_json::{json, Value};
 
 pub mod manifest_tools;
 
-pub use manifest_tools::manifest_tools;
+pub use manifest_tools::{manifest_members, manifest_tools};
 
 /// Default I2C bus index for tools that omit `bus`.
 fn default_bus(ctx: &mut ToolCtx) -> u8 {
