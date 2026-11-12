@@ -122,10 +122,12 @@ impl Drop for EventStreamSlot {
 // Requests are served on the accept thread — one stack instead of one per connection — so
 // this stack carries the heaviest handler. `/api/tools` serialises 41 tool descriptors and
 // overflowed a 6 kB stack with a `***ERROR*** A stack overflow in task pthread` and a
-// reboot; 16 kB is what it takes with room to spare. The extra 4 kB is the TLS handshake
-// (mbedTLS), which runs on this thread too when the board serves https — a second thread
-// for it does not fit in internal RAM alongside the agent.
-const ACCEPT_STACK: usize = 20 * 1024;
+// reboot, which is why this number was 16 kB + 4 kB for the TLS handshake that also runs
+// here. The measured reading at 20 kB is 13.5 kB free — 6.5 kB peak — over a run that
+// included `/api/tools`, the portal, `/api/status`, `/api/memory`, and an https request
+// (the handshake is the costly part, and it is on this thread). max(2 x 6.5, 6.5 + 4) =
+// 13.0 kB, so 16 kB is the floor the rule allows and 4 kB goes back to the heap.
+const ACCEPT_STACK: usize = 16 * 1024;
 #[cfg(not(target_os = "espidf"))]
 const ACCEPT_STACK: usize = 256 * 1024;
 
