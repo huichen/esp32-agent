@@ -27,48 +27,41 @@ sensor can be declared in JSON while the board runs.
 
 ## Flash and connect
 
-Write the merged image from a [release](https://github.com/huichen/esp32-agent/releases) at offset 0 (or build it, see
-[docs/flashing.md](docs/flashing.md)):
-
 ```bash
 espflash write-bin --chip esp32s3 --flash-size 16mb 0x0 esp32-agent-vX.Y.Z.bin
 ```
 
-With no credentials stored the board starts an access point called `esp32-agent-setup`. Join
-it from a phone, open **http://192.168.4.1/** and enter your WiFi name and password. They are
-kept in NVS, never in the image, and they are what the board needs to reach anything beyond
-the LAN — the model, a package mirror, `/agent.json` on someone else's desk.
+The board has no WiFi credentials, so it starts an access point named `esp32-agent-setup`.
+Join it, open `http://192.168.4.1/`, type the network name and password, save. They go to
+NVS and the board reconnects. Until that happens it reaches nothing outside the LAN: no
+model endpoint, no package mirror.
 
 ## Use it
 
-Two things it is for.
+**From a browser**: `http://<board>/` (or `https://<board>/`) is the console. Chat with the
+model, list the devices the probe found, turn tools on and off, read the log, set the PIN.
 
-**A person with a phone.** Open `http://<board>/` (or the same over https on 443): chat with
-the model, look at the devices the probe found, switch a tool off, read the log, set the PIN.
-
-**An agent that was handed `http://<board>/agent.json`.** That document is the interface as
-data — every route with method, body and auth, the MCP surface, the streaming endpoints, the
-settings table with types and defaults, and the limits. An agent that can fetch one URL can
-use this board without reading a line of this README; that is what the endpoint is for.
+**From an agent**: `GET http://<board>/agent.json` returns the interface as JSON — every
+route with its method, body and auth, the MCP surface, the settings table with types and
+defaults, and the limits. An agent that can fetch a URL needs nothing else.
 
 ## Give it a model
 
-Two ways, same three fields.
+Open `http://<board>/`, choose **Agent**, and fill in the endpoint, the model id and the key,
+then save. The key is write-only: it goes to NVS and reads back as `__set__`. The same panel
+holds `protocol` (`chat`, `responses` or `anthropic`), `reasoning`, `context_tokens` and
+`max_output_tokens`.
 
-**In the console.** Open the page, Agent panel, fill in endpoint, model and key, save. The key
-is write-only: it goes to NVS and reads back as `__set__`.
+**Or let an agent do it.** Once an agent has fetched `agent.json` it knows these settings, their
+types and their defaults, so a prompt is enough:
 
-**By an agent.** `POST /api/agent/config` with the same fields:
+> point the board at `https://your-provider/v1/chat/completions`, model `…`, key `sk-…`,
+> thinking `low`, context `64000`, output `4096`
 
-```bash
-curl -sS -X POST http://<board>/api/agent/config -H 'Content-Type: application/json' \
-  -d '{"base_url":"https://your-provider/v1/chat/completions","model":"…","api_key":"…"}'
-```
-
-Three wire protocols (`chat`, `responses`, `anthropic`), a thinking level, a context window and
-an output ceiling are on the same panel and the same route. With no key at all, point
-`base_url` at `http://127.0.0.1/selftest/chat/completions` and the loop still runs, so a board
-can be tested before an account exists. [Model](docs/model.md) has the field list.
+The agent applies them with `POST /api/agent/config` — the same call the panel makes — and reads
+the configuration back to confirm. No command line is needed on your side, and the same prompt
+works for every board it can reach. Without a key at all, `base_url` set to
+`http://127.0.0.1/selftest/chat/completions` runs the loop against the board itself.
 
 ## Safety notes
 

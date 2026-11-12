@@ -28,52 +28,43 @@ répond avec eux ; un nouveau capteur peut être déclaré en JSON pendant que
 
 ## Flasher et connecter
 
-Écrivez l'image fusionnée d'une [release](https://github.com/huichen/esp32-agent/releases) à l'offset 0 (ou compilez-la, voir
-[docs/flashing.md](docs/flashing.md)) :
-
 ```bash
 espflash write-bin --chip esp32s3 --flash-size 16mb 0x0 esp32-agent-vX.Y.Z.bin
 ```
 
-Sans identifiants enregistrés, la carte démarre un point d'accès `esp32-agent-setup`. Rejoignez-le
-depuis un téléphone, ouvrez **http://192.168.4.1/** et saisissez le nom et le mot de passe du
-WiFi. Ils vont en NVS, jamais dans l'image, et ce sont eux qui permettent à la carte d'atteindre
-quoi que ce soit hors du réseau local : le modèle, un miroir de paquets, un `/agent.json` sur le
-bureau d'à côté.
+La carte n'a aucun identifiant WiFi : elle démarre un point d'accès `esp32-agent-setup`.
+Rejoignez-le, ouvrez `http://192.168.4.1/`, saisissez le nom du réseau et le mot de passe,
+enregistrez. Ils vont en NVS et la carte se reconnecte. Avant cela elle n'atteint rien hors
+du réseau local : ni point d'entrée de modèle, ni miroir de paquets.
 
 ## Utilisation
 
-Deux usages, et rien d'autre.
+**Dans un navigateur** : `http://<board>/` (ou `https://<board>/`) est la console. Parler au
+modèle, lister les appareils trouvés, activer ou couper des outils, lire le journal, définir
+le PIN.
 
-**Une personne avec un téléphone.** Ouvrir `http://<board>/` (ou la même chose en https sur
-443) : parler au modèle, regarder les appareils trouvés, désactiver un outil, lire le journal,
-définir le PIN.
-
-**Un agent à qui on donne `http://<board>/agent.json`.** Ce document est l'interface sous forme
-de données : chaque route avec sa méthode, son corps et son authentification, la surface MCP,
-les points de flux, la table des réglages avec types et valeurs par défaut, et les limites. Un
-agent capable de récupérer une URL peut utiliser cette carte sans lire une ligne de ce README :
-c'est pour cela que ce point d'entrée existe.
+**Depuis un agent** : `GET http://<board>/agent.json` renvoie l'interface en JSON — chaque
+route avec sa méthode, son corps et son authentification, la surface MCP, la table des
+réglages avec types et valeurs par défaut, et les limites. Un agent qui sait récupérer une URL
+n'a besoin de rien d'autre.
 
 ## Donnez-lui un modèle
 
-Deux façons, les mêmes trois champs.
+Ouvrez `http://<board>/`, panneau **Agent**, saisissez le point d'entrée, l'identifiant du
+modèle et la clé, enregistrez. La clé est en écriture seule : elle va en NVS et se relit
+`__set__`. Le même panneau porte `protocol` (`chat`, `responses` ou `anthropic`), `reasoning`,
+`context_tokens` et `max_output_tokens`.
 
-**Dans la console.** Ouvrez la page, panneau Agent, saisissez point d'entrée, modèle et clé,
-enregistrez. La clé est en écriture seule : elle va en NVS et se relit `__set__`.
+**Ou laissez un agent le faire.** Une fois qu'un agent a récupéré `agent.json`, il connaît ces
+réglages, leurs types et leurs valeurs par défaut, donc une consigne suffit :
 
-**Par un agent.** `POST /api/agent/config` avec les mêmes champs :
+> configure la carte sur `https://your-provider/v1/chat/completions`, modèle `…`, clé `sk-…`,
+> réflexion `low`, contexte `64000`, sortie `4096`
 
-```bash
-curl -sS -X POST http://<board>/api/agent/config -H 'Content-Type: application/json' \
-  -d '{"base_url":"https://your-provider/v1/chat/completions","model":"…","api_key":"…"}'
-```
-
-Trois protocoles (`chat`, `responses`, `anthropic`), un niveau de réflexion, une fenêtre de
-contexte et un plafond de sortie sont sur le même panneau et la même route. Sans aucune clé,
-pointez `base_url` sur `http://127.0.0.1/selftest/chat/completions` : la boucle tourne quand
-même, donc une carte se teste avant d'avoir un compte. La liste des champs est dans
-[Model](docs/model.md).
+L'agent les applique par `POST /api/agent/config` — le même appel que le panneau — puis relit la
+configuration pour confirmer. Aucune ligne de commande de votre côté, et la même consigne vaut
+pour chaque carte qu'il peut joindre. Sans aucune clé, `base_url` sur
+`http://127.0.0.1/selftest/chat/completions` fait tourner la boucle sur la carte elle-même.
 
 ## Notes de sécurité
 

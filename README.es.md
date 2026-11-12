@@ -29,50 +29,42 @@ marcha.
 
 ## Grabar y conectar
 
-Escribe la imagen fusionada de una [release](https://github.com/huichen/esp32-agent/releases) en el desplazamiento 0 (o
-compílala, ver [docs/flashing.md](docs/flashing.md)):
-
 ```bash
 espflash write-bin --chip esp32s3 --flash-size 16mb 0x0 esp32-agent-vX.Y.Z.bin
 ```
 
-Sin credenciales guardadas, la placa levanta un punto de acceso llamado `esp32-agent-setup`.
-Únete desde el móvil, abre **http://192.168.4.1/** y escribe el nombre y la contraseña del
-WiFi. Se guardan en NVS, nunca en la imagen, y son lo que la placa necesita para llegar a algo
-fuera de la red local: el modelo, un espejo de paquetes, un `/agent.json` en la mesa de al lado.
+La placa no tiene credenciales WiFi, así que levanta un punto de acceso llamado
+`esp32-agent-setup`. Únete, abre `http://192.168.4.1/`, escribe el nombre de la red y la
+contraseña, guarda. Van a NVS y la placa se reconecta. Hasta entonces no alcanza nada fuera de
+la red local: ni el endpoint del modelo, ni un espejo de paquetes.
 
 ## Uso
 
-Sirve para dos cosas.
+**En un navegador**: `http://<board>/` (o `https://<board>/`) es la consola. Hablar con el
+modelo, listar los dispositivos encontrados, activar o apagar herramientas, leer el registro,
+poner el PIN.
 
-**Una persona con un móvil.** Abrir `http://<board>/` (o lo mismo en https en 443): hablar con
-el modelo, ver los dispositivos encontrados, apagar una herramienta, leer el registro, poner el
-PIN.
-
-**Un agente al que se le entrega `http://<board>/agent.json`.** Ese documento es la interfaz
-como datos: cada ruta con método, cuerpo y autenticación, la superficie MCP, los puntos de
-streaming, la tabla de ajustes con tipos y valores por defecto, y los límites. Un agente que
-pueda pedir una URL puede usar esta placa sin leer una línea de este README: para eso existe el
-endpoint.
+**Desde un agente**: `GET http://<board>/agent.json` devuelve la interfaz en JSON: cada ruta
+con su método, cuerpo y autenticación, la superficie MCP, la tabla de ajustes con tipos y
+valores por defecto, y los límites. Un agente que sepa pedir una URL no necesita nada más.
 
 ## Dale un modelo
 
-Dos formas, los mismos tres campos.
+Abre `http://<board>/`, panel **Agent**, escribe el endpoint, el id del modelo y la clave, y
+guarda. La clave es de solo escritura: va a NVS y se relee como `__set__`. El mismo panel tiene
+`protocol` (`chat`, `responses` o `anthropic`), `reasoning`, `context_tokens` y
+`max_output_tokens`.
 
-**En la consola.** Abre la página, panel Agent, escribe endpoint, modelo y clave, guarda. La
-clave es de solo escritura: va a NVS y se relee como `__set__`.
+**O deja que lo haga un agente.** Cuando un agente ha pedido `agent.json` ya conoce estos
+ajustes, sus tipos y sus valores por defecto, así que basta una instrucción:
 
-**Por un agente.** `POST /api/agent/config` con los mismos campos:
+> apunta la placa a `https://your-provider/v1/chat/completions`, modelo `…`, clave `sk-…`,
+> razonamiento `low`, contexto `64000`, salida `4096`
 
-```bash
-curl -sS -X POST http://<board>/api/agent/config -H 'Content-Type: application/json' \
-  -d '{"base_url":"https://your-provider/v1/chat/completions","model":"…","api_key":"…"}'
-```
-
-Tres protocolos (`chat`, `responses`, `anthropic`), un nivel de razonamiento, una ventana de
-contexto y un tope de salida están en el mismo panel y la misma ruta. Sin ninguna clave, apunta
-`base_url` a `http://127.0.0.1/selftest/chat/completions` y el bucle funciona igual, así que una
-placa se prueba antes de tener cuenta. La lista de campos está en [Model](docs/model.md).
+El agente los aplica con `POST /api/agent/config` —la misma llamada que hace el panel— y vuelve
+a leer la configuración para confirmar. No hace falta escribir nada en una terminal, y la misma
+instrucción sirve para cada placa que pueda alcanzar. Sin ninguna clave, `base_url` en
+`http://127.0.0.1/selftest/chat/completions` hace que el bucle corra contra la propia placa.
 
 ## Notas de seguridad
 
