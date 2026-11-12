@@ -6,8 +6,10 @@
 //! through [`ChatTransport`], and time is passed in as a `fn() -> u64` so the
 //! loop itself never reads a clock and stays testable on the host.
 //!
-//! Bounds, because the board has ~300 KB of usable heap and this history is
-//! transcript lives on the heap, not in NVS: a reboot starts a new conversation
+//! Bounds, because the board has ~300 KB of usable heap: the history lives on the heap
+//! while it is in use, and a bounded tail of it lives in NVS between boots
+//! ([`MAX_SAVED_BYTES`]; [`transcript_jsonl`] and [`transcript_from_jsonl`] are the
+//! format, `App` owns the store side).
 //!
 //! * at most [`MAX_HISTORY_MESSAGES`] messages and [`MAX_HISTORY_BYTES`] of text;
 //! * a user message is cut to [`MAX_USER_BYTES`];
@@ -52,6 +54,37 @@ pub const MAX_USER_BYTES: usize = 4096;
 /// Reasoning is shown in the portal but never sent back as answer text, so it gets a
 /// tighter cap than the reply itself.
 pub const MAX_REASONING_BYTES: usize = 4096;
+
+/// The most transcript bytes the board keeps between boots.
+///
+/// Not a storage limit: the tail is written through [`crate::store::KvStore`], and the
+/// board's NVS holds far more than this. It is a RAM limit. Building the stored form
+/// means holding a copy of the tail (this buffer) next to the history that is already on
+/// the heap, on a board with kilobytes of internal SRAM left once TLS is up. Raising it
+/// without a measurement of exactly that would trade a rare lost conversation for a
+/// board that reboots under load, so the number stays where it is until somebody
+/// measures it.
+///
+/// What the budget buys at the per-message caps below: roughly fifty messages of text,
+/// which is the tail of a real task rather than a history.
+pub const MAX_SAVED_BYTES: usize = 16 * 1024;
+/// Text longer than this is cut when the message is stored, with
+/// [`llm::TRUNCATED_MARK`]. The message in RAM keeps the whole text; only the copy that
+/// survives a reboot is shortened.
+pub const MAX_SAVED_TEXT_BYTES: usize = 300;
+/// Reasoning gets less room than the answer: it is folded away in the portal and no
+/// request needs it back in full.
+pub const MAX_SAVED_REASONING_BYTES: usize = 200;
+/// Tool arguments are echoed to the model when the transcript is rebuilt, so they are
+/// stored; a `write` of a whole file is not worth the budget, so they are cut too.
+pub const MAX_SAVED_ARG_BYTES: usize = 256;
+/// The stored format's version. A blob written by a version this build does not know is
+/// refused rather than parsed on a guess.
+pub const TRANSCRIPT_VERSION: u32 = 1;
+/// Room left for the header line when the tail is priced against [`MAX_SAVED_BYTES`].
+/// The header carries five fields and a 16-hex-digit checksum; this is a ceiling, so the
+/// assembled blob cannot exceed the budget by the length of its own header.
+const SAVED_HEADER_RESERVE: usize = 128;
 
 /// When compaction fires, as a fraction of the declared context window.
 ///
@@ -311,6 +344,11 @@ pub struct Agent {
     pub archive: Vec<String>,
     /// How many earlier answers were reduced to a line, so the prompt can say so.
     pub demoted_answers: usize,
+    /// How many of the newest messages a restored transcript had to leave out, because
+    /// the stored tail is capped at [`MAX_SAVED_BYTES`]. Non-zero only on the boot that
+    /// read it back, and stated in the prompt: a model that does not know the beginning
+    /// is gone will confidently assume what it said.
+    pub saved_dropped: usize,
     /// Depth-1 queue: a trigger while a run is in flight coalesces into this.
     pub pending: Option<Message>,
     pub last_error: String,
@@ -343,6 +381,7 @@ impl Default for Agent {
             history: Vec::new(),
             archive: Vec::new(),
             demoted_answers: 0,
+            saved_dropped: 0,
             pending: None,
             last_error: String::new(),
             runs: 0,
@@ -505,6 +544,18 @@ impl Agent {
         self.pending = None;
         self.last_error.clear();
         self.runs = 0;
+        self.saved_dropped = 0;
+    }
+
+    /// The newest question in the transcript, which is what a resumed turn asks again.
+    pub fn last_user(&self) -> Option<&str> {
+        self.history.iter().rev().find(|m| m.role == Role::User).map(|m| m.text.as_str())
+    }
+
+    /// Whether the transcript ends on a tool result: a call landed and no assistant
+    /// message followed it, which is exactly what an interrupted turn looks like.
+    pub fn ends_on_a_tool_result(&self) -> bool {
+        matches!(self.history.last().map(|m| m.role), Some(Role::Tool))
     }
 
     /// One step of a turn, as handed back to whoever drives it.
@@ -832,6 +883,7 @@ impl Agent {
         let removed = self.history.drain(..cut).count();
         self.archive.clear();
         self.demoted_answers = 0;
+        self.saved_dropped = 0;
         self.pending = None;
         self.last_error.clear();
         (removed, self.history.len())
@@ -989,6 +1041,19 @@ impl Agent {
                 ));
             }
         }
+        // What a reboot did not keep. The model has to know: a transcript that silently
+        // starts in the middle reads as "we were always here", and the first thing a model
+        // does with a gap is fill it in from memory.
+        if self.saved_dropped > 0 {
+            text.push_str(&format!(
+                "\n## Recovered after a reboot\nThe board lost power and only the last {kept} \
+                 message(s) of this conversation were stored; {dropped} older one(s) were not \
+                 kept. Do not assume what they said — re-read a file or re-run a tool when the \
+                 answer matters, and say so if the gap blocks the task.\n",
+                kept = self.history.len(),
+                dropped = self.saved_dropped
+            ));
+        }
         text
     }
 }
@@ -1123,6 +1188,181 @@ fn message_json(seq: usize, message: &Message) -> Value {
         out["is_error"] = json!(true);
     }
     out
+}
+
+// ---------------------------------------------------------------- stored transcript
+
+/// The transcript in the form it is stored between boots: JSON Lines, a header line
+/// followed by one message per line.
+///
+/// Why this shape rather than one JSON array: a blob torn by a power cut loses its last
+/// lines, and a line-oriented format plus a checksum in the header makes that detectable
+/// instead of half-adopted. The per-message caps ([`MAX_SAVED_TEXT_BYTES`],
+/// [`MAX_SAVED_REASONING_BYTES`], [`MAX_SAVED_ARG_BYTES`]) are what keep the whole thing
+/// inside [`MAX_SAVED_BYTES`] instead of storing a 2 KB tool result fifty times over.
+///
+/// Attachments are not stored: a base64 screenshot is larger than the entire budget, and
+/// the image had already been seen by the model when the turn ran.
+pub fn transcript_jsonl(history: &[Message], at_ms: u64) -> String {
+    let lines: Vec<String> = history.iter().map(stored_message_line).collect();
+    // Keep the newest messages, dropping the oldest until the tail fits. The header is
+    // priced in up front, so assembling it cannot push the blob over the budget.
+    let mut start = 0usize;
+    while start + 1 < lines.len() {
+        let body: usize = lines[start..].iter().map(|line| line.len() + 1).sum();
+        if body + SAVED_HEADER_RESERVE <= MAX_SAVED_BYTES {
+            break;
+        }
+        start += 1;
+    }
+    // A tail that begins with a tool result carries a `tool_call_id` whose call was cut
+    // with the message before it, and every provider rejects that. Those go too, and they
+    // are counted as dropped: they are gone from what a boot restores.
+    while start + 1 < lines.len() && history[start].role == Role::Tool {
+        start += 1;
+    }
+    let body = if start < lines.len() { lines[start..].join("\n") + "\n" } else { String::new() };
+    let header = stored_header(at_ms, start, checksum(body.as_bytes()));
+    format!("{header}\n{body}")
+}
+
+/// Read back what [`transcript_jsonl`] wrote: the messages and how many older ones the
+/// tail had to drop.
+///
+/// `None` is the answer for anything that does not check out: no header, an unknown
+/// version, a checksum that does not match the body (a write torn by a power cut looks
+/// exactly like this), a line that is not a message, or a tool result whose call is not
+/// in the tail. The caller starts a new conversation instead, which is worse than a
+/// complete history and far better than a transcript a provider rejects on every turn.
+pub fn transcript_from_jsonl(text: &str) -> Option<(Vec<Message>, usize)> {
+    let (header, body) = text.split_once('\n')?;
+    let header: Value = serde_json::from_str(header).ok()?;
+    if header.get("v").and_then(|v| v.as_u64())? != TRANSCRIPT_VERSION as u64 {
+        return None;
+    }
+    let dropped = header.get("dropped").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+    let expected = u64::from_str_radix(header.get("hash").and_then(|v| v.as_str())?, 16).ok()?;
+    if checksum(body.as_bytes()) != expected {
+        return None;
+    }
+    let mut messages = Vec::new();
+    for line in body.lines().filter(|line| !line.trim().is_empty()) {
+        messages.push(stored_message(line)?);
+    }
+    // Structure: every result must answer a call that is still in the tail, or the next
+    // request is one no endpoint will accept. Calls left open at the end are fine - that
+    // is the interrupted turn this whole module exists to resume.
+    let mut open: Vec<String> = Vec::new();
+    for message in &messages {
+        match message.role {
+            Role::Assistant => open.extend(message.tool_calls.iter().map(|call| call.id.clone())),
+            Role::Tool => {
+                let id = message.tool_call_id.clone().unwrap_or_default();
+                let at = open.iter().position(|seen| *seen == id)?;
+                open.remove(at);
+            }
+            _ => {}
+        }
+    }
+    Some((messages, dropped))
+}
+
+fn stored_header(at_ms: u64, dropped: usize, checksum: u64) -> String {
+    json!({
+        "v": TRANSCRIPT_VERSION,
+        "at_ms": at_ms,
+        "dropped": dropped,
+        "hash": format!("{checksum:016x}"),
+    })
+    .to_string()
+}
+
+/// One stored message. Absent fields are absent rather than empty: the blob is read under
+/// a 16 KB ceiling and an `"is_error":false` per line is bytes that buy nothing.
+fn stored_message_line(message: &Message) -> String {
+    let mut out = serde_json::Map::new();
+    out.insert("role".into(), json!(message.role.as_str()));
+    if !message.text.is_empty() {
+        out.insert("text".into(), json!(llm::truncate_bytes(&message.text, MAX_SAVED_TEXT_BYTES)));
+    }
+    if !message.reasoning.is_empty() {
+        out.insert(
+            "reasoning".into(),
+            json!(llm::truncate_bytes(&message.reasoning, MAX_SAVED_REASONING_BYTES)),
+        );
+    }
+    if !message.tool_calls.is_empty() {
+        let calls: Vec<Value> = message
+            .tool_calls
+            .iter()
+            .map(|call| {
+                let arguments = llm::arguments_request_json(call);
+                json!({
+                    "id": call.id,
+                    "name": call.name,
+                    "arguments": llm::truncate_bytes(&arguments, MAX_SAVED_ARG_BYTES),
+                })
+            })
+            .collect();
+        out.insert("tool_calls".into(), Value::Array(calls));
+    }
+    if let Some(id) = &message.tool_call_id {
+        out.insert("tool_call_id".into(), json!(id));
+    }
+    if message.is_error {
+        out.insert("is_error".into(), json!(true));
+    }
+    if !message.source.is_empty() {
+        out.insert("source".into(), json!(message.source));
+    }
+    out.insert("at_ms".into(), json!(message.at_ms));
+    Value::Object(out).to_string()
+}
+
+fn stored_message(line: &str) -> Option<Message> {
+    let value: Value = serde_json::from_str(line).ok()?;
+    let role = Role::parse(value.get("role")?.as_str()?);
+    let text = value.get("text").and_then(|v| v.as_str()).unwrap_or_default();
+    let reasoning = value.get("reasoning").and_then(|v| v.as_str()).unwrap_or_default();
+    let mut tool_calls = Vec::new();
+    for call in value.get("tool_calls").and_then(|v| v.as_array()).into_iter().flatten() {
+        let id = call.get("id").and_then(|v| v.as_str())?.to_string();
+        let name = call.get("name").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+        // A cut argument string is not JSON any more; the transcript must still parse, so
+        // the call is re-sent with no arguments rather than dropped: its result names the
+        // id, and a call without arguments is a request the endpoint still accepts.
+        let arguments = call
+            .get("arguments")
+            .and_then(|v| v.as_str())
+            .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+            .unwrap_or_else(|| json!({}));
+        tool_calls.push(ToolCall { id, name, arguments });
+    }
+    Some(Message {
+        role,
+        // The stored copy is already cut; constructing through the role helpers would cut
+        // it again against the larger in-RAM caps, so the fields are filled directly.
+        text: text.to_string(),
+        reasoning: reasoning.to_string(),
+        tool_calls,
+        tool_call_id: value.get("tool_call_id").and_then(|v| v.as_str()).map(|v| v.to_string()),
+        is_error: value.get("is_error").and_then(|v| v.as_bool()).unwrap_or(false),
+        source: value.get("source").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
+        at_ms: value.get("at_ms").and_then(|v| v.as_u64()).unwrap_or(0),
+        attachments: Vec::new(),
+    })
+}
+
+/// FNV-1a over the body: one cheap pass, no dependency, and enough to tell a torn or
+/// half-overwritten blob from an intact one. It is an integrity check for a power cut,
+/// not a signature.
+fn checksum(bytes: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
 }
 
 fn merge_sources(a: &str, b: &str) -> String {
@@ -2033,5 +2273,211 @@ mod tests {
         assert!(agent.pending.is_none());
         assert_eq!(agent.runs, 0);
         assert_eq!(agent.transcript_json()["count"], 0);
+    }
+
+    // ------------------------------------------------ the transcript between boots
+
+    /// Three turns of real work, through the stored form and back: roles, text, the
+    /// reasoning that produced a call, the call itself and the result that answers it.
+    #[test]
+    fn a_transcript_round_trips_through_the_stored_form() {
+        let mut agent = Agent::new();
+        for turn in 0..3u64 {
+            agent.history.push(Message::user(&format!("question {turn}"), "http", 10 * turn));
+            let call = ToolCall {
+                id: format!("c{turn}"),
+                name: "board_status".into(),
+                arguments: json!({ "detail": true }),
+            };
+            agent.history.push(Message::assistant_with_reasoning(
+                "checking",
+                &format!("because {turn}"),
+                vec![call],
+                10 * turn + 1,
+            ));
+            agent.history.push(Message::tool_result(
+                &format!("c{turn}"),
+                &format!("{{\"boot\":true,\"turn\":{turn}}}"),
+                false,
+                10 * turn + 2,
+            ));
+            agent.history.push(Message::assistant(&format!("answer {turn}"), Vec::new(), 10 * turn + 3));
+        }
+
+        let stored = transcript_jsonl(&agent.history, 999);
+        let (restored, dropped) = transcript_from_jsonl(&stored).expect("a stored transcript parses");
+        assert_eq!(dropped, 0, "everything fitted, so nothing was dropped");
+        assert_eq!(restored.len(), agent.history.len());
+
+        for (before, after) in agent.history.iter().zip(restored.iter()) {
+            assert_eq!(before.role, after.role);
+            assert_eq!(before.text, after.text);
+            assert_eq!(before.reasoning, after.reasoning);
+            assert_eq!(before.at_ms, after.at_ms);
+            assert_eq!(before.tool_call_id, after.tool_call_id);
+            assert_eq!(before.is_error, after.is_error);
+            assert_eq!(before.source, after.source);
+            assert_eq!(
+                before.tool_calls.iter().map(|c| (&c.id, &c.name)).collect::<Vec<_>>(),
+                after.tool_calls.iter().map(|c| (&c.id, &c.name)).collect::<Vec<_>>()
+            );
+        }
+        // The arguments come back as JSON, not as a string that still has to be parsed.
+        let call = &restored[1].tool_calls[0];
+        assert_eq!(call.arguments, json!({ "detail": true }));
+        // The tool results are intact, which is the whole point: the model must be able to
+        // see what a call returned without the call running again.
+        assert_eq!(restored[2].text, "{\"boot\":true,\"turn\":0}");
+        assert_eq!(restored[2].tool_call_id.as_deref(), Some("c0"));
+
+        // An image never reaches flash: it is larger than the budget and the model already
+        // saw it during the turn that carried it.
+        let with_image = vec![Message::user("look", "http", 1).with_attachments(vec![Attachment {
+            name: "shot.jpg".into(),
+            mime: "image/jpeg".into(),
+            data_b64: "aGVsbG8=".into(),
+        }])];
+        let (restored, _) = transcript_from_jsonl(&transcript_jsonl(&with_image, 2)).expect("parses");
+        assert!(restored[0].attachments.is_empty());
+        assert_eq!(restored[0].text, "look");
+    }
+
+    #[test]
+    fn the_stored_form_cuts_long_text_and_reasoning_with_the_repo_marker() {
+        let history = vec![
+            Message::user(&"q".repeat(400), "http", 1),
+            Message::assistant_with_reasoning(
+                &"a".repeat(400),
+                &"r".repeat(400),
+                vec![ToolCall {
+                    id: "c1".into(),
+                    name: "fs_read".into(),
+                    arguments: json!({ "path": "/AGENTS.md" }),
+                }],
+                2,
+            ),
+            Message::tool("c1", &"y".repeat(600), 3),
+        ];
+        let stored = transcript_jsonl(&history, 4);
+        assert!(!stored.contains(&"q".repeat(400)), "the whole question is not stored");
+        let (restored, dropped) = transcript_from_jsonl(&stored).expect("parses");
+        assert_eq!(dropped, 0, "cutting a message is not dropping it");
+        assert!(restored[0].text.ends_with(llm::TRUNCATED_MARK));
+        assert!(restored[0].text.len() <= MAX_SAVED_TEXT_BYTES + llm::TRUNCATED_MARK.len());
+        assert!(restored[1].text.ends_with(llm::TRUNCATED_MARK));
+        assert!(restored[1].reasoning.ends_with(llm::TRUNCATED_MARK));
+        assert!(restored[1].reasoning.len() <= MAX_SAVED_REASONING_BYTES + llm::TRUNCATED_MARK.len());
+        assert!(restored[2].text.ends_with(llm::TRUNCATED_MARK));
+        // The cut does not break the pairing the next request depends on.
+        assert_eq!(restored[1].tool_calls[0].id, "c1");
+        assert_eq!(restored[2].tool_call_id.as_deref(), Some("c1"));
+        // In RAM the message keeps everything; only the stored copy is cut.
+        assert_eq!(history[0].text.len(), 400);
+        // Every line is one message: a JSON Lines file is not a JSON document.
+        let lines: Vec<&str> = stored.lines().collect();
+        assert_eq!(lines.len(), 4, "a header and three messages");
+        let header: Value = serde_json::from_str(lines[0]).expect("the header is JSON");
+        assert_eq!(header["v"], json!(TRANSCRIPT_VERSION));
+        assert_eq!(header["dropped"], json!(0));
+    }
+
+    #[test]
+    fn a_transcript_over_the_budget_keeps_its_tail_and_counts_what_it_dropped() {
+        let mut history = Vec::new();
+        for i in 0..120u64 {
+            history.push(Message::user(&format!("question {i} {}", "q".repeat(300)), "http", 10 * i));
+            history.push(Message::assistant(
+                &format!("answer {i} {}", "a".repeat(300)),
+                Vec::new(),
+                10 * i + 1,
+            ));
+        }
+        let stored = transcript_jsonl(&history, 5_000);
+        assert!(
+            stored.len() <= MAX_SAVED_BYTES,
+            "the stored tail is {} bytes, over the {MAX_SAVED_BYTES} budget",
+            stored.len()
+        );
+
+        let (restored, dropped) = transcript_from_jsonl(&stored).expect("parses");
+        assert!(dropped > 0, "a transcript this long must have dropped messages");
+        assert_eq!(restored.len() + dropped, history.len(), "nothing appears or vanishes silently");
+        assert!(restored.len() >= 10, "the tail is worth keeping: {} message(s) survived", restored.len());
+        // What survived is the end of the conversation, in order, not a prefix.
+        assert_eq!(
+            restored.last().map(|m| m.text.clone()),
+            Some(llm::truncate_bytes(&history.last().unwrap().text, MAX_SAVED_TEXT_BYTES))
+        );
+        assert_eq!(restored[0].text, llm::truncate_bytes(&history[dropped].text, MAX_SAVED_TEXT_BYTES));
+        // And the header says how much is missing, which is what the prompt repeats.
+        let header: Value = serde_json::from_str(stored.lines().next().unwrap()).expect("header");
+        assert_eq!(header["dropped"], json!(dropped));
+    }
+
+    /// The case the whole checksum exists for: a power cut in the middle of a write leaves
+    /// a blob whose tail is not the tail its header was built with.
+    #[test]
+    fn a_blob_torn_by_a_power_cut_is_refused_rather_than_half_adopted() {
+        let mut agent = Agent::new();
+        for i in 0..6u64 {
+            agent.history.push(Message::user(&format!("question {i}"), "http", 10 * i));
+            agent.history.push(Message::assistant(&format!("answer {i}"), Vec::new(), 10 * i + 1));
+        }
+        let stored = transcript_jsonl(&agent.history, 900);
+
+        // Not JSON at all.
+        assert!(transcript_from_jsonl("not json").is_none());
+        // No header.
+        assert!(transcript_from_jsonl("").is_none());
+        assert!(transcript_from_jsonl("{\"role\":\"user\",\"text\":\"hi\"}\n{}").is_none());
+        // Cut in the middle: the header is complete, the body is not.
+        let cut = &stored[..stored.len() - 40];
+        assert!(transcript_from_jsonl(cut).is_none(), "a torn body must not be adopted");
+        // Cut exactly at a line boundary: still a different body than the header describes.
+        let lines: Vec<&str> = stored.lines().collect();
+        let short = format!("{}\n{}\n", lines[0], lines[1]);
+        assert!(transcript_from_jsonl(&short).is_none(), "a shortened body must not be adopted");
+        // A body edited in place.
+        let edited = stored.replacen("answer 3", "answer 9", 1);
+        assert!(transcript_from_jsonl(&edited).is_none(), "an edited body must not be adopted");
+        // The intact blob still parses, so the checks above refused for the right reason.
+        assert!(transcript_from_jsonl(&stored).is_some());
+    }
+
+    /// A tail whose first message is a tool result names a call that was cut with the
+    /// message before it. Sending that to a provider is a 400 on every turn, so the tail
+    /// is refused instead of being adopted with a hole in it.
+    #[test]
+    fn a_tool_result_whose_call_is_not_in_the_tail_is_refused() {
+        let history = vec![
+            Message::assistant(
+                "checking",
+                vec![ToolCall { id: "c1".into(), name: "board_status".into(), arguments: json!({}) }],
+                1,
+            ),
+            Message::tool("c1", "{}", 2),
+        ];
+        let stored = transcript_jsonl(&history, 3);
+        assert!(transcript_from_jsonl(&stored).is_some());
+
+        // The same result with its call removed, as a bad tail would be.
+        let orphan = json!({ "role": "tool", "tool_call_id": "c9", "text": "{}", "at_ms": 2 }).to_string();
+        let body = format!("{orphan}\n");
+        let header = stored_header(4, 0, checksum(body.as_bytes()));
+        assert!(transcript_from_jsonl(&format!("{header}\n{body}")).is_none());
+
+        // A call left open at the end is not an error: that is the interrupted turn.
+        let interrupted = vec![
+            Message::user("turn the pump on", "http", 1),
+            Message::assistant(
+                "",
+                vec![ToolCall { id: "c1".into(), name: "gpio_write".into(), arguments: json!({}) }],
+                2,
+            ),
+            Message::tool("c1", "{\"ok\":true}", 3),
+        ];
+        let (restored, _) = transcript_from_jsonl(&transcript_jsonl(&interrupted, 4)).expect("parses");
+        assert!(restored.last().map(|m| m.role) == Some(Role::Tool));
+        assert_eq!(restored.last().and_then(|m| m.tool_call_id.clone()).as_deref(), Some("c1"));
     }
 }
