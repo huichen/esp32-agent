@@ -1037,7 +1037,7 @@ impl App {
         }
         // `shell` is a router in front of the fs_*/net_* handlers, so it has to be reached
         // from both entry points: the model's tool host and the MCP `tools/call`.
-        if name == "nsh" || name == "shell" {
+        if name == "shell" {
             let text = self.run_shell(args).map_err(McpError::invalid_params)?;
             return Ok(serde_json::from_str(&text).unwrap_or_else(|_| json!({ "text": text })));
         }
@@ -4369,7 +4369,7 @@ mod tests {
             .iter()
             .map(|t| t["function"]["name"].as_str().unwrap_or("").to_string())
             .collect();
-        for kept in ["nsh", "script"] {
+        for kept in ["shell", "script"] {
             assert!(names.iter().any(|n| n == kept), "{kept} must survive the minimal profile");
         }
 
@@ -4551,7 +4551,7 @@ mod tests {
         let mut app = test_app();
         ToolHost::call_tool(
             &mut app,
-            "nsh",
+            "shell",
             &json!({"command": "system_prompt set the pump is on GPIO12; never run it past two minutes"}),
         )
         .expect("set");
@@ -4585,14 +4585,15 @@ mod tests {
     fn nsh_hashes_a_file_the_way_sha256sum_does() {
         let mut app = test_app();
         ToolHost::call_tool(&mut app, "write", &json!({"path":"/h.txt","text":"abc"})).expect("write");
-        let out =
-            ToolHost::call_tool(&mut app, "nsh", &json!({"command": "sha256sum /h.txt"})).expect("sha256sum");
+        let out = ToolHost::call_tool(&mut app, "shell", &json!({"command": "sha256sum /h.txt"}))
+            .expect("sha256sum");
         let value: Value = serde_json::from_str(&out).unwrap();
         assert_eq!(
             value["sha256"],
             json!("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
         );
-        let md5 = ToolHost::call_tool(&mut app, "nsh", &json!({"command": "md5sum /h.txt"})).expect("md5sum");
+        let md5 =
+            ToolHost::call_tool(&mut app, "shell", &json!({"command": "md5sum /h.txt"})).expect("md5sum");
         let value: Value = serde_json::from_str(&md5).unwrap();
         assert_eq!(value["md5"], json!("900150983cd24fb0d6963f7d28e17f72"));
     }
@@ -5065,7 +5066,7 @@ mod tests {
         assert!(tools.iter().all(|t| t["type"] == "function" && t["function"]["parameters"].is_object()));
         assert!(names.contains(&"board_status"), "got {names:?}");
         assert!(names.contains(&"oled_text"));
-        assert!(names.contains(&"nsh"), "the file and network commands are missing: {names:?}");
+        assert!(names.contains(&"shell"), "the file and network commands are missing: {names:?}");
         // A tool whose hardware is absent is not offered, exactly as in tools/list.
         assert!(!names.contains(&"mpu6050_read"));
     }
@@ -5417,7 +5418,7 @@ mod tests {
             .filter_map(|t| t["function"]["name"].as_str())
             .collect();
         assert!(names.contains(&"board_status"), "got {names:?}");
-        assert!(names.contains(&"nsh"), "got {names:?}");
+        assert!(names.contains(&"shell"), "got {names:?}");
         assert_eq!(body1["model"], "stub");
 
         // The second request carries the board's answer back as a `tool` message.
@@ -5527,7 +5528,7 @@ mod tests {
     fn the_file_and_network_tools_are_in_the_mcp_list_and_callable() {
         let mut app = test_app();
         let names = tool_names(&mut app);
-        for needle in ["nsh", "script", "image_read"] {
+        for needle in ["shell", "script", "image_read"] {
             assert!(names.contains(&needle.to_string()), "{needle} is missing from tools/list: {names:?}");
         }
 
@@ -5537,7 +5538,7 @@ mod tests {
             .as_array()
             .unwrap()
             .iter()
-            .find(|t| t["name"] == "nsh")
+            .find(|t| t["name"] == "shell")
             .expect("shell in the list");
         assert!(shell["inputSchema"]["properties"]["command"].is_object(), "{shell}");
 
@@ -5853,7 +5854,7 @@ mod tests {
         sorted.sort_unstable();
         assert_eq!(names, sorted, "the tool list is not alphabetical: {names:?}");
 
-        for needle in ["board_status", "manifest_apply", "nsh", "script", "image_read"] {
+        for needle in ["board_status", "manifest_apply", "shell", "script", "image_read"] {
             assert!(names.contains(&needle), "{needle} is missing: {names:?}");
         }
         // A manifest tool sorts among the rest — `aaa_manifest` is first, not last.
@@ -5901,7 +5902,7 @@ mod tests {
         let tools = body["tools"].as_array().expect("tools");
         let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().expect("a name")).collect();
 
-        for needle in ["script", "nsh", "image_read", "board_status"] {
+        for needle in ["script", "shell", "image_read", "board_status"] {
             assert!(names.contains(&needle), "{needle} is missing from the portal: {names:?}");
         }
         let mut sorted = names.clone();
@@ -6025,7 +6026,7 @@ mod tests {
             assert!(!names.contains(&absent.to_string()), "{absent} is back in the tool list: {names:?}");
         }
         // The file tools that do reach them are still there.
-        for present in ["nsh"] {
+        for present in ["shell"] {
             assert!(names.contains(&present.to_string()), "{present} is missing: {names:?}");
         }
 

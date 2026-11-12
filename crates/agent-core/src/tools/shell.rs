@@ -245,7 +245,7 @@ pub fn usage(op: &str) -> Option<&'static str> {
     })
 }
 
-/// Every command with its usage, for `nsh {"command":"help"}`.
+/// Every command with its usage, for `shell {"command":"help"}`.
 pub fn help_text() -> String {
     let mut out = String::from("shell commands:\n");
     for (op, _) in OPS {
@@ -268,7 +268,7 @@ pub fn route(op: &str) -> Option<&'static str> {
 /// The one tool definition the model and MCP clients see.
 pub fn spec() -> ToolDef {
     ToolDef::new(
-        "nsh",
+        "shell",
         "Run a command on the board, as on any unix shell: one `command` string.\n\
          ls [path] · rm <path> --confirm · cp <from> <to> · mv <from> <to> --confirm · grep <pattern> [path]\n\
          curl <url> [-d body] [-f text|raw] · wget <url> [-o path] · nslookup <host> · nc <host> [-p port] · ping <host> [-c n] · ifconfig\n\
@@ -276,7 +276,7 @@ pub fn spec() -> ToolDef {
          df · free · uptime · date · uname · ps · help\n\
          `curl` reduces an HTML page to its text unless -f raw. A wrong command answers with its usage; `shell help` lists everything.",
     )
-    .title("NuttX shell")
+    .title("Shell")
     .category("system")
     .schema(object_schema(
         &[
@@ -324,7 +324,7 @@ mod tests {
         }
         assert_eq!(route("sudo"), None);
         let spec = spec();
-        assert_eq!(spec.spec.name, "nsh");
+        assert_eq!(spec.spec.name, "shell");
         assert!(spec.spec.input_schema["properties"]["command"].is_object());
     }
 }
