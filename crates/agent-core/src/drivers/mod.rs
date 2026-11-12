@@ -1043,23 +1043,47 @@ mod cap_tests {
     /// `devices_list` and change nothing the model can call.
     #[test]
     fn each_declarable_driver_builds_a_device_with_tools() {
-        let cases: &[(&str, serde_json::Value)] = &[
-            ("bdc_motor", serde_json::json!({"in1": 4, "in2": 5})),
-            ("bdc_motor", serde_json::json!({"pwm": 4, "dir": 5})),
-            ("stepper", serde_json::json!({"step": 4, "dir": 5, "enable": 6})),
-            ("encoder", serde_json::json!({"a": 4, "b": 5})),
-            ("pir", serde_json::json!({"out": 4})),
-            ("hx711", serde_json::json!({"dout": 4, "sck": 5})),
-            ("tm1637", serde_json::json!({"clk": 4, "dio": 5})),
-            ("max7219", serde_json::json!({"cs": 4})),
-            ("rc522", serde_json::json!({"cs": 4, "rst": 5})),
-            ("bme680", serde_json::json!({"address": 118})),
-            ("aht20", serde_json::json!({"address": 56})),
-            ("bh1750", serde_json::json!({"address": 35})),
-            ("ds3231", serde_json::json!({"address": 104})),
-            ("vl53l0x", serde_json::json!({"address": 41})),
+        // (kind, pins, options). The camera is the first driver that needs options rather
+        // than pins to be declarable, so the table carries both.
+        let cases: &[(&str, serde_json::Value, &[(&str, &str)])] = &[
+            ("bdc_motor", serde_json::json!({"in1": 4, "in2": 5}), &[]),
+            ("bdc_motor", serde_json::json!({"pwm": 4, "dir": 5}), &[]),
+            ("stepper", serde_json::json!({"step": 4, "dir": 5, "enable": 6}), &[]),
+            ("encoder", serde_json::json!({"a": 4, "b": 5}), &[]),
+            ("pir", serde_json::json!({"out": 4}), &[]),
+            ("hx711", serde_json::json!({"dout": 4, "sck": 5}), &[]),
+            ("tm1637", serde_json::json!({"clk": 4, "dio": 5}), &[]),
+            ("max7219", serde_json::json!({"cs": 4}), &[]),
+            ("rc522", serde_json::json!({"cs": 4, "rst": 5}), &[]),
+            ("bme680", serde_json::json!({"address": 118}), &[]),
+            ("aht20", serde_json::json!({"address": 56}), &[]),
+            ("bh1750", serde_json::json!({"address": 35}), &[]),
+            ("ds3231", serde_json::json!({"address": 104}), &[]),
+            ("vl53l0x", serde_json::json!({"address": 41}), &[]),
+            // A DVP camera: twelve pins and a geometry, because the frame comes from the
+            // platform and the driver has to be told where the bus is wired.
+            (
+                "camera",
+                serde_json::json!({"address": 48}),
+                &[
+                    ("xclk", "10"),
+                    ("pclk", "11"),
+                    ("vsync", "12"),
+                    ("href", "13"),
+                    ("d0", "14"),
+                    ("d1", "15"),
+                    ("d2", "16"),
+                    ("d3", "17"),
+                    ("d4", "18"),
+                    ("d5", "19"),
+                    ("d6", "20"),
+                    ("d7", "21"),
+                    ("width", "320"),
+                    ("height", "240"),
+                ],
+            ),
         ];
-        for (kind, pins) in cases {
+        for (kind, pins, options) in cases {
             let spec = crate::manifest::DeviceSpec {
                 id: format!("{kind}_t"),
                 kind: kind.to_string(),
@@ -1072,7 +1096,7 @@ mod cap_tests {
                         m.iter().filter_map(|(k, v)| v.as_i64().map(|n| (k.clone(), n as i32))).collect()
                     })
                     .unwrap_or_default(),
-                options: Default::default(),
+                options: options.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
                 enabled: true,
                 note: String::new(),
             };
