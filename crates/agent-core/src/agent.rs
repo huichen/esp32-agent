@@ -1063,7 +1063,7 @@ impl Agent {
         if !skills.is_empty() {
             text.push_str(
                 "\n\n## Skills\nEach line is `name: description` followed by the file to read. \
-                 When one matches the task, open that file with fs_read before following it; a \
+                 When one matches the task, open that file with `read` before following it; a \
                  directory may hold other files next to SKILL.md (diagrams, tables, a pinout) and \
                  those are readable the same way. Do not reconstruct a procedure from its \
                  description.\n",
@@ -1073,12 +1073,12 @@ impl Agent {
             }
         }
         // What earlier sessions wrote down. The index is all that goes in the prompt; a
-        // memory is opened with `fs_read` like any other file, so nothing is loaded twice
+        // memory is opened with `read` like any other file, so nothing is loaded twice
         // and nothing is spent on a topic this turn does not need.
         text.push_str(
             "\n\n## Memory (/MEMORY.md)\n\
              This is what you wrote down in earlier sessions, as an index. Open a topic with \
-             fs_read before relying on it; a fresh board has none.\n\
+             `read` before relying on it; a fresh board has none.\n\
              To remember something: write the fact to `/memory/<topic>.md` (2 KB is the file \
              limit) and add **one line** to `/MEMORY.md` — `- [topic](path) — hook`. The line is a \
              pointer, never the memory itself, and the index is kept under 24 lines; replace an \
@@ -1131,9 +1131,9 @@ pub fn system_prompt() -> &'static str {
     "You are the agent running on an esp32-agent board over a small LAN.\n\
      1. Answer the user's question in their language, briefly: replies are capped at 8 KB and shown on a small portal page.\n\
      2. When a fact about the board is needed, call a tool instead of guessing; one call at a time, then use its result.\n\
-     3. Prefer board_status, then the narrower tool. Never repeat a call whose result you already have.\n\
+     3. Prefer the `board` tool's status command, then the narrower tool. Never repeat a call whose result you already have.\n\
      4. If a tool fails, say what failed and what you tried; do not invent readings.\n\
-     5. You cannot browse the internet except through the net_get/net_post tools, and you cannot reboot the board."
+     5. You cannot browse the internet except through `shell`, with a command line like `curl <url>`; you cannot reboot the board."
 }
 
 /// Where the last `keep` question-and-answer exchanges begin.
