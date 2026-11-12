@@ -5,9 +5,9 @@ what is not done or not verified.
 
 ## Verified / unverified
 
-- ✅ `agent-core`: 684 unit tests and 14 integration tests (protocol, HTTP, manifest
+- ✅ `agent-core`: 680 unit tests and 14 integration tests (protocol, HTTP, manifest
   validation, driver conversion, capability filtering, auth, hot reload, the agent loop,
-  shell and script, the file tools, sched, SSE streams)
+  shell and script, the file tools, sched, SSE streams, a streamed request body)
 - ✅ Simulator end to end: `scripts/smoke.ps1` and `scripts/smoke.sh`
 - ✅ Firmware runs on real hardware (ESP32-S3-DevKitC-1 N16R8, ESP-IDF v5.5.2):
   boots without a reset loop, the I2C bus works, setup AP and station mode coexist, `/`
@@ -22,7 +22,8 @@ what is not done or not verified.
 - ✅ Live journal over SSE (`/api/agent/stream`), `tool_progress`, `agent.tick_ms`
 - ⚠️ Not measured: WS2812/RMT, ADC/PWM values, boot time and power draw under a full
   sdkconfig; the portal's live console has only been driven with `curl -N`, not in a
-  browser
+  browser; and `POST /audio/pcm` has only been played to the simulator — on the board the
+  claim that the amplifier's DMA paces the socket is untested
 
 ## Near term
 
@@ -42,24 +43,28 @@ what is not done or not verified.
 
 ## Medium term
 
-7. **A camera frame that does not hold a lock.** `camera_capture` returns a frame as
+7. **Audio streaming, the two things `/audio/pcm` does not do**: change the I2S TX rate at
+   runtime (the clock is a constant, so only 24000 Hz is accepted) and hold two uploads at
+   once. Both need a second thread or a reopenable channel, and internal RAM is the
+   constraint — `docs/audio.md` §6 has the arithmetic.
+8. **A camera frame that does not hold a lock.** `camera_capture` returns a frame as
    base64 through the same tool result a sensor reading uses, which is why the frame has to
    be small. A mode and frame-size negotiation over SCCB plus DMA frame buffers in PSRAM —
    writing the frame to the workspace, or streaming it — is a feature, not a driver, and it
    should land after the storage question (3) is answered.
-8. **Manifest template library**: grow `examples/manifests/` into a set of device recipes
+9. **Manifest template library**: grow `examples/manifests/` into a set of device recipes
    that the console can import in one click.
-9. **Capability registry**: make the table in `docs/capabilities.md` the single source a
+10. **Capability registry**: make the table in `docs/capabilities.md` the single source a
     `scripts/` check validates (the repository ships without CI).
-10. **Multi-bus / multi-device UI**: a second device of the same kind gets a `_2` suffix
+11. **Multi-bus / multi-device UI**: a second device of the same kind gets a `_2` suffix
     today, and the console cannot tell them apart.
 
 ## Long term
 
-11. **Zero-code extension**: expressions in manifests (`scale`, `map`, `threshold`) for
+12. **Zero-code extension**: expressions in manifests (`scale`, `map`, `threshold`) for
     conversion, to remove more of the need for drivers.
-12. **Resource subscriptions**: push sensor changes to clients (`resources/subscribe`).
-13. **Security**: on-device OAuth (at least a token + rate limits + an allowlist for
+13. **Resource subscriptions**: push sensor changes to clients (`resources/subscribe`).
+14. **Security**: on-device OAuth (at least a token + rate limits + an allowlist for
     dangerous actions).
-14. **Community**: issue templates split by "new device / new driver / protocol bug";
+15. **Community**: issue templates split by "new device / new driver / protocol bug";
     package `examples/manifests/` into a demo board every quarter.

@@ -274,6 +274,16 @@ pub const ROUTES: &[Route] = &[
         "",
         "{system, bytes, archive_lines, history}",
     ),
+    // --- audio ---------------------------------------------------------------------
+    r(
+        "POST",
+        "/audio/pcm",
+        "audio",
+        Auth::Pin,
+        "Play PCM as it arrives: the body is raw PCM16LE mono at 24000 Hz, streamed straight into the amplifier — a song, not a 43 ms tool argument (docs/audio.md)",
+        "raw PCM16LE mono, 24000 Hz, chunked or Content-Length; at most 30 s",
+        "{ok, rate_hz, channels, bits, bytes, samples, ms, limit_bytes}",
+    ),
     // --- scheduling ----------------------------------------------------------------
     r("GET", "/api/sched", "sched", Auth::Open, "Scheduled tasks and sensor rules", "", "{tasks, rules}"),
     r(

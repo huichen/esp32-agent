@@ -142,11 +142,63 @@ host. It is **not implemented** — this document proposes it, it does not claim
 2. Do not attempt an Opus encoder for this board. Flash would fit; internal SRAM would not,
    by a factor of three, and a forked libopus is a maintenance burden for a chip that cannot
    run it.
-3. Revisit if a board arrives with ~40–50 kB of free internal SRAM *and* a PSRAM-capable task
+3. Play a song by streaming PCM into `POST /audio/pcm` (§6), which reads the body as it
+   arrives. Do not grow `speaker_play`: its 2 KB is the tool-result cap, not an oversight.
+4. Revisit if a board arrives with ~40–50 kB of free internal SRAM *and* a PSRAM-capable task
    stack (ESP32-P4 class, or DMA that reaches PSRAM): the flash arithmetic above already says
    the code would fit there.
 
-## 6. How to check these numbers again
+## 6. Streaming playback: `POST /audio/pcm`
+
+The board could make a tone but not play a song: `speaker_play` carries 2048 bytes, which is
+43 ms at 24 kHz, and every fix along that road runs into the same wall as the encoder — a
+tool result is 2 KB and a request body is 128 KB (`agent::MAX_TOOL_RESULT_BYTES`,
+`http::MAX_BODY_BYTES`), i.e. 1.3 s. Neither is the format's fault; both are the cost of
+holding the bytes somewhere first.
+
+So there is one route whose body is not held at all. `POST /audio/pcm` takes raw PCM16LE,
+mono, 24 kHz, framed with `Content-Length` or `Transfer-Encoding: chunked`, and hands each
+piece straight to `i2s_out_write` as it arrives:
+
+| | Value | Where |
+|---|---|---|
+| Sample format | PCM16LE, mono, 24000 Hz | `drivers::audio::AMP_RATE_HZ` |
+| One upload | at most **30 s** = 1 440 000 bytes | `AUDIO_STREAM_MAX_BYTES` |
+| Buffer used | two reused `Vec`s, ~3 KB of capacity, no growth per piece | `AudioSink` |
+| New task thread | **none** — the request runs on the accept thread it already owns | `http.rs` |
+| Lock held | one piece at a time (about 1 KB, 21 ms), never for the song | `AudioSink::push` |
+
+The three numbers that matter, in the order they bite:
+
+- **No new stack.** A dedicated audio thread would want the same 6 kB `CONN_STACK` the event
+  streams use, and the boot log already says internal free heap is around 7 kB. The upload
+  therefore runs inline: while one plays, the accept thread is busy and other requests wait
+  in the listen backlog. That is the same trade the sync-melody call makes on the bench
+  firmware, and it is bounded here by the 30 s cap instead of by a task that might not fit.
+- **No body buffer.** 48 KB/s into a `Vec` is not a stream, it is a memory leak with a
+  deadline; the body never becomes one. The socket is throttled by the amplifier, because
+  `i2s_channel_write` blocks until the DMA has taken the piece.
+- **The lock is per piece.** `App` is one mutex, and a handler that held it for a song would
+  stop the portal, `/api/status` and the board's own agent thread for its duration.
+
+Two failures this path has to answer honestly, because both are easy to get wrong:
+
+1. **An odd byte.** A socket read can end mid-sample. The byte is carried into the next piece,
+   and if the body ends with one it is reported as `400` and dropped — never played as half a
+   sample (which is a click).
+2. **A body that ends early.** The client hung up or the amplifier refused. The answer is
+   `ok: false` with the samples that *were* played, because half a song is not a song.
+
+The amplifier itself needs no new handling: `i2s_out_write` already duplicates mono into both
+slots and clears the TX descriptor afterwards, which is what keeps a finished stream from
+replaying its last DMA buffer forever (the bench bug in `firmware/src/esp_hw.rs`).
+
+What this does **not** do: change the sample rate (the I2S TX clock is the constant
+`AMP_RATE_HZ`, so `?rate=` accepts 24000 only), and hold two uploads at once. Both need a
+`i2s_open_tx(rate)` and a second thread, i.e. RAM this board does not have; they are
+`ROADMAP.md` items, not promises.
+
+## 7. How to check these numbers again
 
 - Flash: `espflash flash --partition-table firmware/partitions.csv --target-app-partition
   factory <elf>` prints `App size … (N%)`; compare N with 86%.
@@ -155,3 +207,7 @@ host. It is **not implemented** — this document proposes it, it does not claim
 - The WAV itself: call `mic_record` over `/mcp`, write `wav_b64` to a file after
   base64-decoding it, then `soxi`/`ffprobe` should say `16000 Hz, 1 channels, 16-bit` with the
   sample count the tool reported.
+- The stream route: `sox` a known 10 s clip to raw PCM16 mono at 24 kHz, `POST` it to
+  `/audio/pcm` with `Transfer-Encoding: chunked`, and compare the answer's `ms` with 10000 —
+  then watch `/api/status`'s `free_heap_kb` before and after, which must not have moved. A
+  `samples` count short of `bytes / 2` means a piece was cut; `ok: false` names why.

@@ -301,6 +301,7 @@ impl Response {
             409 => "Conflict",
             413 => "Payload Too Large",
             414 => "URI Too Long",
+            415 => "Unsupported Media Type",
             500 => "Internal Server Error",
             501 => "Not Implemented",
             503 => "Service Unavailable",
@@ -310,6 +311,63 @@ impl Response {
 }
 
 pub type Handler = Arc<dyn Fn(&Request) -> Response + Send + Sync>;
+
+/// A request body read as it arrives, instead of being buffered into `Request::body`.
+///
+/// A buffered body is a `Vec` in RAM, and [`MAX_BODY_BYTES`] is what the board can pay for
+/// a manifest or a config patch. An upload is not that: PCM audio at 24 kHz is 48 KB/s, a
+/// minute of it is 2.9 MB, and the board's free internal RAM is counted in kilobytes
+/// (`docs/audio.md`). A sink takes the bytes in arrival order — the speaker's own pacing
+/// blocks the reader, so the socket is throttled by the hardware rather than by a buffer —
+/// and answers when the body ends.
+pub trait BodySink: Send {
+    /// One piece of the body, in order. `Err` stops the upload and is answered as-is.
+    fn push(&mut self, bytes: &[u8]) -> std::io::Result<()>;
+    /// The body ended. `complete` is false when the client hung up mid-body, which a
+    /// sink must not report as success: half a song is not a song.
+    fn finish(self: Box<Self>, complete: bool) -> Response;
+}
+
+/// What a route does with a body nobody has read yet.
+pub enum BodyRoute {
+    /// Not this route: buffer the body and call the request handler, as before.
+    Buffer,
+    /// Read it here, into this sink. The body never becomes a `Vec`, and the connection
+    /// closes once the sink has answered.
+    Sink(Box<dyn BodySink>),
+    /// Refused before a byte of body was read — auth, method, content type. Answering here
+    /// is what makes a refusal cost one header exchange instead of a whole song.
+    Answer(Response),
+}
+
+/// Decides, from the request line and the headers alone, whether a route wants its body
+/// streamed. It runs before the body is touched, which is the only moment the decision can
+/// still be cheap.
+pub type BodyRouter = Arc<dyn Fn(&Request) -> BodyRoute + Send + Sync>;
+
+/// Everything a server answers with: the request handler, and the routes whose bodies are
+/// consumed as they arrive.
+///
+/// One struct rather than a second constructor per listener: a server that streams uploads
+/// must do so on http *and* https, and the alternative was a twin of every `start` method
+/// with an extra argument.
+pub struct Routes {
+    pub request: Handler,
+    /// `None` means no route streams its body, which is the right shape for a unit test
+    /// that only exercises request/response.
+    pub body: Option<BodyRouter>,
+}
+
+impl Routes {
+    pub fn new(request: Handler) -> Self {
+        Self { request, body: None }
+    }
+
+    pub fn with_body(mut self, body: BodyRouter) -> Self {
+        self.body = Some(body);
+        self
+    }
+}
 
 /// Anything that can carry an HTTP connection.
 ///
@@ -431,6 +489,99 @@ impl<S: Stream> BufferedReader<S> {
             let _ = self.line(2)?; // trailing CRLF
         }
     }
+
+    /// Send the `100 Continue` a client is waiting for before it will send its body.
+    ///
+    /// It belongs to the body, not to the head: a request refused on its headers (a bad
+    /// content type, a missing PIN) must not invite the client to upload a song first.
+    fn expect_continue(&mut self, headers: &BTreeMap<String, String>) -> std::io::Result<()> {
+        let wants =
+            headers.get("expect").map(|e| e.to_ascii_lowercase().contains("100-continue")).unwrap_or(false);
+        if wants {
+            self.stream.write_all(b"HTTP/1.1 100 Continue\r\n\r\n")?;
+            self.stream.flush()?;
+        }
+        Ok(())
+    }
+
+    /// The whole body, for the routes that want it in one piece — every route but the
+    /// ones that name a [`BodySink`]. Bounded by [`MAX_BODY_BYTES`] however it is framed.
+    fn read_body(&mut self, framing: &Framing) -> std::io::Result<Vec<u8>> {
+        match framing {
+            Framing::Empty => Ok(Vec::new()),
+            Framing::Fixed(len) if *len > MAX_BODY_BYTES => {
+                Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "body too large"))
+            }
+            Framing::Fixed(len) => self.exact(*len),
+            Framing::Chunked => self.chunked(),
+        }
+    }
+
+    /// The body in arrival order, never buffered: one call per piece, each piece being
+    /// what the socket had. The sink decides when there has been enough.
+    fn stream_body(
+        &mut self,
+        framing: &Framing,
+        sink: &mut dyn FnMut(&[u8]) -> std::io::Result<()>,
+    ) -> std::io::Result<()> {
+        match framing {
+            Framing::Empty => Ok(()),
+            Framing::Fixed(len) => self.stream_exact(*len, sink),
+            Framing::Chunked => loop {
+                let line = self.line(128)?.unwrap_or_default();
+                let size_str = line.split(';').next().unwrap_or("").trim();
+                let size = usize::from_str_radix(size_str, 16)
+                    .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "bad chunk size"))?;
+                if size == 0 {
+                    while let Some(l) = self.line(1024)? {
+                        if l.is_empty() {
+                            break;
+                        }
+                    }
+                    return Ok(());
+                }
+                self.stream_exact(size, sink)?;
+                let _ = self.line(2)?; // trailing CRLF
+            },
+        }
+    }
+
+    fn stream_exact(
+        &mut self,
+        mut left: usize,
+        sink: &mut dyn FnMut(&[u8]) -> std::io::Result<()>,
+    ) -> std::io::Result<()> {
+        while left > 0 {
+            if self.pos == self.buf.len() && self.fill()? == 0 {
+                return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "short body"));
+            }
+            let n = (self.buf.len() - self.pos).min(left);
+            sink(&self.buf[self.pos..self.pos + n])?;
+            self.pos += n;
+            left -= n;
+        }
+        Ok(())
+    }
+}
+
+/// How a request's body is delimited, decided from the headers alone.
+///
+/// Separate from the body itself so a route can be asked about it before a byte of it has
+/// been read — the whole point of [`BodySink`].
+enum Framing {
+    Empty,
+    Fixed(usize),
+    Chunked,
+}
+
+fn framing_of(headers: &BTreeMap<String, String>) -> Framing {
+    if headers.get("transfer-encoding").map(|t| t.to_ascii_lowercase().contains("chunked")).unwrap_or(false) {
+        return Framing::Chunked;
+    }
+    match headers.get("content-length").and_then(|v| v.parse().ok()).unwrap_or(0) {
+        0 => Framing::Empty,
+        len => Framing::Fixed(len),
+    }
 }
 
 fn find_crlf(hay: &[u8]) -> Option<usize> {
@@ -441,7 +592,7 @@ fn parse_request<S: Stream>(
     conn: &mut BufferedReader<S>,
     peer: &str,
     scheme: &'static str,
-) -> std::io::Result<Option<Request>> {
+) -> std::io::Result<Option<(Request, Framing)>> {
     let request_line = match conn.line(MAX_HEADER_BYTES)? {
         Some(l) => l,
         None => return Ok(None),
@@ -462,7 +613,7 @@ fn parse_with_line<S: Stream>(
     peer: &str,
     request_line: &str,
     scheme: &'static str,
-) -> std::io::Result<Option<Request>> {
+) -> std::io::Result<Option<(Request, Framing)>> {
     let mut parts = request_line.split_whitespace();
     let method = parts.next().unwrap_or("").to_ascii_uppercase();
     let target = parts.next().unwrap_or("/").to_string();
@@ -486,31 +637,13 @@ fn parse_with_line<S: Stream>(
         }
     }
 
-    // 100-continue before touching the body, otherwise the client waits.
-    if headers.get("expect").map(|e| e.to_ascii_lowercase().contains("100-continue")).unwrap_or(false) {
-        conn.stream.write_all(b"HTTP/1.1 100 Continue\r\n\r\n")?;
-        conn.stream.flush()?;
-    }
-
-    let body = if headers
-        .get("transfer-encoding")
-        .map(|t| t.to_ascii_lowercase().contains("chunked"))
-        .unwrap_or(false)
-    {
-        conn.chunked()?
-    } else {
-        let len: usize = headers.get("content-length").and_then(|v| v.parse().ok()).unwrap_or(0);
-        if len > MAX_BODY_BYTES {
-            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "body too large"));
-        }
-        if len > 0 {
-            conn.exact(len)?
-        } else {
-            Vec::new()
-        }
-    };
-
-    Ok(Some(Request { method, path, query, headers, body, peer: peer.to_string(), scheme }))
+    // 100-continue and the body are both left to the caller: it is the only place that
+    // knows whether this route wants the bytes buffered or streamed (`BodyRoute`).
+    let framing = framing_of(&headers);
+    Ok(Some((
+        Request { method, path, query, headers, body: Vec::new(), peer: peer.to_string(), scheme },
+        framing,
+    )))
 }
 
 fn split_target(target: &str) -> (String, BTreeMap<String, String>) {
@@ -676,11 +809,11 @@ pub struct Server {
 
 impl Server {
     /// Plain http only.
-    pub fn start(addr: &str, handler: Handler, log: Arc<LogBuf>) -> std::io::Result<Self> {
+    pub fn start(addr: &str, routes: Routes, log: Arc<LogBuf>) -> std::io::Result<Self> {
         let http = bind(addr)?;
         let local = http.local_addr()?;
         http.set_nonblocking(true)?;
-        Self::spawn(vec![http], handler, log, "http", local)
+        Self::spawn(vec![http], routes, log, "http", local)
     }
 
     /// https only, on one port.
@@ -691,7 +824,7 @@ impl Server {
     /// nothing at all.
     pub fn start_tls_only(
         tls_addr: &str,
-        handler: Handler,
+        routes: Routes,
         log: Arc<LogBuf>,
         handshake: Handshake,
     ) -> std::io::Result<Self> {
@@ -699,7 +832,7 @@ impl Server {
         let local = tls.local_addr()?;
         tls.set_nonblocking(true)?;
         log.info("http", format!("listening on https://{}/ (http is off)", local));
-        Self::spawn_with(vec![(tls, Some(handshake))], handler, log, "http", local)
+        Self::spawn_with(vec![(tls, Some(handshake))], routes, log, "http", local)
     }
 
     /// http and https on two ports, served by **one** accept thread.
@@ -714,7 +847,7 @@ impl Server {
     pub fn start_with_tls(
         http_addr: &str,
         tls_addr: &str,
-        handler: Handler,
+        routes: Routes,
         log: Arc<LogBuf>,
         handshake: Handshake,
     ) -> std::io::Result<Self> {
@@ -727,23 +860,23 @@ impl Server {
         let mut listeners = vec![(http, None), (tls, Some(handshake))];
         // Keep the plaintext listener first: it is the one that must never starve.
         listeners.sort_by_key(|(_, tls)| tls.is_some());
-        Self::spawn_with(listeners, handler, log, "http", local)
+        Self::spawn_with(listeners, routes, log, "http", local)
     }
 
     fn spawn(
         listeners: Vec<TcpListener>,
-        handler: Handler,
+        routes: Routes,
         log: Arc<LogBuf>,
         scheme: &'static str,
         local: SocketAddr,
     ) -> std::io::Result<Self> {
         let listeners = listeners.into_iter().map(|l| (l, None)).collect();
-        Self::spawn_with(listeners, handler, log, scheme, local)
+        Self::spawn_with(listeners, routes, log, scheme, local)
     }
 
     fn spawn_with(
         listeners: Vec<(TcpListener, Option<Handshake>)>,
-        handler: Handler,
+        routes: Routes,
         log: Arc<LogBuf>,
         scheme: &'static str,
         local: SocketAddr,
@@ -754,7 +887,7 @@ impl Server {
         let join = std::thread::Builder::new()
             .name("httpd".into())
             .stack_size(ACCEPT_STACK)
-            .spawn(move || accept_loop(listeners, handler, stop_thread, log_thread))?;
+            .spawn(move || accept_loop(listeners, routes, stop_thread, log_thread))?;
         log.info("http", format!("listening on {scheme}://{local}/"));
         Ok(Self { stop, addr: local, scheme, join: Some(join), log })
     }
@@ -800,7 +933,7 @@ fn bind(addr: &str) -> std::io::Result<TcpListener> {
 
 fn accept_loop(
     listeners: Vec<(TcpListener, Option<Handshake>)>,
-    handler: Handler,
+    routes: Routes,
     stop: Arc<AtomicBool>,
     log: Arc<LogBuf>,
 ) {
@@ -819,7 +952,7 @@ fn accept_loop(
                     Ok((stream, peer)) => match tls {
                         // A TLS socket cannot be probed for readiness without speaking
                         // TLS, so it is served here and now.
-                        Some(handshake) => serve_tls(stream, peer, handshake, &handler, &log, &active),
+                        Some(handshake) => serve_tls(stream, peer, handshake, &routes, &log, &active),
                         None => {
                             if stream.set_nonblocking(true).is_err() {
                                 continue;
@@ -866,7 +999,7 @@ fn accept_loop(
                 Ready::Data(prefix) => {
                     let (stream, peer, _, _) = pending.remove(index);
                     stream.set_nonblocking(false).ok();
-                    match serve_until_stream(stream, prefix, &peer, "http", true, &handler, &log) {
+                    match serve_until_stream(stream, prefix, &peer, "http", true, &routes, &log) {
                         Serve::Done | Serve::Failed => {}
                         Serve::KeepAlive(stream, rest) => {
                             if stream.set_nonblocking(true).is_ok() {
@@ -927,7 +1060,7 @@ fn serve_tls(
     stream: TcpStream,
     peer: std::net::SocketAddr,
     handshake: &Handshake,
-    handler: &Handler,
+    routes: &Routes,
     log: &Arc<LogBuf>,
     active: &Arc<AtomicUsize>,
 ) {
@@ -958,7 +1091,7 @@ fn serve_tls(
     let peer = peer.to_string();
     // No keep-alive: one request per TLS connection, because each one occupies the
     // listener while it lasts.
-    match serve_until_stream(conn, Vec::new(), &peer, "https", false, handler, log) {
+    match serve_until_stream(conn, Vec::new(), &peer, "https", false, routes, log) {
         Serve::Done | Serve::Failed | Serve::KeepAlive(..) => {}
         Serve::Stream(conn, resp, body, head_only) => {
             spawn_stream(conn, resp, body, head_only, log, active);
@@ -1008,7 +1141,7 @@ fn serve_until_stream<S: Stream>(
     peer: &str,
     scheme: &'static str,
     allow_keep_alive: bool,
-    handler: &Handler,
+    routes: &Routes,
     log: &Arc<LogBuf>,
 ) -> Serve<S> {
     let mut conn = match BufferedReader::with_prefix(stream, prefix) {
@@ -1016,7 +1149,51 @@ fn serve_until_stream<S: Stream>(
         Err(_) => return Serve::Failed,
     };
     match parse_request(&mut conn, peer, scheme) {
-        Ok(Some(req)) => {
+        Ok(Some((mut req, framing))) => {
+            // Asked before a byte of body is read: a route that streams its body cannot
+            // be served after the body has been buffered, and a refusal costs one header
+            // exchange instead of a whole song.
+            if let Some(router) = routes.body.as_ref() {
+                match router(&req) {
+                    BodyRoute::Sink(mut sink) => {
+                        let read = match conn.expect_continue(&req.headers) {
+                            Ok(()) => conn.stream_body(&framing, &mut |piece| sink.push(piece)),
+                            Err(e) => Err(e),
+                        };
+                        if let Err(e) = &read {
+                            // The client hung up, or the sink refused the bytes (a cap, a
+                            // dead amplifier). Either way the upload stopped early, and the
+                            // answer says so — the sink decides the status.
+                            log.warn("http", format!("{} {} upload stopped: {e}", req.method, req.path));
+                        }
+                        let resp = sink.finish(read.is_ok());
+                        conn.stream.set_write_timeout(Some(IDLE_TIMEOUT)).ok();
+                        let _ = write_response(&mut conn.stream, &resp, false, false);
+                        // Nothing follows a body that was consumed here: the request is
+                        // spent, and a client that wanted keep-alive can reconnect.
+                        return Serve::Done;
+                    }
+                    BodyRoute::Answer(resp) => {
+                        conn.stream.set_write_timeout(Some(IDLE_TIMEOUT)).ok();
+                        let _ = write_response(&mut conn.stream, &resp, false, false);
+                        return Serve::Done;
+                    }
+                    BodyRoute::Buffer => {}
+                }
+            }
+            if let Err(e) = conn.expect_continue(&req.headers) {
+                log.warn("http", format!("{peer}: could not answer 100-continue: {e}"));
+                return Serve::Failed;
+            }
+            match conn.read_body(&framing) {
+                Ok(body) => req.body = body,
+                Err(e) => {
+                    log.warn("http", format!("{peer}: bad body: {e}"));
+                    let mut s = conn.stream;
+                    let _ = write_response(&mut s, &Response::error_json(400, "bad request"), false, false);
+                    return Serve::Failed;
+                }
+            }
             // A listener may refuse keep-alive outright. TLS does: its connections own
             // a stack each, and holding one open for an idle browser socket costs internal
             // RAM that the next handshake needs.
@@ -1027,7 +1204,7 @@ fn serve_until_stream<S: Stream>(
                 };
             let head_only = req.method == "HEAD";
             let started = std::time::Instant::now();
-            let mut resp = handler(&req);
+            let mut resp = (routes.request)(&req);
             if started.elapsed().as_millis() > 500 {
                 log.warn(
                     "http",
@@ -1060,9 +1237,9 @@ fn serve_until_stream<S: Stream>(
 }
 
 #[allow(dead_code)]
-fn serve_connection(stream: TcpStream, peer: String, handler: Handler, log: Arc<LogBuf>) {
+fn serve_connection(stream: TcpStream, peer: String, routes: Routes, log: Arc<LogBuf>) {
     if let Serve::Stream(mut conn, resp, body, head_only) =
-        serve_until_stream(stream, Vec::new(), &peer, "http", true, &handler, &log)
+        serve_until_stream(stream, Vec::new(), &peer, "http", true, &routes, &log)
     {
         let _ = write_stream_response(&mut conn.stream, &resp, body, head_only);
     }
@@ -1111,7 +1288,7 @@ mod tests {
                 Response::text("hello")
             }
         });
-        let server = Server::start("127.0.0.1:0", handler, log.clone()).expect("bind");
+        let server = Server::start("127.0.0.1:0", Routes::new(handler), log.clone()).expect("bind");
         (server, log)
     }
 
@@ -1356,7 +1533,7 @@ mod tests {
                 Response::text("hello")
             }
         });
-        let server = Server::start("127.0.0.1:0", handler, log).expect("bind");
+        let server = Server::start("127.0.0.1:0", Routes::new(handler), log).expect("bind");
         let addr = server.local_addr();
         let raw = raw_request_until_close(
             addr,
@@ -1382,7 +1559,7 @@ mod tests {
             let body: StreamBody = Box::new(|sink: &mut dyn EventSink| sink.send(test_frame(1).as_bytes()));
             Response::streamed(200, "text/event-stream", body)
         });
-        let server = Server::start("127.0.0.1:0", handler, log).expect("bind");
+        let server = Server::start("127.0.0.1:0", Routes::new(handler), log).expect("bind");
         let raw = raw_request_until_close(
             server.local_addr(),
             "HEAD /api/agent/stream HTTP/1.1\r\nHost: x\r\n\r\n",
@@ -1390,6 +1567,68 @@ mod tests {
         assert!(raw.starts_with("HTTP/1.1 200 OK"), "got: {raw}");
         assert!(!raw.contains("id: 1"), "no frames for HEAD: {raw}");
         drop(server);
+    }
+
+    /// A body route is asked before a byte is read, and the bytes never become a `Vec`:
+    /// that is the difference between buffering a song and playing it. The payload here is
+    /// three times `MAX_BODY_BYTES`, which the buffered path refuses outright.
+    #[test]
+    fn a_body_route_streams_past_the_buffer_cap() {
+        let log = LogBuf::new(64);
+        let handler: Handler = Arc::new(|_req: &Request| Response::text("buffered"));
+
+        struct Counting(usize);
+        impl BodySink for Counting {
+            fn push(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+                assert!(bytes.len() <= 1024, "a piece is one socket read, not the whole body");
+                self.0 += bytes.len();
+                Ok(())
+            }
+            fn finish(self: Box<Self>, complete: bool) -> Response {
+                Response::json(&serde_json::json!({ "ok": complete, "bytes": self.0 }))
+            }
+        }
+
+        let router: BodyRouter = Arc::new(|req: &Request| {
+            if req.path == "/upload" && req.method == "POST" {
+                BodyRoute::Sink(Box::new(Counting(0)))
+            } else {
+                BodyRoute::Buffer
+            }
+        });
+        let server = Server::start("127.0.0.1:0", Routes::new(handler).with_body(router), log).expect("bind");
+
+        let payload = "x".repeat(300 * 1024);
+        let raw =
+            format!("POST /upload HTTP/1.1\r\nHost: x\r\nContent-Length: {}\r\n\r\n{payload}", payload.len());
+        let out = raw_request(server.local_addr(), &raw);
+        assert!(out.starts_with("HTTP/1.1 200 OK"), "got: {out}");
+        assert!(out.contains(&format!("\"bytes\":{}", payload.len())), "got: {out}");
+        assert!(out.contains("\"ok\":true"), "a whole body is a complete upload: {out}");
+    }
+
+    /// A refusal decided from the headers costs one exchange, not one upload: the client
+    /// announces a megabyte and gets its answer without sending any of it.
+    #[test]
+    fn a_refused_upload_is_answered_before_the_body_arrives() {
+        let log = LogBuf::new(64);
+        let handler: Handler = Arc::new(|_req: &Request| Response::text("buffered"));
+        let router: BodyRouter = Arc::new(|req: &Request| {
+            if req.path == "/upload" {
+                BodyRoute::Answer(Response::error_json(415, "only audio/pcm"))
+            } else {
+                BodyRoute::Buffer
+            }
+        });
+        let server = Server::start("127.0.0.1:0", Routes::new(handler).with_body(router), log).expect("bind");
+
+        // Headers only, with a body announced and never sent. A server that read the body
+        // first would sit here until the idle timeout.
+        let out = raw_request(
+            server.local_addr(),
+            "POST /upload HTTP/1.1\r\nHost: x\r\nContent-Length: 1000000\r\n\r\n",
+        );
+        assert!(out.starts_with("HTTP/1.1 415 "), "got: {out}");
     }
 
     /// Read until the server closes the connection - the only way a chunked body

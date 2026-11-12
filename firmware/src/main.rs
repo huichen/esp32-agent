@@ -20,7 +20,7 @@ mod runner;
 mod tls_server;
 mod wifi;
 
-use esp32_agent_core::app::{make_handler, App, FwMeta, Shared, TlsInfo};
+use esp32_agent_core::app::{make_routes, App, FwMeta, Shared, TlsInfo};
 use esp32_agent_core::config::Config;
 use esp32_agent_core::hardware::Hardware;
 use esp32_agent_core::http::Server;
@@ -318,14 +318,14 @@ fn run() -> anyhow::Result<()> {
                 Server::start_with_tls(
                     &addr,
                     &tls_bind,
-                    make_handler(app.clone()),
+                    make_routes(app.clone()),
                     log.clone(),
                     identity.handshake(),
                 )
             } else {
                 Server::start_tls_only(
                     &tls_bind,
-                    make_handler(app.clone()),
+                    make_routes(app.clone()),
                     log.clone(),
                     identity.handshake(),
                 )
@@ -348,12 +348,12 @@ fn run() -> anyhow::Result<()> {
                         guard.tls = TlsInfo { port: 0, fingerprint: String::new(), error: format!("{e}") };
                     }
                     log.error("boot", format!("https: could not listen on {}: {e}; http only", tls_server::TLS_PORT));
-                    Server::start(&addr, make_handler(app.clone()), log.clone())?
+                    Server::start(&addr, make_routes(app.clone()), log.clone())?
                 }
             }
         }
         None => {
-            let mut server = Server::start(&addr, make_handler(app.clone()), log.clone())?;
+            let mut server = Server::start(&addr, make_routes(app.clone()), log.clone())?;
             if !tls_error.is_empty() {
                 if let Ok(mut guard) = app.lock() {
                     guard.tls = TlsInfo { port: 0, fingerprint: String::new(), error: tls_error.clone() };
@@ -432,7 +432,7 @@ fn run() -> anyhow::Result<()> {
         if port_now != port {
             log.warn("system", format!("MCP port changed to {port_now}; restarting the server only"));
             server.stop();
-            server = Server::start(&format!("0.0.0.0:{port_now}"), make_handler(app.clone()), log.clone())?;
+            server = Server::start(&format!("0.0.0.0:{port_now}"), make_routes(app.clone()), log.clone())?;
             port = port_now;
             // The https listener went down with the old server and is not rebuilt here.
             // Say so instead of leaving `/api/tls` claiming a port that no longer answers.
