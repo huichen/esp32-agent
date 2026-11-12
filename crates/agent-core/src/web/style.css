@@ -438,6 +438,21 @@ button.btn:active { transform: scale(0.98); }
   background: var(--bg-soft);
   font-size: 12.5px;
 }
+
+/* The Files tab: a row is a button, so the whole line is the tap target. */
+.list .file-row {
+  appearance: none;
+  border: 1px solid transparent;
+  color: var(--text);
+  text-align: left;
+  width: 100%;
+  font: inherit;
+  cursor: pointer;
+}
+.list .file-row b { font-weight: 500; }
+.list .file-row .faint { margin-left: auto; font-size: 11px; color: var(--muted); }
+.crumbs { display: flex; flex-wrap: wrap; gap: 4px; margin: 0 0 8px; font-size: 12px; }
+.crumbs a { color: var(--accent); text-decoration: none; }
 .list .item b { font-weight: 600; }
 .list .item span { color: var(--muted); }
 .list .item.faint { opacity: 0.55; }

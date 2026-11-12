@@ -65,18 +65,49 @@ mod tests {
         assert!(INDEX_HTML.contains("<html lang=\"en\">"), "the document language must be English");
     }
 
-    /// Six tabs, and only six: the conversation is the page, so everything else has to
-    /// earn a slot. Order is by how often a person needs it.
+    /// Five tabs, and only five: the conversation is the page, so everything else has to
+    /// earn a slot. Order is by how often a person needs it. The schedule sits inside Agent
+    /// (it queues turns for that agent) and the log inside Settings (it is the other thing to
+    /// read when the board misbehaves), so nine panels never had to exist.
     #[test]
     fn the_board_sheet_stays_small_and_ordered() {
         let tabs: Vec<&str> =
             INDEX_HTML.split("data-panel=\"").skip(1).filter_map(|s| s.split('"').next()).collect();
         assert_eq!(
             tabs,
-            vec!["devices", "tools", "agent", "schedule", "logs", "settings"],
+            vec!["devices", "tools", "agent", "files", "settings"],
             "the sheet is ordered by importance and nothing else is in it"
         );
         assert!(!INDEX_HTML.contains("manifest-"), "the manifest editor moved to the agent's job");
+
+        // Each moved card really is inside the panel it now belongs to: a tab that hides its
+        // own contents is the failure this catches, and it is invisible in a unit test that
+        // only counts ids.
+        let panel = |id: &str| -> &str {
+            let start = INDEX_HTML.find(&format!("id=\"panel-{id}\"")).expect("panel");
+            let rest = &INDEX_HTML[start..];
+            let end = rest.find("<div id=\"panel-").unwrap_or(rest.len());
+            &rest[..end]
+        };
+        assert!(panel("agent").contains("sched-list"), "the schedule belongs to the agent panel");
+        assert!(panel("settings").contains("id=\"logs\""), "the log belongs to settings");
+        assert!(panel("files").contains("files-list") && panel("files").contains("files-viewer"));
+    }
+
+    /// The Files tab reads the workspace and writes nothing: every write stays behind the
+    /// `write` tool, which is where the 8 KB budget and the NVS blob are enforced.
+    #[test]
+    fn the_files_tab_only_reads() {
+        assert!(APP_JS.contains("/api/files?path="));
+        assert!(APP_JS.contains("/api/files/read?path="));
+        for writer in ["method: \"POST\"", "method: \"PUT\"", "method: \"DELETE\""] {
+            let segment = APP_JS
+                .split("async function loadFiles")
+                .nth(1)
+                .and_then(|s| s.split("async function loadLogs").next())
+                .expect("the files functions");
+            assert!(!segment.contains(writer), "the files tab must not write ({writer})");
+        }
     }
 
     /// Tool calls collapse into one line and expand on tap, like the rest of the chat.
