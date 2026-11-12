@@ -14,7 +14,14 @@ const $$ = (sel, root = document) => Array.from(root.querySelectorAll(sel));
 
 const S = {
   token: localStorage.getItem("esp32-agent.token") || "",
-  lastSeq: 0,
+  attach: null, // {name, mime, data_b64, kb} — one per message, downscaled here
+  // Two counters that are not the same number space: the transcript is indexed by
+  // message, the event journal by event. Feeding the transcript's index to
+  // `?after=` skipped every event of the run — which is exactly what "no streaming"
+  // looked like.
+  lastMsg: 0,
+  lastEvent: 0,
+  rendered: 0,
   stream: null,
   busy: false,
   panel: "status",
@@ -316,7 +323,8 @@ async function loadHistory() {
       return;
     }
     for (const turn of groupTurns(msgs)) renderTurn(turn);
-    for (const m of msgs) S.lastSeq = Math.max(S.lastSeq, m.seq || 0);
+    S.rendered = msgs.length;
+    for (const m of msgs) S.lastMsg = Math.max(S.lastMsg, m.seq || 0);
     scrollToEnd();
   } catch (e) {
     if (String(e.message).includes("PIN")) return;
@@ -324,15 +332,71 @@ async function loadHistory() {
   }
 }
 
+/** Downscale an image in the browser, before it crosses the LAN.
+ *
+ * The board keeps an attachment in RAM and a request has to fit what its TLS stack can
+ * send, so a 4 MB phone photo is not a thing to upload: 1024 px on the long side as JPEG
+ * is ~20 kB and still legible. If it is still too big after that, say so instead of
+ * handing the board a request it will refuse. */
+function downscale(file) {
+  return new Promise((resolve, reject) => {
+    const url = URL.createObjectURL(file);
+    const img = new Image();
+    img.onload = () => {
+      URL.revokeObjectURL(url);
+      const max = 1024;
+      const scale = Math.min(1, max / Math.max(img.width, img.height));
+      const w = Math.max(1, Math.round(img.width * scale));
+      const h = Math.max(1, Math.round(img.height * scale));
+      const canvas = document.createElement("canvas");
+      canvas.width = w;
+      canvas.height = h;
+      canvas.getContext("2d").drawImage(img, 0, 0, w, h);
+      let dataUrl = canvas.toDataURL("image/jpeg", 0.72);
+      // Step the quality down once if the first pass is over the cap.
+      if (dataUrl.length * 0.75 > 24000) dataUrl = canvas.toDataURL("image/jpeg", 0.5);
+      const data_b64 = dataUrl.split(",", 2)[1] || "";
+      resolve({ name: file.name || "image.jpg", mime: "image/jpeg", data_b64, kb: Math.round((data_b64.length * 0.75) / 1024) });
+    };
+    img.onerror = () => {
+      URL.revokeObjectURL(url);
+      reject(new Error("could not read that image"));
+    };
+    img.src = url;
+  });
+}
+
+function showAttach() {
+  const chip = $("#attach-chip");
+  if (!S.attach) {
+    chip.hidden = true;
+    chip.innerHTML = "";
+    return;
+  }
+  chip.hidden = false;
+  chip.innerHTML =
+    '<span class="attach-name">' + escapeHtml(S.attach.name) + " \u00b7 " + S.attach.kb + " kB</span>" +
+    '<button type="button" class="attach-x" aria-label="Remove attachment">\u00d7</button>';
+  chip.querySelector(".attach-x").onclick = () => {
+    S.attach = null;
+    showAttach();
+  };
+}
+
 async function send(text) {
   const trimmed = text.trim();
   if (!trimmed) return;
   const { bubble } = addRow("user");
-  bubble.innerHTML = markdown(trimmed);
+  bubble.innerHTML = markdown(trimmed + (S.attach ? "\n\n_[image: " + S.attach.name + "]_" : ""));
   $("#input").value = "";
   autosize();
+  const attachment = S.attach;
+  S.attach = null;
+  showAttach();
   try {
-    await api("/api/agent/message", { method: "POST", body: { text: trimmed } });
+    const payload = { text: trimmed };
+    if (attachment) payload.attachments = [attachment];
+    await api("/api/agent/message", { method: "POST", body: payload });
     S.busy = true;
     $("#link").className = "dot busy";
     liveTrace = null;
@@ -385,7 +449,7 @@ function ensureLiveBubble() {
 }
 
 function handleEvent(name, data) {
-  S.lastSeq = Math.max(S.lastSeq, data.seq || 0);
+  S.lastEvent = Math.max(S.lastEvent, data.seq || 0);
   switch (name) {
     case "message_start":
       S.busy = true;
@@ -469,7 +533,7 @@ const EVENT_KINDS = [
 
 function connectStream() {
   if (S.stream) return;
-  const es = new EventSource("/api/agent/stream?after=" + S.lastSeq);
+  const es = new EventSource("/api/agent/stream?after=" + S.lastEvent);
   S.stream = es;
   for (const kind of EVENT_KINDS) {
     es.addEventListener(kind, (ev) => {
@@ -613,6 +677,9 @@ async function loadAgent() {
     $("#agent-model").value = d.model || "";
     $("#agent-steps").value = d.max_steps;
     $("#agent-temperature").value = d.temperature;
+    $("#agent-protocol").value = d.protocol || "chat";
+    $("#agent-reasoning").value = d.reasoning || "";
+    $("#agent-vision").value = d.vision === false ? "false" : "true";
     $("#auth-tick").value = d.tick_ms;
     const prompt = await api("/api/agent/prompt");
     kv($("#conversation-kv"), [
@@ -678,6 +745,8 @@ async function loadSettings() {
   try {
     const d = await api("/api/config");
     $("#wifi-ssid").value = d.wifi.ssid || "";
+    $("#wifi-gateway").value = d.wifi.gateway || "";
+    $("#wifi-dns").value = d.wifi.dns || "";
     $("#wifi-password").value = "";
   } catch (e) {
     if (!String(e.message).includes("PIN")) toast(e.message);
@@ -745,6 +814,40 @@ function init() {
     e.preventDefault();
     send($("#input").value);
   };
+
+  // One image per message. It is downscaled in the browser, because what crosses the LAN
+  // has to fit the request the board can send and the heap it can spare.
+  // A run can start without this page — a schedule, a goal, another client — and the event
+// stream only follows the run this page asked for. So look every 20 s, and only redraw
+// when the transcript actually changed: a phone should not spend its battery on a page
+// that has nothing new to say.
+setInterval(async () => {
+  if (S.busy || S.stream) return;
+  try {
+    const data = await api("/api/agent/history");
+    const count = ((data && data.messages) || []).length;
+    if (count !== S.rendered) loadHistory();
+  } catch {
+    /* offline or locked: the next tick tries again */
+  }
+}, 20000);
+
+$("#attach").onclick = () => $("#attach-input").click();
+  $("#attach-input").onchange = async (ev) => {
+    const file = ev.target.files && ev.target.files[0];
+    ev.target.value = "";
+    if (!file) return;
+    if (!file.type.startsWith("image/")) {
+      toast("only images can be attached");
+      return;
+    }
+    try {
+      S.attach = await downscale(file);
+      showAttach();
+    } catch (e) {
+      toast(e.message);
+    }
+  };
   $("#input").addEventListener("input", autosize);
   $("#input").addEventListener("keydown", (e) => {
     if (e.key === "Enter" && !e.shiftKey) {
@@ -770,6 +873,9 @@ function init() {
       model: $("#agent-model").value.trim(),
       max_steps: Number($("#agent-steps").value || 0),
       temperature: Number($("#agent-temperature").value || 0.2),
+      protocol: $("#agent-protocol").value,
+      reasoning: $("#agent-reasoning").value,
+      vision: $("#agent-vision").value === "true",
     };
     const key = $("#agent-key").value.trim();
     if (key) body.api_key = key;
@@ -809,6 +915,12 @@ function init() {
   $("#wifi-connect").onclick = async () => {
     $("#wifi-result").textContent = "joining…";
     try {
+      // The gateway and DNS belong to the device config, not to the join request: they
+      // describe the network the board sits on, not the credentials it uses.
+      await api("/api/config", {
+        method: "POST",
+        body: { wifi: { gateway: $("#wifi-gateway").value.trim(), dns: $("#wifi-dns").value.trim() } },
+      });
       await api("/api/wifi/connect", {
         method: "POST",
         body: { ssid: $("#wifi-ssid").value.trim(), password: $("#wifi-password").value },

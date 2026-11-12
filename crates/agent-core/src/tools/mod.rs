@@ -37,6 +37,24 @@ fn now_ms(ctx: &mut ToolCtx) -> u64 {
 pub fn board_tools() -> Vec<ToolDef> {
     vec![
         ToolDef::new(
+            "chip_temp",
+            "Read the chip's own temperature sensor, in degrees Celsius. Different from a board thermometer: this is the die, which runs warmer than the room",
+        )
+        .title("Chip temperature")
+        .category("board")
+        .bind(|ctx, _args| {
+            let celsius = ctx.hw.chip_temp_c();
+            Ok(json!({
+                "celsius": celsius,
+                "available": celsius.is_some(),
+                "note": if celsius.is_some() {
+                    "the die temperature, not the ambient one"
+                } else {
+                    "this part has no on-die sensor, or the driver did not start"
+                },
+            }))
+        }),
+        ToolDef::new(
             "board_status",
             "Board status: chip, firmware, uptime, temperature, heap, WiFi, detected device count, tool counters",
         )
@@ -474,12 +492,31 @@ pub fn system_tools() -> Vec<ToolDef> {
 ///
 /// One entry, because the language carries the generality: a script is how the model
 /// writes the loop it needs instead of asking for a new fixed tool every time.
+/// The tools the model gets but MCP does not: they need the app's own state.
+pub fn agent_extra_specs() -> Value {
+    json!([{
+        "type": "function",
+        "function": {
+            "name": "image_read",
+            "description": "Read an image the user attached to their message, by asking a vision model about it. Give a `prompt` (\"transcribe the text\" for OCR, \"describe\" for a caption) and optionally `name` when more than one is attached. This costs a second model call.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "prompt": { "type": "string", "description": "what to ask about the image; the default is a full transcription plus a description" },
+                    "name": { "type": "string", "description": "which attachment, when the message carried more than one" },
+                },
+                "required": [],
+            },
+        },
+    }])
+}
+
 pub fn script_specs() -> Value {
     json!([{
         "type": "function",
         "function": {
             "name": "script",
-            "description": "Run a small script on the board — the way to write a loop or a condition the fixed tools cannot express. Syntax: `let x = 1`, `x = 2`, `l[0] = 9`, `if c { } else { }`, `while c { }` with `break`, values are numbers, strings, bools, nil, lists `[1,2]` and maps `{a: 1}`; operators `+ - * / %`, `== != < <= > >=`, `and or not`; builtins `len str num type log` and `tool(name, args)` which calls any other board tool; `#` starts a comment; the last expression is the result. Send {\"lint\": true} with `source` to check it without running, {\"help\": true} (or {\"section\": \"overview\"|\"builtins\"|\"examples\"}) for the full reference. Bounded at 50000 steps; `tool(\"script\")` is refused.",
+            "description": "Run a small script on the board — the way to write a loop or a condition the fixed tools cannot express. Syntax: `let x = 1`, `x = 2`, `l[0] = 9`, `if c { } else { }`, `while c { }` with `break`, values are numbers, strings, bools, nil, lists `[1,2]` and maps `{a: 1}`; operators `+ - * / %`, `== != < <= > >=`, `and or not`; builtins `len str num type log` and `tool(name, args)` which calls any other board tool; `#` starts a comment; the last expression is the result. Send {\"lint\": true} with `source` to check it without running, {\"help\": true} (or {\"section\": \"overview\"|\"builtins\"|\"examples\"}) for the full reference. Bounded by wall clock (30 s) and, as a backstop, 5 000 000 steps; `tool(\"script\")` is refused.",
             "parameters": {
                 "type": "object",
                 "properties": {

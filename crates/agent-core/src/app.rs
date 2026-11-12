@@ -105,6 +105,11 @@ pub struct FwMeta {
     pub build: String,
 }
 
+/// Two images of ~24 kB each is what a phone screenshot downscaled in the browser comes
+/// to; anything larger does not fit the request the board can send over TLS.
+pub const MAX_ATTACHMENT_BYTES: usize = 24 * 1024;
+pub const MAX_ATTACHMENTS: usize = 2;
+
 /// HTTPS on this board: the port it listens on and the SHA-256 fingerprint of the
 /// certificate it made for itself. Empty `fingerprint` means no https.
 #[derive(Debug, Clone, Default)]
@@ -160,6 +165,9 @@ pub struct App {
     pub firmware: FwMeta,
     /// Set by the platform layer once the HTTP server is up.
     pub lan_url: String,
+    /// Files attached to the most recent message. Replaced, never accumulated: an
+    /// attachment belongs to one turn, and the heap is the scarcest thing here.
+    pub attachments: Vec<crate::agent::Attachment>,
     /// The board's own certificate, when it serves https on a second port. The
     /// fingerprint is what a person compares against the browser's warning page —
     /// it is the only proof that this board, and not something on the path, answered.
@@ -253,6 +261,7 @@ impl App {
             profile_exact: true,
             firmware,
             lan_url: String::new(),
+            attachments: Vec::new(),
             tls: TlsInfo::default(),
             agent: Agent::new(),
             llm: LlmConfig::default(),
@@ -534,7 +543,12 @@ impl App {
     /// is a device tool.
     fn extra_mcp_specs(&self) -> Vec<Value> {
         let mut out = Vec::new();
-        for group in [fs_tools::specs(), net_tools::specs(), board_tools::script_specs()] {
+        for group in [
+            fs_tools::specs(),
+            net_tools::specs(),
+            board_tools::script_specs(),
+            board_tools::agent_extra_specs(),
+        ] {
             for tool in openai_tools(&group) {
                 let name = tool["function"]["name"].as_str().unwrap_or_default().to_string();
                 if self.cfg.mcp.disabled_tools.iter().any(|d| d == &name) {
@@ -597,7 +611,12 @@ impl App {
         // The agent's own tools are not in the registry (they need the workspace and the
         // HTTP client), so they never appeared here — which is why the portal could show
         // 40 tools while the model had 49 and `script` looked missing.
-        for group in [fs_tools::specs(), net_tools::specs(), board_tools::script_specs()] {
+        for group in [
+            fs_tools::specs(),
+            net_tools::specs(),
+            board_tools::script_specs(),
+            board_tools::agent_extra_specs(),
+        ] {
             for entry in group.as_array().into_iter().flatten() {
                 let f = &entry["function"];
                 let name = f["name"].as_str().unwrap_or("");
@@ -875,6 +894,69 @@ impl App {
         }
     }
 
+    /// Ask the configured model about an attached image.
+    ///
+    /// This is a **second** model call, made inside a tool: the board has no OCR engine and
+    /// no image pipeline, so the only reader it has is the model the user configured. That
+    /// costs a round trip and tokens, which is why the tool description says so.
+    ///
+    /// It always uses the chat-completions shape: image parts are OpenAI's
+    /// `image_url` blocks there, Anthropic's `image` blocks in the Messages API, and the
+    /// Responses API wants input items — three shapes for one question, and this tool
+    /// answers only the shape it can be sure of.
+    fn image_read(&mut self, args: &Value) -> Result<Value> {
+        let prompt = args
+            .get("prompt")
+            .and_then(|v| v.as_str())
+            .unwrap_or("Transcribe every piece of text in this image exactly, then describe what it shows.")
+            .to_string();
+        let wanted = args.get("name").and_then(|v| v.as_str()).unwrap_or("");
+
+        let attachment = match self.attachments.iter().find(|a| wanted.is_empty() || a.name == wanted) {
+            Some(a) => a.clone(),
+            None => {
+                return Err(McpError::invalid_params(if self.attachments.is_empty() {
+                    "no image attached to the last message; attach one in the portal first".to_string()
+                } else {
+                    format!(
+                        "no attachment named `{wanted}`; the last message carried: {}",
+                        self.attachments.iter().map(|a| a.name.clone()).collect::<Vec<_>>().join(", ")
+                    )
+                }))
+            }
+        };
+        if self.llm.base_url.trim().is_empty() || self.llm.model.trim().is_empty() {
+            return Err(McpError::unsupported(
+                "no model configured, and this tool needs one to read an image",
+            ));
+        }
+        let Some(transport) = self.tool_transport.as_mut() else {
+            return Err(McpError::unsupported("no HTTP transport attached"));
+        };
+
+        let mut cfg = self.llm.clone();
+        cfg.protocol = "chat".into();
+        cfg.vision = true;
+        let messages = json!([{
+            "role": "user",
+            "content": [
+                { "type": "text", "text": prompt },
+                { "type": "image_url", "image_url": { "url": format!("data:{};base64,{}", attachment.mime, attachment.data_b64) } }
+            ]
+        }]);
+        // No tools: this is a question about a picture, not a turn.
+        let reply = crate::llm::chat(transport.as_mut(), &cfg, &messages, &json!([]))
+            .map_err(|e| McpError::hardware(format!("image_read: {e}")))?;
+        let text = crate::llm::truncate_bytes(&reply.content, 1800);
+        Ok(json!({
+            "name": attachment.name,
+            "model": cfg.model,
+            "text": text,
+            "prompt_tokens": reply.usage.prompt_tokens,
+            "completion_tokens": reply.usage.completion_tokens,
+        }))
+    }
+
     /// If this `net_*` call points at the board itself, the method, path and body to serve.
     ///
     /// Recognised hosts are loopback, the station address and the setup-AP address — that
@@ -950,6 +1032,11 @@ impl App {
         // only see a `ToolCtx`.
         if name == "script" {
             return self.run_script(args);
+        }
+        // `image_read` asks the model about an attachment, which means it needs the model
+        // config and the transport — neither of which a `ToolCtx` carries.
+        if name == "image_read" {
+            return self.image_read(args);
         }
         if !self.is_visible(name) {
             let missing =
@@ -1448,7 +1535,60 @@ impl App {
             Ok(v) => v,
             Err(e) => return Response::error_json(400, &format!("invalid JSON: {e}")),
         };
-        let text = body.get("text").and_then(|t| t.as_str()).unwrap_or("").to_string();
+        let mut text = body.get("text").and_then(|t| t.as_str()).unwrap_or("").to_string();
+
+        // Attachments: a name, a mime type and base64 bytes. The board cannot show an
+        // image and the model here is text-only, so what the model gets is a line naming
+        // the file; the bytes are served back at `/api/attachment/<name>` for whoever can
+        // use them. Refusing quietly would be worse than this: the user would attach a
+        // screenshot and never learn it went nowhere.
+        let mut notes: Vec<String> = Vec::new();
+        if let Some(list) = body.get("attachments").and_then(|v| v.as_array()) {
+            if list.len() > MAX_ATTACHMENTS {
+                return Response::json_status(
+                    413,
+                    &json!({ "error": format!("{} attachments; the limit is {MAX_ATTACHMENTS}", list.len()) }),
+                );
+            }
+            self.attachments.clear();
+            for item in list {
+                let name = item.get("name").and_then(|v| v.as_str()).unwrap_or("attachment").to_string();
+                let mime = item
+                    .get("mime")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("application/octet-stream")
+                    .to_string();
+                let mut bytes = Vec::new();
+                let encoded = item.get("data_b64").and_then(|v| v.as_str()).unwrap_or("");
+                if let Err(e) = crate::util::b64_decode(encoded, &mut bytes) {
+                    return Response::json_status(
+                        400,
+                        &json!({ "error": format!("`{name}`: base64: {}", e.message) }),
+                    );
+                }
+                if bytes.len() > MAX_ATTACHMENT_BYTES {
+                    return Response::json_status(
+                        413,
+                        &json!({
+                            "error": format!(
+                                "`{name}` is {} bytes; an attachment is limited to {MAX_ATTACHMENT_BYTES}",
+                                bytes.len()
+                            )
+                        }),
+                    );
+                }
+                notes.push(format!(
+                    "[attached: {name}, {mime}, {} kB — fetch with GET /api/attachment/{name}]",
+                    bytes.len().div_ceil(1024)
+                ));
+                let data_b64 = crate::util::b64_encode(&bytes);
+                self.attachments.push(crate::agent::Attachment { name, mime, data_b64 });
+            }
+            if !notes.is_empty() {
+                text.push_str("\n\n");
+                text.push_str(&notes.join("\n"));
+            }
+        }
         if text.trim().is_empty() {
             return Response::json_status(400, &json!({ "error": "`text` is required" }));
         }
@@ -1458,8 +1598,17 @@ impl App {
                 &json!({ "error": format!("`text` is {} bytes; the limit is {AGENT_TEXT_MAX}", text.len()) }),
             );
         }
+        // Kept twice on purpose: the app serves the bytes back, the message sends them.
+        // Vecs over 512 bytes live in PSRAM and an attachment is capped at 24 kB.
+        let attachments = self.attachments.clone();
+        self.agent.vision = self.llm.vision;
         if !self.agent.push_user(&text, "http", now_ms()) {
             return Response::json_status(400, &json!({ "error": "`text` is required" }));
+        }
+        // Attachments belong to the message, not to the app: the request that carries
+        // them and the transcript that reports them must not be able to disagree.
+        if let Some(message) = self.agent.pending.as_mut() {
+            message.attachments = attachments;
         }
         // The index this message will occupy once the run appends it: the queue is
         // depth 1, so a second trigger coalesces into the same slot.
@@ -2056,6 +2205,25 @@ impl App {
                 .with_header("Access-Control-Max-Age", "600");
         }
 
+        // What was attached to the last message, for whoever can use it: an external
+        // agent, a vision model later, or a person downloading their own screenshot back.
+        if let Some(name) = path.strip_prefix("/api/attachment/") {
+            if let Err(r) = self.require_read(req) {
+                return r;
+            }
+            let name = crate::http::url_decode(name);
+            return match self.attachments.iter().find(|a| a.name == name) {
+                Some(a) => {
+                    let mut bytes = Vec::new();
+                    if crate::util::b64_decode(&a.data_b64, &mut bytes).is_err() {
+                        return Response::error_json(500, "attachment is not decodable");
+                    }
+                    Response::new(200, &a.mime, bytes).with_header("Cache-Control", "no-store")
+                }
+                None => Response::error_json(404, "no attachment by that name"),
+            };
+        }
+
         if path == mcp_path {
             let resp = match method {
                 "POST" => self.handle_mcp_post(req),
@@ -2647,7 +2815,12 @@ impl ToolHost for App {
         let mut tools: Vec<Value> = visible.iter().map(|d| load(d)).collect();
         // File, HTTP and script tools gate on nothing the hardware must provide, so they
         // are not MCP tools; the model still gets them, in the same sorted list.
-        for group in [fs_tools::specs(), net_tools::specs(), board_tools::script_specs()] {
+        for group in [
+            fs_tools::specs(),
+            net_tools::specs(),
+            board_tools::script_specs(),
+            board_tools::agent_extra_specs(),
+        ] {
             tools.extend(openai_tools(&group));
         }
         tools.sort_by_key(|t| t["function"]["name"].as_str().unwrap_or("").to_string());
@@ -2809,6 +2982,9 @@ fn llm_json(cfg: &LlmConfig, with_key: bool) -> Value {
         "max_steps": cfg.max_steps,
         "temperature": cfg.temperature,
         "timeout_s": cfg.timeout_s,
+        "reasoning": cfg.reasoning,
+        "vision": cfg.vision,
+        "protocol": cfg.protocol,
     });
     if with_key {
         v["api_key"] = json!(cfg.api_key);
@@ -2841,7 +3017,27 @@ fn llm_apply_json(cfg: &mut LlmConfig, v: &Value) {
     if let Some(t) = v.get("timeout_s").and_then(|x| x.as_u64()) {
         cfg.timeout_s = t.clamp(5, 180) as u32;
     }
+    // `off | low | medium | high`, or empty for the provider's own default. Anything else
+    // is refused by name rather than forwarded as a typo the endpoint would reject.
+    if let Some(r) = v.get("reasoning") {
+        let text = r.as_str().unwrap_or("").trim().to_ascii_lowercase().replace("none", "off");
+        cfg.reasoning = if text.is_empty() || REASONING_LEVELS.contains(&text.as_str()) {
+            text
+        } else {
+            cfg.reasoning.clone()
+        };
+    }
+    if let Some(b) = v.get("vision").and_then(|x| x.as_bool()) {
+        cfg.vision = b;
+    }
+    if let Some(p) = v.get("protocol").and_then(|x| x.as_str()) {
+        cfg.protocol = crate::llm::Protocol::parse(p).as_str().to_string();
+    }
 }
+
+/// What `reasoning` may say. `none` is accepted as a synonym for `off` because that is
+/// what DeepSeek calls it.
+pub const REASONING_LEVELS: &[&str] = &["off", "low", "medium", "high"];
 
 fn task_json(t: &ScheduledTask) -> Value {
     json!({
@@ -3783,6 +3979,52 @@ mod tests {
 
         assert_eq!(app.route(&post("/api/agent/message", r#"{"text":"   "}"#)).status, 400);
         assert_eq!(app.route(&post("/api/agent/message", r#"{}"#)).status, 400);
+    }
+
+    /// An attachment is carried, named to the model, and served back — nothing more and
+    /// nothing less. The board has no way to show an image and this model cannot see one,
+    /// so pretending otherwise would be the bug.
+    #[test]
+    fn an_attachment_reaches_the_model_as_a_named_file() {
+        let mut app = test_app();
+        let body = json!({
+            "text": "what is in this photo?",
+            "attachments": [{
+                "name": "shot.jpg",
+                "mime": "image/jpeg",
+                "data_b64": "aGVsbG8=",
+            }],
+        });
+        let resp = app.route(&post("/api/agent/message", &body.to_string()));
+        assert_eq!(resp.status, 202, "{}", String::from_utf8_lossy(&resp.body));
+        assert_eq!(app.attachments.len(), 1);
+        assert_eq!(app.attachments[0].data_b64, "aGVsbG8=");
+        let queued = app.agent.pending.as_ref().expect("a queued turn");
+        assert_eq!(queued.attachments.len(), 1, "the message carries the image");
+        assert_eq!(queued.attachments[0].mime, "image/jpeg");
+
+        // The model is told what arrived, because it cannot look at it.
+        let text = app.agent.pending.as_ref().expect("a queued turn").text.clone();
+        assert!(text.contains("attached: shot.jpg"), "{text}");
+        assert!(text.contains("image/jpeg"), "{text}");
+
+        // And it can be fetched back by whoever can use the bytes.
+        let got = app.route(&get("/api/attachment/shot.jpg"));
+        assert_eq!(got.status, 200);
+        assert_eq!(got.body, b"hello");
+        assert!(
+            got.headers.iter().any(|(k, v)| k.eq_ignore_ascii_case("content-type") && v == "image/jpeg"),
+            "{:?}",
+            got.headers
+        );
+
+        // Too large is refused rather than truncated.
+        let big = "A".repeat((MAX_ATTACHMENT_BYTES / 3 + 8) * 4);
+        let resp = app.route(&post(
+            "/api/agent/message",
+            &json!({"text":"x","attachments":[{"name":"big.bin","mime":"x/y","data_b64":big}]}).to_string(),
+        ));
+        assert_eq!(resp.status, 413);
     }
 
     // ---- the live journal stream (docs/agent-stream.md §1) ----
