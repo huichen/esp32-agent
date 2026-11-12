@@ -6,8 +6,7 @@ what is not done or not verified.
 ## Verified / unverified
 
 - ✅ `agent-core`: 222 tests (protocol, HTTP, manifest validation, driver conversion,
-  capability filtering, auth, hot reload, the agent loop, fs/net/sched, SSE streams, the
-  goal loop)
+  capability filtering, auth, hot reload, the agent loop, fs/net/sched, SSE streams)
 - ✅ Simulator end to end: `scripts/smoke.ps1`
 - ✅ Firmware runs on real hardware (ESP32-S3-DevKitC-1 N16R8, ESP-IDF v5.5.2):
   boots without a reset loop, the I2C bus works, setup AP and station mode coexist, `/`
@@ -20,11 +19,6 @@ what is not done or not verified.
 - ✅ Model latency is outside the `App` lock: a turn in flight no longer queues the
   portal (measured on the board: `/api/status` ≤ 253 ms while a 2.5 s model call runs)
 - ✅ Live journal over SSE (`/api/agent/stream`), `tool_progress`, `agent.tick_ms`
-- ✅ Goal loop (`/api/goal`, `docs/agent-goal.md`): on the board, a 3-iteration goal ran
-  itself to its cap with a real note per iteration, a second goal ran to iteration 7 in
-  five seconds and froze there when stopped, and the objective plus notes survived a
-  reboot. `scripts/goal-smoke.ps1` covers the same path in the simulator, including the
-  409 on a second start and the abort after three consecutive failures
 - ⚠️ Not measured: WS2812/RMT, ADC/PWM values, `/api/ota`, boot time and power draw under
   a full sdkconfig; the portal's live console has only been driven with `curl -N`, not in
   a browser
