@@ -682,6 +682,25 @@ impl Server {
         Self::spawn(vec![http], handler, log, "http", local)
     }
 
+    /// https only, on one port.
+    ///
+    /// The same accept thread and the same inline handshake as [`Server::start_with_tls`],
+    /// with the plaintext socket simply absent. Used when `mcp.plain_http` is false; the
+    /// board calls it only with a certificate in hand, because with none it would listen on
+    /// nothing at all.
+    pub fn start_tls_only(
+        tls_addr: &str,
+        handler: Handler,
+        log: Arc<LogBuf>,
+        handshake: Handshake,
+    ) -> std::io::Result<Self> {
+        let tls = bind(tls_addr)?;
+        let local = tls.local_addr()?;
+        tls.set_nonblocking(true)?;
+        log.info("http", format!("listening on https://{}/ (http is off)", local));
+        Self::spawn_with(vec![(tls, Some(handshake))], handler, log, "http", local)
+    }
+
     /// http and https on two ports, served by **one** accept thread.
     ///
     /// That is not a shortcut, it is the only shape that fits. A TLS connection needs a

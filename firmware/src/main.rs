@@ -258,9 +258,9 @@ fn run() -> anyhow::Result<()> {
     let app: Shared = Arc::new(Mutex::new(App::new(hw, Box::new(store), log.clone(), firmware)));
     mem("after devices");
 
-    let mut port = {
+    let (mut port, plain_http) = {
         let guard = app.lock().map_err(|_| anyhow::anyhow!("app lock poisoned"))?;
-        guard.cfg.mcp.port
+        (guard.cfg.mcp.port, guard.cfg.mcp.plain_http)
     };
 
     // The console is the provisioning path that does not cost anybody their network.
@@ -288,6 +288,20 @@ fn run() -> anyhow::Result<()> {
     };
 
     let addr = format!("0.0.0.0:{port}");
+    // `mcp.plain_http = false` closes port 80 and leaves only https on 443. It is refused
+    // when there is no certificate to serve, because a board that answers on nothing is not
+    // more secure, only unreachable: the way back in would be the USB cable.
+    let plain_http = if plain_http {
+        true
+    } else if tls_identity.is_none() {
+        log.error(
+            "boot",
+            "mcp.plain_http=false but no certificate is available; keeping http on, or the board would answer on no port",
+        );
+        true
+    } else {
+        false
+    };
     // One accept thread serves both ports. A second listener thread for TLS does not fit:
     // with it the agent thread itself failed to start ("Not enough space"), which costs the
     // whole board to gain a second URL.
@@ -295,13 +309,24 @@ fn run() -> anyhow::Result<()> {
     let mut server = match tls_identity {
         Some(identity) => {
             let fingerprint = identity.fingerprint.clone();
-            match Server::start_with_tls(
-                &addr,
-                &tls_bind,
-                make_handler(app.clone()),
-                log.clone(),
-                identity.handshake(),
-            ) {
+            // https-only: the same listener thread, with a single TLS socket in it.
+            let started = if plain_http {
+                Server::start_with_tls(
+                    &addr,
+                    &tls_bind,
+                    make_handler(app.clone()),
+                    log.clone(),
+                    identity.handshake(),
+                )
+            } else {
+                Server::start_tls_only(
+                    &tls_bind,
+                    make_handler(app.clone()),
+                    log.clone(),
+                    identity.handshake(),
+                )
+            };
+            match started {
                 Ok(s) => {
                     if let Ok(mut guard) = app.lock() {
                         guard.tls = TlsInfo {
