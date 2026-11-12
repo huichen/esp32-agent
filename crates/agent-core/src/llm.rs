@@ -103,13 +103,21 @@ pub struct LlmConfig {
     ///
     /// This is what decides when the board compacts: the trigger is 80% of it, exactly
     /// as the host agent's `trigger_tokens` does, and the reserve left over is what keeps
-    /// room for the answer. Default 8192 — roughly the 24 KB of text the board sent
-    /// before the setting existed, so an upgrade does not change behaviour silently.
+    /// room for the answer. Default 262144 (256K), the window the models this board is
+    /// pointed at declare.
+    ///
+    /// Note the interaction with [`MAX_HISTORY_BYTES`]: the board has kilobytes of RAM,
+    /// not megabytes, so the transcript is also capped at 24 KB of text. On a 256K window
+    /// that byte ceiling binds first and the token trigger may never fire — which is the
+    /// honest outcome, because a request large enough to need that window cannot be built
+    /// on this chip anyway.
     pub context_tokens: u32,
-    /// Ceiling on the reply, in tokens; sent as `max_tokens` (`chat` and `responses`)
-    /// and `max_tokens` (Anthropic always requires it). Also part of the compaction
-    /// reserve: a request whose history plus this no longer fits the window is rejected
-    /// by the provider rather than trimmed by the board.
+    /// Ceiling on the reply, in tokens; sent as `max_tokens` on all three protocols.
+    /// Also part of the compaction reserve.
+    ///
+    /// The board still truncates a reply at [`MAX_REPLY_BYTES`] (8 KB) to keep it out of
+    /// the portal's way, so a 32K ceiling is a provider-side limit rather than a promise
+    /// of a longer answer here.
     pub max_output_tokens: u32,
 }
 
@@ -125,8 +133,8 @@ impl Default for LlmConfig {
             reasoning: String::new(),
             vision: true,
             protocol: "chat".into(),
-            context_tokens: 8192,
-            max_output_tokens: 2048,
+            context_tokens: 262_144,
+            max_output_tokens: 32_768,
         }
     }
 }
