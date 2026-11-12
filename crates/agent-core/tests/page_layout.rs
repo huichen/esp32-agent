@@ -13,7 +13,7 @@
 //! a standard place (see `browser()`).
 
 use esp32_agent_core::web::{APP_JS, INDEX_HTML, STYLE_CSS};
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -44,12 +44,65 @@ window.__esp32Measure = function () {
   };
   var snap = function () { return { chip: r(q("#attach-chip")), input: r(q("#input")), send: r(q("#send")) }; };
   var attach = function (a) { S.attach = a; showAttach(); };
+
+  // Markdown, measured as DOM: a table is a table, its cells kept their inline code and
+  // their pipes, and it stays inside the bubble it was rendered into. A hidden host at the
+  // page's own width, so the numbers are the ones a phone would produce.
+  window.__esp32Markdown = function () {
+    var host = document.createElement("div");
+    host.style.cssText = "position:absolute;left:0;top:0;width:100%;visibility:hidden";
+    var row = document.createElement("div");
+    row.className = "row agent";
+    var bubble = document.createElement("div");
+    bubble.className = "bubble";
+    row.appendChild(bubble);
+    host.appendChild(row);
+    document.body.appendChild(host);
+    bubble.innerHTML = markdown([
+      "检测到 4 个设备：",
+      "",
+      "| 设备 | 说明 | 引脚 | 可用工具 |",
+      "|---|---|:---:|---|",
+      "| buttons | 3 个按键 | GPIO 0、39、40 | `buttons_read`、`button_wait` |",
+      "| led | WS2812 灯珠 | GPIO 48 | `led_set` |",
+      "| a \\| b | 竖线 | — | `x` |",
+      "",
+      "结尾。",
+    ].join("\n"));
+
+    var table = bubble.querySelector("table");
+    var wrap = bubble.querySelector(".table-wrap");
+    var all = table ? Array.prototype.slice.call(table.querySelectorAll("th,td")) : [];
+    var pipeOnly = document.createElement("div");
+    pipeOnly.className = "bubble";
+    pipeOnly.innerHTML = markdown("a | b\nc | d");
+    var out = {
+      table: !!table,
+      inBubble: !!bubble.querySelector("table"),
+      thead: table ? table.querySelectorAll("thead tr").length : 0,
+      bodyRows: table ? table.querySelectorAll("tbody tr").length : 0,
+      headers: table
+        ? Array.prototype.map.call(table.querySelectorAll("th"), function (c) { return c.textContent; })
+        : [],
+      cells: all.map(function (c) { return c.textContent; }),
+      centered: all.filter(function (c) { return c.style.textAlign === "center"; }).length,
+      codeInCell: table ? table.querySelectorAll("td code").length : 0,
+      pipeOnly: !!pipeOnly.querySelector("table"),
+      text: bubble.textContent,
+      wrap: wrap ? r(wrap) : null,
+      bubble: r(bubble),
+    };
+    host.remove();
+    return out;
+  };
+
   var out = { width: innerWidth, height: innerHeight };
   out.empty = snap();
   attach({ name: "IMG_20261112_1942.jpg", mime: "image/jpeg", data_b64: "", kb: 21 });
   out.attached = snap();
   attach(null);
   out.restored = snap();
+  out.md = window.__esp32Markdown();
   return out;
 };
 </script>
@@ -203,9 +256,13 @@ fn in_path(name: &str) -> Option<PathBuf> {
 
 /// Render the harness and hand back the dumped DOM. A unique profile per run matters: with
 /// the default one Chrome hands the request to a browser that is already running and prints
-/// nothing at all.
+/// nothing at all. Per *run*, not per process: the tests in this file run in parallel
+/// threads of one process, and two browsers handed the same `--user-data-dir` do the same
+/// thing — the second prints nothing (exit code 21).
 fn dump_dom(browser: &Path, url: &str) -> String {
-    let profile = std::env::temp_dir().join(format!("esp32-agent-layout-{}", std::process::id()));
+    static RUNS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let run = RUNS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let profile = std::env::temp_dir().join(format!("esp32-agent-layout-{}-{run}", std::process::id()));
     let _ = std::fs::remove_dir_all(&profile);
     let out = Command::new(browser)
         .args([
@@ -397,5 +454,72 @@ fn the_composer_fits_a_phone_screen() {
                 send.width
             );
         }
+    }
+}
+
+/// A table is a table: the model answers a device question with four columns, and on a
+/// phone the unrendered version is one paragraph of `|` and `---`. Measured as DOM, not as
+/// a string — the cells, the inline code inside them, an escaped pipe, the centred column,
+/// and the part a string cannot say: that the table stays inside its bubble.
+#[test]
+fn a_markdown_table_renders_as_a_table_on_a_phone() {
+    let browser = browser();
+    let url = format!("{}/harness", serve());
+    let dom = dump_dom(&browser, &url);
+    let measured = measurements(&dom);
+
+    for width in PHONE_WIDTHS {
+        let md = &measured[width]["md"];
+        let at = format!("{width} px");
+        assert!(md["table"].as_bool().unwrap_or(false), "{at}: no <table> rendered: {md}");
+        assert!(md["inBubble"].as_bool().unwrap_or(false), "{at}: the table left its bubble: {md}");
+        assert_eq!(md["thead"], json!(1), "{at}: one header row: {md}");
+        assert_eq!(md["bodyRows"], json!(3), "{at}: three body rows: {md}");
+        assert_eq!(
+            md["headers"],
+            json!(["设备", "说明", "引脚", "可用工具"]),
+            "{at}: the header cells: {md}"
+        );
+        assert!(
+            md["codeInCell"].as_u64().unwrap_or(0) >= 3,
+            "{at}: `code` inside a cell must still be code: {md}"
+        );
+        assert!(
+            md["centered"].as_u64().unwrap_or(0) >= 4,
+            "{at}: `:---:` is one centred column over four rendered rows: {md}"
+        );
+        assert!(
+            md["cells"].as_array().into_iter().flatten().any(|c| c == "a | b"),
+            "{at}: `\\|` is a pipe in the text, not a separator: {md}"
+        );
+        assert_eq!(
+            md["pipeOnly"],
+            json!(false),
+            "{at}: pipes without a `|---|` row are text, not a table: {md}"
+        );
+        assert!(
+            !md["text"].as_str().unwrap_or("").contains("|---"),
+            "{at}: the delimiter row leaked into the text: {md}"
+        );
+
+        // A wide table may scroll inside its wrapper; what it may not do is make the bubble
+        // wider than the row it sits in.
+        let wrap = &md["wrap"];
+        let bubble = &md["bubble"];
+        let num = |v: &Value, key: &str| v[key].as_f64().unwrap_or(f64::NAN);
+        assert!(
+            num(wrap, "left") >= num(bubble, "left") - 0.5
+                && num(wrap, "right") <= num(bubble, "right") + 0.5,
+            "{at}: the table spans {:.1}..{:.1}, the bubble {:.1}..{:.1}",
+            num(wrap, "left"),
+            num(wrap, "right"),
+            num(bubble, "left"),
+            num(bubble, "right")
+        );
+        assert!(
+            num(bubble, "width") <= *width as f64 * 0.9,
+            "{at}: the bubble is {:.1} px wide, more than the 86% a bubble may take",
+            num(bubble, "width")
+        );
     }
 }
