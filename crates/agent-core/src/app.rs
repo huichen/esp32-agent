@@ -3594,7 +3594,8 @@ mod tests {
         let mut app = test_app();
         let started = std::time::Instant::now();
         // The path MCP and the on-board agent both take for `net_*` is `ToolHost`.
-        let out = ToolHost::call_tool(&mut app, "net_get", &json!({"url": "http://127.0.0.1:8080/healthz"}))
+        let url = format!("http://127.0.0.1:{}/healthz", app.cfg.mcp.port);
+        let out = ToolHost::call_tool(&mut app, "net_get", &json!({"url": url}))
             .expect("a self request is answered");
         let body: Value = serde_json::from_str(&out).expect("json");
         let took = started.elapsed();
