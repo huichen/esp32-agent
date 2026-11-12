@@ -7,7 +7,7 @@
 //! loop itself never reads a clock and stays testable on the host.
 //!
 //! Bounds, because the board has ~300 KB of usable heap and this history is
-//! persisted to NVS:
+//! transcript lives on the heap, not in NVS: a reboot starts a new conversation
 //!
 //! * at most [`MAX_HISTORY_MESSAGES`] messages and [`MAX_HISTORY_BYTES`] of text;
 //! * a user message is cut to [`MAX_USER_BYTES`];
@@ -21,7 +21,19 @@ use serde_json::{json, Value};
 /// Oldest messages are dropped above this count.
 pub const MAX_HISTORY_MESSAGES: usize = 48;
 /// Oldest messages are dropped above this much text.
-pub const MAX_HISTORY_BYTES: usize = 24 * 1024;
+///
+/// Not a physical limit of the chip: the transcript and the request built from it live
+/// in PSRAM (8 MB here), and the two ceilings that used to bind, the internal-RAM
+/// allocations and the mbedTLS buffers, were both moved off it. What this bounds is the
+/// *request body*: tools (about 18 KB of JSON), the system prompt, and this text all go
+/// out in one POST, and the board has to build and send that body while its internal
+/// SRAM is down to a few kilobytes after TLS.
+///
+/// Measured on the bench (see `docs/troubleshooting.md`): 30 KB bodies go out, a 22 KB
+/// body failed only when internal heap had collapsed to 1 kB. Raised from 24 KB to 64 KB
+/// after that measurement; the reading that made it safe is `mem.internal_kb` in
+/// `/api/status`, not a guess.
+pub const MAX_HISTORY_BYTES: usize = 64 * 1024;
 /// How many question-and-answer exchanges survive compression verbatim.
 ///
 /// Four is enough to keep the thread of a task (what was asked, what the last tools did)
