@@ -27,6 +27,7 @@ pub mod error;
 pub mod font6x8;
 pub mod goal;
 pub mod hardware;
+pub mod hash;
 pub mod http;
 pub mod json;
 pub mod llm;

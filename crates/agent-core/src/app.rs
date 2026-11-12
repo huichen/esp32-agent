@@ -1037,7 +1037,7 @@ impl App {
         }
         // `shell` is a router in front of the fs_*/net_* handlers, so it has to be reached
         // from both entry points: the model's tool host and the MCP `tools/call`.
-        if name == "shell" {
+        if name == "nsh" || name == "shell" {
             let text = self.run_shell(args).map_err(McpError::invalid_params)?;
             return Ok(serde_json::from_str(&text).unwrap_or_else(|_| json!({ "text": text })));
         }
@@ -2423,6 +2423,50 @@ impl App {
             // What the model is actually told, system part only. Memory, instructions and
             // the compressed index live here, and a client that cannot see them cannot
             // tell a bad prompt from a bad model.
+            // Create, replace, append and clear the standing orders. The `GET` above
+            // reports what the model is told; this is the one part of it a person writes.
+            ("POST", "/api/agent/prompt") => {
+                if let Err(r) = self.require_pin(req) {
+                    return r;
+                }
+                let body: Value = match req.json() {
+                    Ok(v) => v,
+                    Err(e) => return Response::error_json(400, &format!("invalid JSON: {e}")),
+                };
+                let action = body.get("action").and_then(|v| v.as_str()).unwrap_or("set");
+                let text = body.get("text").and_then(|v| v.as_str()).unwrap_or("");
+                match action {
+                    "clear" => self.cfg.agent.system_prompt.clear(),
+                    "append" => {
+                        let current = self.cfg.agent.system_prompt.trim_end();
+                        let joined = if current.is_empty() {
+                            text.trim().to_string()
+                        } else {
+                            format!("{current}\n{}", text.trim())
+                        };
+                        self.cfg.agent.system_prompt =
+                            joined.chars().take(crate::config::MAX_SYSTEM_PROMPT).collect();
+                    }
+                    "set" => {
+                        self.cfg.agent.system_prompt =
+                            text.chars().take(crate::config::MAX_SYSTEM_PROMPT).collect();
+                    }
+                    other => {
+                        return Response::error_json(
+                            400,
+                            &format!("unknown action `{other}`; use set, append or clear"),
+                        )
+                    }
+                }
+                self.persist_config();
+                Response::json(&json!({
+                    "ok": true,
+                    "action": action,
+                    "system_prompt": self.cfg.agent.system_prompt,
+                    "bytes": self.cfg.agent.system_prompt.len(),
+                    "limit": crate::config::MAX_SYSTEM_PROMPT,
+                }))
+            }
             ("GET", "/api/agent/prompt") => {
                 if let Err(r) = self.require_read(req) {
                     return r;
@@ -2877,6 +2921,10 @@ impl ToolHost for App {
     ///
     /// Both shapes reach here: `/skills/<name>/SKILL.md` (a skill with material next to
     /// it) and `/skills/<name>.md` (a skill that is one file).
+    fn custom_prompt(&self) -> Option<String> {
+        Some(self.cfg.agent.system_prompt.clone())
+    }
+
     fn skills(&self) -> Vec<crate::agent::SkillRef> {
         crate::tools::knowledge::index(&self.workspace)
             .into_iter()
@@ -2987,6 +3035,9 @@ impl App {
             "shell_ps" => self.shell_ps(),
             "shell_hexdump" => self.shell_hexdump(&inner),
             "shell_base64" => self.shell_base64(&inner),
+            "shell_sha256sum" => self.shell_hash(&inner, true),
+            "shell_md5sum" => self.shell_hash(&inner, false),
+            "shell_system_prompt" => self.shell_system_prompt(&inner),
             other => self.fs_or_net_call(other, &inner),
         };
         result.map_err(|e| {
@@ -3062,6 +3113,60 @@ impl App {
             out["note"] = json!("the file holds the first 2048 bytes of the response");
         }
         Ok(out.to_string())
+    }
+
+    /// `sha256sum` / `md5sum`: what is in this file, in a form another machine can check.
+    fn shell_hash(&mut self, args: &Value, sha: bool) -> std::result::Result<String, String> {
+        let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("").trim();
+        if path.is_empty() {
+            return Err("`path` is required".into());
+        }
+        let bytes = fs_tools::Workspace::read(&self.workspace, path)?.into_bytes();
+        let digest = if sha { crate::hash::sha256(&bytes) } else { crate::hash::md5(&bytes) };
+        let key = if sha { "sha256" } else { "md5" };
+        let mut out = json!({ "path": path, "bytes": bytes.len() });
+        out[key] = json!(digest);
+        Ok(out.to_string())
+    }
+
+    /// `system_prompt get|set|append|clear`: the owner's standing orders, from the agent.
+    fn shell_system_prompt(&mut self, args: &Value) -> std::result::Result<String, String> {
+        let action = args.get("action").and_then(|v| v.as_str()).unwrap_or("get").trim().to_ascii_lowercase();
+        let text = args.get("text").and_then(|v| v.as_str()).unwrap_or("");
+        match action.as_str() {
+            "get" => {}
+            "set" => {
+                self.cfg.agent.system_prompt = text.chars().take(crate::config::MAX_SYSTEM_PROMPT).collect();
+                self.persist_config();
+            }
+            "append" => {
+                let current = self.cfg.agent.system_prompt.trim_end().to_string();
+                let joined = if current.is_empty() {
+                    text.trim().to_string()
+                } else {
+                    format!("{current}\n{}", text.trim())
+                };
+                self.cfg.agent.system_prompt =
+                    joined.chars().take(crate::config::MAX_SYSTEM_PROMPT).collect();
+                self.persist_config();
+            }
+            "clear" => {
+                self.cfg.agent.system_prompt.clear();
+                self.persist_config();
+            }
+            other => {
+                return Err(format!(
+                "unknown action `{other}`\n\nusage: system_prompt get | set <text> | append <text> | clear"
+            ))
+            }
+        }
+        Ok(json!({
+            "action": action,
+            "system_prompt": self.cfg.agent.system_prompt,
+            "bytes": self.cfg.agent.system_prompt.len(),
+            "limit": crate::config::MAX_SYSTEM_PROMPT,
+        })
+        .to_string())
     }
 
     /// `df`: how much of the workspace is used.
@@ -4274,7 +4379,7 @@ mod tests {
             .iter()
             .map(|t| t["function"]["name"].as_str().unwrap_or("").to_string())
             .collect();
-        for kept in ["shell", "script"] {
+        for kept in ["nsh", "script"] {
             assert!(names.iter().any(|n| n == kept), "{kept} must survive the minimal profile");
         }
 
@@ -4447,6 +4552,59 @@ mod tests {
             &json!({"text":"x","attachments":[{"name":"big.bin","mime":"x/y","data_b64":big}]}).to_string(),
         ));
         assert_eq!(resp.status, 413);
+    }
+
+    /// The standing orders are part of the system prompt, writable from the shell and
+    /// from HTTP, and they disappear when cleared.
+    #[test]
+    fn the_standing_orders_reach_the_model_and_can_be_edited() {
+        let mut app = test_app();
+        ToolHost::call_tool(
+            &mut app,
+            "nsh",
+            &json!({"command": "system_prompt set the pump is on GPIO12; never run it past two minutes"}),
+        )
+        .expect("set");
+
+        assert_eq!(
+            ToolHost::custom_prompt(&app).as_deref(),
+            Some("the pump is on GPIO12; never run it past two minutes")
+        );
+
+        // It is in the prompt the model receives, under its own heading.
+        let prompt = body_json(&app.route(&get("/api/agent/prompt")));
+        let system = prompt["system"].as_str().unwrap_or_default();
+        assert!(system.contains("Standing orders for this board"), "{system}");
+        assert!(system.contains("never run it past two minutes"), "{system}");
+
+        // The HTTP route appends and clears, for an agent that is not on the board.
+        let added = app
+            .route(&post("/api/agent/prompt", r#"{"action":"append","text":"the LED is a status light"}"#));
+        assert_eq!(added.status, 200);
+        let value = body_json(&added);
+        assert!(value["system_prompt"].as_str().unwrap().contains("status light"), "{value}");
+        assert!(value["system_prompt"].as_str().unwrap().contains("GPIO12"), "{value}");
+
+        let cleared = app.route(&post("/api/agent/prompt", r#"{"action":"clear"}"#));
+        assert_eq!(cleared.status, 200);
+        assert_eq!(ToolHost::custom_prompt(&app).as_deref(), Some(""));
+    }
+
+    /// Hashing is a command, and the digest is the one a `sha256sum` on the host prints.
+    #[test]
+    fn nsh_hashes_a_file_the_way_sha256sum_does() {
+        let mut app = test_app();
+        ToolHost::call_tool(&mut app, "write", &json!({"path":"/h.txt","text":"abc"})).expect("write");
+        let out =
+            ToolHost::call_tool(&mut app, "nsh", &json!({"command": "sha256sum /h.txt"})).expect("sha256sum");
+        let value: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(
+            value["sha256"],
+            json!("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
+        );
+        let md5 = ToolHost::call_tool(&mut app, "nsh", &json!({"command": "md5sum /h.txt"})).expect("md5sum");
+        let value: Value = serde_json::from_str(&md5).unwrap();
+        assert_eq!(value["md5"], json!("900150983cd24fb0d6963f7d28e17f72"));
     }
 
     /// A model that gets a command wrong should read the correction in the error, and
@@ -4916,7 +5074,7 @@ mod tests {
         assert!(tools.iter().all(|t| t["type"] == "function" && t["function"]["parameters"].is_object()));
         assert!(names.contains(&"board_status"), "got {names:?}");
         assert!(names.contains(&"oled_text"));
-        assert!(names.contains(&"shell"), "the file and network commands are missing: {names:?}");
+        assert!(names.contains(&"nsh"), "the file and network commands are missing: {names:?}");
         // A tool whose hardware is absent is not offered, exactly as in tools/list.
         assert!(!names.contains(&"mpu6050_read"));
     }
@@ -5268,7 +5426,7 @@ mod tests {
             .filter_map(|t| t["function"]["name"].as_str())
             .collect();
         assert!(names.contains(&"board_status"), "got {names:?}");
-        assert!(names.contains(&"shell"), "got {names:?}");
+        assert!(names.contains(&"nsh"), "got {names:?}");
         assert_eq!(body1["model"], "stub");
 
         // The second request carries the board's answer back as a `tool` message.
@@ -5378,7 +5536,7 @@ mod tests {
     fn the_file_and_network_tools_are_in_the_mcp_list_and_callable() {
         let mut app = test_app();
         let names = tool_names(&mut app);
-        for needle in ["shell", "script", "image_read"] {
+        for needle in ["nsh", "script", "image_read"] {
             assert!(names.contains(&needle.to_string()), "{needle} is missing from tools/list: {names:?}");
         }
 
@@ -5388,7 +5546,7 @@ mod tests {
             .as_array()
             .unwrap()
             .iter()
-            .find(|t| t["name"] == "shell")
+            .find(|t| t["name"] == "nsh")
             .expect("shell in the list");
         assert!(shell["inputSchema"]["properties"]["command"].is_object(), "{shell}");
 
@@ -5704,7 +5862,7 @@ mod tests {
         sorted.sort_unstable();
         assert_eq!(names, sorted, "the tool list is not alphabetical: {names:?}");
 
-        for needle in ["board_status", "manifest_apply", "shell", "script", "image_read"] {
+        for needle in ["board_status", "manifest_apply", "nsh", "script", "image_read"] {
             assert!(names.contains(&needle), "{needle} is missing: {names:?}");
         }
         // A manifest tool sorts among the rest — `aaa_manifest` is first, not last.
@@ -5752,7 +5910,7 @@ mod tests {
         let tools = body["tools"].as_array().expect("tools");
         let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().expect("a name")).collect();
 
-        for needle in ["script", "shell", "image_read", "board_status"] {
+        for needle in ["script", "nsh", "image_read", "board_status"] {
             assert!(names.contains(&needle), "{needle} is missing from the portal: {names:?}");
         }
         let mut sorted = names.clone();
@@ -5876,7 +6034,7 @@ mod tests {
             assert!(!names.contains(&absent.to_string()), "{absent} is back in the tool list: {names:?}");
         }
         // The file tools that do reach them are still there.
-        for present in ["shell"] {
+        for present in ["nsh"] {
             assert!(names.contains(&present.to_string()), "{present} is missing: {names:?}");
         }
 

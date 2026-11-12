@@ -80,6 +80,15 @@ pub const ROUTES: &[Route] = &[
         "{ok, uptime_s, devices}",
     ),
     r(
+        "POST",
+        "/api/agent/prompt",
+        "agent",
+        Auth::Pin,
+        "Set, append or clear the standing orders the model is given: {action: set|append|clear, text}",
+        "{action, text}",
+        "{ok, action, system_prompt, bytes, limit}",
+    ),
+    r(
         "GET",
         "/api/tls",
         "status",

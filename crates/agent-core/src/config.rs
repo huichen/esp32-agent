@@ -199,11 +199,21 @@ pub struct AgentCfg {
     /// The platform reads it on every tick instead of once at boot, so a portal edit
     /// takes effect on the next tick.
     pub tick_ms: u32,
+    /// Extra instructions appended to the system prompt, verbatim.
+    ///
+    /// The static prompt says how to behave on this board; this field is where the owner
+    /// says what *their* board is for — "the pump on GPIO12 waters the plants, never run
+    /// it longer than two minutes" — without editing firmware. Read and written from the
+    /// portal, from `nsh system_prompt …`, and from `GET`/`POST /api/agent/prompt`.
+    pub system_prompt: String,
 }
+
+/// Long enough for a page of standing orders, short enough that every request carries it.
+pub const MAX_SYSTEM_PROMPT: usize = 2048;
 
 impl Default for AgentCfg {
     fn default() -> Self {
-        Self { tick_ms: DEFAULT_TICK_MS }
+        Self { tick_ms: DEFAULT_TICK_MS, system_prompt: String::new() }
     }
 }
 
@@ -335,6 +345,10 @@ impl Config {
                 self.board = s.trim().to_string();
                 touched.push("board".into());
             }
+        }
+        if let Some(v) = patch.get("agent").and_then(|a| a.get("system_prompt")).and_then(|v| v.as_str()) {
+            self.agent.system_prompt = v.chars().take(MAX_SYSTEM_PROMPT).collect();
+            touched.push("agent.system_prompt".into());
         }
         if let Some(b) = patch.get("auto_peripherals").and_then(|v| v.as_bool()) {
             self.auto_peripherals = b;
