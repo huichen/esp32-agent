@@ -434,32 +434,52 @@ impl Hardware for EspHw {
     }
 
     fn i2c_read(&mut self, bus: u8, addr: u8, reg: Option<u8>, out: &mut [u8]) -> Result<()> {
-        let dev = self.device(bus, addr)?;
-        if let Some(r) = reg {
-            let rc = unsafe { sys::i2c_master_transmit(dev, &r, 1, I2C_TIMEOUT_MS) };
-            if rc != sys::ESP_OK {
-                return Err(McpError::hardware(format!("i2c write reg: {rc}")));
+        let mut last = sys::ESP_OK;
+        for attempt in 0..2 {
+            let dev = self.device(bus, addr)?;
+            if let Some(r) = reg {
+                last = unsafe { sys::i2c_master_transmit(dev, &r, 1, I2C_TIMEOUT_MS) };
+                if last != sys::ESP_OK {
+                    if attempt == 0 {
+                        self.reset_bus(bus);
+                        continue;
+                    }
+                    return Err(McpError::hardware(format!("i2c write reg: {last}")));
+                }
+            }
+            last = unsafe { sys::i2c_master_receive(dev, out.as_mut_ptr(), out.len(), I2C_TIMEOUT_MS) };
+            if last == sys::ESP_OK {
+                return Ok(());
+            }
+            if attempt == 0 {
+                self.reset_bus(bus);
             }
         }
-        let rc = unsafe { sys::i2c_master_receive(dev, out.as_mut_ptr(), out.len(), I2C_TIMEOUT_MS) };
-        if rc != sys::ESP_OK {
-            return Err(McpError::hardware(format!("i2c read: {rc}")));
-        }
-        Ok(())
+        Err(McpError::hardware(format!("i2c read: {last}")))
     }
 
     fn i2c_write(&mut self, bus: u8, addr: u8, reg: Option<u8>, data: &[u8]) -> Result<()> {
-        let dev = self.device(bus, addr)?;
         let mut buf = Vec::with_capacity(data.len() + 1);
         if let Some(r) = reg {
             buf.push(r);
         }
         buf.extend_from_slice(data);
-        let rc = unsafe { sys::i2c_master_transmit(dev, buf.as_ptr(), buf.len(), I2C_TIMEOUT_MS) };
-        if rc != sys::ESP_OK {
-            return Err(McpError::hardware(format!("i2c write: {rc}")));
+        let mut last = sys::ESP_OK;
+        for attempt in 0..2 {
+            let dev = self.device(bus, addr)?;
+            last = unsafe { sys::i2c_master_transmit(dev, buf.as_ptr(), buf.len(), I2C_TIMEOUT_MS) };
+            if last == sys::ESP_OK {
+                return Ok(());
+            }
+            // A jumper that glitches mid-byte leaves the driver's bus state invalid
+            // (`ESP_ERR_INVALID_STATE`) and then *every* later transfer fails until the
+            // peripheral is reset - the screen goes dead after one bad frame on a
+            // breadboard, which is exactly how this was found. Reset and try once more.
+            if attempt == 0 {
+                self.reset_bus(bus);
+            }
         }
-        Ok(())
+        Err(McpError::hardware(format!("i2c write: {last}")))
     }
 
     fn gpio_config(&mut self, pin: i32, mode: PinMode) -> Result<()> {
@@ -799,6 +819,18 @@ fn i2s_channel(
 // ---------------------------------------------------------------- WS2812 helpers
 
 impl EspHw {
+    /// Put the peripheral back into a state where it will talk again.
+    ///
+    /// The controller is untouched: this clears the driver's bus state and the lines, not
+    /// the panel's memory, so the next frame repaints what it should.
+    fn reset_bus(&mut self, bus: u8) {
+        if let Some(handle) = self.buses.get(&bus) {
+            unsafe {
+                let _ = sys::i2c_master_bus_reset(*handle);
+            }
+        }
+    }
+
     /// Create the RMT transmit channel and its WS2812 byte encoder for one pin.
     ///
     /// 10 MHz resolution turns the part's 0.3/0.9 us bits into 3/9 and 9/3 ticks. A
