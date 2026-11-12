@@ -206,6 +206,14 @@ pub struct AgentCfg {
     /// it longer than two minutes" — without editing firmware. Read and written from the
     /// portal, from `shell system_prompt …`, and from `GET`/`POST /api/agent/prompt`.
     pub system_prompt: String,
+    /// Keep the conversation in flash, so a power cut does not restart it from nothing.
+    ///
+    /// On by default: a board that forgets what it was told whenever the power blinks is
+    /// not an agent, and the stored tail is bounded ([`crate::agent::MAX_SAVED_BYTES`])
+    /// rather than left to grow. `false` stops both the writes and the restore; the stored
+    /// copy is left alone, so switching it back on brings the conversation back.
+    #[serde(default = "default_true")]
+    pub persist_transcript: bool,
 }
 
 /// Long enough for a page of standing orders, short enough that every request carries it.
@@ -213,7 +221,7 @@ pub const MAX_SYSTEM_PROMPT: usize = 2048;
 
 impl Default for AgentCfg {
     fn default() -> Self {
-        Self { tick_ms: DEFAULT_TICK_MS, system_prompt: String::new() }
+        Self { tick_ms: DEFAULT_TICK_MS, system_prompt: String::new(), persist_transcript: true }
     }
 }
 
@@ -563,6 +571,10 @@ impl Config {
                 // The tick does not need a reboot: the platform re-reads it every tick.
                 self.agent.tick_ms = clamp_tick_ms(n.min(u32::MAX as u64) as u32);
                 touched.push("agent.tick_ms".into());
+            }
+            if let Some(b) = a.get("persist_transcript").and_then(|v| v.as_bool()) {
+                self.agent.persist_transcript = b;
+                touched.push("agent.persist_transcript".into());
             }
         }
         *self = self.clone().sanitized();

@@ -40,6 +40,28 @@ pub const NVS_KEY_SCHED: &str = "sched";
 pub const NVS_KEY_WORKSPACE: &str = "ws";
 /// The one goal the board may be working towards, as one JSON document.
 pub const NVS_KEY_GOAL: &str = "goal";
+/// The transcript between boots: a header line and one message per line.
+///
+/// The board's NVS refuses a single string value above roughly 4000 bytes - the firmware
+/// reads through a fixed 4096-byte buffer (`firmware/src/nvs_store.rs`) and ESP-IDF
+/// rejects a longer write - so the blob is stored as a few values: this key holds the
+/// header and the first part, `agent.transcript.1`, `.2` ... hold the rest. The header
+/// carries a checksum over everything after it, so chunks from two different writes are
+/// detected instead of concatenated into a transcript that never existed.
+pub const NVS_KEY_TRANSCRIPT: &str = "agent.transcript";
+/// The most bytes one stored value may hold: the same ceiling `GOAL_BLOB_MAX` is sized
+/// against, for the same reason.
+pub const TRANSCRIPT_CHUNK_BYTES: usize = 3500;
+/// How many values a full transcript may span, and then some: a 16 KB tail needs five,
+/// and the spare room is what keeps a shrinking transcript from colliding with the tail
+/// of the previous one.
+pub const TRANSCRIPT_CHUNKS_MAX: usize = 8;
+/// Written before a run starts and removed when it ends. Its presence at boot is the
+/// only evidence that a turn was cut off by a power loss rather than finished.
+pub const NVS_KEY_RUN_IN_FLIGHT: &str = "agent.run_in_flight";
+/// The source a resumed turn carries, so a reply can be told apart from one the user just
+/// asked for.
+pub const RESUME_SOURCE: &str = "resume";
 
 /// The source a goal iteration's turn carries. It is how a reply is attributed to the
 /// goal: the queue merges the sources of everything that landed in one turn, so a
@@ -1335,6 +1357,212 @@ impl App {
                 Err(e) => self.log.error("goal", format!("the stored goal is unreadable ({e})")),
             }
         }
+        // Last, because resuming needs the config that decides whether anything was stored
+        // at all, and the transcript a resumed turn continues from.
+        self.load_transcript();
+    }
+
+    // ---------------------------------------------------------------- transcript
+
+    /// Where one chunk of the stored transcript lives. The first one owns the base key.
+    fn transcript_key(index: usize) -> String {
+        if index == 0 {
+            NVS_KEY_TRANSCRIPT.to_string()
+        } else {
+            format!("{NVS_KEY_TRANSCRIPT}.{index}")
+        }
+    }
+
+    /// The stored transcript, chunks joined in order, or `None` when nothing was stored.
+    fn read_transcript(&self) -> Option<String> {
+        let mut text = self.store.get(NVS_KEY_TRANSCRIPT)?;
+        for index in 1..TRANSCRIPT_CHUNKS_MAX {
+            match self.store.get(&Self::transcript_key(index)) {
+                Some(part) => text.push_str(&part),
+                None => break,
+            }
+        }
+        Some(text)
+    }
+
+    /// Store the blob, split at line boundaries so no value is longer than the board's NVS
+    /// will take.
+    ///
+    /// Chunk 0 is written first and carries the checksum, so a write cut short by a power
+    /// failure leaves a header that no longer matches its body. That is detected on the
+    /// next boot and the blob is discarded whole - a half-published transcript would be
+    /// worse than none, because the model would be told it said things it did not.
+    fn write_transcript(&mut self, text: &str) -> bool {
+        let mut chunks: Vec<String> = Vec::new();
+        let mut current = String::new();
+        for line in text.split_inclusive('\n') {
+            if !current.is_empty() && current.len() + line.len() > TRANSCRIPT_CHUNK_BYTES {
+                chunks.push(std::mem::take(&mut current));
+            }
+            current.push_str(line);
+        }
+        if !current.is_empty() {
+            chunks.push(current);
+        }
+        if chunks.len() > TRANSCRIPT_CHUNKS_MAX {
+            // Unreachable while `MAX_SAVED_BYTES` and the chunk size agree; refusing beats
+            // writing a tail and leaving the rest of the previous one behind it.
+            self.log.error("agent", "the transcript needs more chunks than the store allows; not saved");
+            return false;
+        }
+        for (index, chunk) in chunks.iter().enumerate() {
+            if !self.store.set(&Self::transcript_key(index), chunk) {
+                self.log.error("agent", format!("could not write transcript chunk {index}"));
+                return false;
+            }
+        }
+        // A shorter transcript must not be followed by the tail of the longer one it
+        // replaced, or the next read concatenates two conversations.
+        for index in chunks.len()..TRANSCRIPT_CHUNKS_MAX {
+            if self.store.get(&Self::transcript_key(index)).is_none() {
+                break;
+            }
+            self.store.remove(&Self::transcript_key(index));
+        }
+        true
+    }
+
+    fn remove_transcript(&mut self) -> bool {
+        let mut removed = self.store.remove(NVS_KEY_TRANSCRIPT);
+        for index in 1..TRANSCRIPT_CHUNKS_MAX {
+            if self.store.get(&Self::transcript_key(index)).is_none() {
+                break;
+            }
+            removed = self.store.remove(&Self::transcript_key(index)) || removed;
+        }
+        removed
+    }
+
+    /// Keep the conversation for the next boot: the tail of the history, or nothing when
+    /// there is nothing to keep.
+    ///
+    /// Called at every boundary of a turn - after the queued message enters the history and
+    /// after each model reply - rather than only at the end. That is what makes "the tool
+    /// results that landed before the power went out are still there" true: a turn can die
+    /// in the middle, and only what was written before that point comes back.
+    ///
+    /// An empty history always clears the keys, whatever `agent.persist_transcript` says: a
+    /// forget that did not reach flash would come back at the next boot, which is the worst
+    /// thing this feature could do.
+    pub fn persist_transcript(&mut self) -> bool {
+        if self.agent.history.is_empty() {
+            let had = self.remove_transcript();
+            if had {
+                self.log.info("agent", "the stored transcript was dropped");
+            }
+            return had;
+        }
+        if !self.cfg.agent.persist_transcript {
+            return false;
+        }
+        let text = crate::agent::transcript_jsonl(&self.agent.history, now_ms());
+        let ok = self.write_transcript(&text);
+        if !ok {
+            self.log.error("agent", "the transcript could not be saved; a reboot loses this conversation");
+        }
+        ok
+    }
+
+    /// Restore the transcript from flash and finish a turn a power cut interrupted.
+    ///
+    /// Two independent pieces of evidence are read here, in this order:
+    ///
+    /// * the transcript, which holds everything up to the last completed step. A blob that
+    ///   does not check out - torn by a power failure, written by a newer build, or just not
+    ///   JSON - is logged and skipped, never a panic and never half-adopted;
+    /// * the in-flight marker, whose presence means a turn was running when the board lost
+    ///   power. The question it was answering is queued again with the source
+    ///   [`RESUME_SOURCE`], so the turn continues from the last completed step: a tool call
+    ///   whose result is already in the transcript is not repeated, because the model sees
+    ///   the result and has no reason to ask again.
+    pub fn load_transcript(&mut self) {
+        if self.cfg.agent.persist_transcript {
+            if let Some(text) = self.read_transcript() {
+                match crate::agent::transcript_from_jsonl(&text) {
+                    Some((messages, dropped)) => {
+                        let kept = messages.len();
+                        self.agent.history = messages;
+                        self.agent.saved_dropped = dropped;
+                        self.log.info("agent", format!("restored {kept} message(s) from flash"));
+                        if dropped > 0 {
+                            self.log.warn(
+                                "agent",
+                                format!(
+                                    "{dropped} older message(s) were not stored; the saved tail is capped at {} bytes",
+                                    crate::agent::MAX_SAVED_BYTES
+                                ),
+                            );
+                        }
+                    }
+                    None => self.log.warn(
+                        "agent",
+                        "the stored transcript does not check out (a write torn by a power cut looks like this); starting a new conversation",
+                    ),
+                }
+            }
+        }
+        // The marker is consumed whatever the setting says: leaving one behind would resume
+        // a turn from weeks ago the day persistence is switched back on.
+        let Some(marker) = self.store.get(NVS_KEY_RUN_IN_FLIGHT).filter(|text| !text.is_empty()) else {
+            return;
+        };
+        let parsed: Value = serde_json::from_str(&marker).unwrap_or(Value::Null);
+        let source = parsed.get("source").and_then(|v| v.as_str()).unwrap_or("unknown").to_string();
+        let started = parsed.get("started_ms").and_then(|v| v.as_u64()).unwrap_or(0);
+        self.store.remove(NVS_KEY_RUN_IN_FLIGHT);
+        match self.agent.last_user().map(|text| text.to_string()) {
+            Some(text) => {
+                let extra = if self.agent.ends_on_a_tool_result() {
+                    " The tool results it already had are kept, so those calls do not run again."
+                } else {
+                    ""
+                };
+                self.log.warn(
+                    "agent",
+                    format!(
+                        "a turn from `{}` (started {started} ms after boot) was interrupted by a reboot; asking it again.{extra}",
+                        clip(&source, 40)
+                    ),
+                );
+                self.agent.push_user(&text, RESUME_SOURCE, now_ms());
+            }
+            None => self.log.warn(
+                "agent",
+                format!(
+                    "a turn from `{}` was interrupted by a reboot, but the stored transcript has no question left to resume",
+                    clip(&source, 40)
+                ),
+            ),
+        }
+    }
+
+    /// Note that a run has started, so the next boot knows a turn was cut off.
+    ///
+    /// `source` and a timestamp, and nothing else: the transcript already holds the
+    /// question, and a marker that duplicated it could disagree with it. Nothing is written
+    /// when the transcript is not being kept, because a marker without a transcript has no
+    /// question to resume and would only be noise in the next boot log.
+    fn mark_run_in_flight(&mut self, source: &str) -> bool {
+        if !self.cfg.agent.persist_transcript {
+            return false;
+        }
+        let marker = json!({ "source": source, "started_ms": now_ms() }).to_string();
+        let ok = self.store.set(NVS_KEY_RUN_IN_FLIGHT, &marker);
+        if !ok {
+            // Worth a line: without it a power cut mid-turn looks like a finished turn, and
+            // the question is never asked again.
+            self.log.warn("agent", "could not write the run-in-flight marker");
+        }
+        ok
+    }
+
+    fn clear_run_in_flight(&mut self) {
+        self.store.remove(NVS_KEY_RUN_IN_FLIGHT);
     }
 
     /// Hand over the HTTP client the `net_*` tools use. The model call has its own,
@@ -1359,13 +1587,23 @@ impl App {
     /// Nothing here touches the network, so the caller holds the lock for a few
     /// microseconds. `None` means nothing was queued.
     pub fn agent_begin(&mut self) -> Option<AgentStep> {
+        // Nothing queued is not an error, it is "no work": an idle tick calls this.
+        let source = self.agent.pending.as_ref().map(|pending| pending.source.clone())?;
         let max_steps = self.llm.max_steps;
         let (context_tokens, max_output_tokens) = (self.llm.context_tokens, self.llm.max_output_tokens);
-        self.turn_source = self.pending_source();
-        self.with_agent(move |agent, host| {
+        self.turn_source = source.clone();
+        // Before the run, not after: the marker is what tells the next boot that this turn
+        // did not finish, and a marker written afterwards would only describe turns that
+        // already survived.
+        self.mark_run_in_flight(&source);
+        let step = self.with_agent(move |agent, host| {
             agent.set_budget(context_tokens, max_output_tokens);
             agent.begin(host, now_ms, max_steps)
-        })
+        });
+        // The queued question is in the transcript now. Saving here is what lets the next
+        // boot resume this turn instead of the one before it.
+        self.persist_transcript();
+        step
     }
 
     /// Phase 2: fold one model reply back in (journal, tool calls, transcript) and say
@@ -1373,8 +1611,15 @@ impl App {
     pub fn agent_reply(&mut self, reply: std::result::Result<llm::ModelReply, String>) -> AgentStep {
         let step = self.with_agent(move |agent, host| agent.apply(host, reply, now_ms));
         if let AgentStep::Done(result) = &step {
+            // The turn is over, so a reboot from here must not ask it again. Clearing the
+            // marker before the final save means the worst case is a lost reply, never a
+            // reply the board repeats.
+            self.clear_run_in_flight();
             self.finish_turn(result);
         }
+        // Every step, not only the last one: a tool result that landed is worth more after
+        // a power cut than the reply that never arrived.
+        self.persist_transcript();
         step
     }
 
@@ -2053,6 +2298,13 @@ impl App {
         }
         let cfg = self.llm.clone();
         self.turn_source = self.pending_source();
+        // This runner takes the whole turn in one call (`run_pending`), so its transcript
+        // write comes at the end and the marker can only say "a turn was running". A power
+        // cut here resumes the last question that reached flash, which is the previous one;
+        // the driver path (`agent_begin`) writes the question before the first model call,
+        // and that is the path the firmware and the simulator use.
+        let source = self.turn_source.clone();
+        self.mark_run_in_flight(&source);
         // The agent lives in `self` and needs `self` as its tool host, so it is
         // moved out for the duration of the run and put back afterwards.
         let mut agent = std::mem::replace(&mut self.agent, Agent::new());
@@ -2072,8 +2324,10 @@ impl App {
         // message queued for a later attempt, and counting it would spend the goal's
         // budget twice on one prompt.
         if ran {
+            self.clear_run_in_flight();
             self.finish_turn(&out);
         }
+        self.persist_transcript();
         match &out {
             Ok(text) if !text.is_empty() => self.log.info("agent", format!("run done: {}", clip(text, 120))),
             Ok(_) => self.log.info("agent", "run done with no text"),
@@ -2507,6 +2761,7 @@ impl App {
                     return r;
                 }
                 let (removed, kept) = self.agent.forget(0);
+                self.persist_transcript();
                 self.log.info("agent", "transcript cleared from the portal");
                 Response::json(&json!({ "reset": true, "removed": removed, "kept": kept }))
             }
@@ -2519,6 +2774,9 @@ impl App {
                 let body: Value = serde_json::from_str(&req.body_str()).unwrap_or(Value::Null);
                 let keep = body.get("keep").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
                 let (removed, kept) = self.agent.forget(keep);
+                // Forgetting has to reach flash, or the conversation comes back after a
+                // reboot - the one outcome nobody asking for `forget` would accept.
+                self.persist_transcript();
                 self.log.info(
                     "agent",
                     format!("forgot {removed} message(s), kept the last {kept} toward {keep} exchange(s)"),
@@ -4296,6 +4554,412 @@ mod tests {
     fn test_app() -> App {
         let log = LogBuf::new(256);
         App::new(Box::new(VirtualBoard::new()), Box::new(MemoryStore::new()), log, FwMeta::default())
+    }
+
+    // ------------------------------------------------- a store that outlives the App
+
+    /// A store two `App`s can share, so "reload" means "a new `App` over the same keys",
+    /// which is what a reboot looks like from the inside. The transcript feature is
+    /// exactly the property that a new `App` and an old one disagree about, and a store
+    /// per `App` could not express it.
+    #[derive(Clone, Debug, Default)]
+    struct SharedStore(Arc<Mutex<std::collections::BTreeMap<String, String>>>);
+
+    impl SharedStore {
+        fn new() -> Self {
+            Self::default()
+        }
+
+        /// Every key currently stored, in order: the transcript spans several of them.
+        fn all(&self) -> Vec<String> {
+            self.0.lock().map(|m| m.keys().cloned().collect()).unwrap_or_default()
+        }
+    }
+
+    impl KvStore for SharedStore {
+        fn get(&self, key: &str) -> Option<String> {
+            self.0.lock().ok()?.get(key).cloned()
+        }
+
+        fn set(&mut self, key: &str, value: &str) -> bool {
+            match self.0.lock() {
+                Ok(mut m) => {
+                    m.insert(key.to_string(), value.to_string());
+                    true
+                }
+                Err(_) => false,
+            }
+        }
+
+        fn remove(&mut self, key: &str) -> bool {
+            match self.0.lock() {
+                Ok(mut m) => m.remove(key).is_some(),
+                Err(_) => false,
+            }
+        }
+
+        fn keys(&self) -> Vec<String> {
+            self.all()
+        }
+    }
+
+    const STUB_URL: &str = "http://127.0.0.1:8899/v1/chat/completions";
+
+    fn app_with_log(store: &SharedStore) -> (App, Arc<LogBuf>) {
+        let log = LogBuf::new(512);
+        let app =
+            App::new(Box::new(VirtualBoard::new()), Box::new(store.clone()), log.clone(), FwMeta::default());
+        (app, log)
+    }
+
+    fn app_with(store: &SharedStore) -> App {
+        app_with_log(store).0
+    }
+
+    /// The model endpoint is a stub, and the stub is the transport: only the URL has to
+    /// look real, which is the same requirement the board has.
+    fn point_at_the_stub(app: &mut App) {
+        app.llm.base_url = STUB_URL.to_string();
+        app.llm.model = "stub".to_string();
+    }
+
+    /// A model that answers from a script and keeps every request body it was sent.
+    struct Scripted {
+        replies: std::collections::VecDeque<String>,
+        seen: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl Scripted {
+        fn new(replies: Vec<String>) -> Self {
+            Self { replies: replies.into(), seen: Arc::new(Mutex::new(Vec::new())) }
+        }
+
+        fn answer(text: &str) -> String {
+            json!({ "choices": [{ "message": { "role": "assistant", "content": text } }] }).to_string()
+        }
+
+        fn tool_call(id: &str, name: &str, arguments: &str) -> String {
+            json!({ "choices": [{ "message": { "role": "assistant", "content": null, "tool_calls": [
+                { "id": id, "type": "function", "function": { "name": name, "arguments": arguments } }
+            ] } }] })
+            .to_string()
+        }
+    }
+
+    impl ChatTransport for Scripted {
+        fn post_json(
+            &mut self,
+            _url: &str,
+            _headers: &[(&str, &str)],
+            body: &str,
+        ) -> std::result::Result<String, String> {
+            self.seen.lock().unwrap().push(body.to_string());
+            self.replies.pop_front().ok_or_else(|| "scripted: nothing left".to_string())
+        }
+    }
+
+    /// One turn through the same path the firmware uses: queue, begin, model, apply.
+    fn run_turn(app: &Shared, model: &mut Scripted) -> String {
+        let out = drive_agent(app, model).expect("a queued turn");
+        out.expect("the turn finished")
+    }
+
+    /// The budget, the chunk size and the number of keys have to agree, or a full tail
+    /// would be refused at the one moment it matters.
+    #[test]
+    fn the_transcript_budget_fits_the_nvs_values_the_board_allows() {
+        let needed = crate::agent::MAX_SAVED_BYTES.div_ceil(TRANSCRIPT_CHUNK_BYTES);
+        assert!(
+            needed < TRANSCRIPT_CHUNKS_MAX,
+            "a full tail needs {needed} values, only {} allowed",
+            TRANSCRIPT_CHUNKS_MAX
+        );
+        assert!(TRANSCRIPT_CHUNK_BYTES <= 4000, "ESP-IDF refuses an NVS string value above ~4000 bytes");
+        assert_eq!(NVS_KEY_TRANSCRIPT, "agent.transcript");
+        assert_eq!(NVS_KEY_RUN_IN_FLIGHT, "agent.run_in_flight");
+    }
+
+    #[test]
+    fn a_conversation_survives_a_reboot_with_its_tool_results() {
+        let store = SharedStore::new();
+        let shared = Arc::new(Mutex::new(app_with(&store)));
+        {
+            let mut app = shared.lock().unwrap();
+            point_at_the_stub(&mut app);
+        }
+        for turn in 0..3u64 {
+            let mut model = Scripted::new(vec![
+                Scripted::tool_call(&format!("c{turn}"), "board_status", "{}"),
+                Scripted::answer(&format!("turn {turn} done")),
+            ]);
+            shared.lock().unwrap().agent.push_user(&format!("question {turn}"), "http", turn);
+            assert_eq!(run_turn(&shared, &mut model), format!("turn {turn} done"));
+        }
+        let before = { shared.lock().unwrap().agent.history.clone() };
+        drop(shared);
+
+        // The power goes out here, and comes back to a new App over the same flash.
+        let (app, log) = app_with_log(&store);
+        assert_eq!(app.agent.history.len(), before.len(), "the transcript came back whole");
+        let roles: Vec<crate::agent::Role> = app.agent.history.iter().map(|m| m.role).collect();
+        assert_eq!(roles, before.iter().map(|m| m.role).collect::<Vec<_>>());
+
+        // The tool results are the reason this exists: they are what stops the model from
+        // running the same call again.
+        let results: Vec<&crate::agent::Message> =
+            app.agent.history.iter().filter(|m| m.role == crate::agent::Role::Tool).collect();
+        assert_eq!(results.len(), 3, "one result per turn survived");
+        for (i, result) in results.iter().enumerate() {
+            assert_eq!(result.tool_call_id.as_deref(), Some(format!("c{i}").as_str()));
+            assert!(result.text.contains("board_name"), "the result text is intact: {}", result.text);
+        }
+        assert_eq!(app.agent.history.last().map(|m| m.text.as_str()), Some("turn 2 done"));
+        assert_eq!(app.agent.saved_dropped, 0);
+
+        // A finished turn leaves no in-flight marker, so nothing is asked again.
+        assert!(app.agent.pending.is_none(), "a finished turn is not resumed");
+        assert!(
+            log.tail(50, 0).iter().any(|l| l.message.contains("restored")),
+            "the boot log says the transcript came back: {:?}",
+            log.tail(50, 0).iter().map(|l| &l.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn a_large_transcript_keeps_its_tail_says_so_in_the_prompt_and_spans_several_values() {
+        let store = SharedStore::new();
+        let mut app = app_with(&store);
+        // Far more than 16 KB of text, which the board would have dropped from RAM long
+        // before storing it: 240 messages of 300+ bytes come to ~80 KB.
+        for i in 0..120u64 {
+            app.agent.history.push(crate::agent::Message::user(
+                &format!("question {i} {}", "q".repeat(300)),
+                "http",
+                i,
+            ));
+            app.agent.history.push(crate::agent::Message::assistant(
+                &format!("answer {i} {}", "a".repeat(300)),
+                Vec::new(),
+                i,
+            ));
+        }
+        assert!(app.persist_transcript());
+
+        // The board's NVS takes no value above ~4 KB, so the blob is stored as a run of
+        // keys rather than one that would be silently refused on the bench.
+        let chunks = store.all().iter().filter(|key| key.starts_with(NVS_KEY_TRANSCRIPT)).count();
+        assert!(chunks > 1, "a 16 KB tail cannot be one NVS value: {chunks} key(s)");
+        for key in store.all().iter().filter(|key| key.starts_with(NVS_KEY_TRANSCRIPT)) {
+            assert!(
+                store.get(key).map(|v| v.len()).unwrap_or(0) <= TRANSCRIPT_CHUNK_BYTES,
+                "{key} is longer than the store will take"
+            );
+        }
+
+        let (app, log) = app_with_log(&store);
+        assert!(app.agent.saved_dropped > 0, "the tail was cut and the count is known");
+        assert_eq!(
+            app.agent.saved_dropped + app.agent.history.len(),
+            240,
+            "every message is either kept or counted as dropped"
+        );
+        assert!(app.agent.history.len() < 240, "the oldest messages gave way");
+        assert_eq!(app.agent.history.last().map(|m| m.text.starts_with("answer 119")), Some(true));
+        assert!(
+            log.tail(80, 0).iter().any(|l| l.level == "warn" && l.message.contains("were not stored")),
+            "a cut tail is stated in the log"
+        );
+        // And in the prompt, which is what the model reads: silence would let it assume.
+        let prompt = app.agent.prompt_text(&app);
+        assert!(prompt.contains("Recovered after a reboot"), "{prompt}");
+        assert!(prompt.contains(&format!("{} older one(s) were not kept", app.agent.saved_dropped)));
+    }
+
+    #[test]
+    fn a_corrupt_stored_transcript_is_logged_and_the_board_starts_clean() {
+        // Whatever the corruption is, the answer is the same: say so and start over.
+        for bad in ["not json", "", "{\"v\":9,\"dropped\":0,\"hash\":\"0000000000000000\"}\n{}", "[]"] {
+            let store = SharedStore::new();
+            let mut writer = store.clone();
+            assert!(writer.set(NVS_KEY_TRANSCRIPT, bad));
+            let (app, log) = app_with_log(&store);
+            assert!(app.agent.history.is_empty(), "`{bad}` became a transcript");
+            assert!(app.agent.pending.is_none(), "nothing is resumed from a blob that is not there");
+            assert!(
+                log.tail(80, 0).iter().any(|l| l.level == "warn" && l.message.contains("does not check out")),
+                "`{bad}` was skipped without a word"
+            );
+        }
+
+        // A torn write is the same case: a good transcript cut in half by a power failure.
+        let store = SharedStore::new();
+        let mut writer = app_with(&store);
+        writer.agent.history.push(crate::agent::Message::user("before the outage", "http", 1));
+        writer.agent.history.push(crate::agent::Message::assistant("and before", Vec::new(), 2));
+        assert!(writer.persist_transcript());
+        let good = store.get(NVS_KEY_TRANSCRIPT).expect("stored");
+        let mut writer = store.clone();
+        assert!(writer.set(NVS_KEY_TRANSCRIPT, &good[..good.len() - 20]));
+        let (app, log) = app_with_log(&store);
+        assert!(app.agent.history.is_empty(), "a torn blob is not half-adopted");
+        assert!(log.tail(80, 0).iter().any(|l| l.message.contains("does not check out")));
+    }
+
+    #[test]
+    fn forgetting_reaches_flash_so_the_conversation_does_not_come_back() {
+        let store = SharedStore::new();
+        let shared = Arc::new(Mutex::new(app_with(&store)));
+        {
+            let mut app = shared.lock().unwrap();
+            point_at_the_stub(&mut app);
+        }
+        let mut model = Scripted::new(vec![Scripted::answer("noted")]);
+        shared.lock().unwrap().agent.push_user("remember this", "http", 1);
+        assert_eq!(run_turn(&shared, &mut model), "noted");
+        assert!(store.get(NVS_KEY_TRANSCRIPT).is_some(), "the turn reached flash");
+
+        // `forget` through the same route an external agent uses.
+        let resp = shared.lock().unwrap().route(&post("/api/agent/forget", "{}"));
+        assert_eq!(resp.status, 200);
+        assert_eq!(body_json(&resp)["removed"], json!(2));
+        assert!(
+            store.get(NVS_KEY_TRANSCRIPT).is_none(),
+            "the stored copy survived a forget, so it would come back at the next boot"
+        );
+        drop(shared);
+
+        let (app, _log) = app_with_log(&store);
+        assert!(app.agent.history.is_empty(), "forgetting a conversation must outlive the reboot");
+
+        // The other spelling of the same thing: the portal's reset button.
+        let store = SharedStore::new();
+        let mut app = app_with(&store);
+        app.agent.history.push(crate::agent::Message::user("anything", "http", 1));
+        app.agent.history.push(crate::agent::Message::assistant("at all", Vec::new(), 2));
+        assert!(app.persist_transcript());
+        assert_eq!(app.route(&post("/api/agent/reset", "{}")).status, 200);
+        assert!(store.get(NVS_KEY_TRANSCRIPT).is_none());
+    }
+
+    #[test]
+    fn turning_persistence_off_keeps_the_conversation_out_of_flash() {
+        let store = SharedStore::new();
+        let shared = Arc::new(Mutex::new(app_with(&store)));
+        {
+            let mut app = shared.lock().unwrap();
+            point_at_the_stub(&mut app);
+            assert!(app.cfg.agent.persist_transcript, "on by default");
+            app.cfg.agent.persist_transcript = false;
+        }
+        let mut model = Scripted::new(vec![Scripted::answer("answered anyway")]);
+        shared.lock().unwrap().agent.push_user("keep this out of flash", "http", 1);
+        assert_eq!(run_turn(&shared, &mut model), "answered anyway");
+        assert!(store.get(NVS_KEY_TRANSCRIPT).is_none(), "a disabled transcript was written anyway");
+        assert!(store.get(NVS_KEY_RUN_IN_FLIGHT).is_none(), "the marker was cleared at the end");
+        drop(shared);
+
+        let (app, _log) = app_with_log(&store);
+        assert!(app.agent.history.is_empty(), "nothing is restored when the setting is off");
+
+        // The setting is reachable from the portal's config patch, under `agent`.
+        let mut app = app_with(&SharedStore::new());
+        let resp = app.route(&post("/api/config", r#"{"agent":{"persist_transcript":false}}"#));
+        assert_eq!(resp.status, 200, "{:?}", body_json(&resp));
+        assert!(!app.cfg.agent.persist_transcript);
+        app.cfg.apply_patch(&json!({ "agent": { "persist_transcript": true } })).expect("patch");
+        assert!(app.cfg.agent.persist_transcript);
+    }
+
+    #[test]
+    fn an_interrupted_turn_is_queued_again_and_its_tool_result_is_not_repeated() {
+        let store = SharedStore::new();
+        let shared = Arc::new(Mutex::new(app_with(&store)));
+        {
+            let mut app = shared.lock().unwrap();
+            point_at_the_stub(&mut app);
+        }
+        // A first turn that finished, so the transcript has a history behind it.
+        let mut model = Scripted::new(vec![Scripted::answer("yes, it is up")]);
+        shared.lock().unwrap().agent.push_user("is the board up?", "http", 1);
+        assert_eq!(run_turn(&shared, &mut model), "yes, it is up");
+
+        // The second turn is cut off in the middle: the model asked for a board reading,
+        // the result landed and was stored, and the answer never came back. Everything here
+        // is the real path - `agent_begin` writes the marker, `agent_reply` stores the step -
+        // and the "power failure" is simply that no third reply ever arrives.
+        {
+            let mut app = shared.lock().unwrap();
+            app.agent.push_user("turn the pump on for two seconds", "http", 2);
+            assert!(matches!(app.agent_begin(), Some(AgentStep::Ask { .. })));
+            assert!(store.get(NVS_KEY_RUN_IN_FLIGHT).is_some(), "a running turn is marked");
+            let reply = llm::ModelReply {
+                tool_calls: vec![llm::ToolCall {
+                    id: "c1".into(),
+                    name: "board_status".into(),
+                    arguments: json!({}),
+                }],
+                ..Default::default()
+            };
+            assert!(matches!(app.agent_reply(Ok(reply)), AgentStep::Ask { .. }));
+            assert!(
+                store.get(NVS_KEY_RUN_IN_FLIGHT).is_some(),
+                "a turn that is still asking is still in flight"
+            );
+            assert!(app.agent.ends_on_a_tool_result(), "the result landed and was not answered");
+        }
+        drop(shared);
+
+        let (mut app, log) = app_with_log(&store);
+        point_at_the_stub(&mut app);
+        // The marker is consumed at boot, so a second reboot does not ask a third time.
+        assert!(store.get(NVS_KEY_RUN_IN_FLIGHT).is_none(), "the marker outlived the boot that read it");
+        let queued = app.agent.pending.clone().expect("the interrupted turn is queued again");
+        assert_eq!(queued.source, RESUME_SOURCE);
+        assert_eq!(queued.text, "turn the pump on for two seconds");
+        assert!(
+            log.tail(80, 0)
+                .iter()
+                .any(|l| l.level == "warn" && l.message.contains("interrupted by a reboot")),
+            "a resumed turn is announced: {:?}",
+            log.tail(80, 0).iter().map(|l| &l.message).collect::<Vec<_>>()
+        );
+        // The results that landed are still there, and no answer was invented for them.
+        assert_eq!(app.agent.history.iter().filter(|m| m.role == crate::agent::Role::Tool).count(), 1);
+        assert!(app.agent.ends_on_a_tool_result());
+
+        // The turn continues: one model call, which already carries the call and its result.
+        let shared = Arc::new(Mutex::new(app));
+        let mut model = Scripted::new(vec![Scripted::answer("the pump ran for two seconds")]);
+        assert_eq!(run_turn(&shared, &mut model), "the pump ran for two seconds");
+        let seen = model.seen.lock().unwrap();
+        assert_eq!(seen.len(), 1, "a resumed turn is one model call, not a replay of the tool work");
+        let request: Value = serde_json::from_str(&seen[0]).expect("json");
+        let messages = request["messages"].as_array().expect("messages");
+        let call = messages
+            .iter()
+            .find(|m| m["tool_calls"][0]["id"] == "c1")
+            .unwrap_or_else(|| panic!("the call is missing from the resumed request: {request}"));
+        let result = messages
+            .iter()
+            .find(|m| m["role"] == "tool" && m["tool_call_id"] == "c1")
+            .unwrap_or_else(|| panic!("its result is missing: {request}"));
+        assert!(call["tool_calls"][0]["function"]["arguments"].as_str().unwrap_or_default().contains("{}"));
+        assert!(
+            result["content"].as_str().unwrap_or_default().contains("board_name"),
+            "the board reading is carried: {result}"
+        );
+        assert_eq!(
+            messages.last().map(|m| m["role"].clone()),
+            Some(json!("user")),
+            "the question is asked again, after the work that already happened"
+        );
+        assert!(messages.last().unwrap()["content"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("turn the pump on for two seconds"));
+        // And the resumed turn is stored like any other, marker cleared.
+        assert!(store.get(NVS_KEY_RUN_IN_FLIGHT).is_none());
+        assert!(store.get(NVS_KEY_TRANSCRIPT).is_some());
     }
 
     #[test]
