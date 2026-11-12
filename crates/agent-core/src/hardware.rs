@@ -253,3 +253,108 @@ impl Hardware for NullHardware {
         BoardInfo { soc: "null".into(), firmware: "test".into(), ..Default::default() }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A board that has a chip and nothing else. Every other method comes from the trait
+    /// default, which is the contract this module is: a new board writes only what it has,
+    /// and everything it does not have has to refuse by name instead of pretending.
+    struct Bare;
+
+    impl Hardware for Bare {
+        fn board_info(&mut self) -> BoardInfo {
+            BoardInfo { soc: "bare".into(), ..Default::default() }
+        }
+    }
+
+    fn unsupported(e: McpError) -> String {
+        assert_eq!(e.code, crate::error::code::UNSUPPORTED, "{}", e.message);
+        e.message
+    }
+
+    /// Each default says which capability is missing. A driver that gets a bare refusal
+    /// still has to be able to name the bus it wanted, so the message is the assertion.
+    #[test]
+    fn every_unimplemented_method_refuses_and_names_the_missing_capability() {
+        let mut hw = Bare;
+
+        assert!(unsupported(hw.i2c_scan(0).expect_err("no i2c")).contains("I2C"));
+        let mut buf = [0u8; 2];
+        assert!(unsupported(hw.i2c_read(0, 0x20, None, &mut buf).expect_err("no i2c")).contains("I2C"));
+        assert!(unsupported(hw.i2c_write(0, 0x20, None, &[0]).expect_err("no i2c")).contains("I2C"));
+        assert!(unsupported(hw.spi_transfer(0, &[0]).expect_err("no spi")).contains("SPI"));
+        assert!(unsupported(hw.dvp_capture(&json!({})).expect_err("no camera")).contains("camera"));
+        assert!(unsupported(hw.gpio_config(4, PinMode::Input).expect_err("no gpio")).contains("GPIO"));
+        assert!(unsupported(hw.gpio_read(4).expect_err("no gpio")).contains("GPIO"));
+        assert!(unsupported(hw.gpio_write(4, true).expect_err("no gpio")).contains("GPIO"));
+        assert!(unsupported(hw.pwm_set(4, 1_000, 50.0).expect_err("no pwm")).contains("PWM"));
+        assert!(unsupported(hw.adc_mv(4).expect_err("no adc")).contains("ADC"));
+        assert!(unsupported(hw.i2s_setup(None, None).expect_err("no i2s")).contains("I2S"));
+        assert!(unsupported(hw.i2s_mic_read(&mut [0i32; 4], 10).expect_err("no mic")).contains("microphone"));
+        assert!(unsupported(hw.i2s_out_write(&[0i16; 4]).expect_err("no amp")).contains("speaker"));
+        assert!(unsupported(hw.ring_set(4, (1, 2, 3), 1).expect_err("no rgb")).contains("RGB"));
+        assert!(unsupported(hw.wifi_scan().expect_err("no wifi")).contains("WiFi"));
+        assert!(unsupported(hw.wifi_connect("ssid", "pw").expect_err("no wifi")).contains("WiFi"));
+        assert!(unsupported(hw.ping("example.com", 1).expect_err("no ping")).contains("ping"));
+    }
+
+    /// The methods that answer rather than refuse: a board with no facts still has to
+    /// produce a well-formed answer, because these feed the portal and the tool results.
+    #[test]
+    fn the_methods_that_answer_explain_themselves_rather_than_refusing() {
+        let mut hw = Bare;
+
+        // WiFi is reported as off, not as an error: an API client asking "where are we?"
+        // gets an answer even from a board with no radio.
+        let wifi = hw.wifi_status();
+        assert_eq!(wifi.state, "off");
+        assert_eq!(wifi.ssid, "", "nothing connected");
+        assert_eq!(hw.hint_buses().len(), 0, "no profile hints on a bare board");
+        assert_eq!(hw.inventory_extra(), json!({}), "no extra inventory rows");
+        assert_eq!(hw.heap_internal(), None, "no platform heap numbers");
+        assert_eq!(hw.chip_temp_c(), None, "a board without a sensor says so");
+        assert_eq!(hw.tasks().len(), 0, "no task table the platform can print");
+        assert_eq!(hw.millis(), 0);
+        // These three are silent because there is nothing to report, not because they
+        // failed: a delay on a board with no clock, a reboot that is the platform's job.
+        hw.delay_us(1_000);
+        hw.reboot();
+        let info = hw.board_info();
+        assert_eq!(info.soc, "bare");
+        assert_eq!(info.firmware, "", "the default has no firmware string");
+    }
+
+    /// `NullHardware` exists so a graceful-degradation test does not have to write a fake.
+    /// It has to be as bare as its name, or a test using it would silently get behaviour.
+    #[test]
+    fn null_hardware_answers_nothing_but_identifies_itself() {
+        let mut hw = NullHardware;
+        let info = hw.board_info();
+        assert_eq!(info.soc, "null");
+        assert_eq!(info.firmware, "test");
+        assert_eq!(hw.gpio_read(0).expect_err("null has no gpio").code, crate::error::code::UNSUPPORTED);
+        assert_eq!(hw.wifi_status().state, "off");
+    }
+
+    #[test]
+    fn pin_mode_parses_the_spellings_a_manifest_can_carry() {
+        for (text, want) in [
+            ("input", PinMode::Input),
+            ("IN", PinMode::Input),
+            (" input_pullup ", PinMode::InputPullup),
+            ("pullup", PinMode::InputPullup),
+            ("up", PinMode::InputPullup),
+            ("input_pulldown", PinMode::InputPulldown),
+            ("pulldown", PinMode::InputPulldown),
+            ("down", PinMode::InputPulldown),
+            ("output", PinMode::Output),
+            ("OUT", PinMode::Output),
+        ] {
+            assert_eq!(PinMode::parse(text), Some(want), "{text:?}");
+        }
+        assert_eq!(PinMode::parse("tri-state"), None, "an unknown mode is refused, not guessed");
+        assert_eq!(PinMode::parse(""), None);
+    }
+}
