@@ -13,17 +13,18 @@ answers; a new sensor can be declared with a JSON manifest while the board runs.
 
 ## Features
 
-| # | Feature |
+| What | In detail |
 |---|---|
-| 1 | **A model runs on the board.** Agent loop, tools, memory and transcript are in the firmware; the model can be any OpenAI-compatible or Anthropic endpoint. |
-| 2 | **The tool surface is a document.** `manifest_apply` validates a JSON manifest, compiles it into tools and takes effect in the same turn — no restart, no reflash. |
-| 3 | **It finds its own hardware.** Drivers probe I2C, 1-Wire and configured pins at boot; only what answers gets tools. |
-| 4 | **One tool set, two callers.** The MCP endpoint and the on-board agent see the same tools: 48 today, with the shell among them. |
-| 5 | **A web console over HTTPS.** Chat with the model, and change devices, tools, manifest, schedule, logs, WiFi and model settings from a phone. |
-| 6 | **It works while nobody watches.** Timed prompts, sensor rules, and an objective it iterates on across runs. |
-| 7 | **A shell and a scripting language.** `nsh` with 26 commands named as NuttX names them (files, network, hashing, diagnostics), and a small interpreter for loops and conditions over tool calls. |
-| 8 | **Self-contained on the LAN.** HTTP and HTTPS from the board, a certificate it generates itself, a PIN and a token for the three callers. |
-| 9 | **Testable without hardware.** The simulator runs the same core against a virtual board. |
+| A model runs on the board | The agent loop, tools, memory and transcript live in the firmware; the model is any OpenAI-compatible or Anthropic endpoint. [Give it a model](#give-it-a-model) |
+| The tool surface is a document | `manifest_apply` validates a JSON manifest, compiles it into tools and takes effect in the same turn — no restart, no reflash. [Manifest](#manifest) |
+| It finds its own hardware | Drivers probe I2C, 1-Wire and configured pins at boot; only what answers gets tools. Unrecognised addresses are reported, so a chip without a driver is still visible. [Capabilities](docs/capabilities.md) |
+| One tool set, two callers | The MCP endpoint and the on-board agent see the same 48 tools. A manifest edit moves both at once, because there is one description. [HTTP and MCP API](docs/http-api.md) |
+| A web console over HTTPS | Chat with the model and change devices, tools, manifest, schedule, logs, WiFi and the model settings from a phone; the board generates its own certificate. [Web console](#web-console) |
+| It works while nobody watches | Timed prompts (`every_s`, `at_hhmm`), sensor rules that fire a prompt on a threshold, and an objective it iterates on across runs. [Scheduled work](#scheduled-work) |
+| A shell and a scripting language | `nsh` with 26 commands named as NuttX names them — files, network, hashing, inspection — and a small interpreter for loops and conditions over tool calls. [nsh](#nsh-the-shell) · [Script](#script) |
+| Standing orders | A 2 KB slot in the system prompt for what this board is for, writable from the portal, from `nsh` and from HTTP. [Standing orders](#standing-orders) |
+| Self-contained on a LAN | HTTP and HTTPS from the board, a certificate it generates itself, a PIN and a token for the three callers, no cloud in the path. [Authentication](#authentication) |
+| Testable without hardware | The simulator runs the same `agent-core` against a virtual board on a real port. [Simulator](#simulator) |
 
 ## Flash and connect
 
@@ -60,6 +61,27 @@ browser shows. Port 80 stays open, so a TLS misconfiguration costs a URL and not
 `GET /agent.json` is the whole interface as data: 40 routes with method, body, return and
 auth, the MCP surface, error shape, limits, and a `settings` table listing every writable
 field with its type and default.
+
+## Web console
+
+```
+http://<board>/        the console, and /mcp on the same port
+https://<board>/       the same routes over TLS, certificate generated on the board
+```
+
+| Where | What you do there |
+|---|---|
+| Chat (the page itself) | talk to the model; each turn shows the answer, and the tool calls and reasoning that produced it fold into one line you can open |
+| Devices | what the probe found, its pins and address, `Probe devices`, the candidates waiting to be adopted |
+| Tools | every tool with its input schema, and why one is hidden |
+| Agent | endpoint, model, key, protocol, thinking level, temperature, max steps, images |
+| Schedule | timed prompts and sensor rules |
+| Logs | the board's ring buffer, newest first |
+| Settings | WiFi with gateway and DNS overrides, the portal PIN, reboot, factory reset |
+
+The page needs no build step and loads nothing from the internet: about 58 KB of HTML, CSS
+and JavaScript compiled into the firmware and served from the board, with
+`Cache-Control: no-store` so a reflash is visible on the next reload.
 
 ## Give it a model
 
@@ -105,8 +127,7 @@ request.
 | Hardware | GPIO, ADC, PWM, I2C, 1-Wire, WS2812, SSD1306, BME280, SHT3x, INA219/226, MPU6050, ADS1115, PCF8574, DS18B20, HC-SR04, servo, relay, I²S microphone and amplifier |
 | Discovery | `inventory`, `devices_list`, `i2c_scan`, `i2c_identify`, `devices_probe` |
 | Manifest | `manifest_get`, `manifest_describe`, `manifest_validate`, `manifest_apply`, `manifest_reset` |
-| Shell | `shell` with 14 commands: `ls cat write edit rm cp mv grep` on the workspace, `get post dns tcp` on the network, `zip unzip` on archives |
-| Model support | `script` (loops and conditions over any tool), `image_read` (asks the vision model about an attachment), `chip_temp` |
+| Shell | `nsh` with 26 commands: files, archives, network, hashing, inspection, and `system_prompt` |
 | Scheduling | `schedule` tool, `POST /api/sched` for timed prompts and sensor rules |
 | Configuration | `config_set`, `POST /api/config` (WiFi, buses, pins, MCP, auth, log, UI, discovery) |
 
@@ -132,8 +153,8 @@ nsh    {"command": "unzip UEsDB..."}
 ```
 
 `nsh` takes one command line and parses it, the way a shell does: words, quotes, and
-`-f`/`--flag` options. `{"op":"ls","path":"/notes"}` still works when a client would rather
-build an object than a string.
+`-f`/`--flag` options. There is no second calling convention; `nsh {"command":"ls"}` is the
+only form.
 
 The commands a shell has for looking at itself, as NuttX's `nsh` does:
 
