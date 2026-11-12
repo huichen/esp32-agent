@@ -7235,6 +7235,34 @@ mod tests {
         }
     }
 
+    /// `grep -E`: the regex subset, reached through the shell, with the parts outside it
+    /// refused rather than matched differently.
+    #[test]
+    fn grep_e_matches_a_regex_and_refuses_the_rest_of_the_language() {
+        let mut app = test_app();
+        write_file(&mut app, "/app.log", "ERR: disk full\nok\nWARN: disk 90%\nERROR: disk\n");
+        let anchored = sh(&mut app, "grep -E '^ERR' /app.log");
+        assert_eq!(anchored["count"], json!(2), "{anchored}");
+        assert_eq!(anchored["mode"], json!("regex"));
+
+        // A class and a quantifier: the digits after `disk `.
+        write_file(&mut app, "/pct.txt", "disk 90%\ndisk 7%\ndisk full\n");
+        let digits = sh(&mut app, "grep -E 'disk [0-9]+%' /pct.txt");
+        assert_eq!(digits["count"], json!(2), "{digits}");
+
+        // Without `-E` the same pattern is a literal, and matches nothing — which is the
+        // difference the flag is for.
+        assert_eq!(sh(&mut app, "grep '^ERR' /app.log")["count"], json!(0));
+
+        // `$` binds to the end of the line, and `\d` is a digit.
+        assert_eq!(sh(&mut app, "grep -E 'full$' /app.log")["count"], json!(1));
+
+        let err =
+            ToolHost::call_tool(&mut app, "shell", &json!({"command": "grep -E '(ERR|WARN)' /app.log"}))
+                .unwrap_err();
+        assert!(err.contains("not supported"), "groups must be refused: {err}");
+    }
+
     #[test]
     fn tee_writes_the_text_it_is_given() {
         let mut app = test_app();

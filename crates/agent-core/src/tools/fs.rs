@@ -421,6 +421,13 @@ fn grep(ws: &mut dyn Workspace, args: &Value) -> Result<String, String> {
     };
     let root = normalize(&opt_str(args, "path").unwrap_or_else(|| "/".to_string()))?;
 
+    // `grep -E`: the pattern is compiled once and matched per line. A pattern outside the
+    // subset is refused here rather than silently matching nothing.
+    let regex = match args.get("regex").and_then(Value::as_bool).unwrap_or(false) {
+        true => Some(crate::tools::regex::Pattern::compile(&pattern)?),
+        false => None,
+    };
+
     // A file works as the start path too: grep it alone.
     let mut files: Vec<String> = Vec::new();
     let mut budget = MAX_FILES;
@@ -440,7 +447,11 @@ fn grep(ws: &mut dyn Workspace, args: &Value) -> Result<String, String> {
         };
         files_scanned += 1;
         for (idx, line) in text.lines().enumerate() {
-            if line.contains(&pattern) {
+            let hit = match regex.as_ref() {
+                Some(compiled) => compiled.is_match(line),
+                None => line.contains(&pattern),
+            };
+            if hit {
                 if matches.len() >= MAX_MATCHES {
                     truncated = true;
                     break;
@@ -458,6 +469,7 @@ fn grep(ws: &mut dyn Workspace, args: &Value) -> Result<String, String> {
     }
     Ok(to_text(json!({
         "pattern": pattern,
+        "mode": if regex.is_some() { "regex" } else { "literal" },
         "path": root,
         "files_scanned": files_scanned,
         "count": matches.len(),

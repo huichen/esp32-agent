@@ -103,6 +103,12 @@ says otherwise. No patterns, no arithmetic, no `BEGIN`/`END`, no variables — `
 where a condition or a loop goes, and a half-`awk` that silently printed nothing would be
 the worse of the two tools.
 
+`grep -E <pattern>` is a documented subset of a regular expression: literals, `.`, `^`, `$`,
+`*`, `+`, `?`, `[...]` with ranges and `[^...]`, and `\d \w \s` (with their negations).
+Groups, alternation, `{n,m}` intervals and back references are refused with the sentence
+that says so — `(ERR|WARN)` is a `script` condition here, not a pattern. Without `-E` the
+pattern is a literal substring, which is what it always was.
+
 `jq [query] <path>` is a path into a JSON document, not a query language:
 `.name`, `.a.b`, `.[0]`, `.a[0].b`, `.[]` and `.length`, one compact value per line, so a
 `| head` downstream sees one result. `-r` prints a string without its quotes. It is the

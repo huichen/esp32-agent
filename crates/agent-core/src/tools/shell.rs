@@ -728,6 +728,7 @@ fn arguments_inner(parsed: &Parsed, piped: bool) -> Result<serde_json::Value, St
             // No path and a pipe: the text arrives on stdin. Without a pipe the tree is what
             // `grep` searches, as it always has.
             "path": arg(1).or(if piped { None } else { Some("/".to_string()) }),
+            "regex": flag_bool("extended", "e"),
         }),
         "zip" => {
             let name = need(0, "<archive>")?;
@@ -850,7 +851,9 @@ pub fn usage(op: &str) -> Option<&'static str> {
         "rm" => "rm <path> --confirm",
         "cp" => "cp <from> <to>",
         "mv" => "mv <from> <to> --confirm",
-        "grep" => "grep <pattern> [path]",
+        "grep" => {
+            "grep [-E] <pattern> [path]  (literal by default; -E = regex: . ^ $ * + ? [...] \\d \\w \\s)"
+        }
         "zip" => "zip <archive> <path...>",
         "unzip" => "unzip <archive_b64>",
         "df" => "df",
