@@ -90,6 +90,19 @@ minimum). `od` is `hexdump` in octal, because that is what `od` means.
 existing one: the workspace stores text and no timestamps, so `touch` answers with
 `"mtime": null` and a note rather than pretending it moved a time.
 
+`sed 's/from/to/[g]'` is **one** substitution, applied line by line: `g` replaces every
+match on a line, without it only the first. `/` is the usual delimiter and `,` works too
+(`|` cannot — the shell splits the command line on it before `sed` sees the script).
+There are no addresses, no `d`/`p`, no `-e`, no script file: those make `sed` a language,
+and the board already has one. A script that is not a substitution is refused with the
+form to write instead.
+
+`awk '{print $1, $2}'` is the field-printing subset: `$0` is the whole line, `$N` a field
+(counted from 1), `$NF` the last one. Fields are whitespace-separated unless `--sep <char>`
+says otherwise. No patterns, no arithmetic, no `BEGIN`/`END`, no variables — `script` is
+where a condition or a loop goes, and a half-`awk` that silently printed nothing would be
+the worse of the two tools.
+
 `jq [query] <path>` is a path into a JSON document, not a query language:
 `.name`, `.a.b`, `.[0]`, `.a[0].b`, `.[]` and `.length`, one compact value per line, so a
 `| head` downstream sees one result. `-r` prints a string without its quotes. It is the

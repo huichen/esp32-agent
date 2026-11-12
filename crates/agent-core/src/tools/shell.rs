@@ -70,6 +70,11 @@ pub const OPS: &[(&str, &str)] = &[
     ("sort", "shell_sort"),
     ("uniq", "shell_uniq"),
     ("tr", "shell_tr"),
+    // The two text processors that earn their place: one substitution, one field print.
+    // Anything with addresses, branches or arithmetic is `script`'s job 鈥? a second
+    // interpreter would only make the model guess which one it is in.
+    ("sed", "shell_sed"),
+    ("awk", "shell_awk"),
     ("tee", "shell_tee"),
     ("touch", "shell_touch"),
     ("du", "shell_du"),
@@ -436,10 +441,9 @@ pub enum Stdio {
 pub fn pipe_stdio(op: &str) -> Option<Stdio> {
     Some(match op {
         // `jq` reads lines (a JSON document) and writes lines, which is what a stage does.
-        "jq" | "cat" | "grep" | "sort" | "uniq" | "tr" | "cut" | "head" | "tail" | "wc" | "strings"
-        | "od" | "xd" | "hexdump" | "base64enc" | "base64dec" | "sha256sum" | "md5sum" | "crc32" | "tee" => {
-            Stdio::Reads
-        }
+        "jq" | "cat" | "grep" | "sort" | "uniq" | "tr" | "cut" | "sed" | "awk" | "head" | "tail" | "wc"
+        | "strings" | "od" | "xd" | "hexdump" | "base64enc" | "base64dec" | "sha256sum" | "md5sum"
+        | "crc32" | "tee" => Stdio::Reads,
         // A fetch is a producer: it has no stdin to read, and its body is exactly the text a
         // `jq`, `grep` or `head` downstream wants. Refusing it made `curl api | jq .x` — the
         // reason both commands exist — impossible.
@@ -460,6 +464,8 @@ pub fn pipe_commands() -> String {
         "sort",
         "uniq",
         "tr",
+        "sed",
+        "awk",
         "cut",
         "head",
         "tail",
@@ -798,6 +804,13 @@ fn arguments_inner(parsed: &Parsed, piped: bool) -> Result<serde_json::Value, St
             "to": need(1, "<to>")?,
             "path": path_arg(2)?,
         }),
+        "sed" => json!({ "script": need(0, "<s/from/to/[g]>")?, "path": path_arg(1)? }),
+        // `-F ,` reaches here as the flag `f`, because flags are matched case-insensitively;
+        // `-F,` attached is not accepted by the tokenizer, so the usage line spells the
+        // separated form.
+        "awk" => {
+            json!({ "program": need(0, "<{print $1}> ")?, "sep": flag("sep", "f"), "path": path_arg(1)? })
+        }
         "tee" => json!({ "path": need(0, "<path>")?, "input": parsed.flags.get("i").cloned() }),
         "strings" => json!({ "path": path_arg(0)?, "min": parsed.flags.get("n").cloned() }),
         "sleep" => json!({ "unit": "s", "value": need(0, "<seconds>")? }),
@@ -865,6 +878,10 @@ pub fn usage(op: &str) -> Option<&'static str> {
         "sort" => "sort [-r] [-u] <path>",
         "uniq" => "uniq <path>",
         "tr" => "tr <from> <to> <path>",
+        "sed" => {
+            "sed 's/from/to/[g]' <path>  (one substitution per line; `g` = every match, not just the first)"
+        }
+        "awk" => "awk '{print $1, $2}' <path> [--sep <char>]  (whitespace fields by default; $0, $N, $NF)",
         "tee" => "tee <path> [-i <text>]  (a pipe feeds it; -i carries the text without one)",
         "touch" => "touch <path>",
         "du" => "du",
@@ -905,6 +922,117 @@ pub fn usage(op: &str) -> Option<&'static str> {
 }
 
 /// Every command with its usage, for `shell {"command":"help"}`.
+/// One item of an `awk` print list.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PrintItem {
+    /// `$0`: the whole line.
+    Line,
+    /// `$N`, one-based.
+    Field(usize),
+    /// `$NF`: the last field.
+    Last,
+}
+
+/// `s/from/to/[g]` — the one `sed` expression this board implements.
+///
+/// Deliberately not a `sed`: no addresses, no `d`/`p`, no multiple `-e`, no script file.
+/// Those turn it into a language, and the board already has one (`script`); two
+/// interpreters would only make the model guess which one it is in.
+pub fn parse_substitute(script: &str) -> Result<(String, String, bool), String> {
+    let body = script.trim();
+    let mut chars = body.chars();
+    if chars.next() != Some('s') {
+        return Err(format!(
+            "sed: `{body}` is not a substitution; the form is `s/from/to/` or `s/from/to/g`"
+        ));
+    }
+    let Some(sep) = chars.next() else {
+        return Err("sed: `s` needs a delimiter, e.g. `s/a/b/`".to_string());
+    };
+    if sep.is_alphanumeric() || sep.is_whitespace() {
+        return Err(format!("sed: `{sep}` cannot be a delimiter; use `/` or `,` (`|` is the pipe)"));
+    }
+    let mut parts: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let mut escaped = false;
+    for ch in chars {
+        if escaped {
+            // `\/` is a literal delimiter; every other escape is kept as written.
+            if ch == sep {
+                current.push(sep);
+            } else {
+                current.push('\\');
+                current.push(ch);
+            }
+            escaped = false;
+            continue;
+        }
+        match ch {
+            '\\' => escaped = true,
+            c if c == sep => parts.push(std::mem::take(&mut current)),
+            c => current.push(c),
+        }
+    }
+    if escaped {
+        current.push('\\');
+    }
+    parts.push(current);
+    if parts.len() < 2 {
+        return Err(format!("sed: `{body}` needs both sides, as in `s/from/to/`"));
+    }
+    if parts.len() > 3 {
+        return Err(format!("sed: `{body}` has more than three parts; one substitution per call"));
+    }
+    let from = parts.remove(0);
+    let to = parts.remove(0);
+    let flags = parts.pop().unwrap_or_default();
+    if from.is_empty() {
+        return Err("sed: an empty `from` matches everywhere; give something to find".to_string());
+    }
+    if let Some(bad) = flags.chars().find(|c| *c != 'g') {
+        return Err(format!("sed: `{bad}` is not a flag here; only `g` (every match) is implemented"));
+    }
+    Ok((from, to, flags.contains('g')))
+}
+
+/// `{print $1, $NF}` — the field-printing subset of `awk`.
+pub fn parse_print_program(program: &str) -> Result<Vec<PrintItem>, String> {
+    let inner = program
+        .trim()
+        .strip_prefix('{')
+        .and_then(|rest| rest.strip_suffix('}'))
+        .ok_or_else(|| format!("awk: the program must be `{{print ...}}`, got `{program}`"))?
+        .trim();
+    let list = inner
+        .strip_prefix("print")
+        .ok_or_else(|| {
+            format!("awk: only `print` is implemented, got `{inner}` — use `script` for conditions and loops")
+        })?
+        .trim();
+    if list.is_empty() {
+        return Ok(vec![PrintItem::Line]);
+    }
+    let mut items = Vec::with_capacity(4);
+    for piece in list.split(',') {
+        let piece = piece.trim();
+        let Some(rest) = piece.strip_prefix('$') else {
+            return Err(format!("awk: `{piece}` is not a field; only `$0`, `$N` and `$NF` are implemented"));
+        };
+        if rest == "0" {
+            items.push(PrintItem::Line);
+        } else if rest.eq_ignore_ascii_case("NF") {
+            items.push(PrintItem::Last);
+        } else {
+            let n: usize = rest.parse().map_err(|_| format!("awk: `${rest}` is not a field number"))?;
+            if n == 0 {
+                return Err("awk: write `$0` for the whole line".to_string());
+            }
+            items.push(PrintItem::Field(n));
+        }
+    }
+    Ok(items)
+}
+
 pub fn help_text() -> String {
     let mut out = String::from("shell commands:\n");
     for (op, _) in OPS {
@@ -1183,6 +1311,32 @@ mod tests {
     }
 
     /// Only the line commands are stages, and the list the error prints is this list.
+    /// The two script parsers, without the shell in the way.
+    ///
+    /// A script that arrives through `shell` has already been through the tokenizer, so an
+    /// escaped delimiter cannot be tested from there. Testing the parser here is the only
+    /// place it can be.
+    #[test]
+    fn the_sed_and_awk_scripts_are_parsed_before_anything_runs() {
+        assert_eq!(parse_substitute("s/a/b/"), Ok(("a".to_string(), "b".to_string(), false)));
+        assert_eq!(parse_substitute("s/a/b/g"), Ok(("a".to_string(), "b".to_string(), true)));
+        assert_eq!(
+            parse_substitute("s/a\\/b/c/"),
+            Ok(("a/b".to_string(), "c".to_string(), false)),
+            "an escaped delimiter is a literal"
+        );
+        assert!(parse_substitute("s/a").unwrap_err().contains("both sides"));
+        assert!(parse_substitute("s//b/").unwrap_err().contains("empty `from`"));
+        assert!(parse_substitute("s/a/b/x").unwrap_err().contains("not a flag"));
+
+        assert_eq!(parse_print_program("{print $1}"), Ok(vec![PrintItem::Field(1)]));
+        assert_eq!(parse_print_program("{print $0}"), Ok(vec![PrintItem::Line]));
+        assert_eq!(parse_print_program("{print $NF}"), Ok(vec![PrintItem::Last]));
+        assert_eq!(parse_print_program("{print}"), Ok(vec![PrintItem::Line]));
+        assert!(parse_print_program("{print 1}").unwrap_err().contains("not a field"));
+        assert!(parse_print_program("$1").unwrap_err().contains("{print"));
+    }
+
     #[test]
     fn only_the_line_commands_may_be_stages() {
         for op in [
