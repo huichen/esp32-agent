@@ -17,7 +17,7 @@ because they are the three most common operations and a wrapper would only add a
 | Group | Commands |
 |---|---|
 | Files | `ls rm cp mv grep zip unzip` |
-| Reading and slicing text | `cat wc head tail cut sort uniq tr tee touch du strings od` |
+| Reading and slicing text | `cat echo wc head tail cut sort uniq tr tee touch du strings od` |
 | Network | `curl wget nslookup nc ping ifconfig netstat route arp` |
 | Numbers and time | `sleep usleep jot crc32` |
 | Looking at the board | `df free uptime date uname ps hexdump xd hostname whoami id env setenv unsetenv` |
@@ -29,20 +29,51 @@ Names follow NuttX's shell where one exists, so anyone who has used it can guess
 `cat` is `read` under the other name — NuttX has both and both get typed. `xd` is
 `hexdump`, `tail` is `head` from the other end, `which` answers exactly what `type` does.
 
-## There is no pipeline
+## Pipes and redirection
 
-No pipes, no redirection, no `&&`, no `;`. One call is one command, and there is no second
-command for its output to reach. A grammar with a pipeline would promise a process model
-the board does not have, so instead:
+One line may carry a pipeline, and what a stage prints is what the next one reads:
 
-- a filter names its file: `sort /log.txt`, `wc -l /log.txt`, `tail -n 5 /log.txt`,
-  `cut -d , -f 2 /readings.csv`, `tr abc ABC /log.txt`;
-- `tee` takes the text it would have read from a pipe as `-i`: `tee /out.txt -i hello`;
-- a sequence to feed a loop comes from `jot`, not from a pipeline: `jot 5 10 -1` prints
-  `10 9 8 7 6`.
+```json
+{"command": "ls / | grep txt"}
+{"command": "cat /log.txt | grep error | wc -l"}
+{"command": "echo done >> /log.txt"}
+```
 
-That is the same absence NuttX's `nsh` has, and it is documented here rather than
-half-implemented in the parser.
+`< file` feeds a stage from a file, `> file` writes a stage's output truncating it first, and
+`>> file` appends. All three write into the same 8 KB workspace as everything else, so a
+redirect that would not fit is refused with the number of bytes it needed and **nothing is
+written**.
+
+**The stages** are the commands that read or write lines. `cat echo grep sort uniq tr cut
+head tail wc strings od xd hexdump base64enc base64dec sha256sum md5sum crc32 tee` read
+stdin; `ls jot du df free ps uname date uptime echo` only produce, so they may start a
+pipeline but not continue one (`echo hi | ls` is refused). Every other command — `curl`,
+`rm`, `touch`, `sleep`, `script` — is refused by name: a pipeline is another way to write one
+command line, not a second way into the tool table.
+
+Up to **five stages**. Each stage goes through the same handler, the same argument table and
+the same credential a single command does, so `ls / | grep txt` cannot reach anything `ls`
+could not, and `echo hi | rm /x` is refused exactly as `rm /x` is.
+
+This is not bash:
+
+- no `&&`, no `;` — a word that *is* one of them is refused (`echo a && echo b` does not run
+  the second half); inside a sentence they are ordinary characters, so
+  `system_prompt set the pump is on GPIO12; never past it` stays one argument;
+- no `$(…)`, no backticks, no subshells — refused by name;
+- no `$VAR` expansion: `$HOME` is the five characters it is;
+- no background jobs: a `&` on its own is refused;
+- no `xargs`: it would need a command line inside a command line, and the stage list plus
+  `jot` already covers what it is usually reached for.
+
+A trailing `|`, and a `>`/`>>`/`<` with no file name, are errors with the line that says how
+a pipeline is written:
+
+```text
+cmd | cmd | …  ·  cmd > file  ·  cmd >> file  ·  cmd < file   (one line, up to 5 stages)
+```
+
+A quoted pipe is text, not an operator: `echo "a | b"` prints `a | b`.
 
 ## What each filter means here
 
@@ -58,6 +89,11 @@ minimum). `od` is `hexdump` in octal, because that is what `od` means.
 `touch <path>` creates an empty file if it is missing. There is nothing to update on an
 existing one: the workspace stores text and no timestamps, so `touch` answers with
 `"mtime": null` and a note rather than pretending it moved a time.
+
+A filter with no file reads the pipe, a filter with a file ignores the pipe (as `sort a.txt`
+ignores stdin in a shell), and a filter with neither is an error: it has nothing to read.
+`echo` joins its words with one space; `-n` leaves the newline off. `tee <path>` writes what
+it is handed and passes it on; on its own, `-i <text>` is what a pipe would have provided.
 
 ## The board looking at itself
 
@@ -104,9 +140,10 @@ The usage line comes from the same table the help text does, so the two cannot d
 ```text
 shell {"command":"rm /x"}          → usage: rm <path> --confirm
 shell {"command":"cp /a"}          → usage: cp <from> <to>     (a missing argument says it too)
+shell {"command":"ls / |"}         → a pipeline cannot end with `|`, then the pipeline usage
 shell {"command":"sudo ls"}        → `sudo` is not a shell command, then every usage line
 shell {"command":"cp -h"}          → usage: cp <from> <to>        (help answers before validation)
-shell {"command":"help"}           → all 55 commands
+shell {"command":"help"}           → all 56 commands
 ```
 
 `help` is generated from the command table, so a command that was added is in it, and a

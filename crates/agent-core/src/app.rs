@@ -91,6 +91,12 @@ pub const WORKSPACE_TOTAL_MAX: usize = 8192;
 /// keeps the command useful without letting it become an outage.
 pub const MAX_SHELL_SLEEP_MS: u64 = 10_000;
 
+/// How much of a pipeline's last stage reaches the answer.
+///
+/// The same reason `hexdump` and `unzip` have budgets: a tool result is about 2 KB, and a
+/// pipeline can multiply what a single command would have returned.
+pub const PIPE_RESULT_MAX: usize = 1800;
+
 /// How many scheduled prompts and sensor rules the board keeps. The scheduler
 /// tick walks both lists on every tick, so this is bounded like everything else.
 pub const MAX_TASKS: usize = 8;
@@ -3557,22 +3563,32 @@ impl App {
 
 impl App {
     /// `shell {op, …}`: pick the command, hand the rest of the arguments to the handler.
+    ///
+    /// A line is a *pipeline* of one or more stages. One stage with no redirect keeps the
+    /// answer shape it has always had; anything else runs through [`App::run_pipeline`].
     fn run_shell(&mut self, args: &Value) -> std::result::Result<String, String> {
         // One way in: a command line, as a shell has. No `op`, no parallel object form.
         let line = args.get("command").and_then(|v| v.as_str()).unwrap_or("");
         if line.trim().is_empty() {
             return Err(format!("`command` is required.\n\n{}", crate::tools::shell::help_text()));
         }
-        let parsed = crate::tools::shell::parse(line)?;
-        let op = parsed.name.clone();
+        let pipeline = crate::tools::shell::parse_pipeline(line)?;
         // `help`, `-h` and `--help` answer before anything is validated, so `cp -h` does not
-        // fail for a missing argument on the way to its own usage line.
-        let wants_help = op == "help"
-            || args.get("help").and_then(|v| v.as_bool()).unwrap_or(false)
-            || parsed.flags.contains_key("help")
-            || parsed.flags.contains_key("h");
+        // fail for a missing argument on the way to its own usage line. In a pipeline the
+        // stage that asked wins, so `ls / | grep --help` explains `grep`.
+        let asking = pipeline
+            .stages
+            .iter()
+            .find(|stage| stage.parsed.flags.contains_key("help") || stage.parsed.flags.contains_key("h"));
+        let wants_help = args.get("help").and_then(|v| v.as_bool()).unwrap_or(false)
+            || asking.is_some()
+            || pipeline.stages.iter().any(|stage| stage.parsed.name == "help");
         if wants_help {
-            let text = match crate::tools::shell::usage(&op) {
+            let op = asking
+                .map(|stage| stage.parsed.name.as_str())
+                .or_else(|| pipeline.stages.first().map(|stage| stage.parsed.name.as_str()))
+                .unwrap_or("");
+            let text = match crate::tools::shell::usage(op) {
                 Some(line) if op != "help" => {
                     format!("usage: {line}\n\n{}", crate::tools::shell::help_text())
                 }
@@ -3580,10 +3596,23 @@ impl App {
             };
             return Ok(json!({ "help": text }).to_string());
         }
+        match pipeline.single() {
+            Some(parsed) => self.run_single(parsed, args),
+            None => self.run_pipeline(&pipeline),
+        }
+    }
+
+    /// One command, no pipe and no redirect: the form that existed before pipelines.
+    fn run_single(
+        &mut self,
+        parsed: &crate::tools::shell::Parsed,
+        args: &Value,
+    ) -> std::result::Result<String, String> {
+        let op = parsed.name.clone();
         // A missing argument is a wrong command line like any other, so it answers with the
         // usage line too: `cp` with one word should not be the one error that stays silent
         // about how the command is written.
-        let mut inner = match crate::tools::shell::arguments(&parsed) {
+        let mut inner = match crate::tools::shell::arguments(parsed) {
             Ok(inner) => inner,
             Err(e) => return Err(with_usage(&op, e)),
         };
@@ -3594,12 +3623,27 @@ impl App {
             format!("`{op}` is not a shell command.\n\n{}", crate::tools::shell::help_text())
         })?;
         let usage = crate::tools::shell::usage(&op).unwrap_or("");
-        let result = match tool {
-            "shell_zip" => self.shell_zip(&inner),
-            "shell_unzip" => self.shell_unzip(&inner),
-            "shell_curl" => self.run_curl("curl", &inner),
-            "shell_wget" => self.run_curl("wget", &inner),
-            "shell_ping" => self.run_ping(&inner).map(|v| v.to_string()),
+        self.shell_dispatch(tool, &inner).map_err(|e| {
+            if usage.is_empty() || e.contains("usage:") {
+                e
+            } else {
+                format!("{e}\n\nusage: {usage}")
+            }
+        })
+    }
+
+    /// The handler behind a command, by handler name.
+    ///
+    /// One table: a command behaves the same whether it was typed alone or as a stage of a
+    /// pipeline, because a pipeline must not be a second way round anything (the PIN, the
+    /// workspace limit, the refusals).
+    fn shell_dispatch(&mut self, tool: &str, inner: &Value) -> std::result::Result<String, String> {
+        match tool {
+            "shell_zip" => self.shell_zip(inner),
+            "shell_unzip" => self.shell_unzip(inner),
+            "shell_curl" => self.run_curl("curl", inner),
+            "shell_wget" => self.run_curl("wget", inner),
+            "shell_ping" => self.run_ping(inner).map(|v| v.to_string()),
             "shell_ifconfig" => Ok(self.ifconfig_json().to_string()),
             "shell_df" => Ok(self.shell_df()),
             "shell_free" => Ok(self.shell_free()),
@@ -3607,42 +3651,197 @@ impl App {
             "shell_date" => Ok(self.shell_date()),
             "shell_uname" => Ok(self.shell_uname()),
             "shell_ps" => self.shell_ps(),
-            "shell_hexdump" => self.shell_hexdump(&inner),
-            "shell_base64" => self.shell_base64(&inner),
-            "shell_sha256sum" => self.shell_hash(&inner, true),
-            "shell_md5sum" => self.shell_hash(&inner, false),
-            "shell_system_prompt" => self.shell_system_prompt(&inner),
-            "shell_wc" => self.shell_wc(&inner),
-            "shell_head" => self.shell_head(&inner),
-            "shell_cut" => self.shell_cut(&inner),
-            "shell_sort" => self.shell_sort(&inner),
-            "shell_uniq" => self.shell_uniq(&inner),
-            "shell_tr" => self.shell_tr(&inner),
-            "shell_tee" => self.shell_tee(&inner),
-            "shell_touch" => self.shell_touch(&inner),
+            "shell_hexdump" => self.shell_hexdump(inner),
+            "shell_base64" => self.shell_base64(inner),
+            "shell_sha256sum" => self.shell_hash(inner, true),
+            "shell_md5sum" => self.shell_hash(inner, false),
+            "shell_system_prompt" => self.shell_system_prompt(inner),
+            "shell_wc" => self.shell_wc(inner),
+            "shell_head" => self.shell_head(inner),
+            "shell_cut" => self.shell_cut(inner),
+            "shell_sort" => self.shell_sort(inner),
+            "shell_uniq" => self.shell_uniq(inner),
+            "shell_tr" => self.shell_tr(inner),
+            "shell_tee" => self.shell_tee(inner),
+            "shell_touch" => self.shell_touch(inner),
             "shell_du" => Ok(self.shell_du()),
-            "shell_strings" => self.shell_strings(&inner),
-            "shell_sleep" => self.shell_sleep(&inner),
-            "shell_jot" => self.shell_jot(&inner),
-            "shell_crc32" => self.shell_crc32(&inner),
-            "shell_hostname" => self.shell_hostname(&inner),
+            "shell_strings" => self.shell_strings(inner),
+            "shell_sleep" => self.shell_sleep(inner),
+            "shell_jot" => self.shell_jot(inner),
+            "shell_crc32" => self.shell_crc32(inner),
+            "shell_hostname" => self.shell_hostname(inner),
             "shell_whoami" => Ok(self.shell_whoami()),
             "shell_id" => Ok(self.shell_id()),
-            "shell_env" => self.shell_env(&inner),
+            "shell_env" => self.shell_env(inner),
             "shell_netstat" => Ok(self.shell_netstat()),
             "shell_route" => Ok(self.shell_route()),
             "shell_arp" => Ok(self.shell_arp()),
-            "shell_type" => self.shell_type(&inner),
+            "shell_type" => self.shell_type(inner),
+            "shell_echo" => self.shell_echo(inner),
             "shell_help" => Ok(json!({ "help": crate::tools::shell::help_text() }).to_string()),
-            other => self.fs_or_net_call(other, &inner),
-        };
-        result.map_err(|e| {
-            if usage.is_empty() || e.contains("usage:") {
-                e
-            } else {
-                format!("{e}\n\nusage: {usage}")
+            other => self.fs_or_net_call(other, inner),
+        }
+    }
+
+    /// `cmd | cmd`, `cmd > file`, `cmd < file`: the stages run in order, each one through
+    /// [`App::shell_dispatch`], and the text between them is what `stdout` means.
+    ///
+    /// The result is one JSON object rather than a stage's own answer: a pipeline has an
+    /// answer of its own (what came out of the last stage, and what was written where).
+    fn run_pipeline(
+        &mut self,
+        pipeline: &crate::tools::shell::Pipeline,
+    ) -> std::result::Result<String, String> {
+        let mut stdin: Option<String> = None;
+        let mut stages: Vec<Value> = Vec::new();
+        let mut writes: Vec<Value> = Vec::new();
+
+        for (index, stage) in pipeline.stages.iter().enumerate() {
+            let op = stage.parsed.name.clone();
+            let stdio = crate::tools::shell::pipe_stdio(&op).ok_or_else(|| {
+                format!(
+                    "`{op}` cannot run in a pipeline: only the commands that read or write lines \
+                     can be a stage\n\nthe stages are: {}\n\nusage: {}",
+                    crate::tools::shell::pipe_commands(),
+                    crate::tools::shell::PIPE_USAGE
+                )
+            })?;
+            // `< file` on the first stage is where its text comes from; on a later stage the
+            // pipe is already the input and two sources would be a guess.
+            if let Some(path) = &stage.stdin {
+                if index > 0 {
+                    return Err(format!(
+                        "`<` is only for the first stage: stage {} already reads the pipe\n\nusage: {}",
+                        index + 1,
+                        crate::tools::shell::PIPE_USAGE
+                    ));
+                }
+                stdin = Some(fs_tools::Workspace::read(&self.workspace, path)?);
             }
-        })
+            if index > 0 && stdio == crate::tools::shell::Stdio::Produces {
+                return Err(format!(
+                    "`{op}` does not read stdin, so it cannot be stage {} of a pipeline \
+                     (it only produces output)\n\nusage: {}",
+                    index + 1,
+                    crate::tools::shell::PIPE_USAGE
+                ));
+            }
+
+            let mut inner = match crate::tools::shell::stage_arguments(&stage.parsed, true) {
+                Ok(inner) => inner,
+                Err(e) => return Err(with_usage(&op, e)),
+            };
+            if let Some(text) = &stdin {
+                inner["stdin"] = json!(text);
+            }
+            let out = self.pipe_stage(&op, &inner).map_err(|e| with_usage(&op, e))?;
+
+            let mut record = json!({ "op": op, "bytes_out": out.len() });
+            match &stage.stdout {
+                Some(target) => {
+                    let written = self.shell_redirect(target, &out)?;
+                    record["file"] = written["path"].clone();
+                    record["append"] = written["append"].clone();
+                    writes.push(written);
+                    // A redirected stage sends nothing down the pipe, as in a shell.
+                    stdin = Some(String::new());
+                }
+                None => stdin = Some(out),
+            }
+            stages.push(record);
+        }
+
+        let bytes_out = stdin.as_ref().map(|text| text.len()).unwrap_or(0);
+        let mut out = stdin.unwrap_or_default();
+        let truncated = out.len() > PIPE_RESULT_MAX;
+        if truncated {
+            out = crate::llm::truncate_bytes(&out, PIPE_RESULT_MAX);
+        }
+        let mut result = json!({
+            "pipeline": pipeline.stages.iter().map(|s| s.parsed.name.as_str()).collect::<Vec<_>>(),
+            "stages": stages,
+            "stdout": out,
+            "bytes_out": bytes_out,
+        });
+        if !writes.is_empty() {
+            result["writes"] = json!(writes);
+        }
+        if truncated {
+            result["truncated"] = json!(true);
+            result["note"] =
+                json!(format!("stdout was cut to {PIPE_RESULT_MAX} bytes; a tool answer is capped"));
+        }
+        Ok(result.to_string())
+    }
+
+    /// One stage: the handler behind it, then its answer rendered as the text a pipe carries.
+    ///
+    /// `cat`, `grep` and `echo` are the three whose answer is not already a line shape: `cat`
+    /// with no file copies its input, `grep` with no file filters what the pipe left, and
+    /// `echo` is the producer a redirect is usually written for.
+    fn pipe_stage(&mut self, op: &str, inner: &Value) -> std::result::Result<String, String> {
+        if op == "cat" {
+            match inner.get("path").and_then(|v| v.as_str()) {
+                Some(path) if !path.is_empty() => {
+                    // A named file wins over the pipe, as `cat a b` does over stdin.
+                }
+                _ => return Ok(inner.get("stdin").and_then(|v| v.as_str()).unwrap_or("").to_string()),
+            }
+        }
+        if op == "grep" && inner.get("path").map(|v| v.is_null()).unwrap_or(true) {
+            let pattern = inner.get("pattern").and_then(|v| v.as_str()).unwrap_or("");
+            let text = inner.get("stdin").and_then(|v| v.as_str()).unwrap_or("");
+            // The same rule as `fs_grep`: a literal substring, as typed.
+            let hits: Vec<&str> = text.lines().filter(|line| line.contains(pattern)).collect();
+            return Ok(hits.join("\n"));
+        }
+        let tool = crate::tools::shell::route(op).ok_or_else(|| {
+            format!("`{op}` is not a shell command.\n\n{}", crate::tools::shell::help_text())
+        })?;
+        let answer = self.shell_dispatch(tool, inner)?;
+        let value: Value = serde_json::from_str(&answer).unwrap_or_else(|_| json!({ "text": answer }));
+        pipe_text(op, &value)
+    }
+
+    /// `> file` / `>> file`: the text goes into the workspace, refused if it cannot fit.
+    fn shell_redirect(
+        &mut self,
+        target: &crate::tools::shell::Redirect,
+        text: &str,
+    ) -> std::result::Result<Value, String> {
+        let existing = if target.append {
+            fs_tools::Workspace::read(&self.workspace, &target.path).unwrap_or_default()
+        } else {
+            String::new()
+        };
+        let joined = if target.append { format!("{existing}{text}") } else { text.to_string() };
+        if joined.len() > WORKSPACE_FILE_MAX {
+            return Err(format!(
+                "a redirect needs {} bytes and a file holds at most {WORKSPACE_FILE_MAX}: nothing was written",
+                joined.len()
+            ));
+        }
+        let others: usize = self.workspace.to_json()["files"]
+            .as_object()
+            .map(|files| {
+                files
+                    .iter()
+                    .filter(|(path, _)| {
+                        path.as_str() != fs_tools::normalize(&target.path).unwrap_or_default()
+                    })
+                    .map(|(_, text)| text.as_str().unwrap_or("").len())
+                    .sum()
+            })
+            .unwrap_or(0);
+        if others + joined.len() > WORKSPACE_TOTAL_MAX {
+            return Err(format!(
+                "a redirect needs {} bytes and the workspace holds {WORKSPACE_TOTAL_MAX}: nothing was written",
+                others + joined.len()
+            ));
+        }
+        fs_tools::Workspace::write(&mut self.workspace, &target.path, &joined)?;
+        self.persist_workspace();
+        Ok(json!({ "path": target.path, "bytes": joined.len(), "append": target.append }))
     }
 
     fn run_ping(&mut self, args: &Value) -> std::result::Result<Value, String> {
@@ -3713,11 +3912,8 @@ impl App {
 
     /// `sha256sum` / `md5sum`: what is in this file, in a form another machine can check.
     fn shell_hash(&mut self, args: &Value, sha: bool) -> std::result::Result<String, String> {
-        let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("").trim();
-        if path.is_empty() {
-            return Err("`path` is required".into());
-        }
-        let bytes = fs_tools::Workspace::read(&self.workspace, path)?.into_bytes();
+        let (path, text) = self.shell_input(args, if sha { "sha256sum" } else { "md5sum" })?;
+        let bytes = text.into_bytes();
         let digest = if sha { crate::hash::sha256(&bytes) } else { crate::hash::md5(&bytes) };
         let key = if sha { "sha256" } else { "md5" };
         let mut out = json!({ "path": path, "bytes": bytes.len() });
@@ -3841,15 +4037,12 @@ impl App {
     }
 
     fn shell_hexdump(&mut self, args: &Value) -> std::result::Result<String, String> {
-        let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("").trim();
-        if path.is_empty() {
-            return Err("`path` is required".into());
-        }
         let width = args.get("width").and_then(|v| v.as_u64()).unwrap_or(16).clamp(4, 32) as usize;
         // `od` and `hexdump` are the same walk over the same bytes; the base is the only
         // difference, and `od` is the one that prints octal.
         let octal = args.get("octal").and_then(|v| v.as_bool()).unwrap_or(false);
-        let data = fs_tools::Workspace::read(&self.workspace, path)?.into_bytes();
+        let (path, text) = self.shell_input(args, if octal { "od" } else { "hexdump" })?;
+        let data = text.into_bytes();
         // A tool result is 2 KB; a column per byte eats 4 (octal) or 5 (hex) bytes, so dump
         // as much as arrives whole and say what was left out.
         let lines_that_fit = 1800 / (width * if octal { 4 } else { 5 } + 12);
@@ -3882,18 +4075,19 @@ impl App {
 
     /// `base64`: encode a file to base64, or decode base64 back into one.
     fn shell_base64(&mut self, args: &Value) -> std::result::Result<String, String> {
-        let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("").trim();
-        if path.is_empty() {
-            return Err("`path` is required".into());
-        }
         let decode = args.get("decode").and_then(|v| v.as_bool()).unwrap_or(false);
         let out_path = args.get("out").and_then(|v| v.as_str()).map(|s| s.to_string());
-        let text = fs_tools::Workspace::read(&self.workspace, path)?;
+        let (path, text) = self.shell_input(args, if decode { "base64dec" } else { "base64enc" })?;
         if decode {
             let mut bytes = Vec::new();
             crate::util::b64_decode(text.trim(), &mut bytes).map_err(|e| e.message)?;
             let decoded = String::from_utf8_lossy(&bytes).to_string();
-            let target = out_path.unwrap_or_else(|| format!("{path}.decoded"));
+            // `-o` is where it goes; a file that was named gets its `.decoded` neighbour; text
+            // arriving on a pipe has neither, and the decoded text is the answer itself.
+            let target = out_path.or_else(|| path.as_str().map(|p| format!("{p}.decoded")));
+            let Some(target) = target else {
+                return Ok(serde_json::json!({ "text": decoded, "bytes": bytes.len() }).to_string());
+            };
             fs_tools::Workspace::write(&mut self.workspace, &target, &decoded)?;
             self.persist_workspace();
             return Ok(serde_json::json!({ "path": target, "bytes": bytes.len() }).to_string());
@@ -4009,10 +4203,45 @@ impl App {
         Ok(path)
     }
 
+    /// The text a filter works on: the file it names, or the text a pipe handed it.
+    ///
+    /// A named file wins over the pipe, the way `sort a.txt` ignores stdin in a shell. With
+    /// neither there is nothing to read, and that is an error rather than an empty answer:
+    /// a filter that silently returns nothing looks like a filter that found nothing.
+    fn shell_input(&self, args: &Value, op: &str) -> std::result::Result<(Value, String), String> {
+        let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+        if !path.is_empty() {
+            let text = fs_tools::Workspace::read(&self.workspace, &path)?;
+            return Ok((json!(path), text));
+        }
+        if let Some(stdin) = args.get("stdin").and_then(|v| v.as_str()) {
+            return Ok((Value::Null, stdin.to_string()));
+        }
+        Err(format!("{op}: nothing to read — give it a path, or feed it with `< file` or a pipe"))
+    }
+
+    /// `echo [-n] <text...>`: the text, and the newline a redirect is usually written for.
+    fn shell_echo(&mut self, args: &Value) -> std::result::Result<String, String> {
+        let words: Vec<&str> = args
+            .get("words")
+            .and_then(|v| v.as_array())
+            .map(|items| items.iter().filter_map(|word| word.as_str()).collect())
+            .unwrap_or_default();
+        let text = words.join(" ");
+        let newline = args.get("newline").and_then(|v| v.as_bool()).unwrap_or(true);
+        let stdout = if newline { format!("{text}\n") } else { text.clone() };
+        Ok(json!({
+            "text": text,
+            "stdout": stdout,
+            "bytes": text.len(),
+            "newline": newline,
+        })
+        .to_string())
+    }
+
     /// `wc [-l|-w|-c] <path>`: lines, words or bytes, whichever was asked for.
     fn shell_wc(&mut self, args: &Value) -> std::result::Result<String, String> {
-        let path = App::shell_path(args, "wc")?;
-        let text = fs_tools::Workspace::read(&self.workspace, &path)?;
+        let (path, text) = self.shell_input(args, "wc")?;
         let lines = text.lines().count();
         let words = text.split_whitespace().count();
         let bytes = text.len();
@@ -4042,8 +4271,7 @@ impl App {
     /// `head` / `tail [-n N] <path>`: the first or last `N` lines, default 10.
     fn shell_head(&mut self, args: &Value) -> std::result::Result<String, String> {
         let tail = args.get("tail").and_then(|v| v.as_bool()).unwrap_or(false);
-        let path = App::shell_path(args, if tail { "tail" } else { "head" })?;
-        let text = fs_tools::Workspace::read(&self.workspace, &path)?;
+        let (path, text) = self.shell_input(args, if tail { "tail" } else { "head" })?;
         let want = args
             .get("lines")
             .and_then(|v| v.as_u64().or_else(|| v.as_str().and_then(|s| s.trim().parse().ok())))
@@ -4066,7 +4294,6 @@ impl App {
 
     /// `cut -d <delimiter> -f <field> <path>`: one column out of every line.
     fn shell_cut(&mut self, args: &Value) -> std::result::Result<String, String> {
-        let path = App::shell_path(args, "cut")?;
         let delimiter = args.get("delimiter").and_then(|v| v.as_str()).unwrap_or("\t").to_string();
         let mut chars = delimiter.chars();
         let delim = chars.next().unwrap_or('\t');
@@ -4080,7 +4307,7 @@ impl App {
         if field == 0 {
             return Err("cut: fields are numbered from 1".into());
         }
-        let text = fs_tools::Workspace::read(&self.workspace, &path)?;
+        let (path, text) = self.shell_input(args, "cut")?;
         let mut out: Vec<&str> = Vec::new();
         let mut missing = 0usize;
         for line in text.lines() {
@@ -4102,10 +4329,9 @@ impl App {
 
     /// `sort [-r] [-u] <path>`: byte order, like `LC_ALL=C sort`.
     fn shell_sort(&mut self, args: &Value) -> std::result::Result<String, String> {
-        let path = App::shell_path(args, "sort")?;
         let reverse = args.get("reverse").and_then(|v| v.as_bool()).unwrap_or(false);
         let unique = args.get("unique").and_then(|v| v.as_bool()).unwrap_or(false);
-        let text = fs_tools::Workspace::read(&self.workspace, &path)?;
+        let (path, text) = self.shell_input(args, "sort")?;
         let mut lines: Vec<&str> = text.lines().collect();
         lines.sort_unstable();
         if reverse {
@@ -4126,8 +4352,7 @@ impl App {
 
     /// `uniq <path>`: collapse *adjacent* repeats, which is what `uniq` means.
     fn shell_uniq(&mut self, args: &Value) -> std::result::Result<String, String> {
-        let path = App::shell_path(args, "uniq")?;
-        let text = fs_tools::Workspace::read(&self.workspace, &path)?;
+        let (path, text) = self.shell_input(args, "uniq")?;
         let mut lines: Vec<&str> = Vec::new();
         for line in text.lines() {
             if lines.last() != Some(&line) {
@@ -4154,8 +4379,7 @@ impl App {
         if to.is_empty() {
             return Err("tr: `to` is required (deleting a set is not implemented)".into());
         }
-        let path = App::shell_path(args, "tr")?;
-        let text = fs_tools::Workspace::read(&self.workspace, &path)?;
+        let (path, text) = self.shell_input(args, "tr")?;
         // `tr` repeats the last character of SET2 when SET2 is shorter; ranges are *not*
         // expanded, so `a-z` is three literal characters and the result says so.
         let mut map: std::collections::BTreeMap<char, char> = std::collections::BTreeMap::new();
@@ -4191,12 +4415,21 @@ impl App {
         .to_string())
     }
 
-    /// `tee <path> -i <text>`: write the text and echo it, since there is no pipe to fill.
+    /// `tee <path> [-i <text>]`: write the text and echo it. In a pipeline the text arrives
+    /// on stdin; on its own it arrives as `-i`, because that is what a pipe would have been.
     fn shell_tee(&mut self, args: &Value) -> std::result::Result<String, String> {
         let path = App::shell_path(args, "tee")?;
-        let input = args.get("input").and_then(|v| v.as_str()).unwrap_or("");
+        let flag = args.get("input").and_then(|v| v.as_str()).unwrap_or("");
+        let piped = args.get("stdin").and_then(|v| v.as_str());
+        let input = match piped {
+            Some(text) => text,
+            None => flag,
+        };
         if input.is_empty() {
-            return Err("tee: `-i <text>` is required — this board has no pipe to read".into());
+            return Err(
+                "tee: nothing to write — in a pipeline the pipe fills it, and on its own `-i <text>` does"
+                    .into(),
+            );
         }
         fs_tools::Workspace::write(&mut self.workspace, &path, input)?;
         self.persist_workspace();
@@ -4204,7 +4437,8 @@ impl App {
             "path": path,
             "bytes": input.len(),
             "text": input,
-            "note": "tee without a pipe: the text is an argument, and it is both written and echoed",
+            "source": if piped.is_some() { "stdin" } else { "-i" },
+            "note": "tee: the text is both written to the file and echoed to the next stage",
         })
         .to_string())
     }
@@ -4254,13 +4488,13 @@ impl App {
 
     /// `strings [-n <min>] <path>`: the printable runs, shortest useful one first.
     fn shell_strings(&mut self, args: &Value) -> std::result::Result<String, String> {
-        let path = App::shell_path(args, "strings")?;
         let min = args
             .get("min")
             .and_then(|v| v.as_u64().or_else(|| v.as_str().and_then(|s| s.trim().parse().ok())))
             .unwrap_or(4)
             .clamp(2, 64) as usize;
-        let data = fs_tools::Workspace::read(&self.workspace, &path)?.into_bytes();
+        let (path, text) = self.shell_input(args, "strings")?;
+        let data = text.into_bytes();
         let mut found: Vec<String> = Vec::new();
         let mut run = String::new();
         let mut budget = 1600usize;
@@ -4610,6 +4844,86 @@ fn plain_number(value: f64) -> String {
     } else {
         format!("{value}")
     }
+}
+
+/// The text a stage hands to the next one.
+///
+/// A command answers with JSON because a tool result is JSON, but a pipe carries *lines* —
+/// that is what `grep`, `wc` and `sort` count downstream. This is the one place the two
+/// meet, per command, and it is deliberately thin: what `ls` prints here is its file names,
+/// one per line, not its whole answer with the sizes in it.
+fn pipe_text(op: &str, answer: &Value) -> std::result::Result<String, String> {
+    let text = |key: &str| answer.get(key).and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let lines_of = |key: &str, field: Option<&str>| -> String {
+        answer
+            .get(key)
+            .and_then(|v| v.as_array())
+            .map(|items| {
+                items
+                    .iter()
+                    .map(|item| match field {
+                        Some(name) => item[name].as_str().unwrap_or("").to_string(),
+                        None => match item {
+                            Value::String(s) => s.clone(),
+                            other => other.to_string(),
+                        },
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+            .unwrap_or_default()
+    };
+    Ok(match op {
+        // The filters already answer with the text they filtered.
+        "cat" | "tee" | "sort" | "uniq" | "tr" | "cut" | "head" | "tail" => text("text"),
+        "grep" => lines_of("matches", Some("text")),
+        "wc" => match answer.get("count") {
+            Some(count) => count.to_string(),
+            // No mode: all three counts, as plain `wc` prints them.
+            None => format!("{} {} {}", answer["lines"], answer["words"], answer["bytes"]),
+        },
+        "strings" => lines_of("strings", None),
+        "od" | "xd" | "hexdump" => text("hexdump"),
+        "base64enc" => text("base64"),
+        "base64dec" => text("text"),
+        "sha256sum" => text("sha256"),
+        "md5sum" => text("md5"),
+        "crc32" => text("crc32"),
+        "jot" => lines_of("numbers", None),
+        "ls" => lines_of("entries", Some("name")),
+        // `bytes<TAB>path`, which is what `du` prints and what a `cut -f 2` downstream reads.
+        "du" => answer
+            .get("files")
+            .and_then(|v| v.as_array())
+            .map(|files| {
+                files
+                    .iter()
+                    .map(|file| format!("{}\t{}", file["bytes"], file["path"].as_str().unwrap_or("")))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+            .unwrap_or_default(),
+        "ps" => lines_of("tasks", None),
+        // A table-shaped answer becomes `key value` lines, which is what a grep can look at.
+        "df" | "free" | "uname" => match answer.as_object() {
+            Some(fields) => {
+                let mut out: Vec<String> = Vec::new();
+                for (key, value) in fields {
+                    let shown = match value {
+                        Value::String(s) => s.clone(),
+                        other => other.to_string(),
+                    };
+                    out.push(format!("{key} {shown}"));
+                }
+                out.join("\n")
+            }
+            None => String::new(),
+        },
+        "date" => text("utc"),
+        "uptime" => text("uptime"),
+        "echo" => text("stdout"),
+        other => return Err(format!("`{other}` has no line form to hand down a pipe")),
+    })
 }
 
 /// The text of an MCP tool result: its `content` text when it already has the MCP
@@ -6418,7 +6732,7 @@ mod tests {
         let read: Value = serde_json::from_str(&read).unwrap();
         assert_eq!(read["text"], cat["text"], "the same file, the same answer");
         let err = ToolHost::call_tool(&mut app, "shell", &json!({"command": "cat /nope"})).unwrap_err();
-        assert!(err.contains("usage: cat <path>"), "{err}");
+        assert!(err.contains("usage: cat [path]"), "{err}");
     }
 
     #[test]
@@ -6510,7 +6824,7 @@ mod tests {
         assert_eq!(out["bytes"], json!(5));
         assert_eq!(sh(&mut app, "cat /teed.txt")["text"], json!("hello"));
         let err = ToolHost::call_tool(&mut app, "shell", &json!({"command": "tee /teed.txt"})).unwrap_err();
-        assert!(err.contains("usage: tee <path> -i <text>"), "{err}");
+        assert!(err.contains("usage: tee <path>"), "{err}");
     }
 
     #[test]
@@ -6754,6 +7068,185 @@ mod tests {
                 ),
             }
         }
+    }
+
+    // ---- pipes and redirection ----
+
+    /// One line, several stages: what the first prints is what the second reads.
+    #[test]
+    fn a_pipeline_feeds_one_stage_into_the_next() {
+        let mut app = test_app();
+        write_file(&mut app, "/a.txt", "alpha\n");
+        write_file(&mut app, "/b.log", "beta\n");
+
+        let out = sh(&mut app, "ls / | grep txt");
+        assert_eq!(out["pipeline"], json!(["ls", "grep"]), "{out}");
+        assert_eq!(out["stdout"], json!("a.txt"), "{out}");
+
+        // `wc` counts the lines the pipe carried, not the tree.
+        assert_eq!(sh(&mut app, "ls / | wc -l")["stdout"], json!("2"));
+        // Four stages, still one line. `head` hands on its lines without a trailing newline.
+        let long = sh(&mut app, "ls / | sort -r | head -n 1 | wc -c");
+        assert_eq!(long["stdout"], json!("5"), "`b.log` is five bytes: {long}");
+    }
+
+    /// `cat < file` is reading a file, `sort | head` is reading the pipe.
+    #[test]
+    fn input_redirection_reads_a_file() {
+        let mut app = test_app();
+        write_file(&mut app, "/in.txt", "one\ntwo\nthree\n");
+        assert_eq!(sh(&mut app, "cat < /in.txt")["stdout"], json!("one\ntwo\nthree\n"));
+        assert_eq!(sh(&mut app, "wc -l < /in.txt")["stdout"], json!("3"));
+        assert_eq!(sh(&mut app, "sort < /in.txt | head -n 1")["stdout"], json!("one"));
+        // A file that is not there is the same error it always is.
+        let err = ToolHost::call_tool(&mut app, "shell", &json!({"command": "cat < /nope"})).unwrap_err();
+        assert!(err.contains("/nope"), "{err}");
+    }
+
+    /// `>` truncates, `>>` appends, and both land in the workspace the file tools read.
+    #[test]
+    fn a_redirect_writes_and_appends() {
+        let mut app = test_app();
+        let out = sh(&mut app, "echo hi > /out.txt");
+        assert_eq!(out["writes"][0]["path"], json!("/out.txt"), "{out}");
+        assert_eq!(out["stdout"], json!(""), "a redirected stage sends nothing down the pipe");
+        assert_eq!(sh(&mut app, "cat /out.txt")["text"], json!("hi\n"));
+        assert_eq!(sh(&mut app, "wc -c /out.txt")["count"], json!(3));
+
+        sh(&mut app, "echo there >> /out.txt");
+        assert_eq!(sh(&mut app, "cat /out.txt")["text"], json!("hi\nthere\n"));
+
+        // `>` starts again from nothing, and the file tools see the result.
+        sh(&mut app, "echo again > /out.txt");
+        assert_eq!(sh(&mut app, "cat /out.txt")["text"], json!("again\n"));
+    }
+
+    /// `grep` on the end of a pipe filters the text it is handed, by the rule `fs_grep` uses.
+    #[test]
+    fn grep_filters_what_the_pipe_carries() {
+        let mut app = test_app();
+        write_file(&mut app, "/log.txt", "boot ok\nerror: pump\nboot done\nerror: fan\n");
+        assert_eq!(sh(&mut app, "cat /log.txt | grep error")["stdout"], json!("error: pump\nerror: fan"));
+        assert_eq!(sh(&mut app, "cat /log.txt | grep error | wc -l")["stdout"], json!("2"));
+        // Nothing matched is an empty answer, not an error.
+        assert_eq!(sh(&mut app, "cat /log.txt | grep nothing")["stdout"], json!(""));
+        // The same pattern, the same rule as the file tool.
+        let found = sh(&mut app, "grep error /log.txt");
+        assert_eq!(found["matches"].as_array().unwrap().len(), 2, "{found}");
+    }
+
+    /// A stage that cannot read stdin stops the pipeline and names itself.
+    #[test]
+    fn a_command_that_cannot_be_a_stage_says_so() {
+        let mut app = test_app();
+        // Not a line command at all.
+        let err = ToolHost::call_tool(&mut app, "shell", &json!({"command": "ls / | touch /x"})).unwrap_err();
+        assert!(err.contains("`touch` cannot run in a pipeline"), "{err}");
+        // A producer cannot be stage two: it has nothing to read.
+        let err = ToolHost::call_tool(&mut app, "shell", &json!({"command": "echo hi | ls /"})).unwrap_err();
+        assert!(err.contains("`ls` does not read stdin"), "{err}");
+        // `script` is not in the table, so a pipeline is not a way to reach it.
+        let err =
+            ToolHost::call_tool(&mut app, "shell", &json!({"command": "echo hi | script"})).unwrap_err();
+        assert!(err.contains("script"), "{err}");
+        // Nothing ran, so nothing was written.
+        assert!(
+            app.workspace.to_json()["files"].as_object().unwrap().is_empty(),
+            "a refused pipeline leaves no file"
+        );
+    }
+
+    /// The stage limit is five, and it is enforced by the parser, not by hoping.
+    #[test]
+    fn a_pipeline_carries_five_stages_and_no_more() {
+        let mut app = test_app();
+        assert_eq!(sh(&mut app, "echo a | cat | cat | cat | cat")["stdout"], json!("a\n"));
+        let err = ToolHost::call_tool(
+            &mut app,
+            "shell",
+            &json!({"command": "echo a | cat | cat | cat | cat | cat"}),
+        )
+        .unwrap_err();
+        assert!(err.contains("at most 5"), "{err}");
+        assert!(err.contains("usage:"), "{err}");
+    }
+
+    /// The syntax that looks like a shell but is not one is refused, with the line that says
+    /// how it *is* written — a trailing pipe included.
+    #[test]
+    fn broken_pipeline_syntax_is_refused_with_a_usage_line() {
+        let mut app = test_app();
+        for (line, needle) in [
+            ("ls / |", "cannot end with `|`"),
+            ("echo hi >", "needs a file name"),
+            ("cat <", "needs a file name"),
+            ("echo a && echo b", "&&"),
+            ("echo $(date)", "$("),
+        ] {
+            let err = ToolHost::call_tool(&mut app, "shell", &json!({ "command": line })).unwrap_err();
+            assert!(err.contains(needle), "`{line}`: {err}");
+            assert!(err.contains("usage:"), "`{line}` has no usage line: {err}");
+        }
+        // A pipe inside quotes is one word, which is how a pattern containing one is written.
+        let quoted = sh(&mut app, "echo \"a | b\"");
+        assert_eq!(quoted["text"], json!("a | b"), "{quoted}");
+        assert_eq!(quoted["pipeline"], Value::Null, "a quoted pipe is not a pipeline");
+    }
+
+    /// `echo` is the command a redirect is written for.
+    #[test]
+    fn echo_joins_its_words() {
+        let mut app = test_app();
+        assert_eq!(sh(&mut app, "echo hello world")["text"], json!("hello world"));
+        assert_eq!(sh(&mut app, "echo hello world")["stdout"], json!("hello world\n"));
+        // `-n` leaves the newline off, which is what builds a line with `>>`.
+        let out = sh(&mut app, "echo -n no-newline > /n.txt");
+        assert_eq!(out["writes"][0]["bytes"], json!(10), "{out}");
+        assert_eq!(sh(&mut app, "cat /n.txt")["text"], json!("no-newline"));
+    }
+
+    /// `tee` in a pipeline copies and passes on; on its own `-i` is what a pipe would be.
+    #[test]
+    fn tee_copies_the_pipe_and_passes_it_on() {
+        let mut app = test_app();
+        write_file(&mut app, "/in.txt", "hello\n");
+        let out = sh(&mut app, "cat /in.txt | tee /copy.txt | wc -c");
+        assert_eq!(out["stdout"], json!("6"), "{out}");
+        assert_eq!(sh(&mut app, "cat /copy.txt")["text"], json!("hello\n"));
+        assert_eq!(sh(&mut app, "cat /copy.txt | tee /second.txt")["stdout"], json!("hello\n"));
+        assert_eq!(sh(&mut app, "cat /second.txt")["text"], json!("hello\n"));
+    }
+
+    /// The 8 KB workspace is the same limit a redirect has to respect, and a refusal says
+    /// how many bytes it wanted.
+    #[test]
+    fn a_redirect_that_would_not_fit_says_how_much_it_needed() {
+        let mut app = test_app();
+        let big = "x".repeat(WORKSPACE_FILE_MAX + 10);
+        let err =
+            ToolHost::call_tool(&mut app, "shell", &json!({"command": format!("echo {big} > /big.txt")}))
+                .unwrap_err();
+        assert!(err.contains(&format!("{} bytes", WORKSPACE_FILE_MAX + 11)), "{err}");
+        assert!(err.contains(&format!("at most {WORKSPACE_FILE_MAX}")), "{err}");
+        assert!(app.workspace.to_json()["files"].as_object().unwrap().is_empty(), "nothing was written");
+    }
+
+    /// A stage goes through the same handler and the same table as a single command: a
+    /// pipeline is a shorthand, not a second way to reach something.
+    #[test]
+    fn a_pipeline_is_not_a_way_round_the_rules() {
+        let mut app = test_app();
+        let err = ToolHost::call_tool(&mut app, "shell", &json!({"command": "echo hi | rm /x"})).unwrap_err();
+        assert!(err.contains("`rm` cannot run in a pipeline"), "{err}");
+
+        // The handler's own limits still apply: `head -n` caps at 200 lines either way.
+        write_file(&mut app, "/many.txt", &"line\n".repeat(50));
+        assert_eq!(sh(&mut app, "cat /many.txt | head -n 2")["stdout"], json!("line\nline"));
+        // And the answer is the pipeline's, not a stage's: it says what ran and what was written.
+        let piped = sh(&mut app, "cat /many.txt | wc -l > /count.txt");
+        assert_eq!(piped["pipeline"], json!(["cat", "wc"]), "{piped}");
+        assert_eq!(piped["writes"][0]["path"], json!("/count.txt"));
+        assert_eq!(sh(&mut app, "cat /count.txt")["text"], json!("50"));
     }
 
     // ---- the live journal stream (docs/agent-stream.md §1) ----
