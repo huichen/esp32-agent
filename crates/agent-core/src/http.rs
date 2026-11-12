@@ -247,8 +247,7 @@ impl Response {
     }
 
     pub fn js(body: impl Into<Vec<u8>>) -> Self {
-        Self::new(200, "application/javascript; charset=utf-8", body)
-            .with_header("Cache-Control", "no-store")
+        Self::new(200, "application/javascript; charset=utf-8", body).with_header("Cache-Control", "no-store")
     }
 
     pub fn css(body: impl Into<Vec<u8>>) -> Self {
