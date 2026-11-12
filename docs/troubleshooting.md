@@ -324,6 +324,10 @@ never had anything to do with it.
 told the change was accepted. It is not a warning: the value is in RAM and not on flash, so
 the next boot reads the one before it. Measured on this bench, firmware `17a9358`, 195 s
 after boot: `{"written": 4, "failed": 23}` — 23 changes the board believed it had saved.
+Those counters restart at every boot and belong to the image that ran them: the capture
+below came from `17a9358`, and the board has been reflashed to `f7bea4b` and then
+`a47d0b1` since, neither of which carries this fix. A number in a report is only worth
+something next to the `firmware.commit` that produced it.
 
 The count is not the diagnosis. Two fields beside it say which key is in trouble and why, so
 a board with no serial terminal attached can still be read:
