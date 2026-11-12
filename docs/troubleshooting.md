@@ -58,6 +58,39 @@ Start with `GET /api/logs` (or the console's log tab). Every boot-time line carr
   thread has 16 KB of stack plus the heap. Lower `log.ring`, or set `tools_mode` to
   `generic`, and run one turn at a time (which the queue already enforces).
 
+## The portal opens over http but not https
+
+`GET /api/tls` is the first thing to read: `{enabled, port, fingerprint, error}` says
+whether a certificate exists and why not.
+
+- `error: "crt_write_pem failed (mbedtls error -0x002e)"` — `MBEDTLS_ERR_OID_NOT_FOUND`:
+  the certificate writer was asked to sign with "no hash". `mbedtls_x509write_crt_set_md_alg`
+  fixes it; it is a missing line, not a missing mbedTLS feature, which is why the message
+  reads like one.
+- `error: "esp-aes: Failed to allocate memory"` on every connection: hardware AES-DMA wants
+  a DMA-capable buffer in internal RAM, and with ~15 kB free the first TLS record dies with
+  `esp-tls-mbedtls: write error :-0x0001`. The handshake succeeds, which makes it look like
+  a certificate problem. `CONFIG_MBEDTLS_HARDWARE_AES=n` trades a few milliseconds per
+  kilobyte for the memory.
+- `could not spawn tls thread` in the log, `ERR_CONNECTION_RESET` in the browser: a thread
+  per TLS connection needs its stack *before* the handshake starts, and a browser opens six
+  sockets for one page. The listener now does the handshake inline on its one thread, and
+  only streaming responses get a thread.
+- `agent thread did not start: Not enough space` at boot: the TLS listener was given its own
+  thread. It now shares the plaintext accept thread; adding a second one costs the agent,
+  which costs the whole board.
+- The browser warns `ERR_CERT_AUTHORITY_INVALID`: **expected**. The certificate is
+  self-signed. Compare the fingerprint it shows with `/api/tls` and click through —
+  a warning that can be verified is the point of generating the key on the device.
+- `internal_kb` drops by about 11 kB the first time a TLS page is served and then stays
+  put: 17 kB after boot becomes 5-6 kB, and twenty more page loads leave it there. Budget
+  for that when raising `log.ring` or adding a listener; the agent still runs in what is
+  left, but the margin is thin.
+- The connection is served one at a time: a page that opens six sockets loads, just not in
+  parallel. If a page seems to hang, check whether an event stream (`/api/agent/stream`) is
+  open — streams run on their own thread, so this should not block, but that is the only
+  long-lived response on this server.
+
 ## Applying a manifest fails
 
 The returned `issues[].path` is a JSON Pointer, so it points straight at the problem:

@@ -6,10 +6,14 @@ page.
 
 ## Deployment recommendations
 
-1. **Trusted LAN only**: the portal and `/mcp` on `8080` have no TLS of their own; do
-   not expose `8080` to the internet. For remote access use a VPN or a reverse proxy
-   that terminates TLS. (Outbound model and `net_*` calls *do* support `https://`,
-   verified against the ESP-IDF certificate bundle — that is a different direction.)
+1. **Trusted LAN only.** The board serves `http://` on port 80 and, when it has a
+   certificate, `https://` on 443 with one **it made for itself**. A browser will warn;
+   accept that warning only after checking the fingerprint (`GET /api/tls`, also in
+   `/agent.json`) against the one the browser shows. That proves the board answered, not
+   that a name is trustworthy: there is no CA behind it, so it does not replace a VPN or
+   a reverse proxy with a real certificate once you leave the LAN. Outbound model and
+   `net_*` calls are the other direction: those verify the **server** against the ESP-IDF
+   certificate bundle, with no "skip verification" switch.
 2. **Turn on the token and the PIN**:
    ```json
    { "auth": { "mcp_token": "<32 random bytes>", "portal_pin": "123456" } }
@@ -28,7 +32,8 @@ page.
 | Risk | Current state | Mitigation |
 |---|---|---|
 | Prompt injection leading to physical action | no approval step | `safety.confirm`, rate limits, LAN isolation |
-| Plaintext HTTP (inbound) | no TLS on the portal/`/mcp` | intranet plus a reverse proxy; never map the port to the internet |
+| Plaintext HTTP (inbound) | port 80 stays open next to https | it exists so a TLS mistake cannot lock you out; block 80 at the router when https is enough |
+| Self-signed certificate (inbound) | the board cannot obtain a CA-signed certificate | compare the fingerprint in `/api/tls`; the private key is generated on the device and never leaves it |
 | Untrusted upstream (outbound) | `https://` is verified against the ESP-IDF CA bundle; there is no "skip verification" switch | point the model endpoint at an `https://` provider rather than a plain `http://` one on an untrusted network |
 | Credentials in plaintext NVS | ESP-IDF NVS is not encrypted by default | NVS encryption (`CONFIG_NVS_ENCRYPTION`) is available but needs keys flashed first |
 | Arbitrary I2C writes | `i2c_write` and the manifest primitive are by design | point it at trusted models only; omit the write primitive when you do not need it |
