@@ -74,6 +74,13 @@ So an absent OLED never shows the model an `oled_text` it would then call and fa
 `tools_mode = "generic"` collapses the device tools further into `device_invoke`, which
 keeps a many-peripheral board from eating the context window.
 
+One predicate answers both questions — offered, and why not — and every view reads it: the
+model's tool array, `/mcp tools/list`, `/api/tools` and `/api/status`. They used to be
+three separate constructions, and they disagreed by six tools for months. A tool outside
+the registry (`shell`, `script`, `read`/`write`/`edit`, `image_read`) is filtered by the
+same rule, so "this board has no camera" reaches the model, the MCP client and the portal
+at once; `/api/tools` and `/api/status` carry the sentence, not only the flag.
+
 ## 4. Hot reload: what takes effect immediately
 
 | Change | How it applies | Restart needed |
