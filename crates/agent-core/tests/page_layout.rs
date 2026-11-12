@@ -109,6 +109,17 @@ window.__esp32Measure = function () {
   out.prettyJson = pretty('{"a":1,"b":2}');
   out.prettyBlock = pretty('{"text":"line one\\nline two","bytes":3}');
   out.prettyPlain = pretty("not json at all");
+  // The transcript's bottom padding must cover the composer whatever height it takes: a
+  // one-line field, then three lines in the same field.
+  out.chatPadBefore = parseFloat(getComputedStyle(q("#chat")).paddingBottom) || 0;
+  out.composerHeightBefore = r(q("#composer")).height;
+  var field = q("#input");
+  field.value = "one\ntwo\nthree";
+  autosize();
+  out.chatPadAfter = parseFloat(getComputedStyle(q("#chat")).paddingBottom) || 0;
+  out.composerHeightAfter = r(q("#composer")).height;
+  field.value = "";
+  autosize();
   return out;
 };
 </script>
@@ -528,6 +539,29 @@ fn a_markdown_table_renders_as_a_table_on_a_phone() {
             measured[width]["prettyPlain"].as_str().unwrap_or(""),
             "not json at all",
             "{at}: text that is not JSON must be left alone"
+        );
+
+        // The transcript must not run under the composer: its padding covers whatever the
+        // composer currently is, not the 84 px a one-line field used to need.
+        let pad_before = measured[width]["chatPadBefore"].as_f64().unwrap_or(0.0);
+        let pad_after = measured[width]["chatPadAfter"].as_f64().unwrap_or(0.0);
+        let h_before = measured[width]["composerHeightBefore"].as_f64().unwrap_or(0.0);
+        let h_after = measured[width]["composerHeightAfter"].as_f64().unwrap_or(0.0);
+        assert!(
+            pad_before >= h_before + 9.0,
+            "{width} px: {pad_before} px of padding for a {h_before} px composer"
+        );
+        assert!(
+            h_after > h_before + 20.0,
+            "{width} px: the three-line field did not grow the composer ({h_before} -> {h_after})"
+        );
+        assert!(
+            pad_after >= h_after + 9.0,
+            "{width} px: a {h_after} px composer but only {pad_after} px of padding"
+        );
+        assert!(
+            pad_after > pad_before,
+            "{width} px: padding did not follow the field ({pad_before} -> {pad_after})"
         );
 
         // A wide table may scroll inside its wrapper; what it may not do is make the bubble
