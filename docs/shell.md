@@ -12,6 +12,12 @@ A shell, not a bag of tools with an `op` field. One call, one line, parsed like 
 Words, quotes and `--flags` are understood. `read`, `write` and `edit` stay separate tools
 because they are the three most common operations and a wrapper would only add a layer.
 
+The declaration says what this is and how a line is written; the **index of 57 commands is
+not in it**. `{"command": "shell", "arguments": {"help": true}}` returns the whole index with
+a usage line per command, and `help <command>` returns one. Keeping the index in the
+declaration cost about 2 KB on every step of every run, to describe a tool whose entire
+interface is a single string.
+
 ## The commands
 
 | Group | Commands |

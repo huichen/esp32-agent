@@ -3572,6 +3572,12 @@ impl App {
         // One way in: a command line, as a shell has. No `op`, no parallel object form.
         let line = args.get("command").and_then(|v| v.as_str()).unwrap_or("");
         if line.trim().is_empty() {
+            // `{"help": true}` is the way to the command index now that the declaration no
+            // longer carries it, so it answers as a result — not as an error a model has to
+            // read as a failure.
+            if args.get("help").and_then(|v| v.as_bool()).unwrap_or(false) {
+                return Ok(json!({ "help": crate::tools::shell::help_text() }).to_string());
+            }
             return Err(format!("`command` is required.\n\n{}", crate::tools::shell::help_text()));
         }
         // `a; b` runs two commands in order, which is what "write a file, then read it back"
@@ -7261,6 +7267,31 @@ mod tests {
             ToolHost::call_tool(&mut app, "shell", &json!({"command": "grep -E '(ERR|WARN)' /app.log"}))
                 .unwrap_err();
         assert!(err.contains("not supported"), "groups must be refused: {err}");
+    }
+
+    /// The shell declaration carries two fields, and everything the index used to say is a
+    /// `help` call away.
+    ///
+    /// The command list was in the description, which meant 57 usage lines were sent on every
+    /// step of every run — 2 KB to describe a tool whose whole interface is one string. The
+    /// trade is one extra call the first time; the test makes sure both halves hold: the
+    /// declaration stays small, and `help` still answers with the index.
+    #[test]
+    fn the_shell_declaration_is_one_string_and_a_help_flag() {
+        let spec = crate::tools::shell::spec();
+        let props = spec.spec.input_schema["properties"].as_object().expect("properties");
+        let mut keys: Vec<&str> = props.keys().map(|k| k.as_str()).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, vec!["command", "help"], "the declaration grew a field back");
+
+        let mut app = test_app();
+        let help =
+            ToolHost::call_tool(&mut app, "shell", &json!({ "help": true })).expect("help must answer");
+        let text = serde_json::to_string(&help).unwrap();
+        for op in ["sed", "awk", "grep", "jq", "curl"] {
+            assert!(text.contains(op), "`{op}` is missing from the index help returns");
+        }
+        assert!(text.len() > 1_000, "the index is still the whole index: {} bytes", text.len());
     }
 
     #[test]
