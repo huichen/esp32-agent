@@ -137,6 +137,12 @@ const BOARD: &[Field] = &[
         "true",
         "keep the conversation in flash across a reboot; the stored tail is capped at 16 KB",
     ),
+    f(
+        "skills.seed_defaults",
+        "boolean",
+        "true",
+        "install the built-in skills into /skills on boot, wherever the file is missing; off means a deleted one stays deleted",
+    ),
 ];
 
 const SCHEDULE: &[Field] = &[
@@ -273,6 +279,18 @@ mod tests {
             .expect("agent.persist_transcript is documented");
         assert_eq!(field.kind, "boolean");
         assert_eq!(field.default, "true", "the feature is on unless a board says otherwise");
+    }
+
+    #[test]
+    fn the_board_group_documents_the_skill_seed() {
+        let board = GROUPS.iter().find(|g| g.group == "board").expect("board group");
+        let field = board
+            .fields
+            .iter()
+            .find(|f| f.name == "skills.seed_defaults")
+            .expect("skills.seed_defaults is documented");
+        assert_eq!(field.kind, "boolean");
+        assert_eq!(field.default, "true", "a new board gets the skills unless it says otherwise");
     }
 
     #[test]

@@ -78,6 +78,8 @@ pub struct Config {
     pub log: LogCfg,
     /// The platform half of the agent: how often its loop wakes up.
     pub agent: AgentCfg,
+    /// The skills the firmware carries, and whether to install them.
+    pub skills: SkillsCfg,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -228,6 +230,31 @@ pub struct AgentCfg {
     pub persist_transcript: bool,
 }
 
+/// The skills the firmware ships with, seeded into the workspace on boot.
+///
+/// Everything here lives on the workspace like any other file — there is no second store
+/// (see [`crate::seed`]). This is only the switch: an owner who does not want the three
+/// procedures in their prompt, or who has replaced them with their own, turns it off.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct SkillsCfg {
+    /// Write the built-in skills into `/skills` wherever the file is absent.
+    ///
+    /// On by default: a freshly flashed board should come up able to write a skill, find
+    /// out what is wired and recover itself, without anyone pasting three files in first.
+    /// A skill the owner edited is never overwritten, so leaving this on costs nothing
+    /// after the first boot. A skill the owner deleted does come back on the next boot;
+    /// switching this off is what makes a deletion stick.
+    #[serde(default = "default_true")]
+    pub seed_defaults: bool,
+}
+
+impl Default for SkillsCfg {
+    fn default() -> Self {
+        Self { seed_defaults: true }
+    }
+}
+
 /// Long enough for a page of standing orders, short enough that every request carries it.
 pub const MAX_SYSTEM_PROMPT: usize = 2048;
 
@@ -253,6 +280,7 @@ impl Default for Config {
             ui: UiCfg::default(),
             log: LogCfg::default(),
             agent: AgentCfg::default(),
+            skills: SkillsCfg::default(),
         }
     }
 }
@@ -606,6 +634,15 @@ impl Config {
             if let Some(b) = a.get("persist_transcript").and_then(|v| v.as_bool()) {
                 self.agent.persist_transcript = b;
                 touched.push("agent.persist_transcript".into());
+            }
+        }
+        if let Some(s) = patch.get("skills").and_then(|v| v.as_object()) {
+            // Turning it on does not seed by itself: the next boot (or a factory reset)
+            // is the moment a board's workspace is written, and nothing here writes files
+            // behind the caller's back.
+            if let Some(b) = s.get("seed_defaults").and_then(|v| v.as_bool()) {
+                self.skills.seed_defaults = b;
+                touched.push("skills.seed_defaults".into());
             }
         }
         *self = self.clone().sanitized();

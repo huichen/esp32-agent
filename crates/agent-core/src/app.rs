@@ -371,6 +371,10 @@ impl App {
         );
         app.rebuild();
         app.load_agent_state();
+        // A freshly flashed board has an empty workspace; a factory-reset board is back on
+        // the default config. Both belong to the same moment: the three skills the
+        // firmware carries are installed here, and in `seed_default_skills`'s other caller.
+        app.seed_default_skills();
         app
     }
 
@@ -1786,6 +1790,35 @@ impl App {
         }
     }
 
+    /// Put the skills the firmware carries into the workspace, where they are missing.
+    ///
+    /// Called once at boot, after the stored workspace is loaded, and again after a
+    /// factory reset — the reset is exactly the moment the owner's `skills.seed_defaults`
+    /// decision and any deleted file go back to what the firmware ships. Returns how many
+    /// it wrote, which is 0 on every boot after the first and 0 always when the flag is
+    /// off.
+    pub fn seed_default_skills(&mut self) -> usize {
+        if !self.cfg.skills.seed_defaults {
+            return 0;
+        }
+        let wrote = crate::seed::seed(&mut self.workspace, self.profile.id);
+        if wrote > 0 {
+            self.log.info(
+                "boot",
+                format!(
+                    "seeded {wrote} of {} built-in skill(s) into {}",
+                    crate::seed::DEFAULT_SKILLS.len(),
+                    crate::tools::knowledge::SKILLS_DIR
+                ),
+            );
+            // The workspace is one persisted blob; a skill that exists only in RAM would be
+            // installed again next boot, and would be missing from what the portal and an
+            // MCP client read today.
+            self.persist_workspace();
+        }
+        wrote
+    }
+
     /// Queue one user message. Returns 202 with the queue position; the run
     /// itself happens on the agent thread, so a slow model never blocks a request.
     fn agent_message(&mut self, req: &Request) -> Response {
@@ -2857,6 +2890,10 @@ impl App {
                 self.runtime.config_dirty = true;
                 self.runtime.manifest_dirty = true;
                 self.runtime.restart_requested = true;
+                // A reset also restores the two things an owner's own decisions replaced:
+                // the built-in skills, wherever a file was deleted, and the flag that
+                // keeps them installed. An edited skill stays the owner's.
+                self.seed_default_skills();
                 self.log.warn("system", "factory reset from the portal");
                 Response::json(&json!({ "ok": true }))
             }
@@ -5409,6 +5446,17 @@ mod tests {
         App::new(Box::new(VirtualBoard::new()), Box::new(MemoryStore::new()), log, FwMeta::default())
     }
 
+    /// An app whose workspace is empty.
+    ///
+    /// `test_app` boots through `App::new`, which installs the three built-in skills (see
+    /// `crate::seed`). A test that counts files or bytes starts from nothing, so its
+    /// arithmetic is about the command it is testing; the seeded skills have their own.
+    fn empty_workspace_app() -> App {
+        let mut app = test_app();
+        app.workspace = AppWorkspace::default();
+        app
+    }
+
     // ------------------------------------------------- a store that outlives the App
 
     /// A store two `App`s can share, so "reload" means "a new `App` over the same keys",
@@ -6606,7 +6654,7 @@ mod tests {
 
     #[test]
     fn du_totals_the_workspace() {
-        let mut app = test_app();
+        let mut app = empty_workspace_app();
         write_file(&mut app, "/a.txt", "12345");
         write_file(&mut app, "/b.txt", "123");
         let out = sh(&mut app, "du");
@@ -6841,7 +6889,7 @@ mod tests {
     /// One line, several stages: what the first prints is what the second reads.
     #[test]
     fn a_pipeline_feeds_one_stage_into_the_next() {
-        let mut app = test_app();
+        let mut app = empty_workspace_app();
         write_file(&mut app, "/a.txt", "alpha\n");
         write_file(&mut app, "/b.log", "beta\n");
 
@@ -6904,7 +6952,7 @@ mod tests {
     /// A stage that cannot read stdin stops the pipeline and names itself.
     #[test]
     fn a_command_that_cannot_be_a_stage_says_so() {
-        let mut app = test_app();
+        let mut app = empty_workspace_app();
         // Not a line command at all.
         let err = ToolHost::call_tool(&mut app, "shell", &json!({"command": "ls / | touch /x"})).unwrap_err();
         assert!(err.contains("`touch` cannot run in a pipeline"), "{err}");
@@ -6987,7 +7035,7 @@ mod tests {
     /// how many bytes it wanted.
     #[test]
     fn a_redirect_that_would_not_fit_says_how_much_it_needed() {
-        let mut app = test_app();
+        let mut app = empty_workspace_app();
         let big = "x".repeat(WORKSPACE_FILE_MAX + 10);
         let err =
             ToolHost::call_tool(&mut app, "shell", &json!({"command": format!("echo {big} > /big.txt")}))
@@ -8567,10 +8615,12 @@ mod tests {
         )
         .expect("supporting file written");
         let index = app.skills();
-        assert_eq!(index.len(), 1, "{index:?}");
-        assert_eq!(index[0].name, "pins");
-        assert_eq!(index[0].description, "GPIO map for the bench");
-        assert_eq!(index[0].path, "/skills/pins/SKILL.md");
+        let pins = index
+            .iter()
+            .find(|s| s.name == "pins")
+            .unwrap_or_else(|| panic!("the bench skill is not in the index: {index:?}"));
+        assert_eq!(pins.description, "GPIO map for the bench");
+        assert_eq!(pins.path, "/skills/pins/SKILL.md");
 
         let read = ToolHost::call_tool(&mut app, "fs_read", &json!({ "path": "/skills/pins/SKILL.md" }))
             .expect("fs_read");
@@ -8591,8 +8641,12 @@ mod tests {
         )
         .expect("skill written");
         let index = app.skills();
-        assert_eq!(index.len(), 1, "{index:?}");
-        assert_eq!(index[0].path, "/skills/quick.md");
+        let quick = index
+            .iter()
+            .find(|s| s.name == "quick")
+            .unwrap_or_else(|| panic!("the flat skill is not in the index: {index:?}"));
+        assert_eq!(quick.path, "/skills/quick.md");
+        assert_eq!(quick.description, "one-file skill");
     }
 
     /// Deleting the SKILL.md is how a skill leaves the prompt, which is why the workspace
@@ -8606,7 +8660,7 @@ mod tests {
             &json!({ "path": "/skills/pins/SKILL.md", "text": "---\ndescription: GPIO map\n---\n12 relay\n" }),
         )
         .unwrap();
-        assert_eq!(app.skills().len(), 1);
+        assert!(app.skills().iter().any(|s| s.name == "pins"));
 
         let gone = ToolHost::call_tool(
             &mut app,
@@ -8615,7 +8669,54 @@ mod tests {
         )
         .expect("fs_rm");
         assert!(gone.contains("removed"), "{gone}");
-        assert!(app.skills().is_empty(), "the index still lists a deleted skill: {:?}", app.skills());
+        assert!(
+            !app.skills().iter().any(|s| s.name == "pins"),
+            "the index still lists a deleted skill: {:?}",
+            app.skills()
+        );
+        // Only the named file went: the skills the firmware seeded are still indexed.
+        assert_eq!(app.skills().len(), crate::seed::DEFAULT_SKILLS.len(), "{:?}", app.skills());
+    }
+
+    /// The seed is an install, not a rewrite, and it runs on every boot: a deleted skill
+    /// comes back, an edited one does not — the path is what decides, nothing else.
+    #[test]
+    fn a_reboot_keeps_the_owners_edit_and_reinstalls_a_deleted_skill() {
+        let store = SharedStore::new();
+        {
+            let mut app = app_with(&store);
+            assert_eq!(app.skills().len(), crate::seed::DEFAULT_SKILLS.len());
+            ToolHost::call_tool(
+                &mut app,
+                "fs_edit",
+                &json!({
+                    "path": "/skills/pinout/SKILL.md",
+                    "find": "description: discover and record what is wired to this board, so the next session knows",
+                    "replace": "description: the bench, as I wired it"
+                }),
+            )
+            .expect("the owner edits a skill");
+            ToolHost::call_tool(
+                &mut app,
+                "fs_rm",
+                &json!({ "path": "/skills/recover-board/SKILL.md", "confirm": true }),
+            )
+            .expect("and deletes another");
+        }
+
+        // The power goes out, and comes back to a new App over the same flash.
+        let (mut app, log) = app_with_log(&store);
+        let index = app.skills();
+        assert_eq!(index.len(), crate::seed::DEFAULT_SKILLS.len(), "the deleted skill came back: {index:?}");
+        let pinout = index.iter().find(|s| s.name == "pinout").expect("pinout is indexed");
+        assert_eq!(pinout.description, "the bench, as I wired it", "the owner's edit was overwritten");
+        assert!(
+            log.tail(50, 0).iter().any(|l| l.message.contains("seeded 1 of 3")),
+            "the boot log says what was installed: {:?}",
+            log.tail(50, 0).iter().map(|l| &l.message).collect::<Vec<_>>()
+        );
+        // A second boot over a complete workspace writes nothing at all.
+        assert_eq!(app.seed_default_skills(), 0);
     }
 
     /// `generic` is the lean mode: per-device tools fold into `device_invoke`, so a board

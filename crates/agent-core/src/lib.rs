@@ -35,6 +35,7 @@ pub mod protocol;
 pub mod provision;
 pub mod sched;
 pub mod script;
+pub mod seed;
 pub mod settings;
 pub mod sitemap;
 pub mod state;
