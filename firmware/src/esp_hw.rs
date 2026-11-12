@@ -1,4 +1,4 @@
-﻿//! The ESP-IDF implementation of [`Hardware`].
+//! The ESP-IDF implementation of [`Hardware`].
 //!
 //! Deliberately thin: every decision about *what* to read lives in
 //! `esp32-agent-core`. This file only moves bytes on buses and pins, using the
