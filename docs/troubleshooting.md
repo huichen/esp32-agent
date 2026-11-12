@@ -207,12 +207,22 @@ one in the source):
 | agent (`STACK_BYTES`, `runner.rs`) | 16 kB | 8.3 kB | 7.7 kB |
 | radio (`wifi.rs`) | 12 kB | 6.5 kB | 5.5 kB |
 | console provisioning (`console.rs`) | 6 kB | 4.7 kB | 1.3 kB |
-| captive DNS (`dns.rs`) | 4 kB | 2.1 kB | 1.9 kB |
+| captive DNS (`dns.rs`) | 4 kB **in PSRAM** | 2.1 kB | 1.9 kB |
 
 74 kB of stack, about 29 kB of it ever touched — the largest single block of internal RAM
 the firmware reserves, and the reason these constants are worth measuring rather than
 guessing. IDF's own tasks (`main`, `esp_timer`, `wifi`, `tiT`, `Tmr Svc`, `sys_evt`, `ipc0`,
 `ipc1`, two `IDLE`) add roughly 26 kB and are not ours to size.
+
+The DNS responder is the only stack that could move, and it is in PSRAM: its whole body is
+`recvfrom`, an A-record reply and `send_to`, so it can never run while the flash cache is
+off. That is the condition — with the cache off, external RAM is not addressable, and a
+thread that commits to NVS from a PSRAM stack asserts in
+`esp_task_stack_is_sane_cache_disabled` and reboots the board. Every other thread here
+writes NVS somewhere (`mcp-main` on a config save, the http listener on a manifest apply,
+the agent on its transcript, the console on `provision`), which is why their stacks stay
+internal; `esp_pthread_set_cfg` is set for exactly one thread and restored immediately,
+because the listener is spawned from the same thread later.
 
 **The rule a stack is judged by: `target >= max(2 x peak, peak + 4 kB)`.** Peak use is the
 size in the source minus `high_water_kb`; FreeRTOS reports what is left of a stack, never
