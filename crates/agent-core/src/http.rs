@@ -239,15 +239,20 @@ impl Response {
     }
 
     pub fn html(body: impl Into<Vec<u8>>) -> Self {
-        Self::new(200, "text/html; charset=utf-8", body)
+        // No caching: the console's HTML and its two assets change together in a firmware
+        // build, and a browser that keeps the old script against the new document renders a
+        // blank page. That looks exactly like "the site is down" and costs a flash cycle to
+        // disprove, so the three files are always revalidated.
+        Self::new(200, "text/html; charset=utf-8", body).with_header("Cache-Control", "no-store")
     }
 
     pub fn js(body: impl Into<Vec<u8>>) -> Self {
         Self::new(200, "application/javascript; charset=utf-8", body)
+            .with_header("Cache-Control", "no-store")
     }
 
     pub fn css(body: impl Into<Vec<u8>>) -> Self {
-        Self::new(200, "text/css; charset=utf-8", body)
+        Self::new(200, "text/css; charset=utf-8", body).with_header("Cache-Control", "no-store")
     }
 
     pub fn empty(status: u16) -> Self {
@@ -863,6 +868,16 @@ fn serve_connection(stream: TcpStream, peer: String, handler: Handler, log: Arc<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The portal's three files must not be cached: an HTML that changed and a script that
+    /// did not is a blank page, which reads as "the site is down".
+    #[test]
+    fn the_portal_assets_are_never_cached() {
+        for resp in [Response::html("x"), Response::js("x"), Response::css("x")] {
+            let cache = resp.headers.iter().find(|(k, _)| k == "Cache-Control");
+            assert_eq!(cache.map(|(_, v)| v.as_str()), Some("no-store"), "{resp:?}");
+        }
+    }
 
     #[test]
     fn query_strings_are_decoded() {
