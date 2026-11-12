@@ -35,9 +35,13 @@ pub type Shared = Arc<Mutex<App>>;
 
 /// NVS keys the agent owns. Separate keys keep a write that fails on one of them
 /// from taking the others down with it.
-pub const NVS_KEY_AGENT_CFG: &str = "agent";
-pub const NVS_KEY_SCHED: &str = "sched";
-pub const NVS_KEY_WORKSPACE: &str = "ws";
+///
+/// The names themselves live in [`crate::keys`], where every key the board can produce is
+/// declared, assembled and checked against NVS's 15-byte ceiling by a test. A literal
+/// added here or anywhere else is a name nothing is watching.
+pub const NVS_KEY_AGENT_CFG: &str = crate::keys::AGENT;
+pub const NVS_KEY_SCHED: &str = crate::keys::SCHED;
+pub const NVS_KEY_WORKSPACE: &str = crate::keys::WORKSPACE;
 /// The transcript between boots: a header line and one message per line.
 ///
 /// The board's NVS refuses a single string value above roughly 4000 bytes - the firmware
@@ -47,16 +51,11 @@ pub const NVS_KEY_WORKSPACE: &str = "ws";
 /// a checksum over everything after it, so chunks from two different writes are detected
 /// instead of concatenated into a transcript that never existed.
 ///
-/// The name is `transcript`, not `agent.transcript`, because a key is at most
-/// [`store::KEY_MAX`] bytes and the longer name was refused with
-/// `ESP_ERR_NVS_KEY_TOO_LONG` on every write: the board had no transcript on flash at all
-/// and said so only as a number in `/api/status.store.failed`. A name is a hardware
-/// limit, not a label — `every_key_the_board_stores_fits_nvs` refuses the next one.
-pub const NVS_KEY_TRANSCRIPT: &str = "transcript";
-/// What a build before 2026-11-12 called the same value. 16 bytes, so NVS refused every
-/// write; only a host state file (`FileStore`) can hold it. Read so a simulator's
-/// conversation survives the rename, never written.
-const LEGACY_KEY_TRANSCRIPT: &str = "agent.transcript";
+/// The name is `transcript` because a key is at most [`store::KEY_MAX`] bytes; the longer
+/// `agent.transcript` was refused with `ESP_ERR_NVS_KEY_TOO_LONG` on every write, so the
+/// board had no transcript on flash at all. There is no migration for it, and no read of
+/// the old name: nothing was ever stored under it (`crate::keys`).
+pub const NVS_KEY_TRANSCRIPT: &str = crate::keys::TRANSCRIPT;
 /// The most bytes one stored value may hold: the board reads NVS through a fixed
 /// 4096-byte buffer (`firmware/src/nvs_store.rs`) and ESP-IDF rejects a longer write.
 pub const TRANSCRIPT_CHUNK_BYTES: usize = 3500;
@@ -68,8 +67,8 @@ pub const TRANSCRIPT_CHUNKS_MAX: usize = 8;
 /// only evidence that a turn was cut off by a power loss rather than finished.
 ///
 /// `agent.run_in_flight` was 19 bytes and therefore never stored; the marker existed only
-/// in the RAM of the run that wrote it.
-pub const NVS_KEY_RUN_IN_FLIGHT: &str = "run_in_flight";
+/// in the RAM of the run that wrote it. Like the transcript, it needs no migration.
+pub const NVS_KEY_RUN_IN_FLIGHT: &str = crate::keys::RUN_IN_FLIGHT;
 /// The source a resumed turn carries, so a reply can be told apart from one the user just
 /// asked for.
 pub const RESUME_SOURCE: &str = "resume";
@@ -2015,36 +2014,14 @@ impl App {
 
     /// Where one chunk of the stored transcript lives. The first one owns the base key.
     fn transcript_key(index: usize) -> String {
-        if index == 0 {
-            NVS_KEY_TRANSCRIPT.to_string()
-        } else {
-            format!("{NVS_KEY_TRANSCRIPT}.{index}")
-        }
+        crate::keys::transcript(index)
     }
 
     /// The stored transcript, chunks joined in order, or `None` when nothing was stored.
     fn read_transcript(&self) -> Option<String> {
-        let Some(mut text) = self.store.get(NVS_KEY_TRANSCRIPT) else {
-            // Nothing under the name this build writes. A host state file from before the
-            // rename may still hold the old one; the board cannot, NVS refused that name.
-            return self.read_legacy_transcript();
-        };
+        let mut text = self.store.get(NVS_KEY_TRANSCRIPT)?;
         for index in 1..TRANSCRIPT_CHUNKS_MAX {
             match self.store.get(&Self::transcript_key(index)) {
-                Some(part) => text.push_str(&part),
-                None => break,
-            }
-        }
-        Some(text)
-    }
-
-    /// The transcript under the names a build before 2026-11-12 used. Read-only: the next
-    /// write stores under the current names, and [`remove_transcript`](Self::remove_transcript)
-    /// clears these too so a forgotten conversation cannot come back.
-    fn read_legacy_transcript(&self) -> Option<String> {
-        let mut text = self.store.get(LEGACY_KEY_TRANSCRIPT)?;
-        for index in 1..TRANSCRIPT_CHUNKS_MAX {
-            match self.store.get(&format!("{LEGACY_KEY_TRANSCRIPT}.{index}")) {
                 Some(part) => text.push_str(&part),
                 None => break,
             }
@@ -2101,24 +2078,6 @@ impl App {
                 break;
             }
             removed = self.store.remove(&Self::transcript_key(index)) || removed;
-        }
-        // A forgotten conversation must not come back under the old names on the next read.
-        removed = self.remove_legacy_transcript() || removed;
-        removed
-    }
-
-    fn remove_legacy_transcript(&mut self) -> bool {
-        let mut removed = self.store.get(LEGACY_KEY_TRANSCRIPT).is_some();
-        if removed {
-            self.store.remove(LEGACY_KEY_TRANSCRIPT);
-        }
-        for index in 1..TRANSCRIPT_CHUNKS_MAX {
-            let key = format!("{LEGACY_KEY_TRANSCRIPT}.{index}");
-            if self.store.get(&key).is_none() {
-                break;
-            }
-            self.store.remove(&key);
-            removed = true;
         }
         removed
     }
@@ -7617,40 +7576,26 @@ mod tests {
         assert_eq!(status["store"]["last_failure"]["key"], json!("agent.transcript"));
     }
 
-    /// The board's NVS keeps 15 bytes of key name (`NVS_KEY_NAME_MAX_SIZE` is 16, with the
-    /// terminator). A longer one is not a long name: it is a value that is never stored and
-    /// never read — which is what `agent.transcript` and `agent.run_in_flight` were, on
-    /// every write, from the day they were named.
+    /// The length invariant itself lives in `keys.rs`, on the generator. This is the other
+    /// half: the two blob plans must stay inside what that table enumerated, or a raised
+    /// `chunks_max` would produce a key the invariant never looked at.
     #[test]
-    fn every_key_the_board_stores_fits_nvs() {
-        let mut keys: Vec<String> = vec![
-            crate::config::NVS_KEY_CONFIG.to_string(),
-            crate::manifest::NVS_KEY_MANIFEST.to_string(),
-            NVS_KEY_AGENT_CFG.to_string(),
-            NVS_KEY_SCHED.to_string(),
-            NVS_KEY_WORKSPACE.to_string(),
-            NVS_KEY_TRANSCRIPT.to_string(),
-            NVS_KEY_RUN_IN_FLIGHT.to_string(),
-        ];
-        // Every chunk a blob of that plan can occupy, not only the first.
+    fn the_blob_plans_stay_inside_the_key_table() {
+        let table = crate::keys::all();
         for index in 1..=WORKSPACE_PLAN.chunks_max {
-            keys.push(format!("{NVS_KEY_WORKSPACE}.{index}"));
+            let key = crate::keys::workspace_chunk(index);
+            assert!(table.contains(&key), "`{key}` is missing from keys::all()");
+            assert!(key.len() <= store::KEY_MAX, "`{key}` is {} bytes", key.len());
         }
-        for index in 1..TRANSCRIPT_CHUNKS_MAX {
-            keys.push(App::transcript_key(index));
+        for index in 0..TRANSCRIPT_CHUNKS_MAX {
+            let key = App::transcript_key(index);
+            assert!(table.contains(&key), "`{key}` is missing from keys::all()");
+            assert!(key.len() <= store::KEY_MAX, "`{key}` is {} bytes", key.len());
         }
-        for key in &keys {
-            assert!(
-                key.len() <= store::KEY_MAX,
-                "`{key}` is {} bytes and NVS keeps {} — it would be refused on every write",
-                key.len(),
-                store::KEY_MAX
-            );
-        }
-        // The names this test was written for. If a future rename brings one back, the loop
-        // above is what fails.
-        assert!("agent.transcript".len() > store::KEY_MAX);
-        assert!("agent.run_in_flight".len() > store::KEY_MAX);
+        // The table is wider than the plans on purpose: raising either ceiling to 99 must
+        // still be under the length limit, and `keys::all()` is what proves it.
+        assert!(crate::keys::all().contains(&crate::keys::transcript(99)));
+        assert!(crate::keys::all().contains(&crate::keys::workspace_chunk(99)));
     }
 
     /// The map is only worth reading if it is true.

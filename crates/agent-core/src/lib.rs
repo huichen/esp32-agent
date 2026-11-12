@@ -11,6 +11,7 @@
 //! protocol.rs      JSON-RPC 2.0 / MCP framing
 //! http.rs          a small blocking HTTP/1.1 server (std only)
 //! app.rs           state, dispatch, routes for /mcp and the HTML portal
+//! keys.rs          every NVS key name, assembled in one place (15 bytes is the limit)
 //! web.rs           the embedded console
 //! virtual_board.rs an in-memory board: the simulator and the test fixture
 //! ```
@@ -28,6 +29,7 @@ pub mod hardware;
 pub mod hash;
 pub mod http;
 pub mod json;
+pub mod keys;
 pub mod llm;
 pub mod logbuf;
 pub mod manifest;

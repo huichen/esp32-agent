@@ -95,8 +95,12 @@ pub enum BlobState {
 
 /// Where one chunk of a blob lives. Chunk 1 owns `base.1`, because the base key itself
 /// holds the header that says whether the chunks belong together.
+///
+/// The shape comes from [`crate::keys::chunk`], the one place a key is assembled: the
+/// 15-byte limit is checked there by `keys.rs`'s test for every chunk number a blob could
+/// ask for, not only for the ones a plan asks for today.
 fn chunk_key(base: &str, index: usize) -> String {
-    format!("{base}.{index}")
+    crate::keys::chunk(base, index)
 }
 
 /// Split at UTF-8 character boundaries: a chunk has to be a `String` on its own, so a cut

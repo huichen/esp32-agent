@@ -26,6 +26,7 @@ use esp32_agent_core::app::{make_routes, App, FwMeta, Shared, TlsInfo};
 use esp32_agent_core::config::Config;
 use esp32_agent_core::hardware::Hardware;
 use esp32_agent_core::http::Server;
+use esp32_agent_core::keys;
 use esp32_agent_core::logbuf::LogBuf;
 use esp32_agent_core::store::KvStore;
 use esp_idf_svc::hal::delay::FreeRtos;
@@ -166,7 +167,9 @@ fn run() -> anyhow::Result<()> {
     let nvs = esp_idf_svc::nvs::EspDefaultNvsPartition::take()?;
     let sys_loop = esp_idf_svc::eventloop::EspSystemEventLoop::take()?;
 
-    let mut store = nvs_store::NvsStore::open("esp32mcp", nvs.clone())?;
+    // The namespace is a name NVS has to hold too, so it comes from the same table that
+    // every key does (`agent-core/src/keys.rs`) and is under the same 15-byte assertion.
+    let mut store = nvs_store::NvsStore::open(keys::NAMESPACE, nvs.clone())?;
     // Read the config once before touching hardware: it says which pins the I2C
     // buses live on.
     let mut cfg = store
