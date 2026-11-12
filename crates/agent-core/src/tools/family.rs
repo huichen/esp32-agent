@@ -93,14 +93,21 @@ impl Family {
             ],
             &["command"],
         );
+        let hints: Vec<String> = self
+            .subs
+            .iter()
+            .map(|d| {
+                let word = Self::command_word(&d.spec.name, name);
+                let takes = arguments_of(&d.spec.input_schema);
+                if takes == "none" {
+                    format!("{word}()")
+                } else {
+                    format!("{word}({takes})")
+                }
+            })
+            .collect();
+        let description = format!("{} Commands: {}.", self.summary, hints.join(", "));
         let shared = Arc::new(self);
-        // The description names every command, generated from `subs` so it cannot drift. A
-        // family that only said "`command: help` lists what each takes" cost a round trip
-        // before every turn: the model had to call `help`, wait, then call the command it
-        // wanted. On a board where each call is a request and a model turn, that is the most
-        // expensive sentence in the tool list.
-        let commands_line = format!("Commands: {}.", words.join(", "));
-        let description = format!("{} {commands_line}", shared.summary);
         ToolDef::new(name, &description).title(name).category(name).core().schema(schema).bind(
             move |ctx, args| {
                 let command =
