@@ -534,7 +534,7 @@ fn split_target(target: &str) -> (String, BTreeMap<String, String>) {
     (if path.is_empty() { "/".into() } else { path }, map)
 }
 
-fn url_decode(s: &str) -> String {
+pub fn url_decode(s: &str) -> String {
     let bytes = s.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;

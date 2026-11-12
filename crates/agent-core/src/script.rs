@@ -30,8 +30,22 @@
 use serde_json::{json, Map, Value};
 use std::collections::BTreeMap;
 
-/// Statements and function calls a script may execute before it is stopped.
-pub const MAX_STEPS: u64 = 50_000;
+/// Milliseconds since boot, from the same clock the rest of the board uses.
+fn now_ms() -> u64 {
+    crate::app::now_ms()
+}
+
+/// Wall-clock budget for one script.
+///
+/// A step count alone is the wrong bound: 50 000 steps is a few hundred milliseconds of
+/// real work, so the old limit stopped honest loops while saying nothing about a script
+/// that spends its steps waiting. Time is what the board can afford — the interpreter runs
+/// on the thread that also answers the portal, so thirty seconds of spinning is thirty seconds
+/// the board is unreachable.
+pub const MAX_MS: u64 = 30_000;
+/// A backstop for cheap steps: even inside the time budget, this many means something is
+/// spinning. Large enough that no honest program notices it.
+pub const MAX_STEPS: u64 = 5_000_000;
 /// Nested blocks (and `if`/`while` bodies) a script may enter.
 const MAX_DEPTH: usize = 32;
 /// A string or a list may not grow past this: the board has kilobytes, not megabytes.
@@ -87,7 +101,10 @@ OPERATORS  + - * / %   == != < <= > >=   and or not   (unary -)
            `+` also joins strings and concatenates lists
 ACCESS     d.field   d["field"]   list[0]   (missing key -> nil)
 RESULT     the value of the last expression is returned
-LIMITS     50000 steps, 32 nested blocks, 4 KB strings, 64 log lines
+NOTE       the interpreter runs on the board's HTTP thread: a script that does not finish
+           makes the portal unreachable until it does, so the clock, not the step count,
+           is the limit that matters
+LIMITS     30 s or 5 000 000 steps, 32 nested blocks, 4 KB strings, 64 log lines
 "#;
 
 const BUILTINS: &str = r#"# board script — builtins
@@ -925,6 +942,9 @@ struct Run<'a> {
     steps: u64,
     depth: usize,
     output: Vec<String>,
+    /// When the script started, so the loop can be stopped by the clock as well as by
+    /// the step count.
+    started_ms: u64,
 }
 
 /// Run `source`, returning its last expression value.
@@ -935,7 +955,14 @@ pub fn run(source: &str, host: &mut dyn ScriptHost) -> Result<Outcome, String> {
     let toks = lex(source)?;
     let mut parser = Parser { toks, pos: 0 };
     let program = parser.program()?;
-    let mut runner = Run { host, scopes: vec![BTreeMap::new()], steps: 0, depth: 0, output: Vec::new() };
+    let mut runner = Run {
+        host,
+        scopes: vec![BTreeMap::new()],
+        steps: 0,
+        depth: 0,
+        output: Vec::new(),
+        started_ms: now_ms(),
+    };
     let mut last = Val::Nil;
     for stmt in &program {
         match runner.stmt(stmt)? {
@@ -961,6 +988,16 @@ impl<'a> Run<'a> {
         self.steps += 1;
         if self.steps > MAX_STEPS {
             return Err(format!("script stopped after {MAX_STEPS} steps (a loop without progress?)"));
+        }
+        // The clock, not the count, is the bound that matters: the script runs on the
+        // thread that also answers the portal, so ten seconds of spinning is ten seconds
+        // the board is unreachable. Checked every 1024 steps so the clock read is not the
+        // cost of the loop.
+        if self.steps & 0x3ff == 0 && now_ms().saturating_sub(self.started_ms) > MAX_MS {
+            return Err(format!(
+                "script stopped after {MAX_MS} ms ({} steps); it runs on the thread that answers the portal, so a longer script makes the board unreachable",
+                self.steps
+            ));
         }
         Ok(())
     }
@@ -1304,6 +1341,24 @@ fn num_op(a: Val, b: Val, op: &str, f: fn(f64, f64) -> f64) -> Result<Val, Strin
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    struct NoHost;
+    impl ScriptHost for NoHost {
+        fn call_tool(&mut self, name: &str, _args: &Value) -> Result<Value, String> {
+            Err(format!("no tool `{name}`"))
+        }
+    }
+
+    /// 50 000 steps stopped honest loops (about 0.2 s of work); the bound is now the clock.
+    #[test]
+    fn a_script_may_run_far_past_the_old_step_cap() {
+        let mut host = NoHost;
+        let out = run("let i = 0\nwhile i < 200000 { i = i + 1 }\ni", &mut host).expect("runs");
+        assert_eq!(out.result, json!(200000));
+        assert!(out.steps > 200_000, "{}", out.steps);
+    }
+
     use super::*;
 
     struct Stub {

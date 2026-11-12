@@ -303,6 +303,10 @@ impl Hardware for VirtualBoard {
         }
     }
 
+    fn chip_temp_c(&mut self) -> Option<f32> {
+        Some(41.5)
+    }
+
     fn i2c_scan(&mut self, _bus: u8) -> Result<Vec<u8>> {
         let mut addrs: Vec<u8> = self.i2c.iter().map(|d| d.addr).collect();
         addrs.sort_unstable();

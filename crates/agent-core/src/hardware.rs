@@ -190,6 +190,13 @@ pub trait Hardware: Send {
     fn heap_internal(&mut self) -> Option<(u32, u32)> {
         None
     }
+
+    /// The chip's own temperature sensor, where the part has one. `None` is a real
+    /// answer: the ESP32-C3 has no such sensor, and a board that made one up would be
+    /// worse than a board that says it cannot.
+    fn chip_temp_c(&mut self) -> Option<f32> {
+        None
+    }
 }
 
 /// Convenience: a `Hardware` that answers nothing, for tests of code paths that

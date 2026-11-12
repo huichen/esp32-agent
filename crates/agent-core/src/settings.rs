@@ -43,6 +43,24 @@ const MODEL: &[Field] = &[
     f("max_steps", "integer", "0", "model calls per run; 0 means no limit, capped at 200"),
     f("temperature", "number", "1.0", "0.0 to 2.0"),
     f("timeout_s", "integer", "45", "5 to 180 seconds per model call"),
+    f(
+        "reasoning",
+        "string",
+        "\"\"",
+        "off | low | medium | high; empty sends nothing and leaves it to the provider (sent as `reasoning_effort`)",
+    ),
+    f(
+        "protocol",
+        "string",
+        "\"chat\"",
+        "chat (OpenAI chat completions) | responses (OpenAI Responses API) | anthropic (Messages API)",
+    ),
+    f(
+        "vision",
+        "boolean",
+        "true",
+        "send attached images as content parts; false names them in the text instead, for a text-only model",
+    ),
 ];
 
 const BOARD: &[Field] = &[
@@ -52,6 +70,14 @@ const BOARD: &[Field] = &[
     f("wifi.ssid", "string", "", "join this network"),
     f("wifi.password", "string", "", "write-only, same __set__ rule as api_key"),
     f("wifi.hostname", "string", "esp32-agent", "DHCP hostname"),
+    f(
+        "wifi.gateway",
+        "string",
+        "\"\"",
+        "default gateway; empty uses the DHCP lease. Set it to a LAN box that tunnels traffic",
+    ),
+    f("wifi.dns", "string", "\"\"", "primary DNS; empty uses the DHCP lease"),
+    f("wifi.dns2", "string", "\"\"", "secondary DNS; empty leaves it alone"),
     f("wifi.auto_reconnect", "boolean", "true", "rejoin after a drop"),
     f("wifi.low_latency", "boolean", "true", "disable modem sleep"),
     f("wifi.ap_fallback", "boolean", "true", "keep the setup AP up beside the station"),

@@ -94,7 +94,14 @@ pub struct WifiCfg {
     /// Optional static IPv4 address; empty means DHCP.
     pub ip: String,
     pub netmask: String,
+    /// Default gateway. Empty means "whatever the DHCP lease says"; a LAN box that
+    /// tunnels traffic is set here.
     pub gateway: String,
+    /// Primary DNS server. Empty means the DHCP lease's. A gateway that resolves
+    /// through a tunnel usually needs this too: the router would otherwise answer.
+    pub dns: String,
+    /// Secondary DNS server; empty to leave it alone.
+    pub dns2: String,
     /// Start a setup access point when the station fails to connect.
     pub ap_fallback: bool,
     pub ap_ssid: String,
@@ -231,6 +238,8 @@ impl Default for WifiCfg {
             ip: String::new(),
             netmask: String::new(),
             gateway: String::new(),
+            dns: String::new(),
+            dns2: String::new(),
             ap_fallback: true,
             ap_ssid: "esp32-agent-setup".into(),
             ap_password: String::new(),
@@ -374,13 +383,15 @@ impl Config {
                 self.wifi.ap_fallback = b;
                 touched.push("wifi.ap_fallback".into());
             }
-            for key in ["ip", "netmask", "gateway", "ap_ssid"] {
+            for key in ["ip", "netmask", "gateway", "dns", "dns2", "ap_ssid"] {
                 if let Some(s) = w.get(key).and_then(|v| v.as_str()) {
                     let s = s.trim().to_string();
                     match key {
                         "ip" => self.wifi.ip = s,
                         "netmask" => self.wifi.netmask = s,
                         "gateway" => self.wifi.gateway = s,
+                        "dns" => self.wifi.dns = s,
+                        "dns2" => self.wifi.dns2 = s,
                         "ap_ssid" => self.wifi.ap_ssid = s,
                         _ => {}
                     }
