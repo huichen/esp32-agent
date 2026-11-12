@@ -4963,6 +4963,36 @@ mod tests {
     }
 
     #[test]
+    fn plain_http_can_be_turned_off_and_the_patch_says_so() {
+        // The setting is a patch field like any other, and the reply has to show it was
+        // applied: a silent no-op here would leave a board serving http while its owner
+        // believes it is not.
+        let mut app = test_app();
+        assert!(app.cfg.mcp.plain_http, "on by default, so an upgrade does not lock anyone out");
+
+        let resp = app.route(&post("/api/config", r#"{"mcp":{"plain_http":false}}"#));
+        assert_eq!(resp.status, 200, "{:?}", body_json(&resp));
+        assert!(!app.cfg.mcp.plain_http, "the flag moved");
+
+        let body = body_json(&resp);
+        let touched = body["touched"].as_array().cloned().unwrap_or_default();
+        assert!(
+            touched.iter().any(|t| t == "mcp.plain_http"),
+            "the reply names the field it changed: {touched:?}"
+        );
+
+        // And it survives a round trip through the stored config.
+        let stored: serde_json::Value =
+            serde_json::from_str(&app.cfg.to_json_string()).expect("the stored config is JSON");
+        assert_eq!(stored["mcp"]["plain_http"], json!(false));
+
+        // Turning it back on is allowed without ceremony: that is the safe direction.
+        let resp = app.route(&post("/api/config", r#"{"mcp":{"plain_http":true}}"#));
+        assert_eq!(resp.status, 200);
+        assert!(app.cfg.mcp.plain_http);
+    }
+
+    #[test]
     fn a_script_can_be_run_over_http_inline_or_as_a_job() {
         let mut app = test_app();
 
