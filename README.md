@@ -22,7 +22,7 @@ sensor can be declared in JSON while the board runs.
 | A console over HTTPS | Chat and configure devices, tools, schedule, logs, WiFi and the model from a phone; the board issues its own certificate. [Web console](#web-console) |
 | It acts unattended | Timed prompts and sensor rules that fire one when a reading crosses a threshold. [Scheduled work](#scheduled-work) |
 | A shell and a script language | `shell` with 26 NuttX-named commands, and an interpreter for loops over tool calls. [Shell](#shell) · [Script](#script) |
-| Standing orders | 2 KB in the system prompt for what this board is for, writable from the console, `shell` and HTTP. [Standing orders](#standing-orders) |
+| It remembers what it was told | Standing orders, `/AGENTS.md`, a `/memory.md` index and skills, assembled into the prompt on every turn. [What the model always sees](#what-the-model-always-sees) |
 | No cloud in the path | HTTPS from the board, a certificate it generates, one PIN for three callers. [Authentication](#authentication) |
 | Testable without hardware | The simulator runs the same `agent-core` against a virtual board. [Simulator](#simulator) |
 
@@ -81,19 +81,39 @@ cap), `context_tokens` and `max_output_tokens` set the window and the reply rese
 transcript compacts at 80% of the window. Without a key, point `base_url` at the board's own
 `/selftest/chat/completions` and the loop still runs.
 
-## Standing orders
+## What the model always sees
 
-A slot for what this board is *for*, written by its owner and read on every turn:
+Four layers go into the system prompt, in this order, on **every** turn: what an owner wrote
+once, and what the agent has learned since. None of it is in the transcript, so it costs the
+same whether the conversation is one message long or a thousand.
+
+| Layer | Where it lives | How much reaches the model | Written by |
+|---|---|---|---|
+| Standing orders | `agent.system_prompt` (NVS) | all of it, 2 KB cap | the owner, over HTTP or `shell` |
+| Project instructions | `/AGENTS.md` | the first 1 KB, then a marker saying the rest is there | the owner, by `fs_write` |
+| Long-term memory | `/memory.md`, an index pointing at `/memory/<topic>.md` | the index only, 24 lines / 2 KB | the agent itself, as it learns |
+| Skills | `/skills/<name>/SKILL.md` plus whatever sits beside it | one line each, name and description | either |
 
 ```bash
+# The owner's standing orders: why this board exists, and the rules that come first.
 curl -sS -X POST http://<board>/api/agent/prompt -H 'Content-Type: application/json' \
   -d '{"action":"set","text":"The pump relay is on GPIO12. Never run it past two minutes."}'
+
+# What the model will actually receive, layers and all — the only way to check this.
+curl -sS http://<board>/api/agent/prompt | jq -r .system
 ```
 
-`action` is `set`, `append` or `clear`, and `system_prompt get` reads it back from the board;
-`GET /api/agent/prompt` shows the prompt the model
-will receive, custom part included, and the agent reaches it with
-`shell {"command":"system_prompt set …"}`. 2 KB in NVS, so it survives a reboot.
+`action` is `set`, `append` or `clear`; `system_prompt get` reads it back from the board and
+`system_prompt set …` writes it from the agent's side. Memory and skills are ordinary files:
+`fs_write /memory/wiring.md "GPIO18 = lamp strip"` plus one line in `/memory.md` is all a
+memory is, and deleting the file forgets it. An edited file takes effect on the next turn —
+no restart, no reflash, no transcript rewrite.
+
+The sizes are the reason the split exists. A board with kilobytes of internal SRAM cannot
+afford to carry the whole of what it knows in every request, so each layer is an index or a
+prefix, and the expensive part is fetched with `fs_read` when a turn actually needs it.
+[docs/agent-memory.md](docs/agent-memory.md) and [docs/agent-skills.md](docs/agent-skills.md)
+have the details, including how the index is bounded.
 
 ## Shell
 
