@@ -49,24 +49,21 @@ espflash write-bin --chip esp32s3 --flash-size 16mb 0x0 esp32-agent-vX.Y.Z.bin
 
 ## Дайте ей модель
 
-Откройте `http://<board>/`, панель **Agent**, заполните три поля, сохраните:
+Откройте `http://<board>/`, панель **Agent**, укажите адрес, идентификатор модели и ключ,
+сохраните. Ключ только на запись: уходит в NVS и читается как `__set__`. На той же панели —
+`protocol` (`chat`, `responses` или `anthropic`), `reasoning`, `context_tokens` и
+`max_output_tokens`.
 
-| Поле | Значение |
-|---|---|
-| `base_url` | полный адрес chat-completions |
-| `model` | идентификатор модели у провайдера |
-| `api_key` | ключ; только на запись, читается как `__set__` |
+**Или поручите это агенту.** Получив `agent.json`, агент знает эти настройки, их типы и
+значения по умолчанию, поэтому достаточно одной фразы:
 
-Те же три поля по HTTP:
+> направь плату на `https://your-provider/v1/chat/completions`, модель `…`, ключ `sk-…`,
+> рассуждения `low`, контекст `64000`, вывод `4096`
 
-```bash
-curl -sS -X POST http://<board>/api/agent/config -H 'Content-Type: application/json' \
-  -d '{"base_url":"https://your-provider/v1/chat/completions","model":"…","api_key":"…"}'
-```
-
-`protocol` выбирает `chat`, `responses` или `anthropic`; `reasoning`, `context_tokens` и
-`max_output_tokens` — на той же панели и том же маршруте. Совсем без ключа поставьте
-`base_url` в `http://127.0.0.1/selftest/chat/completions`, и цикл всё равно работает.
+Агент применит их через `POST /api/agent/config` — тем же вызовом, что и панель, — и перечитает
+конфигурацию для подтверждения. Командная строка вам не нужна, и та же фраза годится для любой
+платы, до которой он дотянется. Совсем без ключа `base_url` на
+`http://127.0.0.1/selftest/chat/completions` гоняет цикл по самой плате.
 
 ## О безопасности
 

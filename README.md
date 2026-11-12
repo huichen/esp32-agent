@@ -47,24 +47,21 @@ defaults, and the limits. An agent that can fetch a URL needs nothing else.
 
 ## Give it a model
 
-Open `http://<board>/`, choose **Agent**, fill three fields, save:
+Open `http://<board>/`, choose **Agent**, and fill in the endpoint, the model id and the key,
+then save. The key is write-only: it goes to NVS and reads back as `__set__`. The same panel
+holds `protocol` (`chat`, `responses` or `anthropic`), `reasoning`, `context_tokens` and
+`max_output_tokens`.
 
-| Field | Value |
-|---|---|
-| `base_url` | the full chat-completions URL |
-| `model` | the provider's model id |
-| `api_key` | the key; write-only, reads back as `__set__` |
+**Or let an agent do it.** Once an agent has fetched `agent.json` it knows these settings, their
+types and their defaults, so a prompt is enough:
 
-The same three fields over HTTP:
+> point the board at `https://your-provider/v1/chat/completions`, model `…`, key `sk-…`,
+> thinking `low`, context `64000`, output `4096`
 
-```bash
-curl -sS -X POST http://<board>/api/agent/config -H 'Content-Type: application/json' \
-  -d '{"base_url":"https://your-provider/v1/chat/completions","model":"…","api_key":"…"}'
-```
-
-`protocol` picks `chat`, `responses` or `anthropic`; `reasoning`, `context_tokens` and
-`max_output_tokens` are on the same panel and the same route. With no key at all, set
-`base_url` to `http://127.0.0.1/selftest/chat/completions` and the loop still runs.
+The agent applies them with `POST /api/agent/config` — the same call the panel makes — and reads
+the configuration back to confirm. No command line is needed on your side, and the same prompt
+works for every board it can reach. Without a key at all, `base_url` set to
+`http://127.0.0.1/selftest/chat/completions` runs the loop against the board itself.
 
 ## Safety notes
 

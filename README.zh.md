@@ -45,24 +45,19 @@ espflash write-bin --chip esp32s3 --flash-size 16mb 0x0 esp32-agent-vX.Y.Z.bin
 
 ## 给它一个模型
 
-打开 `http://<board>/`，进 **Agent** 面板，填三个字段，保存：
+打开 `http://<board>/`，进 **Agent** 面板，填端点、模型 id 和密钥，保存。密钥只写：进 NVS，
+读回来是 `__set__`。同一个面板里有 `protocol`（`chat`、`responses` 或 `anthropic`）、
+`reasoning`、`context_tokens` 和 `max_output_tokens`。
 
-| 字段 | 值 |
-|---|---|
-| `base_url` | 完整的 chat-completions 地址 |
-| `model` | 提供方的模型 id |
-| `api_key` | 密钥；只写，读回来是 `__set__` |
+**或者交给 agent 去做。** agent 取过 `agent.json` 之后就知道这些设置项、它们的类型和默认值，
+所以一句话就够：
 
-同样的三个字段，走 HTTP：
+> 把板子的模型端点设成 `https://your-provider/v1/chat/completions`，模型 `…`，密钥
+> `sk-…`，思考等级 `low`，上下文 `64000`，输出 `4096`
 
-```bash
-curl -sS -X POST http://<board>/api/agent/config -H 'Content-Type: application/json' \
-  -d '{"base_url":"https://your-provider/v1/chat/completions","model":"…","api_key":"…"}'
-```
-
-`protocol` 选 `chat`、`responses` 或 `anthropic`；`reasoning`、`context_tokens`、
-`max_output_tokens` 都在同一个面板和同一个路由。完全没 key 时，把 `base_url` 设成
-`http://127.0.0.1/selftest/chat/completions`，循环照样跑。
+agent 用 `POST /api/agent/config` 写进去——和面板发的是同一个调用——再把配置读回来确认。
+你这边不需要敲命令行，同一句话对它能连上的每一块板都成立。完全没有密钥时，把 `base_url`
+设成 `http://127.0.0.1/selftest/chat/completions`，循环会拿板子自己当模型跑。
 
 ## 安全须知
 

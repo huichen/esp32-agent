@@ -50,24 +50,21 @@ valores por defecto, y los límites. Un agente que sepa pedir una URL no necesit
 
 ## Dale un modelo
 
-Abre `http://<board>/`, panel **Agent**, rellena tres campos, guarda:
+Abre `http://<board>/`, panel **Agent**, escribe el endpoint, el id del modelo y la clave, y
+guarda. La clave es de solo escritura: va a NVS y se relee como `__set__`. El mismo panel tiene
+`protocol` (`chat`, `responses` o `anthropic`), `reasoning`, `context_tokens` y
+`max_output_tokens`.
 
-| Campo | Valor |
-|---|---|
-| `base_url` | la URL completa de chat-completions |
-| `model` | el id del modelo en el proveedor |
-| `api_key` | la clave; de solo escritura, se relee como `__set__` |
+**O deja que lo haga un agente.** Cuando un agente ha pedido `agent.json` ya conoce estos
+ajustes, sus tipos y sus valores por defecto, así que basta una instrucción:
 
-Los mismos tres campos por HTTP:
+> apunta la placa a `https://your-provider/v1/chat/completions`, modelo `…`, clave `sk-…`,
+> razonamiento `low`, contexto `64000`, salida `4096`
 
-```bash
-curl -sS -X POST http://<board>/api/agent/config -H 'Content-Type: application/json' \
-  -d '{"base_url":"https://your-provider/v1/chat/completions","model":"…","api_key":"…"}'
-```
-
-`protocol` elige `chat`, `responses` o `anthropic`; `reasoning`, `context_tokens` y
-`max_output_tokens` están en el mismo panel y la misma ruta. Sin ninguna clave, pon `base_url`
-en `http://127.0.0.1/selftest/chat/completions` y el bucle funciona igual.
+El agente los aplica con `POST /api/agent/config` —la misma llamada que hace el panel— y vuelve
+a leer la configuración para confirmar. No hace falta escribir nada en una terminal, y la misma
+instrucción sirve para cada placa que pueda alcanzar. Sin ninguna clave, `base_url` en
+`http://127.0.0.1/selftest/chat/completions` hace que el bucle corra contra la propia placa.
 
 ## Notas de seguridad
 
