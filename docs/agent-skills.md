@@ -29,18 +29,18 @@ Plain Markdown, written for a reader with no memory of your bench:
 ```
 
 The first 1024 bytes go into the system prompt with a marker where the cut happened, and
-the model is told to read the rest with `read /AGENTS.md`. Editing the file takes
+the model is told to read the rest with `fs_read /AGENTS.md`. Editing the file takes
 effect on the next turn: no restart, no transcript rewrite.
 
 Written from anywhere:
 
 ```bash
 # the agent itself, mid-turn
-write {"path":"/AGENTS.md","text":"GPIO12 is the pump relay, active low."}
+fs_write {"path":"/AGENTS.md","text":"GPIO12 is the pump relay, active low."}
 
 # a skill, written the same way
-write {"path":"/skills/pulse_pump.md",
-       "text":"# pulse_pump\ndescription: switch the pump for a measured pulse\n1. confirm the request names a duration\n2. bench_pulse {ms}\n3. read power_read before and after\n"}
+fs_write {"path":"/skills/pulse_pump.md",
+          "text":"# pulse_pump\ndescription: switch the pump for a measured pulse\n1. confirm the request names a duration\n2. bench_pulse {ms}\n3. read power_read before and after\n"}
 ```
 
 ## Skills
@@ -48,7 +48,7 @@ write {"path":"/skills/pulse_pump.md",
 A skill is a **directory** (`/skills/<name>/`) with a `SKILL.md`, and whatever else it
 needs next to it. That is the shape the host uses, and it is the reason a skill is not
 just a paragraph: a pinout, a table of registers, an acceptance script the model runs by
-hand with `gpio_write` all belong to the procedure, and they are `read` away.
+hand with `gpio_write` all belong to the procedure, and they are `fs_read` away.
 
 ```markdown
 /skills/deploy/SKILL.md
@@ -56,8 +56,8 @@ hand with `gpio_write` all belong to the procedure, and they are `read` away.
 name: deploy
 description: roll the portal forward without losing the transcript
 ---
-1. Read `/AGENTS.md` and confirm no turn is running.
-2. `write` a note to `/notes/deploy-<date>.md` first.
+1. Read `/AGENTS.md` and confirm the board is not mid-turn.
+2. `fs_write` a note to `/notes/deploy-<date>.md` first.
 3. Build, flash, then `board_status` and one `bme280_read`.
 The pinout to check after flashing is in `pinout.md` next to this file.
 
@@ -82,20 +82,20 @@ Rules, such as they are:
 - No includes, no scripts that run by themselves. A skill is a procedure and its
   attachments, read by an agent with the file and GPIO tools it already has.
 
-Write one with `write` — there are no dedicated tools (see below).
+Write one with `fs_write` — there are no dedicated tools (see below).
 
 ### No tools of their own
 
-Deliberately. `read`, `write`, `edit` and `shell` already reach both paths, and a wrapper
+Deliberately. `fs_ls`, `fs_read` and `fs_write` already reach both paths, and a wrapper
 per verb would add a definition to every request and one more choice for a small model.
 
 | Task | How |
 |---|---|
-| see the skills | `shell {"command":"ls /skills"}` — the prompt already names each one with its path |
-| load one | `read {path:"/skills/deploy/SKILL.md"}`, and any file next to it |
-| add or change one | `write {path:"/skills/deploy/SKILL.md", text}` — parent directories are created |
-| remove one | `shell {"command":"rm /skills/deploy/SKILL.md --confirm"}`; the index drops it on the next turn |
-| change the instructions | `write {path:"/AGENTS.md", text}` |
+| see the skills | `fs_ls {path:"/skills"}` — the prompt already names each one with its path |
+| load one | `fs_read {path:"/skills/deploy/SKILL.md"}`, and any file next to it |
+| add or change one | `fs_write {path:"/skills/deploy/SKILL.md", text}` — parent directories are created |
+| remove one | `fs_rm {path:"/skills/deploy/SKILL.md", confirm:true}`; the index drops it on the next turn |
+| change the instructions | `fs_write {path:"/AGENTS.md", text}` |
 
 What you give up without the wrappers: nothing checks a name, a header, or that a skill
 directory has a `SKILL.md`. The index is forgiving (front matter, then a `description:`
@@ -107,10 +107,47 @@ From an MCP client, the same call, since these paths are ordinary files:
 
 ```bash
 curl -sS -X POST http://<board>:80/mcp -H 'Content-Type: application/json' -d \
-  '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"write","arguments":
+  '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"fs_write","arguments":
     {"path":"/skills/deploy.md",
      "text":"# deploy\ndescription: roll the portal forward\n1. snapshot\n2. flash\n"}}}'
 ```
+
+## What a freshly flashed board starts with
+
+Three skills are compiled into the firmware and written into the workspace on the first
+boot: `create-skill`, `pinout` and `recover-board`. They live in the repository's
+`skills/` directory — one directory per skill, `SKILL.md` inside — and reach the board
+through `include_str!` (`crates/agent-core/src/seed.rs`), so deleting one breaks the
+build instead of shipping a board with a procedure missing.
+
+| Skill | What it is for |
+|---|---|
+| `create-skill` | writing the next skill: what one is on this board, when it is worth one, what not to put in it, and the house rules |
+| `pinout` | finding out what is wired — `inventory`, `devices_list`, `i2c_scan`, `i2c_identify` — and recording it in `/memory/pinout.md` with one pointer line in `/MEMORY.md`, plus a manifest entry for the parts no probe can reach |
+| `recover-board` | a board that looks broken: `board_status`, `logs_tail`, `devices_probe`, the difference between "no device" and "declared but not live", a manifest fix with `dry_run` first, reboot last |
+
+After the seeding they are ordinary files, and the rules that matter are about when the
+seed runs. It writes a skill **only where its path holds nothing**:
+
+- A skill the owner edits is never overwritten — not by a firmware upgrade, not by a
+  factory reset. There is no checksum of the shipped copy to argue with the edit.
+- A skill the owner deletes comes back on the next boot, because the path is empty
+  again. To drop one for good, turn the seed off first:
+
+```text
+config_set {"patch":{"skills":{"seed_defaults":false}}}
+shell {"command":"rm /skills/pinout/SKILL.md --confirm"}
+```
+
+`skills.seed_defaults` is a normal configuration field (default `true`): set it with
+`config_set` or on `POST /api/config`. A factory reset sets it back to `true` and restores
+any file that was deleted.
+
+The three files are about 5.6 KB of the 8 KB workspace. That still leaves room for one
+full-size memory file, but it is the tight part of an `AGENTS.md` plus a long memory
+index; the tests in `seed.rs` fail if three skills plus one full-size memory would not
+fit. What they also check: each file is under 2 KB (a larger one cannot be stored), plain
+ASCII, and carries the single `description:` line that reaches the prompt.
 
 ## Why not just put everything in the system prompt
 

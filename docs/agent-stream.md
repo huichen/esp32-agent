@@ -1,10 +1,13 @@
-# Agent console: the live journal
+# Agent console: stream, progress, tick — frozen contract
 
-The turn is phased (the model call runs without the app lock), and the transcript and
-journal use the host agent's event names. This page is the endpoint contract for the run
-journal and for `agent.tick_ms`.
+Continuation of `docs/agent-loop.md`. The turn is already phased (the model call runs
+without the app lock), the transcript and journal already use the host agent's event
+names. This wave makes the journal *live* and the tick configurable, and adds the one
+host event the board was missing.
 
-## 1. `GET /api/agent/stream?after=<seq>`
+## 1. Endpoint contract (frozen — workers code against this)
+
+### `GET /api/agent/stream?after=<seq>`
 
 Server-Sent Events, `Content-Type: text/event-stream`, `Cache-Control: no-cache`.
 
@@ -15,17 +18,18 @@ Server-Sent Events, `Content-Type: text/event-stream`, `Cache-Control: no-cache`
   event: tool_use
   data: {"seq":42,"event":"tool_use","at_ms":...,"tool_call_id":"c1","name":"board_status","text":"{}"}
   ```
-  `data` is exactly the JSON object `Event::json()` produces; `id` and `event` repeat `seq`
-  and `kind` so a browser `EventSource` can use them;
+  `data` is exactly the JSON object `Event::json()` already produces; `id` and
+  `event` repeat `seq` and `kind` so a browser `EventSource` can use them;
 - a comment heart-beat `: ping` every 15 s;
-- **bounded**: the stream closes itself after 30 s with no new event, or after 120 s in
-  total, whichever comes first. `EventSource` reconnects on its own with `after=<last id>`;
-  the portal relies on that and does not resend anything;
-- at most **2** concurrent streams; a third gets `503 {"error":"too many event streams"}`.
-  The board serves HTTP from a pool of 6 connections and the portal must never be starved;
+- **bounded**: the stream closes itself after 30 s with no new event, or after 120 s
+  in total, whichever comes first. `EventSource` reconnects on its own with
+  `after=<last id>`; the portal relies on that and does not resend anything;
+- at most **2** concurrent streams; a third gets `503 {"error":"too many event
+  streams"}`. The board serves HTTP from a pool of 6 connections and the portal must
+  never be starved;
 - no pin/token gate on reading (the transcript endpoint has none either).
 
-## 2. `tool_progress`
+### `tool_progress`
 
 One extra journal kind, emitted by the agent around each tool execution:
 
@@ -35,24 +39,54 @@ One extra journal kind, emitted by the agent around each tool execution:
 ```
 
 Order inside one tool call: `tool_use` → `tool_progress(start)` → [`tool_result`] →
-`tool_progress(end)`. The board cannot report progress *within* a tool, so the pair marks
-the boundaries and carries the elapsed time — a client that ignores it loses nothing.
+`tool_progress(end)`. The board cannot report progress *within* a tool, so the pair
+marks the boundaries and carries the elapsed time — a client that ignores it loses
+nothing.
 
-`GET /api/agent/events?after=<seq>` is the same journal as plain JSON, for a client that
-cannot hold a connection open.
+### `retried`
 
-## 3. `agent.tick_ms`
+One further kind, emitted **at most once per model call**, when the request that produced
+the reply took more than one attempt:
 
-`GET /api/agent/config` reports `tick_ms`; `POST` accepts `{"tick_ms":500}`, clamped to
-`200..=5000`, default `1000`. It is the interval of the platform's scheduler tick and
-therefore the queue-drain latency. The firmware loop reads it each tick, so a portal edit
-takes effect on the next tick, not on reboot.
+```
+{"seq":44,"event":"retried","at_ms":...,"text":"the model request was retried 2 times (waited 250, 500 ms); the last failure was llm: POST … failed: HTTP 503: …"}
+```
 
-## 4. What must not change
+It comes first in that call's group — `retried` → `usage` → `thinking_*` → `text_*` — and
+the failed attempts themselves are not journaled. A client reading the stream learns that
+this answer took two tries; it never sees three failures and one success. Attempts that
+run out never reach a reply: they are one `error` whose text carries both numbers
+("… (gave up after 3 attempts)"), followed by `run_end` with `is_error`. The retry policy
+itself is in `docs/agent-loop.md`; there is no event per wait.
 
-MCP method names, `/mcp` path, tool names, the journal event names and their order (the
-test `the_run_journal_uses_the_host_agents_event_names_in_order` pins it), the
-one-run-at-a-time queue, and the "no lock across the model call" property
+### `agent.tick_ms`
+
+`GET /api/agent/config` reports `tick_ms`; `POST` accepts `{"tick_ms":500}`, clamped
+to `200..=5000`, default `1000`. It is the interval of the platform's scheduler tick
+and therefore the queue-drain latency. The firmware loop reads it each tick, so a
+portal edit takes effect on the next tick, not on reboot.
+
+## 2. Work split
+
+| Task | Owner | Files (write scope) |
+|---|---|---|
+| SSE endpoint + stream registry | worker-a | `crates/agent-core/src/http.rs`, `crates/agent-core/src/app.rs` |
+| Portal: live console, tick field | worker-b | `crates/agent-core/src/web/` |
+| `tool_progress` + `tick_ms` config | worker-c | `crates/agent-core/src/agent.rs`, `crates/agent-core/src/config.rs`, `firmware/src/runner.rs` |
+| gate, flash, bench, commit | supervisor | — |
+
+Invariants nobody may break: MCP method names, `/mcp` path, tool names, the journal
+event names and their existing order (the test
+`the_run_journal_uses_the_host_agents_event_names_in_order` pins it), the one-run-at-a-time
+queue, and the "no lock across the model call" property
 (`a_run_in_flight_does_not_hold_the_app_lock`).
 
-Related: [agent loop](agent-loop.md) · [web console](web-console.md) · [HTTP API](http-api.md)
+## 3. Acceptance for the wave
+
+1. `cargo test -p esp32-agent-core` (169 existing + new), clippy `-D warnings`, fmt,
+   `scripts/smoke.ps1` green.
+2. On the board: `curl -N http://<board>:80/api/agent/stream` shows the run's events
+   as they happen while a message is processed, and closes after the idle timeout.
+3. A third concurrent stream is refused with 503.
+4. Tick interval change is visible: set `tick_ms` 200, queue a message, and the
+   latency between "queued" and "run starting" in the journal is under ~400 ms.

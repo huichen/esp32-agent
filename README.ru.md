@@ -23,6 +23,7 @@
 | Работает без присмотра | Задания по времени и правила по датчикам, которые запускают задание, когда показание пересекает порог. [Работа по расписанию](docs/scheduling.md) |
 | Shell и язык скриптов | `shell` с 55 командами с именами из NuttX и интерпретатор для циклов по вызовам инструментов. [Shell](docs/shell.md) · [Script](docs/scripting.md) |
 | Помнит, что ей сказали | Постоянные указания, `/AGENTS.md`, индекс `/MEMORY.md` и навыки, собранные в промпт на каждом ходу. [Что модель видит всегда](docs/context.md) |
+| Приходит со навыками | Три процедуры в прошивке — написать навык, снять распиновку, вернуть к жизни плату, которая выглядит сломанной — появляются в `/skills` при первом запуске; правка остаётся вашей. [Skills](docs/agent-skills.md) |
 | Никакого облака на пути | HTTPS с платы, сертификат, который она генерирует, один PIN на три вида вызывающих. [Аутентификация](docs/security.md) |
 | Проверяемо без железа | Симулятор запускает тот же `agent-core` на виртуальной плате. [Симулятор](docs/simulator.md) |
 
@@ -46,6 +47,8 @@ espflash write-bin --chip esp32s3 --flash-size 16mb 0x0 esp32-agent-vX.Y.Z.bin
 **Из агента**: `GET http://<board>/agent.json` отдаёт интерфейс в JSON — каждый маршрут с
 методом, телом и авторизацией, поверхность MCP, таблицу настроек с типами и значениями по
 умолчанию, и пределы. Агенту, умеющему запросить URL, больше ничего не нужно.
+
+**Новая плата уже знает три вещи.** `/skills/create-skill` — как агент пишет следующую процедуру, `/skills/pinout` — как снять распиновку и записать её в `/MEMORY.md`, `/skills/recover-board` — что делать, когда плата выглядит сломанной. Это обычные файлы рабочей области: при первом запуске ставятся там, где путь пуст; сброс к заводским вернёт их, а `skills.seed_defaults=false` это отменит. Первая полезная фраза только что прошитой плате — «запиши свою распиновку».
 
 ## Дайте ей модель
 
@@ -98,7 +101,7 @@ I²C стабильно на 8 прогонах; внутренняя SRAM 5–6
 [HTTP и MCP](docs/http-api.md) · [Добавление устройства](docs/adding-a-device.md) · [Прошивка](docs/flashing.md) ·
 [Диагностика](docs/troubleshooting.md) · [Цикл агента](docs/agent-loop.md) · [Поток](docs/agent-stream.md) ·
 [Skills](docs/agent-skills.md) · [Память](docs/agent-memory.md) · [Scripting](docs/scripting.md) ·
-[Model](docs/model.md) · [Web console](docs/web-console.md) · [Scheduling](docs/scheduling.md) · [Shell](docs/shell.md) · [Context layers](docs/context.md) · [Security](docs/security.md) · [Simulator](docs/simulator.md) · [Performance](docs/performance.md)
+[Model](docs/model.md) · [Web console](docs/web-console.md) · [Scheduling](docs/scheduling.md) · [Shell](docs/shell.md) · [Context layers](docs/context.md) · [Security](docs/security.md) · [Simulator](docs/simulator.md) · [Audio](docs/audio.md)
 
 ## Участие в проекте
 

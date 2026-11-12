@@ -12,7 +12,6 @@ use crate::config::Config;
 use crate::device::Devices;
 use crate::drivers;
 use crate::error::{code, McpError, Result};
-use crate::goal::{Goal, GoalStatus, DEFAULT_MAX_ITERATIONS};
 use crate::hardware::Hardware;
 use crate::http::{EventSink, EventStreamGate, EventStreamSlot, Handler, Request, Response, StreamBody};
 use crate::llm;
@@ -38,8 +37,6 @@ pub type Shared = Arc<Mutex<App>>;
 pub const NVS_KEY_AGENT_CFG: &str = "agent";
 pub const NVS_KEY_SCHED: &str = "sched";
 pub const NVS_KEY_WORKSPACE: &str = "ws";
-/// The one goal the board may be working towards, as one JSON document.
-pub const NVS_KEY_GOAL: &str = "goal";
 /// The transcript between boots: a header line and one message per line.
 ///
 /// The board's NVS refuses a single string value above roughly 4000 bytes - the firmware
@@ -49,8 +46,8 @@ pub const NVS_KEY_GOAL: &str = "goal";
 /// carries a checksum over everything after it, so chunks from two different writes are
 /// detected instead of concatenated into a transcript that never existed.
 pub const NVS_KEY_TRANSCRIPT: &str = "agent.transcript";
-/// The most bytes one stored value may hold: the same ceiling `GOAL_BLOB_MAX` is sized
-/// against, for the same reason.
+/// The most bytes one stored value may hold: the board reads NVS through a fixed
+/// 4096-byte buffer (`firmware/src/nvs_store.rs`) and ESP-IDF rejects a longer write.
 pub const TRANSCRIPT_CHUNK_BYTES: usize = 3500;
 /// How many values a full transcript may span, and then some: a 16 KB tail needs five,
 /// and the spare room is what keeps a shrinking transcript from colliding with the tail
@@ -62,22 +59,6 @@ pub const NVS_KEY_RUN_IN_FLIGHT: &str = "agent.run_in_flight";
 /// The source a resumed turn carries, so a reply can be told apart from one the user just
 /// asked for.
 pub const RESUME_SOURCE: &str = "resume";
-
-/// The source a goal iteration's turn carries. It is how a reply is attributed to the
-/// goal: the queue merges the sources of everything that landed in one turn, so a
-/// turn whose source is exactly this string is one that saw the goal prompt and nothing
-/// else.
-pub const GOAL_SOURCE: &str = "goal";
-
-/// The longest objective accepted. The objective is copied into every iteration prompt
-/// and stored in NVS, so it is bounded like the notes are.
-pub const GOAL_OBJECTIVE_MAX: usize = 200;
-
-/// How many bytes the stored goal may take. The board reads NVS through a 4096-byte
-/// buffer (`firmware/src/nvs_store.rs`) and a string value above roughly 4000 bytes is
-/// refused by ESP-IDF, so the document is trimmed to fit before it is written: a blob
-/// the board cannot read back is a goal that disappears at the next boot.
-pub const GOAL_BLOB_MAX: usize = 3500;
 
 /// The file tools write into a RAM map that is persisted as one NVS blob, so the
 /// whole workspace has to stay small enough to serialise next to everything else.
@@ -293,13 +274,6 @@ pub struct App {
     pub tool_specs_cache: std::cell::RefCell<Option<(u64, Value)>>,
     /// Monotonic counter for job ids; not persisted, because the queue is not either.
     pub script_seq: u64,
-    /// The objective the board is working towards on its own, and how far it got.
-    /// Idle until a client posts one; the scheduler tick is what advances it.
-    pub goal: Goal,
-    /// The source of the turn in flight, remembered when the queue is drained because
-    /// the message itself is gone by the time the reply comes back. `agent_begin` and
-    /// `agent_run_once` set it; `finish_turn` reads it.
-    turn_source: String,
     /// Outbound HTTP for the `net_*` tools. The platform layer attaches it once; host
     /// tests leave it empty so nothing reaches the net. It is deliberately **not** the
     /// transport the model call uses: that one is owned by whoever drives the turn
@@ -382,8 +356,6 @@ impl App {
             script_seq: 0,
             workspace: AppWorkspace::default(),
             shell_env: std::collections::BTreeMap::new(),
-            goal: idle_goal(),
-            turn_source: String::new(),
             tool_transport: None,
             model_transport: None,
             streams: EventStreamGate::new(),
@@ -399,6 +371,10 @@ impl App {
         );
         app.rebuild();
         app.load_agent_state();
+        // A freshly flashed board has an empty workspace; a factory-reset board is back on
+        // the default config. Both belong to the same moment: the three skills the
+        // firmware carries are installed here, and in `seed_default_skills`'s other caller.
+        app.seed_default_skills();
         app
     }
 
@@ -846,12 +822,6 @@ impl App {
                 "rules": self.rules.len(),
                 "enabled_tasks": self.tasks.iter().filter(|t| t.enabled).count(),
                 "enabled_rules": self.rules.iter().filter(|r| r.enabled).count(),
-            },
-            // The console shows a goal without polling the whole document.
-            "goal": {
-                "status": self.goal.status.as_str(),
-                "iteration": self.goal.iteration,
-                "max_iterations": self.goal.max_iterations,
             },
             "pins": self.cfg.pins,
         })
@@ -1418,30 +1388,6 @@ impl App {
                 Err(e) => self.log.error("agent", format!("the stored workspace is unreadable ({e})")),
             }
         }
-        // A goal survives a reboot, which is the point of storing it: the board may be
-        // restarted in the middle of an objective and must not forget it. An idle goal
-        // is not stored (it has no objective to store), so a missing key is the normal
-        // case, not an error.
-        if let Some(text) = self.store.get(NVS_KEY_GOAL) {
-            match serde_json::from_str::<Value>(&text) {
-                Ok(v) => match Goal::from_json(&v) {
-                    Some(goal) => {
-                        self.log.info(
-                            "goal",
-                            format!(
-                                "restored `{}` ({}, iteration {})",
-                                clip(&goal.objective, 60),
-                                goal.status.as_str(),
-                                goal.iteration
-                            ),
-                        );
-                        self.goal = goal;
-                    }
-                    None => self.goal = idle_goal(),
-                },
-                Err(e) => self.log.error("goal", format!("the stored goal is unreadable ({e})")),
-            }
-        }
         // Last, because resuming needs the config that decides whether anything was stored
         // at all, and the transcript a resumed turn continues from.
         self.load_transcript();
@@ -1676,7 +1622,6 @@ impl App {
         let source = self.agent.pending.as_ref().map(|pending| pending.source.clone())?;
         let max_steps = self.llm.max_steps;
         let (context_tokens, max_output_tokens) = (self.llm.context_tokens, self.llm.max_output_tokens);
-        self.turn_source = source.clone();
         // Before the run, not after: the marker is what tells the next boot that this turn
         // did not finish, and a marker written afterwards would only describe turns that
         // already survived.
@@ -1695,12 +1640,11 @@ impl App {
     /// whether to ask again.
     pub fn agent_reply(&mut self, reply: std::result::Result<llm::ModelReply, String>) -> AgentStep {
         let step = self.with_agent(move |agent, host| agent.apply(host, reply, now_ms));
-        if let AgentStep::Done(result) = &step {
+        if matches!(&step, AgentStep::Done(_)) {
             // The turn is over, so a reboot from here must not ask it again. Clearing the
             // marker before the final save means the worst case is a lost reply, never a
             // reply the board repeats.
             self.clear_run_in_flight();
-            self.finish_turn(result);
         }
         // Every step, not only the last one: a tool result that landed is worth more after
         // a power cut than the reply that never arrived.
@@ -1790,172 +1734,10 @@ impl App {
                 fired.push(source);
             }
         }
-        // The goal loop, and the only place an iteration is started: one running goal,
-        // nothing else waiting, so a user message or a schedule always goes first. The
-        // turn this queues is what `finish_turn` reads back, and the next tick queues
-        // the following iteration from the notes it wrote.
-        if self.goal.status.is_active() && self.agent.pending.is_none() {
-            if let Some(prompt) = self.goal.next_prompt() {
-                if self.agent.push_user(&prompt, GOAL_SOURCE, at_ms) {
-                    self.log.info(
-                        "goal",
-                        format!(
-                            "queued iteration {} of {}",
-                            self.goal.iteration.saturating_add(1),
-                            self.goal.max_iterations
-                        ),
-                    );
-                    fired.push(GOAL_SOURCE.to_string());
-                }
-            }
-        }
         if dirty {
             self.persist_sched();
         }
         fired
-    }
-
-    // ---------------------------------------------------------------- goal
-
-    /// The source of the message waiting in the queue, or empty when there is none.
-    fn pending_source(&self) -> String {
-        self.agent.pending.as_ref().map(|p| p.source.clone()).unwrap_or_default()
-    }
-
-    /// Fold a finished turn into the goal loop, when that turn was a goal iteration.
-    ///
-    /// Attribution is the source string: only a turn whose source is exactly
-    /// [`GOAL_SOURCE`] saw the goal prompt and nothing else. A message that merged into
-    /// the queued goal turn turns the source into a comma list, and a reply to a user,
-    /// a schedule or a rule is never classified however it happens to read - which is
-    /// what keeps a chat that mentions the marker from ending the goal.
-    fn finish_turn(&mut self, result: &std::result::Result<String, String>) {
-        if self.turn_source != GOAL_SOURCE {
-            return;
-        }
-        self.turn_source.clear();
-        // The goal may have been stopped or deleted while the turn was in flight. Its
-        // reply must not revive it: `observe` on a CONTINUE reply would set `Running`
-        // again, and a stopped goal must never resume.
-        if !self.goal.status.is_active() {
-            self.log.info("goal", "dropped an iteration reply: the goal is no longer running");
-            return;
-        }
-        let now = now_ms();
-        let status = match result {
-            Ok(text) => self.goal.observe(text, now),
-            Err(e) => self.goal.fail_iteration(e, now),
-        };
-        self.log.info(
-            "goal",
-            format!("iteration {} of {}: {}", self.goal.iteration, self.goal.max_iterations, status.as_str()),
-        );
-        self.persist_goal();
-    }
-
-    /// Write the goal out. Called on every state change, because the board can lose
-    /// power between two iterations and the notes are the only memory the loop has.
-    fn persist_goal(&mut self) {
-        // An idle goal is nothing to remember, and `from_json` refuses a document with
-        // no objective anyway; clearing the key keeps "no goal" and "an empty goal"
-        // from looking different.
-        if self.goal.objective.is_empty() {
-            self.store.remove(NVS_KEY_GOAL);
-            return;
-        }
-        // Notes are capped by count and by length, but 24 of them in UTF-8 can still be
-        // far larger than one NVS value. The oldest give way, in RAM as well as on
-        // flash, so what a reboot restores is exactly what the loop was using rather
-        // than a silently shortened copy of it.
-        let mut dropped = 0usize;
-        let mut text = self.goal.to_json().to_string();
-        while text.len() > GOAL_BLOB_MAX && !self.goal.notes.is_empty() {
-            self.goal.notes.remove(0);
-            dropped += 1;
-            text = self.goal.to_json().to_string();
-        }
-        if dropped > 0 {
-            self.log.warn("goal", format!("{dropped} oldest note(s) dropped to fit the stored goal in NVS"));
-        }
-        if !self.store.set(NVS_KEY_GOAL, &text) {
-            self.log.error("goal", "could not save the goal");
-        }
-    }
-
-    /// `GET /api/goal`: the stored document plus the prompt the next iteration would
-    /// send, so a client can see what the board is about to be asked.
-    pub fn goal_json(&self) -> Value {
-        let mut v = self.goal.to_json();
-        v["prompt"] = match self.goal.next_prompt() {
-            Some(prompt) => json!(prompt),
-            None => Value::Null,
-        };
-        v
-    }
-
-    /// Start a goal, replacing whatever finished goal is stored. A running goal is
-    /// refused rather than replaced: one objective at a time is the whole contract, and
-    /// silently dropping one half-done objective for another is worse than a 409.
-    fn goal_start(&mut self, req: &Request) -> Response {
-        let body = match req.json() {
-            Ok(v) => v,
-            Err(e) => return Response::json_status(400, &json!({ "error": format!("invalid JSON: {e}") })),
-        };
-        if self.goal.status.is_active() {
-            return Response::json_status(
-                409,
-                &json!({ "error": "a goal is already running; stop or delete it first", "goal": self.goal_json() }),
-            );
-        }
-        let objective = body.get("objective").and_then(|v| v.as_str()).unwrap_or("");
-        let requested = body
-            .get("max_iterations")
-            .and_then(|v| v.as_u64())
-            .map(|n| n.min(u64::from(u32::MAX)) as u32)
-            .unwrap_or(DEFAULT_MAX_ITERATIONS);
-        let objective = clip(objective.trim(), GOAL_OBJECTIVE_MAX);
-        let Some(goal) = Goal::new(&objective, requested, now_ms()) else {
-            return Response::json_status(400, &json!({ "error": "`objective` is required" }));
-        };
-        self.log.info(
-            "goal",
-            format!("started `{}` ({} iterations)", clip(&goal.objective, 80), goal.max_iterations),
-        );
-        self.goal = goal;
-        self.persist_goal();
-        Response::json(&self.goal_json())
-    }
-
-    /// Stop the loop. `stop` is a decision, not a pause: there is no resume, only a new
-    /// goal. A goal that already finished is left as it finished - rewriting `met` into
-    /// `stopped` would lose the outcome the notes explain.
-    fn goal_stop(&mut self, req: &Request) -> Response {
-        let reason = match req.json() {
-            Ok(v) => v.get("reason").and_then(|r| r.as_str()).unwrap_or("").to_string(),
-            // No body at all is a stop without a reason, not a bad request.
-            Err(_) if req.body.is_empty() => String::new(),
-            Err(e) => return Response::json_status(400, &json!({ "error": format!("invalid JSON: {e}") })),
-        };
-        if self.goal.objective.is_empty() {
-            return Response::json_status(409, &json!({ "error": "there is no goal to stop" }));
-        }
-        if self.goal.status.is_active() {
-            self.goal.stop(&reason, now_ms());
-            self.persist_goal();
-            self.log.info("goal", format!("stopped: {}", clip(&self.goal.stop_reason, 80)));
-        }
-        Response::json(&self.goal_json())
-    }
-
-    /// Forget the goal entirely, notes included, and go back to idle.
-    fn goal_reset(&mut self) -> Response {
-        let had = self.goal.objective.clone();
-        self.goal = idle_goal();
-        self.persist_goal();
-        if !had.is_empty() {
-            self.log.info("goal", format!("cleared `{}`", clip(&had, 80)));
-        }
-        Response::json(&self.goal_json())
     }
 
     /// The model config as the portal may see it: everything except the key.
@@ -2006,6 +1788,35 @@ impl App {
         if !self.store.set(NVS_KEY_WORKSPACE, &text) {
             self.log.warn("agent", "could not save the file workspace");
         }
+    }
+
+    /// Put the skills the firmware carries into the workspace, where they are missing.
+    ///
+    /// Called once at boot, after the stored workspace is loaded, and again after a
+    /// factory reset — the reset is exactly the moment the owner's `skills.seed_defaults`
+    /// decision and any deleted file go back to what the firmware ships. Returns how many
+    /// it wrote, which is 0 on every boot after the first and 0 always when the flag is
+    /// off.
+    pub fn seed_default_skills(&mut self) -> usize {
+        if !self.cfg.skills.seed_defaults {
+            return 0;
+        }
+        let wrote = crate::seed::seed(&mut self.workspace, self.profile.id);
+        if wrote > 0 {
+            self.log.info(
+                "boot",
+                format!(
+                    "seeded {wrote} of {} built-in skill(s) into {}",
+                    crate::seed::DEFAULT_SKILLS.len(),
+                    crate::tools::knowledge::SKILLS_DIR
+                ),
+            );
+            // The workspace is one persisted blob; a skill that exists only in RAM would be
+            // installed again next boot, and would be missing from what the portal and an
+            // MCP client read today.
+            self.persist_workspace();
+        }
+        wrote
     }
 
     /// Queue one user message. Returns 202 with the queue position; the run
@@ -2382,13 +2193,13 @@ impl App {
             return Ok(String::new());
         }
         let cfg = self.llm.clone();
-        self.turn_source = self.pending_source();
+        // The source of the queued message, which the journal and the transcript record.
+        let source = self.agent.pending.as_ref().map(|p| p.source.clone()).unwrap_or_default();
         // This runner takes the whole turn in one call (`run_pending`), so its transcript
         // write comes at the end and the marker can only say "a turn was running". A power
         // cut here resumes the last question that reached flash, which is the previous one;
         // the driver path (`agent_begin`) writes the question before the first model call,
         // and that is the path the firmware and the simulator use.
-        let source = self.turn_source.clone();
         self.mark_run_in_flight(&source);
         // The agent lives in `self` and needs `self` as its tool host, so it is
         // moved out for the duration of the run and put back afterwards.
@@ -2405,12 +2216,11 @@ impl App {
         };
         self.model_transport = transport;
         self.agent = agent;
-        // Only a turn that actually ran is an iteration: a missing transport leaves the
-        // message queued for a later attempt, and counting it would spend the goal's
-        // budget twice on one prompt.
+        // Only a turn that actually ran ends here: a missing transport leaves the
+        // message queued for a later attempt and keeps the run-in-flight marker, so the
+        // next boot resumes it instead of forgetting it.
         if ran {
             self.clear_run_in_flight();
-            self.finish_turn(&out);
         }
         self.persist_transcript();
         match &out {
@@ -3008,27 +2818,6 @@ impl App {
                 }
                 self.sched_apply(req)
             }
-            // The autonomous loop. `GET` is open like the transcript and the
-            // schedule; everything that changes the goal needs the PIN.
-            ("GET", "/api/goal") => Response::json(&self.goal_json()),
-            ("POST", "/api/goal") => {
-                if let Err(r) = self.require_pin(req) {
-                    return r;
-                }
-                self.goal_start(req)
-            }
-            ("POST", "/api/goal/stop") => {
-                if let Err(r) = self.require_pin(req) {
-                    return r;
-                }
-                self.goal_stop(req)
-            }
-            ("DELETE", "/api/goal") => {
-                if let Err(r) = self.require_pin(req) {
-                    return r;
-                }
-                self.goal_reset()
-            }
             ("GET", "/api/wifi/scan") => match self.hw.wifi_scan() {
                 Ok(aps) => Response::json(&json!({ "networks": aps })),
                 Err(e) => Response::json_status(503, &json!({ "error": e.message })),
@@ -3101,6 +2890,10 @@ impl App {
                 self.runtime.config_dirty = true;
                 self.runtime.manifest_dirty = true;
                 self.runtime.restart_requested = true;
+                // A reset also restores the two things an owner's own decisions replaced:
+                // the built-in skills, wherever a file was deleted, and the flag that
+                // keeps them installed. An edited skill stays the owner's.
+                self.seed_default_skills();
                 self.log.warn("system", "factory reset from the portal");
                 Response::json(&json!({ "ok": true }))
             }
@@ -5008,23 +4801,6 @@ fn openai_tools(list: &Value) -> Vec<Value> {
         .collect()
 }
 
-/// The idle goal an `App` starts with and `DELETE /api/goal` restores. Written out
-/// because a goal with no objective has no other constructor: `Goal::new` refuses an
-/// empty objective, which is what keeps an empty objective out of the loop.
-fn idle_goal() -> Goal {
-    Goal {
-        objective: String::new(),
-        status: GoalStatus::Idle,
-        iteration: 0,
-        max_iterations: DEFAULT_MAX_ITERATIONS,
-        failures: 0,
-        notes: Vec::new(),
-        last_result: String::new(),
-        stop_reason: String::new(),
-        updated_ms: 0,
-    }
-}
-
 /// `s` cut to `n` characters, for log lines that must stay one line.
 fn clip(s: &str, n: usize) -> String {
     if s.chars().count() <= n {
@@ -5367,7 +5143,7 @@ pub fn now_ms() -> u64 {
 /// Whether `word` appears in `haystack` as a whole word.
 ///
 /// Substring matching is wrong here because the endpoint is fed back its own output: a
-/// goal note quoting `board_profile` contains `file`, which used to switch the scripted
+/// reply quoting `board_profile` contains `file`, which used to switch the scripted
 /// model onto its file script and burn the whole step budget on the wrong tool.
 fn has_word(haystack: &str, word: &str) -> bool {
     haystack.split(|c: char| !c.is_alphanumeric()).any(|token| token.eq_ignore_ascii_case(word))
@@ -5662,13 +5438,23 @@ pub fn make_handler(app: Shared) -> Handler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::goal::MAX_CONSECUTIVE_FAILURES;
     use crate::store::MemoryStore;
     use crate::virtual_board::VirtualBoard;
 
     fn test_app() -> App {
         let log = LogBuf::new(256);
         App::new(Box::new(VirtualBoard::new()), Box::new(MemoryStore::new()), log, FwMeta::default())
+    }
+
+    /// An app whose workspace is empty.
+    ///
+    /// `test_app` boots through `App::new`, which installs the three built-in skills (see
+    /// `crate::seed`). A test that counts files or bytes starts from nothing, so its
+    /// arithmetic is about the command it is testing; the seeded skills have their own.
+    fn empty_workspace_app() -> App {
+        let mut app = test_app();
+        app.workspace = AppWorkspace::default();
+        app
     }
 
     // ------------------------------------------------- a store that outlives the App
@@ -6868,7 +6654,7 @@ mod tests {
 
     #[test]
     fn du_totals_the_workspace() {
-        let mut app = test_app();
+        let mut app = empty_workspace_app();
         write_file(&mut app, "/a.txt", "12345");
         write_file(&mut app, "/b.txt", "123");
         let out = sh(&mut app, "du");
@@ -7103,7 +6889,7 @@ mod tests {
     /// One line, several stages: what the first prints is what the second reads.
     #[test]
     fn a_pipeline_feeds_one_stage_into_the_next() {
-        let mut app = test_app();
+        let mut app = empty_workspace_app();
         write_file(&mut app, "/a.txt", "alpha\n");
         write_file(&mut app, "/b.log", "beta\n");
 
@@ -7166,7 +6952,7 @@ mod tests {
     /// A stage that cannot read stdin stops the pipeline and names itself.
     #[test]
     fn a_command_that_cannot_be_a_stage_says_so() {
-        let mut app = test_app();
+        let mut app = empty_workspace_app();
         // Not a line command at all.
         let err = ToolHost::call_tool(&mut app, "shell", &json!({"command": "ls / | touch /x"})).unwrap_err();
         assert!(err.contains("`touch` cannot run in a pipeline"), "{err}");
@@ -7249,7 +7035,7 @@ mod tests {
     /// how many bytes it wanted.
     #[test]
     fn a_redirect_that_would_not_fit_says_how_much_it_needed() {
-        let mut app = test_app();
+        let mut app = empty_workspace_app();
         let big = "x".repeat(WORKSPACE_FILE_MAX + 10);
         let err =
             ToolHost::call_tool(&mut app, "shell", &json!({"command": format!("echo {big} > /big.txt")}))
@@ -7936,17 +7722,17 @@ mod tests {
 
     /// The scripted self-test model must not be steered by its own output.
     ///
-    /// Keyword matching used to be substring based, so a goal note quoting
-    /// `board_profile` contained `file`: the next iteration switched to the file
-    /// script, needed four rounds for a three-step budget, and every iteration after
-    /// the first failed with "step limit reached". Matching whole words fixes it.
+    /// Keyword matching used to be substring based, so a reply quoting
+    /// `board_profile` contained `file`: the next round switched to the file
+    /// script, needed four rounds for a three-step budget, and the rest of the turn
+    /// failed with "step limit reached". Matching whole words fixes it.
     #[test]
-    fn a_note_quoting_a_profile_does_not_pick_the_file_script() {
+    fn a_reply_quoting_a_profile_does_not_pick_the_file_script() {
         let body = json!({
             "model": "selftest",
             "messages": [{
                 "role": "user",
-                "content": "Goal: take three small steps\nNotes so far:\n1. board_profile esp32s3-xiaozhi-bread\n"
+                "content": "board_profile returned esp32s3-xiaozhi-bread; take three small steps"
             }],
             "tools": [{ "type": "function", "function": { "name": "board_status" } }],
         })
@@ -7955,7 +7741,7 @@ mod tests {
         assert_eq!(
             reply["choices"][0]["message"]["tool_calls"][0]["function"]["name"],
             json!("board_status"),
-            "a note about a profile must not be read as a request about files"
+            "a reply about a profile must not be read as a request about files"
         );
 
         // The word on its own still selects the file script.
@@ -8829,10 +8615,12 @@ mod tests {
         )
         .expect("supporting file written");
         let index = app.skills();
-        assert_eq!(index.len(), 1, "{index:?}");
-        assert_eq!(index[0].name, "pins");
-        assert_eq!(index[0].description, "GPIO map for the bench");
-        assert_eq!(index[0].path, "/skills/pins/SKILL.md");
+        let pins = index
+            .iter()
+            .find(|s| s.name == "pins")
+            .unwrap_or_else(|| panic!("the bench skill is not in the index: {index:?}"));
+        assert_eq!(pins.description, "GPIO map for the bench");
+        assert_eq!(pins.path, "/skills/pins/SKILL.md");
 
         let read = ToolHost::call_tool(&mut app, "fs_read", &json!({ "path": "/skills/pins/SKILL.md" }))
             .expect("fs_read");
@@ -8853,8 +8641,12 @@ mod tests {
         )
         .expect("skill written");
         let index = app.skills();
-        assert_eq!(index.len(), 1, "{index:?}");
-        assert_eq!(index[0].path, "/skills/quick.md");
+        let quick = index
+            .iter()
+            .find(|s| s.name == "quick")
+            .unwrap_or_else(|| panic!("the flat skill is not in the index: {index:?}"));
+        assert_eq!(quick.path, "/skills/quick.md");
+        assert_eq!(quick.description, "one-file skill");
     }
 
     /// Deleting the SKILL.md is how a skill leaves the prompt, which is why the workspace
@@ -8868,7 +8660,7 @@ mod tests {
             &json!({ "path": "/skills/pins/SKILL.md", "text": "---\ndescription: GPIO map\n---\n12 relay\n" }),
         )
         .unwrap();
-        assert_eq!(app.skills().len(), 1);
+        assert!(app.skills().iter().any(|s| s.name == "pins"));
 
         let gone = ToolHost::call_tool(
             &mut app,
@@ -8877,7 +8669,54 @@ mod tests {
         )
         .expect("fs_rm");
         assert!(gone.contains("removed"), "{gone}");
-        assert!(app.skills().is_empty(), "the index still lists a deleted skill: {:?}", app.skills());
+        assert!(
+            !app.skills().iter().any(|s| s.name == "pins"),
+            "the index still lists a deleted skill: {:?}",
+            app.skills()
+        );
+        // Only the named file went: the skills the firmware seeded are still indexed.
+        assert_eq!(app.skills().len(), crate::seed::DEFAULT_SKILLS.len(), "{:?}", app.skills());
+    }
+
+    /// The seed is an install, not a rewrite, and it runs on every boot: a deleted skill
+    /// comes back, an edited one does not — the path is what decides, nothing else.
+    #[test]
+    fn a_reboot_keeps_the_owners_edit_and_reinstalls_a_deleted_skill() {
+        let store = SharedStore::new();
+        {
+            let mut app = app_with(&store);
+            assert_eq!(app.skills().len(), crate::seed::DEFAULT_SKILLS.len());
+            ToolHost::call_tool(
+                &mut app,
+                "fs_edit",
+                &json!({
+                    "path": "/skills/pinout/SKILL.md",
+                    "find": "description: discover and record what is wired to this board, so the next session knows",
+                    "replace": "description: the bench, as I wired it"
+                }),
+            )
+            .expect("the owner edits a skill");
+            ToolHost::call_tool(
+                &mut app,
+                "fs_rm",
+                &json!({ "path": "/skills/recover-board/SKILL.md", "confirm": true }),
+            )
+            .expect("and deletes another");
+        }
+
+        // The power goes out, and comes back to a new App over the same flash.
+        let (mut app, log) = app_with_log(&store);
+        let index = app.skills();
+        assert_eq!(index.len(), crate::seed::DEFAULT_SKILLS.len(), "the deleted skill came back: {index:?}");
+        let pinout = index.iter().find(|s| s.name == "pinout").expect("pinout is indexed");
+        assert_eq!(pinout.description, "the bench, as I wired it", "the owner's edit was overwritten");
+        assert!(
+            log.tail(50, 0).iter().any(|l| l.message.contains("seeded 1 of 3")),
+            "the boot log says what was installed: {:?}",
+            log.tail(50, 0).iter().map(|l| &l.message).collect::<Vec<_>>()
+        );
+        // A second boot over a complete workspace writes nothing at all.
+        assert_eq!(app.seed_default_skills(), 0);
     }
 
     /// `generic` is the lean mode: per-device tools fold into `device_invoke`, so a board
@@ -8979,7 +8818,13 @@ mod tests {
 
         let rec = app.call_tool("mic_record", &json!({ "samples": 64 })).unwrap();
         assert_eq!(rec["samples"], json!(64), "{rec}");
-        assert!(rec["pcm_b64"].as_str().unwrap().len() <= 2048, "a tool result is capped at 2 KB");
+        // The board records WAV: the result says so, and the payload is header + samples.
+        assert_eq!(rec["format"], json!("wav"), "a recording states its format: {rec}");
+        assert_eq!(rec["wav_bytes"], json!(44 + 64 * 2), "44-byte header, 16-bit mono: {rec}");
+        let mut wave = Vec::new();
+        crate::util::b64_decode(rec["wav_b64"].as_str().unwrap(), &mut wave).expect("the payload is base64");
+        assert_eq!(&wave[0..4], b"RIFF", "the header travels with the samples");
+        assert!(rec["wav_b64"].as_str().unwrap().len() <= 2048, "a tool result is capped at 2 KB");
 
         let tone = app.call_tool("speaker_tone", &json!({ "freq_hz": 440, "ms": 50 })).unwrap();
         assert_eq!(tone["ok"], json!(true), "{tone}");
@@ -9521,161 +9366,6 @@ mod tests {
         assert!(app.devices.infos().iter().any(|d| d.id == "ssd1306" || d.id == "ssd1306_2"));
     }
 
-    // ---- the goal loop (docs/agent-goal.md) ----
-
-    /// A model with one fixed answer, and the bodies it was sent, so a test can read the
-    /// iteration prompt the loop actually built.
-    struct FixedModel {
-        text: String,
-        fail: bool,
-        seen: Seen,
-    }
-
-    impl ChatTransport for FixedModel {
-        fn post_json(
-            &mut self,
-            _url: &str,
-            _headers: &[(&str, &str)],
-            body: &str,
-        ) -> std::result::Result<String, String> {
-            self.seen.lock().unwrap().push((String::new(), Vec::new(), body.to_string()));
-            if self.fail {
-                return Err("the model endpoint is unreachable".to_string());
-            }
-            Ok(json!({"choices":[{"message":{"role":"assistant","content": self.text}}]}).to_string())
-        }
-    }
-
-    fn goal_app(text: &str, fail: bool) -> (App, Seen) {
-        let seen: Seen = Arc::new(Mutex::new(Vec::new()));
-        let mut app = test_app();
-        app.attach_model_transport(Box::new(FixedModel { text: text.to_string(), fail, seen: seen.clone() }));
-        app.route(&post(
-            "/api/agent/config",
-            r#"{"base_url":"http://127.0.0.1:9/v1/chat/completions","model":"stub","max_steps":3,"api_key":""}"#,
-        ));
-        (app, seen)
-    }
-
-    /// The loop end to end: a goal is posted, the tick queues an iteration, the reply
-    /// becomes a note, the next prompt carries that note, and the cap ends the goal.
-    #[test]
-    fn a_goal_iterates_from_its_own_notes_and_ends_at_the_cap() {
-        let (mut app, seen) = goal_app("scanned the bus: one device at 0x23", false);
-        let started = body_json(
-            &app.route(&post("/api/goal", r#"{"objective":"find the light sensor","max_iterations":2}"#)),
-        );
-        assert_eq!(started["status"], "running");
-        assert_eq!(started["iteration"], 0);
-        assert_eq!(started["max_iterations"], 2);
-        assert!(
-            started["prompt"].as_str().unwrap().contains("find the light sensor"),
-            "the next prompt is part of the answer: {started}"
-        );
-        // The POST only starts the goal; the scheduler tick is the loop's clock.
-        assert!(app.agent.pending.is_none(), "the route must not queue a turn itself");
-
-        assert_eq!(app.sched_tick(1_000, 0), vec![GOAL_SOURCE.to_string()]);
-        assert_eq!(app.agent.pending.as_ref().unwrap().source, "goal");
-        // A queued iteration is one turn: further ticks must not stack a second one.
-        assert!(app.sched_tick(2_000, 0).is_empty());
-
-        app.agent_run_once().expect("the first iteration should run");
-        assert_eq!(app.goal.iteration, 1);
-        assert_eq!(app.goal.status, GoalStatus::Running);
-        assert_eq!(app.goal.failures, 0);
-        assert_eq!(app.goal.notes, vec!["scanned the bus: one device at 0x23".to_string()]);
-        assert_eq!(app.goal.last_result, "scanned the bus: one device at 0x23");
-
-        // The second prompt is built from the note the first iteration wrote.
-        assert_eq!(app.sched_tick(3_000, 0), vec![GOAL_SOURCE.to_string()]);
-        let prompt = app.agent.pending.as_ref().unwrap().text.clone();
-        assert!(prompt.contains("1. scanned the bus"), "the note is missing: {prompt}");
-        assert!(prompt.contains("Iteration 2 of 2"), "the count is missing: {prompt}");
-
-        // No marker in the reply, so the cap ends it: exhausted, not failed.
-        app.agent_run_once().expect("the second iteration should run");
-        assert_eq!(app.goal.iteration, 2);
-        assert_eq!(app.goal.status, GoalStatus::Exhausted);
-        assert!(app.goal.stop_reason.contains('2'), "got `{}`", app.goal.stop_reason);
-        assert!(app.sched_tick(4_000, 0).is_empty(), "a finished goal must queue nothing");
-        assert!(app.agent.pending.is_none());
-
-        // One model call per iteration, as ordinary agent runs.
-        assert_eq!(seen.lock().unwrap().len(), 2, "one model call per iteration");
-
-        // And the state is in NVS, notes included, because that is the loop's memory.
-        let blob = app.store.get(NVS_KEY_GOAL).expect("the goal was never saved");
-        let stored: Value = serde_json::from_str(&blob).unwrap();
-        assert_eq!(stored["status"], "exhausted");
-        assert_eq!(stored["notes"].as_array().unwrap().len(), 2, "got {stored}");
-    }
-
-    /// A marker in somebody else's reply is not a goal statement: only a turn whose
-    /// source is exactly `goal` is classified, so a chat that mentions the marker - and
-    /// a message that merged into a queued goal turn - leaves the goal alone.
-    #[test]
-    fn a_reply_from_another_source_never_ends_the_goal() {
-        let (mut app, _seen) = goal_app("GOAL MET", false);
-        app.route(&post("/api/goal", r#"{"objective":"arm the door rule","max_iterations":5}"#));
-
-        // A plain chat turn that says the marker ends nothing.
-        app.route(&post("/api/agent/message", r#"{"text":"say GOAL MET"}"#));
-        app.agent_run_once().expect("the chat turn should run");
-        assert_eq!(app.goal.iteration, 0);
-        assert_eq!(app.goal.status, GoalStatus::Running);
-
-        // A user message landing on a queued goal turn merges the sources, and the merged
-        // turn counts as the user's: no iteration is spent on it.
-        assert_eq!(app.sched_tick(5_000, 0), vec![GOAL_SOURCE.to_string()]);
-        app.agent.push_user("and how warm is it?", "http", 5_100);
-        let source = app.agent.pending.as_ref().unwrap().source.clone();
-        assert!(source.contains("http") && source.contains("goal"), "got `{source}`");
-        app.agent_run_once().expect("the merged turn should run");
-        assert_eq!(app.goal.iteration, 0, "a merged turn is not an iteration");
-        assert!(app.goal.notes.is_empty());
-
-        // The loop is still healthy: the next tick queues a clean iteration and its reply
-        // is classified, which is how a goal ends when the model says it is done.
-        assert_eq!(app.sched_tick(6_000, 0), vec![GOAL_SOURCE.to_string()]);
-        app.agent_run_once().expect("the goal turn should run");
-        assert_eq!(app.goal.status, GoalStatus::Met);
-        assert_eq!(app.goal.iteration, 1);
-        assert!(app.sched_tick(7_000, 0).is_empty(), "a met goal queues nothing");
-    }
-
-    /// The path the board actually runs: `drive_agent` splits the turn around the model
-    /// call, so the iteration is observed in `agent_reply`. `agent_run_once` is the test
-    /// and simulator helper; a goal that only worked through it would not iterate on a
-    /// real board.
-    #[test]
-    fn a_goal_iteration_is_observed_on_the_split_turn_path_too() {
-        let app = Arc::new(Mutex::new(test_app()));
-        {
-            let mut guard = app.lock().unwrap();
-            guard.route(&post(
-                "/api/agent/config",
-                r#"{"base_url":"http://127.0.0.1:9/v1/chat/completions","model":"stub","max_steps":3,"api_key":""}"#,
-            ));
-            guard.route(&post("/api/goal", r#"{"objective":"check the bus","max_iterations":3}"#));
-            assert_eq!(guard.sched_tick(1, 0), vec![GOAL_SOURCE.to_string()]);
-        }
-        let mut model = FixedModel {
-            text: "scanned the bus: a BME280 at 0x76".to_string(),
-            fail: false,
-            seen: Arc::new(Mutex::new(Vec::new())),
-        };
-        let outcome = drive_agent(&app, &mut model).expect("a turn was queued");
-        assert!(outcome.is_ok(), "got {outcome:?}");
-
-        let guard = app.lock().unwrap();
-        assert_eq!(guard.goal.iteration, 1, "the split path must observe the reply too");
-        assert_eq!(guard.goal.notes, vec!["scanned the bus: a BME280 at 0x76".to_string()]);
-        assert_eq!(guard.goal.status, GoalStatus::Running);
-    }
-
-    /// A model endpoint that is down must not burn the whole budget: three failed
-    /// iterations in a row end the goal as blocked, and a failure still costs budget.
     #[test]
     fn forgetting_through_http_keeps_the_tail_and_reports_it() {
         let mut app = test_app();
@@ -9713,169 +9403,5 @@ mod tests {
         assert!(system.contains("/memory/pins.md"), "{system}");
         assert!(system.contains("Earlier in this conversation"), "{system}");
         assert_eq!(body["archive_lines"], 1);
-    }
-
-    #[test]
-    fn three_failed_iterations_in_a_row_block_the_goal() {
-        let (mut app, _seen) = goal_app("", true);
-        app.route(&post("/api/goal", r#"{"objective":"read the display","max_iterations":10}"#));
-        for tick in 0..MAX_CONSECUTIVE_FAILURES {
-            let fired = app.sched_tick(1_000 * (u64::from(tick) + 1), 0);
-            assert_eq!(fired, vec![GOAL_SOURCE.to_string()], "iteration {tick} was not queued");
-            assert!(app.agent_run_once().is_err(), "the model call should fail");
-        }
-        assert_eq!(app.goal.failures, MAX_CONSECUTIVE_FAILURES);
-        assert_eq!(app.goal.iteration, MAX_CONSECUTIVE_FAILURES);
-        assert_eq!(app.goal.status, GoalStatus::Blocked);
-        assert!(
-            app.goal.stop_reason.contains(&MAX_CONSECUTIVE_FAILURES.to_string()),
-            "the reason must name the count: `{}`",
-            app.goal.stop_reason
-        );
-        assert!(app.goal.notes.iter().all(|n| n.starts_with("failed:")), "got {:?}", app.goal.notes);
-        assert!(app.sched_tick(9_000, 0).is_empty(), "a blocked goal queues nothing");
-    }
-
-    /// A stop while a turn is in flight wins: the reply is dropped rather than allowed to
-    /// set `Running` again, because a stopped goal never resumes.
-    #[test]
-    fn a_late_reply_does_not_revive_a_stopped_goal() {
-        let mut app = test_app();
-        app.route(&post("/api/goal", r#"{"objective":"watch the door","max_iterations":5}"#));
-        app.route(&post("/api/goal/stop", r#"{"reason":"enough for today"}"#));
-        assert_eq!(app.goal.status, GoalStatus::Stopped);
-
-        // The turn that was already running when the stop arrived answers now.
-        app.turn_source = GOAL_SOURCE.to_string();
-        app.finish_turn(&Ok("one more step".to_string()));
-        assert_eq!(app.goal.status, GoalStatus::Stopped, "a stopped goal must not resume");
-        assert_eq!(app.goal.iteration, 0, "a dropped reply is not an iteration");
-        assert!(app.goal.notes.is_empty());
-        assert!(app.sched_tick(1_000, 0).is_empty());
-    }
-
-    /// The stored goal is read back at boot: an objective and its notes survive a reboot,
-    /// which is the only reason the loop stores them.
-    #[test]
-    fn a_goal_and_its_notes_survive_a_reboot() {
-        let mut app = test_app();
-        app.route(&post(
-            "/api/goal",
-            r#"{"objective":"keep the greenhouse between 18 and 24 degrees","max_iterations":4}"#,
-        ));
-        app.goal.observe("read 17.9 C, opened the vent", 42);
-        app.goal.observe("read 19.4 C, vent is open", 43);
-        app.persist_goal();
-        let blob = app.store.get(NVS_KEY_GOAL).expect("the goal was never saved");
-        assert!(blob.contains("opened the vent"), "the notes must be in the blob: {blob}");
-
-        // A board that reboots keeps the store: the new App must restore it.
-        let mut rebooted = test_app();
-        rebooted.store.set(NVS_KEY_GOAL, &blob);
-        rebooted.load_agent_state();
-        assert_eq!(rebooted.goal.objective, "keep the greenhouse between 18 and 24 degrees");
-        assert_eq!(rebooted.goal.status, GoalStatus::Running);
-        assert_eq!(rebooted.goal.iteration, 2);
-        assert_eq!(rebooted.goal.notes.len(), 2);
-        assert_eq!(rebooted.goal.notes[1], "read 19.4 C, vent is open");
-        assert_eq!(rebooted.goal.max_iterations, 4);
-        // Restored means runnable: the tick queues from what was read back.
-        assert_eq!(rebooted.sched_tick(50, 0), vec![GOAL_SOURCE.to_string()]);
-
-        // A blob that cannot be a goal leaves the board idle instead of refusing to boot.
-        rebooted.store.set(NVS_KEY_GOAL, "{\"objective\":\"\",\"status\":\"running\"}");
-        rebooted.load_agent_state();
-        assert_eq!(rebooted.goal.status, GoalStatus::Idle);
-        assert!(rebooted.goal.objective.is_empty());
-    }
-
-    /// The board can only read a bounded NVS value back, so the stored goal has to fit
-    /// in one. What gives is the oldest notes - in RAM too, so a reboot restores exactly
-    /// what the loop was using instead of a shorter copy nobody has seen.
-    #[test]
-    fn the_stored_goal_fits_one_nvs_value() {
-        let mut app = test_app();
-        app.route(&post("/api/goal", r#"{"objective":"keep the bench cool","max_iterations":40}"#));
-        // A full ring of maximum-length notes: the worst case the goal can produce.
-        let padding = "x".repeat(300);
-        for i in 0..24 {
-            app.goal.observe(&format!("note-{i:02} {padding}"), i);
-        }
-        app.persist_goal();
-
-        let blob = app.store.get(NVS_KEY_GOAL).expect("the goal was never saved");
-        assert!(blob.len() <= GOAL_BLOB_MAX, "{} bytes would not read back", blob.len());
-        // The newest notes are the ones kept: they are what the next step needs.
-        assert!(blob.contains("note-23"), "the newest note must survive");
-        assert!(!blob.contains("note-00"), "the oldest note must give way");
-        assert!(app.goal.notes.len() < 24, "the ring had to shrink to fit: {}", app.goal.notes.len());
-
-        // RAM and NVS agree, so the loop after a reboot continues where this one was.
-        let mut rebooted = test_app();
-        rebooted.store.set(NVS_KEY_GOAL, &blob);
-        rebooted.load_agent_state();
-        assert_eq!(rebooted.goal.notes, app.goal.notes);
-        assert_eq!(rebooted.goal.iteration, app.goal.iteration);
-    }
-
-    /// The routes: the shape, the PIN gate, the 409 on a second goal, the stop and the
-    /// delete, and the block `/api/status` grows so a console can watch a goal cheaply.
-    #[test]
-    fn the_goal_routes_keep_one_goal_at_a_time() {
-        let mut app = test_app();
-        app.cfg.auth.portal_pin = "1234".into();
-        assert_eq!(app.route(&post("/api/goal", r#"{"objective":"x"}"#)).status, 401);
-        assert_eq!(app.route(&post("/api/goal/stop", "{}")).status, 401);
-        let mut denied = post("/api/goal", "");
-        denied.method = "DELETE".into();
-        assert_eq!(app.route(&denied).status, 401);
-        // Reading the goal is open, like the transcript and the schedule.
-        assert_eq!(app.route(&get("/api/goal")).status, 200);
-        app.cfg.auth.portal_pin.clear();
-
-        assert_eq!(app.route(&post("/api/goal", r#"{"objective":"   "}"#)).status, 400);
-        assert_eq!(app.route(&post("/api/goal", r#"{"objective":"x"}"#)).status, 200);
-        let busy = app.route(&post("/api/goal", r#"{"objective":"another"}"#));
-        assert_eq!(busy.status, 409, "one goal at a time");
-        assert_eq!(body_json(&busy)["goal"]["status"], "running");
-
-        let goal = body_json(&app.route(&get("/api/goal")));
-        for key in [
-            "objective",
-            "status",
-            "iteration",
-            "max_iterations",
-            "failures",
-            "notes",
-            "last_result",
-            "stop_reason",
-            "updated_ms",
-            "prompt",
-        ] {
-            assert!(goal.get(key).is_some(), "`{key}` is missing from {goal}");
-        }
-
-        let status = body_json(&app.route(&get("/api/status")));
-        assert_eq!(status["goal"]["status"], "running");
-        assert_eq!(status["goal"]["iteration"], 0);
-        assert_eq!(status["goal"]["max_iterations"], DEFAULT_MAX_ITERATIONS);
-
-        let stopped = body_json(&app.route(&post("/api/goal/stop", r#"{"reason":"enough"}"#)));
-        assert_eq!(stopped["status"], "stopped");
-        assert_eq!(stopped["stop_reason"], "enough");
-        // Stopping again is a no-op, not an error, and the reason is not rewritten.
-        let again = body_json(&app.route(&post("/api/goal/stop", "")));
-        assert_eq!(again["status"], "stopped");
-        assert_eq!(again["stop_reason"], "enough");
-
-        let mut wipe = post("/api/goal", "");
-        wipe.method = "DELETE".into();
-        let cleared = body_json(&app.route(&wipe));
-        assert_eq!(cleared["status"], "idle");
-        assert_eq!(cleared["objective"], "");
-        assert!(cleared["notes"].as_array().unwrap().is_empty());
-        assert!(cleared["prompt"].is_null());
-        assert!(app.store.get(NVS_KEY_GOAL).is_none(), "a cleared goal must not stay in NVS");
-        assert_eq!(app.route(&post("/api/goal/stop", "{}")).status, 409, "nothing left to stop");
     }
 }
