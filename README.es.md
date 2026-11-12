@@ -93,7 +93,7 @@ El agente de la placa también puede añadirse hardware (`manifest_apply`), memo
 - **Pon un PIN antes de que la placa salga de tu mesa.** `auth.portal_pin` protege todas las
   escrituras y las lecturas que exponen el transcript, el prompt, la configuración y los registros.
 - **Compara el certificado.** El de la placa es autofirmado; su huella está en `GET /api/tls`.
-  El puerto 80 sigue abierto a propósito: un certificado malo cuesta una URL, no la placa.
+  El puerto 80 sigue abierto por defecto: un certificado malo cuesta una URL, no la placa; `mcp.plain_http: false` lo cierra, y entonces el cable USB es la única vuelta atrás.
 - **`shell`, `script` y las herramientas del manifiesto mueven pines.** Ese es el objetivo de la
   placa; el PIN separa al agente haciendo su trabajo de un transeúnte haciéndolo.
 

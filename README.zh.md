@@ -84,7 +84,7 @@ curl -sS -X POST http://<board>/mcp -H 'Content-Type: application/json' \
 - **凭据只留在板上。** WiFi 通过 `provision` 写进 NVS，不烧进镜像；`api_key` 只写，读回来是 `__set__`。
 - **板子离开你的桌子之前先设 PIN。** `auth.portal_pin` 守住所有写操作，以及会暴露会话记录、提示词、
   配置与日志的读操作。
-- **核对证书。** 板子的 TLS 证书是自签的，指纹在 `GET /api/tls`。80 端口故意保持开着，证书坏了只损失一个 URL，不是整块板。
+- **核对证书。** 板子的 TLS 证书是自签的，指纹在 `GET /api/tls`。80 端口默认保持开着，证书坏了只损失一个 URL，不是整块板；把 `mcp.plain_http` 设为 false 就关掉它，那时唯一的退路是 USB 线。
 - **`shell`、`script` 与清单工具会动引脚。** 这正是这块板的意义；PIN 是“agent 在干活”和“路人顺手”之间的界线。
 
 [Security](docs/security.md) 写了哪些东西是故意不设防的。

@@ -90,7 +90,8 @@ The board's own agent can also give itself hardware (`manifest_apply`), a memory
 - **Set a PIN before the board leaves your desk.** `auth.portal_pin` guards every write and the
   reads that expose the transcript, the prompt, the config and the logs.
 - **Compare the certificate.** The board's TLS certificate is self-signed; its fingerprint is at
-  `GET /api/tls`. Port 80 stays open on purpose, so a bad certificate costs a URL, not the board.
+  `GET /api/tls`. Port 80 stays open by default so a bad certificate costs a URL and not the
+  board; `mcp.plain_http: false` closes it, and the USB cable is then the way back in.
 - **`shell`, `script` and manifest tools move pins.** That is the point of the board; the PIN is
   what separates the agent doing its job from a passer-by doing it.
 
