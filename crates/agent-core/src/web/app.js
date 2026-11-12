@@ -14,6 +14,7 @@ const $$ = (sel, root = document) => Array.from(root.querySelectorAll(sel));
 
 const S = {
   token: localStorage.getItem("esp32-agent.token") || "",
+  attach: null, // {name, mime, data_b64, kb} — one per message, downscaled here
   lastSeq: 0,
   stream: null,
   busy: false,
@@ -324,15 +325,71 @@ async function loadHistory() {
   }
 }
 
+/** Downscale an image in the browser, before it crosses the LAN.
+ *
+ * The board keeps an attachment in RAM and a request has to fit what its TLS stack can
+ * send, so a 4 MB phone photo is not a thing to upload: 1024 px on the long side as JPEG
+ * is ~20 kB and still legible. If it is still too big after that, say so instead of
+ * handing the board a request it will refuse. */
+function downscale(file) {
+  return new Promise((resolve, reject) => {
+    const url = URL.createObjectURL(file);
+    const img = new Image();
+    img.onload = () => {
+      URL.revokeObjectURL(url);
+      const max = 1024;
+      const scale = Math.min(1, max / Math.max(img.width, img.height));
+      const w = Math.max(1, Math.round(img.width * scale));
+      const h = Math.max(1, Math.round(img.height * scale));
+      const canvas = document.createElement("canvas");
+      canvas.width = w;
+      canvas.height = h;
+      canvas.getContext("2d").drawImage(img, 0, 0, w, h);
+      let dataUrl = canvas.toDataURL("image/jpeg", 0.72);
+      // Step the quality down once if the first pass is over the cap.
+      if (dataUrl.length * 0.75 > 24000) dataUrl = canvas.toDataURL("image/jpeg", 0.5);
+      const data_b64 = dataUrl.split(",", 2)[1] || "";
+      resolve({ name: file.name || "image.jpg", mime: "image/jpeg", data_b64, kb: Math.round((data_b64.length * 0.75) / 1024) });
+    };
+    img.onerror = () => {
+      URL.revokeObjectURL(url);
+      reject(new Error("could not read that image"));
+    };
+    img.src = url;
+  });
+}
+
+function showAttach() {
+  const chip = $("#attach-chip");
+  if (!S.attach) {
+    chip.hidden = true;
+    chip.innerHTML = "";
+    return;
+  }
+  chip.hidden = false;
+  chip.innerHTML =
+    '<span class="attach-name">' + escapeHtml(S.attach.name) + " \u00b7 " + S.attach.kb + " kB</span>" +
+    '<button type="button" class="attach-x" aria-label="Remove attachment">\u00d7</button>';
+  chip.querySelector(".attach-x").onclick = () => {
+    S.attach = null;
+    showAttach();
+  };
+}
+
 async function send(text) {
   const trimmed = text.trim();
   if (!trimmed) return;
   const { bubble } = addRow("user");
-  bubble.innerHTML = markdown(trimmed);
+  bubble.innerHTML = markdown(trimmed + (S.attach ? "\n\n_[image: " + S.attach.name + "]_" : ""));
   $("#input").value = "";
   autosize();
+  const attachment = S.attach;
+  S.attach = null;
+  showAttach();
   try {
-    await api("/api/agent/message", { method: "POST", body: { text: trimmed } });
+    const payload = { text: trimmed };
+    if (attachment) payload.attachments = [attachment];
+    await api("/api/agent/message", { method: "POST", body: payload });
     S.busy = true;
     $("#link").className = "dot busy";
     liveTrace = null;
@@ -744,6 +801,25 @@ function init() {
   $("#composer").onsubmit = (e) => {
     e.preventDefault();
     send($("#input").value);
+  };
+
+  // One image per message. It is downscaled in the browser, because what crosses the LAN
+  // has to fit the request the board can send and the heap it can spare.
+  $("#attach").onclick = () => $("#attach-input").click();
+  $("#attach-input").onchange = async (ev) => {
+    const file = ev.target.files && ev.target.files[0];
+    ev.target.value = "";
+    if (!file) return;
+    if (!file.type.startsWith("image/")) {
+      toast("only images can be attached");
+      return;
+    }
+    try {
+      S.attach = await downscale(file);
+      showAttach();
+    } catch (e) {
+      toast(e.message);
+    }
   };
   $("#input").addEventListener("input", autosize);
   $("#input").addEventListener("keydown", (e) => {

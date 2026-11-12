@@ -105,6 +105,23 @@ pub struct FwMeta {
     pub build: String,
 }
 
+/// A file the user attached to a message.
+///
+/// Kept in RAM, not on the workspace or in NVS: the workspace is 8 kB in total and NVS is
+/// not a place for images. An attachment therefore lives as long as the board runs, and
+/// the model is *told* about it — see `agent_message`.
+#[derive(Clone, Debug, Default)]
+pub struct Attachment {
+    pub name: String,
+    pub mime: String,
+    pub bytes: Vec<u8>,
+}
+
+/// Two images of ~24 kB each is what a phone screenshot downscaled in the browser comes
+/// to; anything larger does not fit the request the board can send over TLS.
+pub const MAX_ATTACHMENT_BYTES: usize = 24 * 1024;
+pub const MAX_ATTACHMENTS: usize = 2;
+
 /// HTTPS on this board: the port it listens on and the SHA-256 fingerprint of the
 /// certificate it made for itself. Empty `fingerprint` means no https.
 #[derive(Debug, Clone, Default)]
@@ -160,6 +177,9 @@ pub struct App {
     pub firmware: FwMeta,
     /// Set by the platform layer once the HTTP server is up.
     pub lan_url: String,
+    /// Files attached to the most recent message. Replaced, never accumulated: an
+    /// attachment belongs to one turn, and the heap is the scarcest thing here.
+    pub attachments: Vec<Attachment>,
     /// The board's own certificate, when it serves https on a second port. The
     /// fingerprint is what a person compares against the browser's warning page —
     /// it is the only proof that this board, and not something on the path, answered.
@@ -253,6 +273,7 @@ impl App {
             profile_exact: true,
             firmware,
             lan_url: String::new(),
+            attachments: Vec::new(),
             tls: TlsInfo::default(),
             agent: Agent::new(),
             llm: LlmConfig::default(),
@@ -1448,7 +1469,59 @@ impl App {
             Ok(v) => v,
             Err(e) => return Response::error_json(400, &format!("invalid JSON: {e}")),
         };
-        let text = body.get("text").and_then(|t| t.as_str()).unwrap_or("").to_string();
+        let mut text = body.get("text").and_then(|t| t.as_str()).unwrap_or("").to_string();
+
+        // Attachments: a name, a mime type and base64 bytes. The board cannot show an
+        // image and the model here is text-only, so what the model gets is a line naming
+        // the file; the bytes are served back at `/api/attachment/<name>` for whoever can
+        // use them. Refusing quietly would be worse than this: the user would attach a
+        // screenshot and never learn it went nowhere.
+        let mut notes: Vec<String> = Vec::new();
+        if let Some(list) = body.get("attachments").and_then(|v| v.as_array()) {
+            if list.len() > MAX_ATTACHMENTS {
+                return Response::json_status(
+                    413,
+                    &json!({ "error": format!("{} attachments; the limit is {MAX_ATTACHMENTS}", list.len()) }),
+                );
+            }
+            self.attachments.clear();
+            for item in list {
+                let name = item.get("name").and_then(|v| v.as_str()).unwrap_or("attachment").to_string();
+                let mime = item
+                    .get("mime")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("application/octet-stream")
+                    .to_string();
+                let mut bytes = Vec::new();
+                let encoded = item.get("data_b64").and_then(|v| v.as_str()).unwrap_or("");
+                if let Err(e) = crate::util::b64_decode(encoded, &mut bytes) {
+                    return Response::json_status(
+                        400,
+                        &json!({ "error": format!("`{name}`: base64: {}", e.message) }),
+                    );
+                }
+                if bytes.len() > MAX_ATTACHMENT_BYTES {
+                    return Response::json_status(
+                        413,
+                        &json!({
+                            "error": format!(
+                                "`{name}` is {} bytes; an attachment is limited to {MAX_ATTACHMENT_BYTES}",
+                                bytes.len()
+                            )
+                        }),
+                    );
+                }
+                notes.push(format!(
+                    "[attached: {name}, {mime}, {} kB — fetch with GET /api/attachment/{name}]",
+                    bytes.len().div_ceil(1024)
+                ));
+                self.attachments.push(Attachment { name, mime, bytes });
+            }
+            if !notes.is_empty() {
+                text.push_str("\n\n");
+                text.push_str(&notes.join("\n"));
+            }
+        }
         if text.trim().is_empty() {
             return Response::json_status(400, &json!({ "error": "`text` is required" }));
         }
@@ -2054,6 +2127,21 @@ impl App {
                     "Content-Type, Authorization, Mcp-Session-Id, MCP-Protocol-Version, X-Portal-Pin",
                 )
                 .with_header("Access-Control-Max-Age", "600");
+        }
+
+        // What was attached to the last message, for whoever can use it: an external
+        // agent, a vision model later, or a person downloading their own screenshot back.
+        if let Some(name) = path.strip_prefix("/api/attachment/") {
+            if let Err(r) = self.require_read(req) {
+                return r;
+            }
+            let name = crate::http::url_decode(name);
+            return match self.attachments.iter().find(|a| a.name == name) {
+                Some(a) => {
+                    Response::new(200, &a.mime, a.bytes.clone()).with_header("Cache-Control", "no-store")
+                }
+                None => Response::error_json(404, "no attachment by that name"),
+            };
         }
 
         if path == mcp_path {
@@ -3783,6 +3871,49 @@ mod tests {
 
         assert_eq!(app.route(&post("/api/agent/message", r#"{"text":"   "}"#)).status, 400);
         assert_eq!(app.route(&post("/api/agent/message", r#"{}"#)).status, 400);
+    }
+
+    /// An attachment is carried, named to the model, and served back — nothing more and
+    /// nothing less. The board has no way to show an image and this model cannot see one,
+    /// so pretending otherwise would be the bug.
+    #[test]
+    fn an_attachment_reaches_the_model_as_a_named_file() {
+        let mut app = test_app();
+        let body = json!({
+            "text": "what is in this photo?",
+            "attachments": [{
+                "name": "shot.jpg",
+                "mime": "image/jpeg",
+                "data_b64": "aGVsbG8=",
+            }],
+        });
+        let resp = app.route(&post("/api/agent/message", &body.to_string()));
+        assert_eq!(resp.status, 202, "{}", String::from_utf8_lossy(&resp.body));
+        assert_eq!(app.attachments.len(), 1);
+        assert_eq!(app.attachments[0].bytes, b"hello");
+
+        // The model is told what arrived, because it cannot look at it.
+        let text = app.agent.pending.as_ref().expect("a queued turn").text.clone();
+        assert!(text.contains("attached: shot.jpg"), "{text}");
+        assert!(text.contains("image/jpeg"), "{text}");
+
+        // And it can be fetched back by whoever can use the bytes.
+        let got = app.route(&get("/api/attachment/shot.jpg"));
+        assert_eq!(got.status, 200);
+        assert_eq!(got.body, b"hello");
+        assert!(
+            got.headers.iter().any(|(k, v)| k.eq_ignore_ascii_case("content-type") && v == "image/jpeg"),
+            "{:?}",
+            got.headers
+        );
+
+        // Too large is refused rather than truncated.
+        let big = "A".repeat((MAX_ATTACHMENT_BYTES / 3 + 8) * 4);
+        let resp = app.route(&post(
+            "/api/agent/message",
+            &json!({"text":"x","attachments":[{"name":"big.bin","mime":"x/y","data_b64":big}]}).to_string(),
+        ));
+        assert_eq!(resp.status, 413);
     }
 
     // ---- the live journal stream (docs/agent-stream.md §1) ----
