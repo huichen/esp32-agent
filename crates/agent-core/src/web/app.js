@@ -407,12 +407,15 @@ function renderTrace(thinking, steps) {
     const sum = document.createElement("summary");
     sum.textContent = call.name + "(" + previewArgs(call.arguments) + ")";
     d.appendChild(sum);
+    // The same `pretty()` the live chip uses: a restored transcript must read like the one
+    // that produced it, and a tool result is a JSON document with newlines escaped inside a
+    // string, which printed raw is one unreadable line.
     const args = document.createElement("pre");
-    args.textContent = "arguments: " + (typeof call.arguments === "string" ? call.arguments : JSON.stringify(call.arguments || {}));
+    args.textContent = "arguments: " + pretty(typeof call.arguments === "string" ? call.arguments : JSON.stringify(call.arguments || {}));
     d.appendChild(args);
     if (step.result) {
       const res = document.createElement("pre");
-      res.textContent = "result: " + (step.result.text || "");
+      res.textContent = "result: " + pretty(step.result.text || "");
       d.appendChild(res);
       if (step.result.is_error) d.classList.add("err");
       else d.classList.add("ok");

@@ -109,6 +109,16 @@ window.__esp32Measure = function () {
   out.prettyJson = pretty('{"a":1,"b":2}');
   out.prettyBlock = pretty('{"text":"line one\\nline two","bytes":3}');
   out.prettyPlain = pretty("not json at all");
+  // A restored transcript must read like the live one: `renderTrace` lays out what came back
+  // through the same `pretty()`, so a JSON result whose payload holds newlines is a block,
+  // not one line with literal `\n` in it.
+  q("#chat").innerHTML = "";
+  renderTrace("", [{ kind: "call",
+                    call: { id: "c1", name: "shell",
+                            arguments: '{"command":"ps"}' },
+                    result: { text: '{"ok":true,"stdout":"line one\\nline two"}', is_error: false } }]);
+  out.tracePres = Array.prototype.map.call(q("#chat").querySelectorAll("details.tool pre"),
+    function (p) { return p.textContent; });
   // The transcript's bottom padding must cover the composer whatever height it takes: a
   // one-line field, then three lines in the same field.
   out.chatPadBefore = parseFloat(getComputedStyle(q("#chat")).paddingBottom) || 0;
@@ -540,6 +550,23 @@ fn a_markdown_table_renders_as_a_table_on_a_phone() {
             "not json at all",
             "{at}: text that is not JSON must be left alone"
         );
+
+        // A restored transcript goes through the same formatter as the live chips; before
+        // this the result of a tool call came back as one line of JSON with `\n` in it.
+        let pres: Vec<String> = measured[width]["tracePres"]
+            .as_array()
+            .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_owned)).collect())
+            .unwrap_or_default();
+        assert_eq!(pres.len(), 2, "{at}: a call and its result, not {pres:?}");
+        assert!(
+            pres[0].starts_with("arguments: ") && pres[0].contains("\"command\": \"ps\""),
+            "{at}: the arguments were not laid out: {pres:?}"
+        );
+        assert!(
+            pres[1].contains("line one\nline two"),
+            "{at}: the restored result kept its newline escaped: {pres:?}"
+        );
+        assert!(!pres[1].contains("\\n"), "{at}: the restored result still carries a literal \\n: {pres:?}");
 
         // The transcript must not run under the composer: its padding covers whatever the
         // composer currently is, not the 84 px a one-line field used to need.
