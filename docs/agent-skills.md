@@ -112,6 +112,43 @@ curl -sS -X POST http://<board>:80/mcp -H 'Content-Type: application/json' -d \
      "text":"# deploy\ndescription: roll the portal forward\n1. snapshot\n2. flash\n"}}}'
 ```
 
+## What a freshly flashed board starts with
+
+Three skills are compiled into the firmware and written into the workspace on the first
+boot: `create-skill`, `pinout` and `recover-board`. They live in the repository's
+`skills/` directory — one directory per skill, `SKILL.md` inside — and reach the board
+through `include_str!` (`crates/agent-core/src/seed.rs`), so deleting one breaks the
+build instead of shipping a board with a procedure missing.
+
+| Skill | What it is for |
+|---|---|
+| `create-skill` | writing the next skill: what one is on this board, when it is worth one, what not to put in it, and the house rules |
+| `pinout` | finding out what is wired — `inventory`, `devices_list`, `i2c_scan`, `i2c_identify` — and recording it in `/memory/pinout.md` with one pointer line in `/MEMORY.md`, plus a manifest entry for the parts no probe can reach |
+| `recover-board` | a board that looks broken: `board_status`, `logs_tail`, `devices_probe`, the difference between "no device" and "declared but not live", a manifest fix with `dry_run` first, reboot last |
+
+After the seeding they are ordinary files, and the rules that matter are about when the
+seed runs. It writes a skill **only where its path holds nothing**:
+
+- A skill the owner edits is never overwritten — not by a firmware upgrade, not by a
+  factory reset. There is no checksum of the shipped copy to argue with the edit.
+- A skill the owner deletes comes back on the next boot, because the path is empty
+  again. To drop one for good, turn the seed off first:
+
+```text
+config_set {"patch":{"skills":{"seed_defaults":false}}}
+shell {"command":"rm /skills/pinout/SKILL.md --confirm"}
+```
+
+`skills.seed_defaults` is a normal configuration field (default `true`): set it with
+`config_set` or on `POST /api/config`. A factory reset sets it back to `true` and restores
+any file that was deleted.
+
+The three files are about 5.6 KB of the 8 KB workspace. That still leaves room for one
+full-size memory file, but it is the tight part of an `AGENTS.md` plus a long memory
+index; the tests in `seed.rs` fail if three skills plus one full-size memory would not
+fit. What they also check: each file is under 2 KB (a larger one cannot be stored), plain
+ASCII, and carries the single `description:` line that reaches the prompt.
+
 ## Why not just put everything in the system prompt
 
 Because of what it displaces. The prompt is rebuilt every turn from the workspace and the
