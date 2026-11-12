@@ -21,8 +21,8 @@ répond avec eux ; un nouveau capteur peut être déclaré en JSON pendant que
 | Le jeu d’outils est un document | `manifest_apply` valide un manifeste JSON, le compile en outils, effectif dans le même tour. [Manifeste](#manifeste) |
 | Il trouve son propre matériel | L’I2C, le 1-Wire et les broches déclarées sont sondés au démarrage ; seul ce qui répond obtient des outils. [Capacités](docs/capabilities.md) |
 | Un seul jeu d’outils, deux appelants | Le point de terminaison MCP et l’agent embarqué voient les mêmes outils, à partir d’une seule description. [API HTTP et MCP](docs/http-api.md) |
-| Une console en HTTPS | Discutez et configurez périphériques, outils, planification, journaux, WiFi et modèle depuis un téléphone ; la carte émet son propre certificat. [Console web](#console-web) |
-| Il agit sans surveillance | Prompts à heure fixe et règles de capteur qui en déclenchent un quand un relevé franchit un seuil. [Planification](#planification) |
+| Une console en HTTPS | Discutez avec le modèle et configurez les périphériques, outils, planification, journaux, WiFi et modèle depuis un téléphone ; la carte émet son propre certificat. [Console web](#console-web) |
+| Il agit sans surveillance | Prompts à heure fixe et règles de capteur qui en déclenchent une invite quand un relevé franchit un seuil. [Planification](#planification) |
 | Un shell et un langage de script | `shell` avec 26 commandes nommées comme dans NuttX, et un interpréteur pour boucler sur des appels d’outils. [Shell](#shell) · [Script](#script) |
 | Il retient ce qu'on lui a dit | Consignes permanentes, `/AGENTS.md`, un index `/memory.md` et des compétences, assemblés dans le prompt à chaque tour. [Ce que le modèle voit à chaque tour](#ce-que-le-modèle-voit-à-chaque-tour) |
 | Aucun cloud sur le chemin | HTTPS servi par la carte, un certificat qu’elle génère, un seul PIN pour trois appelants. [Authentification](#authentification) |
@@ -106,7 +106,7 @@ curl -sS -X POST http://<board>/api/agent/prompt -H 'Content-Type: application/j
 curl -sS http://<board>/api/agent/prompt | jq -r .system
 ```
 
-`action` vaut `set`, `append` ou `clear` ; `system_prompt get` la relit depuis la carte et `system_prompt set …` l'écrit du côté de l'agent. La mémoire et les compétences sont des fichiers ordinaires : `fs_write /memory/wiring.md "GPIO18 = ruban"` plus une ligne dans `/memory.md`, et voilà une mémoire ; supprimer le fichier l'oublie. Un fichier modifié prend effet au tour suivant, sans redémarrage, sans reflashage, sans réécriture du transcript.
+`action` vaut `set`, `append` ou `clear` ; `system_prompt get` la relit depuis la carte et `system_prompt set …` l'écrit du côté de l'agent. La mémoire et les compétences sont des fichiers ordinaires : `fs_write /memory/wiring.md "GPIO18 = ruban de LED"` plus une ligne dans `/memory.md`, et voilà une mémoire ; supprimer le fichier l'oublie. Un fichier modifié prend effet au tour suivant, sans redémarrage, sans reflashage, sans réécriture du transcript.
 
 La raison de ce découpage est la taille : une carte avec quelques kilo-octets de SRAM interne ne peut pas transporter tout ce qu'elle sait dans chaque requête, donc chaque couche est un index ou un préfixe, et le contenu coûteux est lu par `fs_read` quand un tour en a besoin. [docs/agent-memory.md](docs/agent-memory.md) et [docs/agent-skills.md](docs/agent-skills.md) donnent les détails, y compris la façon dont l'index est borné.
 
@@ -240,7 +240,7 @@ firmware/             main.rs (boot order) · runner.rs (agent thread, TLS) ·
 
 | Partie | État |
 |---|---|
-| `agent-core` | 424 tests unitaires et 14 tests d’intégration passent ; `scripts/smoke.ps1` passe de bout en bout |
+| `agent-core` | 427 tests unitaires et 14 tests d’intégration passent ; `scripts/smoke.ps1` passe de bout en bout |
 | Simulateur | console, MCP et la boucle d’agent fonctionnent de bout en bout |
 | Firmware | flashé sur un ESP32-S3-DevKitC-1 N16R8 (IDF v5.5.2) : 42 outils, OLED 128×32, micro et ampli I²S, WS2812, console TLS, tours de modèle en HTTPS |
 | Non implémenté | OTA, carte SD, DHT11/22, caméra. Voir `ROADMAP.md` |

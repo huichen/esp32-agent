@@ -19,8 +19,8 @@ sensor can be declared in JSON while the board runs.
 | The tool set is a document | `manifest_apply` validates a JSON manifest, compiles it into tools, live in the same turn. [Manifest](#manifest) |
 | It finds its own hardware | I2C, 1-Wire and declared pins are probed at boot; only what answers gets tools. [Capabilities](docs/capabilities.md) |
 | One tool set, two callers | The MCP endpoint and the on-board agent see the same tools, from one description. [HTTP and MCP API](docs/http-api.md) |
-| A console over HTTPS | Chat and configure devices, tools, schedule, logs, WiFi and the model from a phone; the board issues its own certificate. [Web console](#web-console) |
-| It acts unattended | Timed prompts and sensor rules that fire one when a reading crosses a threshold. [Scheduled work](#scheduled-work) |
+| A console over HTTPS | Chat with the model and configure devices, tools, schedule, logs, WiFi and the model, from a phone; the board issues its own certificate. [Web console](#web-console) |
+| It acts unattended | Timed prompts, and sensor rules that fire a prompt when a reading crosses a threshold. [Scheduled work](#scheduled-work) |
 | A shell and a script language | `shell` with 26 NuttX-named commands, and an interpreter for loops over tool calls. [Shell](#shell) · [Script](#script) |
 | It remembers what it was told | Standing orders, `/AGENTS.md`, a `/memory.md` index and skills, assembled into the prompt on every turn. [What the model always sees](#what-the-model-always-sees) |
 | No cloud in the path | HTTPS from the board, a certificate it generates, one PIN for three callers. [Authentication](#authentication) |
@@ -105,7 +105,7 @@ curl -sS http://<board>/api/agent/prompt | jq -r .system
 
 `action` is `set`, `append` or `clear`; `system_prompt get` reads it back from the board and
 `system_prompt set …` writes it from the agent's side. Memory and skills are ordinary files:
-`fs_write /memory/wiring.md "GPIO18 = lamp strip"` plus one line in `/memory.md` is all a
+`fs_write /memory/wiring.md "GPIO18 = LED strip"` plus one line in `/memory.md` is all a
 memory is, and deleting the file forgets it. An edited file takes effect on the next turn —
 no restart, no reflash, no transcript rewrite.
 
@@ -139,7 +139,7 @@ shell {"command":"sha256sum /notes/a.txt"}  shell {"command":"zip t.zip /a.txt"}
 
 `edit` refuses an ambiguous match rather than rewriting the wrong place; `rm` and `mv` need
 `confirm`. A wrong command answers with its usage line, taken from the same table the help
-text comes from, so the two cannot disagree: `rm without --confirm` returns
+text comes from, so the two cannot disagree: `rm` without `--confirm` returns
 `usage: rm <path> --confirm`. `shell {"command":"help"}` lists all 26.
 
 ## Script
@@ -238,7 +238,7 @@ firmware/             main.rs (boot order) · runner.rs (agent thread, TLS) ·
 
 | Part | State |
 |---|---|
-| `agent-core` | 424 unit tests and 14 integration tests pass; `scripts/smoke.ps1` passes end to end |
+| `agent-core` | 427 unit tests and 14 integration tests pass; `scripts/smoke.ps1` passes end to end |
 | Simulator | console, MCP and the agent loop run end to end |
 | Firmware | flashed on an ESP32-S3-DevKitC-1 N16R8 (IDF v5.5.2): 42 tools, OLED 128×32, I²S mic and amp, WS2812, TLS console, model turns over HTTPS |
 | Not implemented | OTA, SD card, DHT11/22, camera. See `ROADMAP.md` |
