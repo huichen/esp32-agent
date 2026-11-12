@@ -741,6 +741,21 @@ fn arguments_inner(parsed: &Parsed, piped: bool) -> Result<serde_json::Value, St
         "setenv" => json!({ "action": "set", "key": need(0, "<key>")?, "value": need(1, "<value>")? }),
         "unsetenv" => json!({ "action": "unset", "key": need(0, "<key>")? }),
         "type" | "which" => json!({ "name": need(0, "<name>")?, "which": parsed.name == "which" }),
+        // The query is positional because `jq` has no flag for it; `-r` is the only flag.
+        // Miss this arm and `jq` is a command with a usage line, a handler and no way in.
+        "jq" => {
+            // The query is the first word, the document is everything after it that is not a
+            // flag. A command of `[path]` shape would read `jq .a.b` as the path.
+            let mut words = parsed.args.iter();
+            let query = words.next().cloned();
+            let path = words.find(|w| !w.starts_with('-')).cloned();
+            json!({
+                "positional": parsed.args,
+                "query": query,
+                "path": path,
+                "r": flag_bool("r", "r"),
+            })
+        }
         other => return Err(format!("`{other}` is not a shell command.\n\n{}", help_text())),
     })
 }
