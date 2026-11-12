@@ -33,6 +33,12 @@ espup install
 powershell scripts/build-firmware.ps1 -Flash -Port COM3
 ```
 
+**بلا سلسلة أدوات؟** كل إصدار موسوم يأتي بصورة مدمجة مبنية من ذلك الوسم:
+`espflash write-bin --chip esp32s3 --flash-size 16mb 0x0 esp32-agent-vX.Y.Z.bin`.
+سكربتات `scripts/` مكتوبة بـPowerShell؛ وعلى macOS أو Linux الخطوات نفسها هي
+`. $HOME/export-esp.sh` ثم `cargo build --release --target xtensa-esp32s3-espidf` داخل
+`firmware/` ([التفاصيل](docs/flashing.md)).
+
 بلا بيانات اعتماد مخزّنة ترفع اللوحة نقطة وصول خاصة بها. اتصل بها من هاتف وافتح
 `http://192.168.4.1/`، أو أرسل `provision <ssid> <password>` عبر USB. تذهب بيانات الاعتماد إلى
 NVS، ولا تدخل الصورة أبدا.
