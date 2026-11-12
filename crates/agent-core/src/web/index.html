@@ -90,6 +90,10 @@
         <input id="agent-key" type="password" placeholder="__set__ = keep the stored one">
         <label for="agent-steps">Max steps (0 = no limit)</label>
         <input id="agent-steps" type="number" min="0" max="200" step="1">
+        <label for="agent-context">Context window in tokens (compaction fires at 80% of it)</label>
+        <input id="agent-context" type="number" min="512" max="2000000" step="1">
+        <label for="agent-output">Max output in tokens</label>
+        <input id="agent-output" type="number" min="64" max="128000" step="1">
         <label for="agent-temperature">Temperature</label>
         <input id="agent-temperature" type="number" min="0" max="2" step="0.1">
         <label for="agent-protocol">Protocol</label>
@@ -99,8 +103,7 @@
           <option value="anthropic">Anthropic Messages</option>
         </select>
         <label for="agent-reasoning">Thinking (empty = the provider's default)</label>
-        <select id="agent-reasoning">
-          <option value="">default</option>
+        <select id="agent-reasoning">          <option value="">default</option>
           <option value="off">off</option>
           <option value="low">low</option>
           <option value="medium">medium</option>

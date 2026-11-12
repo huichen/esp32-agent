@@ -99,6 +99,18 @@ pub struct LlmConfig {
     /// Same routes as the host agent's three adapters — the shapes differ enough that a
     /// request built for one is a 400 on the others.
     pub protocol: String,
+    /// Context window the transcript is allowed to occupy, in tokens.
+    ///
+    /// This is what decides when the board compacts: the trigger is 80% of it, exactly
+    /// as the host agent's `trigger_tokens` does, and the reserve left over is what keeps
+    /// room for the answer. Default 8192 — roughly the 24 KB of text the board sent
+    /// before the setting existed, so an upgrade does not change behaviour silently.
+    pub context_tokens: u32,
+    /// Ceiling on the reply, in tokens; sent as `max_tokens` (`chat` and `responses`)
+    /// and `max_tokens` (Anthropic always requires it). Also part of the compaction
+    /// reserve: a request whose history plus this no longer fits the window is rejected
+    /// by the provider rather than trimmed by the board.
+    pub max_output_tokens: u32,
 }
 
 impl Default for LlmConfig {
@@ -113,6 +125,8 @@ impl Default for LlmConfig {
             reasoning: String::new(),
             vision: true,
             protocol: "chat".into(),
+            context_tokens: 8192,
+            max_output_tokens: 2048,
         }
     }
 }
@@ -217,6 +231,7 @@ fn chat_completions(
         "tools": tools,
         "tool_choice": "auto",
         "temperature": temperature,
+        "max_tokens": cfg.max_output_tokens.max(1),
     });
     // Only when asked: `reasoning_effort` is an OpenAI extension, and an endpoint that
     // does not define it answers 400 rather than ignoring it.
@@ -254,6 +269,7 @@ fn responses(
     let mut body = json!({
         "model": cfg.model.trim(),
         "input": input,
+        "max_output_tokens": cfg.max_output_tokens.max(1),
     });
     let tool_list = responses_tools(tools);
     if !tool_list.is_empty() {
@@ -380,7 +396,7 @@ fn anthropic(
     let (system, lowered) = anthropic_messages(messages);
     let mut body = json!({
         "model": cfg.model.trim(),
-        "max_tokens": ANTHROPIC_MAX_TOKENS,
+        "max_tokens": cfg.max_output_tokens.max(1),
         "messages": lowered,
     });
     if !system.is_empty() {
@@ -407,8 +423,6 @@ fn anthropic(
 }
 
 const ANTHROPIC_VERSION: &str = "2023-06-01";
-/// The Messages API requires a bound; the board never needs a long answer.
-const ANTHROPIC_MAX_TOKENS: u32 = 4096;
 
 fn anthropic_messages(messages: &Value) -> (String, Value) {
     let mut system = String::new();
