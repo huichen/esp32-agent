@@ -318,6 +318,68 @@ inbound buffer this board was configured with, which mbedTLS rejects. It is fixe
 `firmware/sdkconfig.defaults` (16 KB inbound, the protocol maximum) — raising `timeout_s`
 never had anything to do with it.
 
+## A store write was refused
+
+`/api/status.store.failed` counts operations the backing store refused after a caller was
+told the change was accepted. It is not a warning: the value is in RAM and not on flash, so
+the next boot reads the one before it. Measured on this bench, firmware `17a9358`, 195 s
+after boot: `{"written": 4, "failed": 23}` — 23 changes the board believed it had saved.
+
+The count is not the diagnosis. Two fields beside it say which key is in trouble and why, so
+a board with no serial terminal attached can still be read:
+
+| Field | What it says |
+|---|---|
+| `store.failed` | How many operations were refused since boot (unchanged) |
+| `store.last_failure` | The newest refusal: `{key, op, err, err_name, at_ms}` — `op` is `set` or `remove`, `err` is the `esp_err_t` the board returned, `err_name` its `esp_err_to_name`, `at_ms` ms since the store queue was created (within a few ms of boot, so it lines up with a log line's `t_ms`). `null` before anything is refused |
+| `store.refused_keys` | Refusals per key, most refused first, at most 16 keys |
+| `store.refused_other` | Refusals for keys beyond those 16 (counted, so the map cannot grow without bound) |
+| `store.space` | `{used_entries, free_entries, total_entries}` from `nvs_get_stats`, or `null` on a backend that cannot say |
+
+The number and the name come from the same call, so they cannot drift apart. Each refusal is
+also one `store` log line per key — key, operation, code, name and `at_ms` — written by the
+`nvs-writer` task as it drains the queue, not one line for all of them: a count says
+something is wrong, and only the key says what.
+
+**The case that produced this section.** Every write of `agent.transcript`,
+`agent.transcript.N` and `agent.run_in_flight` was refused, and the console showed why:
+
+```
+E (279355) esp32_agent::nvs_store: nvs write `agent.run_in_flight`: ESP_ERR_NVS_KEY_TOO_LONG
+E (279357) esp32_agent::nvs_store: nvs write `agent.transcript`: ESP_ERR_NVS_KEY_TOO_LONG
+E (279361) esp32_agent::nvs_store: nvs write `agent.transcript.1`: ESP_ERR_NVS_KEY_TOO_LONG
+```
+
+Not the partition: a key name is at most 15 bytes (`NVS_KEY_NAME_MAX_SIZE` is 16 with the
+terminator, `nvs.h`), and those names are 16, 18 and 19. `ESP_ERR_NVS_KEY_TOO_LONG` is
+`0x1109` = 4361. Nothing was ever stored, so the transcript and the run-in-flight marker
+existed only in RAM: a power cut lost the conversation, and no reboot could ever find a
+turn to resume. The names are now `transcript` (10), `transcript.N` (12) and
+`run_in_flight` (13), `every_key_the_board_stores_fits_nvs` in `app.rs` checks every key
+and every chunk the plans can produce, and `StoreQueue` refuses an over-long key with that
+same code before it reaches a backend, so the next one costs a log line instead of a flash
+round trip.
+
+What the other codes mean, since they need different fixes:
+
+| `err` | Name | What it means here |
+|---|---|---|
+| 4361 | `ESP_ERR_NVS_KEY_TOO_LONG` | The name is over 15 bytes; the value was never stored |
+| 4357 | `ESP_ERR_NVS_NOT_ENOUGH_SPACE` | The partition is full: the entry would not fit |
+| 4366 | `ESP_ERR_NVS_VALUE_TOO_LONG` | The value is over 4000 bytes — a chunking bug, not a full partition |
+| 4354 | `ESP_ERR_NVS_NOT_FOUND` | A read asked for a key that is not there; a *removal* that finds nothing is not a failure |
+| 4358 | `ESP_ERR_NVS_INVALID_NAME` | The namespace is over 15 bytes (`esp32mcp` is 8) |
+
+Space is worth watching rather than guessing at: the `nvs` partition is `0x6000` = 24 KB
+(`firmware/partitions.csv`), which is 6 pages of 126 entries of 32 bytes — 756 entries. A
+3500-byte value takes 1 header entry plus 110 data entries, 111 of them. So the two blob
+plans cannot both be full at once: `TRANSCRIPT_CHUNKS_MAX` 8 and `WORKSPACE_PLAN` 5 are
+13 values of up to 3500 bytes, about 45 KB of values on a 24 KB partition. Whichever fills
+first wins and the other is refused — visibly, with `ESP_ERR_NVS_NOT_ENOUGH_SPACE` and the
+key named above — and `store.space` is the reading that says how close that is. What the
+right split between the transcript and the file workspace is has not been measured; that is
+in `ROADMAP.md`, not here.
+
 ## Performance and stability
 
 | Symptom | Cause / fix |

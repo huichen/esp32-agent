@@ -154,6 +154,9 @@ fn run(shared: Shared, log: Arc<LogBuf>) {
     loop {
         unsafe { sys::vTaskDelay(PERIOD_MS) };
         let (written_now, total) = with_app(&shared, |app| {
+            // `flush_store` is where a refusal becomes one `log.error` line per key — key,
+            // operation, the store's `esp_err_t` and its name — because this task is the
+            // one that runs it. `/api/status.store.last_failure` carries the newest one.
             let report = app.flush_store(NAME);
             (report.written, app.store_queue().written())
         });
