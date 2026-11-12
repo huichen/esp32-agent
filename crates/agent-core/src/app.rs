@@ -237,6 +237,12 @@ pub struct App {
     pub manifest: Manifest,
     pub devices: Devices,
     pub tools: ToolRegistry,
+    /// Tool names a family took over: `manifest_apply` -> `manifest apply`.
+    ///
+    /// The handlers stay in the registry so a script written before the family existed
+    /// keeps working; what changes is that the model is not shown five names where one
+    /// will do, and the listing explains where each old name went.
+    pub family_members: std::collections::BTreeMap<String, String>,
     pub hw: Box<dyn Hardware>,
     pub store: Box<dyn KvStore>,
     pub log: Arc<LogBuf>,
@@ -343,6 +349,7 @@ impl App {
             manifest,
             devices: Devices::new(),
             tools: ToolRegistry::new(),
+            family_members: std::collections::BTreeMap::new(),
             hw,
             store,
             log: log.clone(),
@@ -496,6 +503,17 @@ impl App {
         let mut tools = ToolRegistry::new();
         tools.register_all(board_tools::always_tools());
         tools.register_all(board_tools::manifest_tools());
+        // The manifest family is one tool with five commands; the five are still registered
+        // above, under their old names, so a stored script keeps calling the same handler.
+        // Remembering which is which is what lets the listing say "reachable as `manifest
+        // apply`" instead of silently dropping four names.
+        self.family_members = board_tools::manifest_members()
+            .into_iter()
+            .map(|name| {
+                let command = name.trim_start_matches("manifest_").to_string();
+                (name, format!("manifest {command}"))
+            })
+            .collect();
         tools.register_all(self.devices.tool_defs());
         // A manifest may not take a name the board already uses (validation refuses it),
         // but a manifest stored by an older build — or one applied before the hardware
@@ -589,38 +607,125 @@ impl App {
         "wifi_status",
         "reboot",
         "factory_reset",
-        "manifest_validate",
-        "manifest_reset",
+        // `manifest_validate` and `manifest_reset` used to sit here. They are not hidden by
+        // the profile any more: the `manifest` family owns them, and the family is what an
+        // empty board needs to rebuild itself — so it stays, and the profile has nothing
+        // left to say about them.
     ];
 
     /// May this tool appear in `tools/list` right now?
     pub fn is_visible(&self, name: &str) -> bool {
-        let Some(def) = self.tools.get(name) else {
-            return false;
-        };
+        self.why_hidden(name).is_none() && self.tools.get(name).is_some()
+    }
+
+    /// Why the board does not offer `name`, or `None` when it does.
+    ///
+    /// One function answers both questions on purpose. A list built from one rule and a
+    /// reason built from another drift apart, and then the board reports "no camera" about
+    /// a tool it is happily listing — which is exactly the class of bug the tool lists had
+    /// before they were all built from this predicate.
+    pub fn why_hidden(&self, name: &str) -> Option<String> {
+        let def = self.tools.get(name)?;
         if self.cfg.mcp.disabled_tools.iter().any(|d| d == name) {
-            return false;
+            return Some("switched off in `mcp.disabled_tools`".to_string());
+        }
+        // A family took this name over. The handler still answers, so the sentence says
+        // where to find it rather than pretending the ability is gone.
+        if let Some(reached) = self.family_members.get(name) {
+            return Some(format!("reachable as `{reached}`"));
         }
         // `minimal` hides conveniences, never capabilities: an HTTP route or a manifest can
         // do these, and a model rarely needs them. Discovery, manifest, GPIO and the file
         // tools stay in every profile — without them an empty board cannot rebuild itself.
         if self.cfg.mcp.profile == "minimal" && Self::MINIMAL_HIDDEN.contains(&name) {
-            return false;
+            return Some("hidden by the `minimal` profile".to_string());
         }
         if self.cfg.mcp.tools_mode == "generic" && def.spec.device_tool {
-            return false;
+            return Some("collapsed into `device_invoke` by `tools_mode: generic`".to_string());
         }
-        if def.spec.core || def.spec.requires.is_empty() {
-            return true;
+        if def.spec.core || def.spec.requires.is_empty() || self.cfg.mcp.tools_mode == "all" {
+            return None;
         }
-        if self.cfg.mcp.tools_mode == "all" {
-            return true;
+        // What is missing is named: "no camera on this board" is a sentence a person can
+        // act on, `false` is not, and an unexplained disappearance is worse than a tool
+        // that explains itself.
+        let missing = self.caps.missing(&def.spec.requires);
+        if missing.is_empty() {
+            return None;
         }
-        self.caps.contains_all(&def.spec.requires)
+        Some(format!("no {} on this board", missing.join(" or no ")))
+    }
+
+    /// Why one of the tools that live outside the registry is not offered.
+    ///
+    /// Same shape as [`why_hidden`](Self::why_hidden): `None` means "offered".
+    fn extra_why_hidden(&self, name: &str) -> Option<String> {
+        if self.cfg.mcp.disabled_tools.iter().any(|d| d == name) {
+            return Some("switched off in `mcp.disabled_tools`".to_string());
+        }
+        match name {
+            // A camera is a driver and a DVP bus. Without them `image_read` can only answer
+            // "a camera is not available on this board", so it is not a tool the model can
+            // use - it is a tool that teaches the model to waste a turn.
+            "image_read" if !self.caps.contains("camera") => Some("no camera on this board".to_string()),
+            _ => None,
+        }
+    }
+
+    /// Every out-of-registry tool, offered or not, in the OpenAI shape the model gets.
+    ///
+    /// One construction feeds three readers — the offered list, the hidden list and the
+    /// portal page — so none of them can invent a tool the others do not have. The groups
+    /// are `shell`, `script` and the four file/image tools that need the app's own state.
+    fn extra_entries() -> Vec<Value> {
+        let mut out = Vec::new();
+        for group in [
+            // One `shell` instead of the twelve fs_*/net_* tools: same handlers, one
+            // schema, one name to remember.
+            json!([crate::tools::shell::openai_spec()]),
+            board_tools::script_specs(),
+            board_tools::agent_extra_specs(),
+        ] {
+            out.extend(openai_tools(&group));
+        }
+        out
+    }
+
+    /// The out-of-registry tools that are offered right now, in declaration order.
+    ///
+    /// Every view that shows tools goes through here or through `is_visible`, so the model,
+    /// `/mcp tools/list` and the portal cannot disagree about what exists.
+    fn extra_specs(&self) -> Vec<Value> {
+        Self::extra_entries()
+            .into_iter()
+            .filter(|entry| self.extra_why_hidden(entry["function"]["name"].as_str().unwrap_or("")).is_none())
+            .collect()
     }
 
     pub fn visible_tool_names(&self) -> Vec<String> {
         self.tools.iter().filter(|d| self.is_visible(&d.spec.name)).map(|d| d.spec.name.clone()).collect()
+    }
+
+    /// Every tool that exists but is not offered, with the reason — registry entries first,
+    /// then the out-of-registry ones, each in name order.
+    ///
+    /// "The board has 47 tools" is only half a fact; this is the other half.
+    pub fn hidden_tools(&self) -> Vec<Value> {
+        let mut out: Vec<Value> = self
+            .tools
+            .iter()
+            .filter_map(|d| {
+                self.why_hidden(&d.spec.name).map(|why| json!({ "name": d.spec.name, "why": why }))
+            })
+            .collect();
+        for entry in Self::extra_entries() {
+            let name = entry["function"]["name"].as_str().unwrap_or("");
+            if let Some(why) = self.extra_why_hidden(name) {
+                out.push(json!({ "name": name, "why": why }));
+            }
+        }
+        out.sort_by_key(|t| t["name"].as_str().unwrap_or("").to_string());
+        out
     }
 
     fn tools_list_json(&self) -> Value {
@@ -635,32 +740,22 @@ impl App {
         json!({ "tools": tools })
     }
 
-    /// The MCP view of the tools that live outside the registry: `fs_*` then `net_*`.
+    /// The MCP view of the tools that live outside the registry.
     ///
-    /// `mcp.disabled_tools` still applies; `tools_mode` does not, because none of these
-    /// is a device tool.
+    /// Built from [`extra_specs`](Self::extra_specs), so the same enable/disable rule that
+    /// decides the model's list decides this one; only the field names differ, because
+    /// MCP says `inputSchema` where OpenAI says `parameters`.
     fn extra_mcp_specs(&self) -> Vec<Value> {
-        let mut out = Vec::new();
-        for group in [
-            // One `shell` instead of the twelve fs_*/net_* tools: same handlers, one
-            // schema, one name to remember.
-            json!([crate::tools::shell::openai_spec()]),
-            board_tools::script_specs(),
-            board_tools::agent_extra_specs(),
-        ] {
-            for tool in openai_tools(&group) {
-                let name = tool["function"]["name"].as_str().unwrap_or_default().to_string();
-                if self.cfg.mcp.disabled_tools.iter().any(|d| d == &name) {
-                    continue;
-                }
-                out.push(json!({
-                    "name": name,
+        self.extra_specs()
+            .iter()
+            .map(|tool| {
+                json!({
+                    "name": tool["function"]["name"],
                     "description": tool["function"]["description"],
                     "inputSchema": tool["function"]["parameters"],
-                }));
-            }
-        }
-        out
+                })
+            })
+            .collect()
     }
 
     /// The discovery document: the static map from `sitemap`, plus what only this board
@@ -700,9 +795,15 @@ impl App {
             .tools
             .iter()
             .map(|d| {
-                let mut v = d.portal_json(self.is_visible(&d.spec.name));
-                if !v["visible"].as_bool().unwrap_or(false) && !d.spec.requires.is_empty() {
-                    v["missing"] = json!(self.caps.missing(&d.spec.requires));
+                // One predicate decides both the flag and the sentence, so the page cannot
+                // say "visible" about something the model does not have.
+                let why = self.why_hidden(&d.spec.name);
+                let mut v = d.portal_json(why.is_none());
+                if let Some(why) = why {
+                    if !d.spec.requires.is_empty() {
+                        v["missing"] = json!(self.caps.missing(&d.spec.requires));
+                    }
+                    v["why"] = json!(why);
                 }
                 v
             })
@@ -710,32 +811,29 @@ impl App {
         // The agent's own tools are not in the registry (they need the workspace and the
         // HTTP client), so they never appeared here — which is why the portal could show
         // 40 tools while the model had 49 and `script` looked missing.
-        for group in [
-            // One `shell` instead of the twelve fs_*/net_* tools: same handlers, one
-            // schema, one name to remember.
-            json!([crate::tools::shell::openai_spec()]),
-            board_tools::script_specs(),
-            board_tools::agent_extra_specs(),
-        ] {
-            for entry in group.as_array().into_iter().flatten() {
-                let f = &entry["function"];
-                let name = f["name"].as_str().unwrap_or("");
-                // The read-only ones, by name: the specs are OpenAI-shaped and carry no
-                // `mutating` flag, and a made-up one would be worse than this list.
-                let read_only = matches!(name, "fs_ls" | "fs_read" | "fs_grep" | "net_get");
-                tools.push(json!({
-                    "name": name,
-                    "title": name,
-                    "description": f["description"],
-                    "category": "agent",
-                    "requires": [],
-                    "mutating": !read_only,
-                    "core": false,
-                    "visible": true,
-                    "mcp": true,
-                    "input_schema": f["parameters"],
-                }));
+        for entry in Self::extra_entries() {
+            let f = &entry["function"];
+            let name = f["name"].as_str().unwrap_or("");
+            let why = self.extra_why_hidden(name);
+            // The read-only ones, by name: the specs are OpenAI-shaped and carry no
+            // `mutating` flag, and a made-up one would be worse than this list.
+            let read_only = matches!(name, "read" | "image_read");
+            let mut v = json!({
+                "name": name,
+                "title": name,
+                "description": f["description"],
+                "category": "agent",
+                "requires": [],
+                "mutating": !read_only,
+                "core": false,
+                "visible": why.is_none(),
+                "mcp": why.is_none(),
+                "input_schema": f["parameters"],
+            });
+            if let Some(why) = why {
+                v["why"] = json!(why);
             }
+            tools.push(v);
         }
         // Alphabetical, one list: the order the model gets, and the order a reader expects.
         tools.sort_by_key(|t| t["name"].as_str().unwrap_or("").to_string());
@@ -806,7 +904,12 @@ impl App {
                 "path": self.cfg.mcp.path,
                 "url": self.mcp_url(),
                 "tools_mode": self.cfg.mcp.tools_mode,
-                "tools_visible": self.visible_tool_names().len(),
+                // What the model actually receives, not the registry count: the out-of-
+                // registry tools (`shell`, `script`, `read`/`write`/`edit`) are tools the
+                // model can call, and leaving them out made this number disagree with
+                // `/api/tools` by six.
+                "tools_visible": self.tool_specs().as_array().map(|a| a.len()).unwrap_or(0),
+                "tools_hidden": self.hidden_tools(),
                 "sessions": self.runtime.sessions.len(),
                 "auth_required": !self.cfg.auth.mcp_token.is_empty(),
                 "manifest_revision": self.runtime.manifest_rev,
@@ -1258,7 +1361,10 @@ impl App {
         if name == "image_read" {
             return self.image_read(args);
         }
-        if !self.is_visible(name) {
+        // A name a family took over still answers. It is hidden from the listing, not
+        // removed from the board, so a script or a person who learned `manifest_apply`
+        // before the family existed keeps working — and the listing says where it went.
+        if !self.is_visible(name) && !self.family_members.contains_key(name) {
             let missing =
                 self.tools.get(name).map(|d| self.caps.missing(&d.spec.requires)).unwrap_or_default();
             if missing.is_empty() {
@@ -2436,10 +2542,16 @@ impl App {
         let value = match uri {
             "mcp://capabilities" => json!({
                 "caps": self.caps.to_json(),
-                "visible_tools": self.visible_tool_names(),
-                "hidden": self.tools.iter().filter(|d| !self.is_visible(&d.spec.name))
-                    .map(|d| json!({ "tool": d.spec.name, "missing": self.caps.missing(&d.spec.requires) }))
-                    .collect::<Vec<Value>>(),
+                // The same list the model gets and the same reasons the portal shows: a
+                // client asking "what can this board do" must not get a third answer.
+                "visible_tools": self
+                    .tool_specs()
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|t| t["function"]["name"].as_str())
+                    .collect::<Vec<&str>>(),
+                "hidden": self.hidden_tools(),
             }),
             "mcp://devices" => json!({
                 "count": self.devices.len(),
@@ -3304,6 +3416,11 @@ impl App {
             name.hash(&mut h);
         }
         self.tools.len().hash(&mut h);
+        // The capabilities decide visibility too, and they are not only a function of the
+        // device count: a manifest can give an existing device a new cap, and a probe can
+        // retire one. Without this line the model would keep the previous array while the
+        // portal showed the new one.
+        self.caps.to_json().to_string().hash(&mut h);
         h.finish()
     }
 
@@ -3320,13 +3437,9 @@ impl App {
     /// shell hands arguments to a script. Positional arguments keep their order in `argv`
     /// including the flags, so a script can read either view.
     ///
-    /// The array built from scratch: one pass over the disabled names, not 51.
+    /// The array built from scratch: one pass over the registry, one predicate.
     fn tool_specs_uncached(&self) -> Value {
-        let disabled: std::collections::BTreeSet<&str> =
-            self.cfg.mcp.disabled_tools.iter().map(|d| d.as_str()).collect();
-        let generic = self.cfg.mcp.tools_mode == "generic";
-        let visible: Vec<&ToolDef> =
-            self.tools.iter().filter(|d| self.visible_given(&d.spec.name, &disabled, generic)).collect();
+        let visible: Vec<&ToolDef> = self.tools.iter().filter(|d| self.is_visible(&d.spec.name)).collect();
         let load = |def: &ToolDef| {
             json!({
                 "type": "function",
@@ -3348,35 +3461,9 @@ impl App {
         let mut tools: Vec<Value> = visible.iter().map(|d| load(d)).collect();
         // File, HTTP and script tools gate on nothing the hardware must provide, so they
         // are not MCP tools; the model still gets them, in the same sorted list.
-        for group in [
-            // One `shell` instead of the twelve fs_*/net_* tools: same handlers, one
-            // schema, one name to remember.
-            json!([crate::tools::shell::openai_spec()]),
-            board_tools::script_specs(),
-            board_tools::agent_extra_specs(),
-        ] {
-            tools.extend(openai_tools(&group));
-        }
+        tools.extend(self.extra_specs());
         tools.sort_by_key(|t| t["function"]["name"].as_str().unwrap_or("").to_string());
         Value::Array(tools)
-    }
-
-    /// `is_visible` with the disabled set and the mode already resolved, for the one caller
-    /// that asks about every tool at once: same rules, one scan of the names.
-    fn visible_given(&self, name: &str, disabled: &std::collections::BTreeSet<&str>, generic: bool) -> bool {
-        let Some(def) = self.tools.get(name) else {
-            return false;
-        };
-        if disabled.contains(name) {
-            return false;
-        }
-        if self.cfg.mcp.profile == "minimal" && Self::MINIMAL_HIDDEN.contains(&name) {
-            return false;
-        }
-        if generic && def.spec.device_tool {
-            return false;
-        }
-        !def.spec.requires.iter().any(|cap| !self.caps.contains(cap))
     }
 
     /// The `fs_*` and `net_*` handlers by name, shared by the tool host and `shell`.
@@ -3423,6 +3510,22 @@ impl App {
         let line = args.get("command").and_then(|v| v.as_str()).unwrap_or("");
         if line.trim().is_empty() {
             return Err(format!("`command` is required.\n\n{}", crate::tools::shell::help_text()));
+        }
+        // `a; b` runs two commands in order, which is what "write a file, then read it back"
+        // needs. The split ignores semicolons inside quotes, and stops at four: a line is a
+        // shorthand, not a program.
+        if let Some(parts) = crate::tools::shell::split_sequence(line)? {
+            let mut answers = Vec::new();
+            for part in parts {
+                let mut inner = args.clone();
+                inner["command"] = json!(part);
+                answers.push(json!({
+                    "command": part,
+                    "result": serde_json::from_str::<Value>(&self.run_shell(&inner)?)
+                        .unwrap_or(Value::Null),
+                }));
+            }
+            return Ok(json!({ "commands": answers }).to_string());
         }
         let pipeline = crate::tools::shell::parse_pipeline(line)?;
         // `help`, `-h` and `--help` answer before anything is validated, so `cp -h` does not
@@ -6303,15 +6406,7 @@ mod tests {
             assert!(!app.is_visible(hidden), "{hidden} should be hidden in minimal");
         }
         // The bootstrap survives: discovery, manifest, GPIO and the file tools.
-        for kept in [
-            "board_status",
-            "devices_list",
-            "devices_probe",
-            "i2c_scan",
-            "manifest_apply",
-            "manifest_describe",
-            "gpio_write",
-        ] {
+        for kept in ["board_status", "devices_list", "devices_probe", "i2c_scan", "manifest", "gpio_write"] {
             assert!(app.is_visible(kept), "{kept} must survive the minimal profile");
         }
         // `fs_*`, `net_*` and `script` live outside the registry, so they are checked in the
@@ -8025,9 +8120,20 @@ mod tests {
     fn the_file_and_network_tools_are_in_the_mcp_list_and_callable() {
         let mut app = test_app();
         let names = tool_names(&mut app);
-        for needle in ["shell", "script", "image_read"] {
+        for needle in ["shell", "script", "read"] {
             assert!(names.contains(&needle.to_string()), "{needle} is missing from tools/list: {names:?}");
         }
+        // `image_read` is the counter-example, and it is the one this test used to make
+        // wrong: this board has no camera, so it is not offered, and `hidden_tools` says
+        // why. A tool the board cannot carry is worse than one fewer tool.
+        assert!(!names.contains(&"image_read".to_string()), "image_read without a camera: {names:?}");
+        assert!(
+            app.hidden_tools()
+                .iter()
+                .any(|t| t["name"] == "image_read" && t["why"].as_str().unwrap_or("").contains("camera")),
+            "a hidden tool must say why: {:?}",
+            app.hidden_tools()
+        );
 
         // The schema is the same object the model gets, in the MCP field name.
         let list = app.handle_rpc(r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#, None).unwrap();
@@ -8057,11 +8163,58 @@ mod tests {
 
         // `mcp.disabled_tools` hides a tool like any other; the commands inside `shell`
         // are not separate tools, which is the point of the consolidation.
-        app.cfg.mcp.disabled_tools = vec!["image_read".into()];
+        app.cfg.mcp.disabled_tools = vec!["script".into()];
+        assert!(!tool_names(&mut app).contains(&"script".to_string()), "disabled_tools did not hide script");
         assert!(
-            !tool_names(&mut app).contains(&"image_read".to_string()),
-            "disabled_tools did not hide image_read"
+            app.hidden_tools()
+                .iter()
+                .any(|t| t["name"] == "script" && t["why"].as_str().unwrap_or("").contains("disabled_tools")),
+            "a disabled tool must say it was switched off: {:?}",
+            app.hidden_tools()
         );
+    }
+
+    /// A family's three tables are one table: declared (the schema enum), helped (`command:
+    /// help`) and dispatchable (a call that is not "no command").
+    ///
+    /// This is the assertion the `jq` bug needed: a command that was documented in `help`
+    /// and absent from dispatch. It fails if a name is added to one list alone — which is
+    /// also why `help` costs at most a kilobyte here: past that, the saving the family made
+    /// leaks back out of the help text.
+    #[test]
+    fn a_family_declares_helps_and_dispatches_the_same_commands() {
+        let mut app = test_app();
+        let spec = ToolHost::tool_specs(&app)
+            .as_array()
+            .expect("array")
+            .iter()
+            .find(|t| t["function"]["name"] == "manifest")
+            .cloned()
+            .expect("the manifest family is offered");
+        let names = |v: &Value| -> Vec<String> {
+            v.as_array().unwrap().iter().map(|s| s.as_str().unwrap().to_string()).collect()
+        };
+        let mut declared = names(&spec["function"]["parameters"]["properties"]["command"]["enum"]);
+        declared.retain(|c| c != "help");
+
+        let help = app.call_tool("manifest", &json!({ "command": "help" })).unwrap();
+        let helped = names(&help["commands"]);
+        assert_eq!(declared, helped, "the schema and `help` disagree");
+
+        for command in helped.iter().chain(std::iter::once(&"help".to_string())) {
+            if let Err(e) = app.call_tool("manifest", &json!({ "command": command })) {
+                assert!(
+                    !e.message.contains("no command"),
+                    "`help` lists `{command}` but dispatch refuses it: {}",
+                    e.message
+                );
+            }
+        }
+        let err = app.call_tool("manifest", &json!({ "command": "frobnicate" })).unwrap_err();
+        assert!(err.message.contains("no command"), "an unknown command must be refused: {err:?}");
+
+        let bytes = serde_json::to_string(&help).unwrap().len();
+        assert!(bytes <= 1024, "manifest help is {bytes} bytes; that eats the saving");
     }
 
     #[test]
@@ -8483,7 +8636,7 @@ mod tests {
         sorted.sort_unstable();
         assert_eq!(names, sorted, "the tool list is not alphabetical: {names:?}");
 
-        for needle in ["board_status", "manifest_apply", "shell", "script", "image_read"] {
+        for needle in ["board_status", "manifest", "shell", "script", "read"] {
             assert!(names.contains(&needle), "{needle} is missing: {names:?}");
         }
         // A manifest tool sorts among the rest — `aaa_manifest` is first, not last.
@@ -8531,28 +8684,137 @@ mod tests {
         let tools = body["tools"].as_array().expect("tools");
         let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().expect("a name")).collect();
 
-        for needle in ["script", "shell", "image_read", "board_status"] {
+        for needle in ["script", "shell", "read", "board_status"] {
             assert!(names.contains(&needle), "{needle} is missing from the portal: {names:?}");
         }
         let mut sorted = names.clone();
         sorted.sort_unstable();
         assert_eq!(names, sorted, "the portal list is not alphabetical: {names:?}");
 
-        // The model has exactly this set: no tool is portal-only or model-only.
+        // The model has exactly the portal's *offered* rows. The comparison is on the
+        // filtered set, deliberately: comparing the two full lists would go green while the
+        // page still offered a tool the board had just decided not to send.
         let model: Vec<String> = ToolHost::tool_specs(&app)
             .as_array()
             .expect("array")
             .iter()
             .map(|t| t["function"]["name"].as_str().expect("name").to_string())
             .collect();
-        // Every model tool is in the portal list ...
+        let offered: Vec<&str> = tools
+            .iter()
+            .filter(|t| t["visible"] == json!(true))
+            .map(|t| t["name"].as_str().expect("a name"))
+            .collect();
         for name in &model {
-            assert!(names.contains(&name.as_str()), "{name} reaches the model but not the portal");
+            assert!(offered.contains(&name.as_str()), "{name} reaches the model but not the portal");
         }
-        // ... and the portal adds nothing the model cannot call.
-        for name in &names {
-            assert!(model.iter().any(|m| m == name), "{name} is in the portal but not in the model's list");
+        for name in &offered {
+            assert!(model.iter().any(|m| m == name), "{name} is offered in the portal but not to the model");
         }
+
+        // Every hidden row says why, and is really absent from the model's list. This board
+        // has no camera, so `image_read` is the row that proves the page can report a tool
+        // it deliberately does not offer.
+        let hidden: Vec<&Value> = tools.iter().filter(|t| t["visible"] != json!(true)).collect();
+        assert!(!hidden.is_empty(), "no camera on this board, so a hidden row must be shown");
+        for row in hidden {
+            let name = row["name"].as_str().unwrap_or("");
+            assert!(!row["why"].as_str().unwrap_or("").is_empty(), "hidden without a reason: {row}");
+            assert!(!model.iter().any(|m| m == name), "{name} is hidden in the portal but the model has it");
+        }
+    }
+
+    /// The board's two faces are one set: what the model is handed, and what
+    /// `/mcp tools/list` answers an outside client. They are built by different code (the
+    /// OpenAI `parameters` shape versus MCP's `inputSchema`), so nothing but this
+    /// assertion keeps them from drifting apart again.
+    ///
+    /// Both directions are checked, and the set is dropped to 47 by a real rule in the
+    /// middle: a filter that only ever adds would pass a one-way comparison.
+    #[test]
+    fn the_agent_and_the_mcp_endpoint_offer_the_same_tools() {
+        let mut app = test_app();
+        let model_names = |app: &mut App| -> Vec<String> {
+            ToolHost::tool_specs(app)
+                .as_array()
+                .expect("array")
+                .iter()
+                .map(|t| t["function"]["name"].as_str().expect("name").to_string())
+                .collect()
+        };
+        let mcp_names = |app: &mut App| -> Vec<String> {
+            let list = app.handle_rpc(r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#, None).unwrap();
+            list["result"]["tools"]
+                .as_array()
+                .expect("tools")
+                .iter()
+                .map(|t| t["name"].as_str().expect("name").to_string())
+                .collect()
+        };
+
+        assert_eq!(mcp_names(&mut app), model_names(&mut app), "the two lists disagree");
+        assert!(!model_names(&mut app).contains(&"image_read".to_string()), "no camera, no image tool");
+
+        app.cfg.mcp.disabled_tools = vec!["script".into()];
+        assert_eq!(mcp_names(&mut app), model_names(&mut app), "the two lists disagree after a disable");
+        assert!(!mcp_names(&mut app).contains(&"script".to_string()), "the disable did not reach MCP");
+    }
+
+    /// What `/api/status` counts is what the model receives, and every tool it does not
+    /// offer is named with a reason.
+    ///
+    /// The count used to be the registry's, which left out `shell`, `script` and the file
+    /// tools — so the status page said 42 while `/api/tools` said 48. A number that
+    /// disagrees with another number is worse than no number: it sends a person looking for
+    /// a bug in the wrong place.
+    #[test]
+    fn the_status_count_is_the_tool_list_the_model_gets() {
+        let mut app = test_app();
+        let status = body_json(&app.route(&get("/api/status")));
+        let model = ToolHost::tool_specs(&app).as_array().expect("array").len();
+        assert_eq!(status["mcp"]["tools_visible"], json!(model), "{status}");
+
+        let hidden = status["mcp"]["tools_hidden"].as_array().expect("a hidden list");
+        // Every tool that exists is either offered or explained, never neither.
+        let registry = app.tools.len();
+        let extras = App::extra_entries().len();
+        assert_eq!(
+            model + hidden.len(),
+            registry + extras,
+            "{} + {} != {registry} + {extras}",
+            model,
+            hidden.len()
+        );
+        for row in hidden {
+            assert!(!row["why"].as_str().unwrap_or("").is_empty(), "hidden without a reason: {row}");
+            assert!(!row["name"].as_str().unwrap_or("").is_empty(), "hidden without a name: {row}");
+        }
+    }
+
+    /// A device the board does not have is not a tool, and the sentence explains it.
+    ///
+    /// `image_read` is the live case: a camera is a driver on a DVP bus, and a board with
+    /// neither can only answer "a camera is not available on this board".
+    #[test]
+    fn a_tool_with_no_device_behind_it_is_hidden_and_says_why() {
+        let mut app = test_app();
+        assert!(!tool_names(&mut app).contains(&"image_read".to_string()));
+        let why = app
+            .hidden_tools()
+            .into_iter()
+            .find(|t| t["name"] == "image_read")
+            .expect("image_read must be reported as hidden");
+        assert!(why["why"].as_str().unwrap_or("").contains("camera"), "{why}");
+
+        // Plug a camera in: the capability is the whole decision, so the tool appears while
+        // the filter stays untouched. That is the reverse proof - a filter that could only
+        // subtract would pass every test above.
+        app.caps.insert("camera");
+        assert!(
+            tool_names(&mut app).contains(&"image_read".to_string()),
+            "a camera must bring the tool back"
+        );
+        assert!(!app.hidden_tools().iter().any(|t| t["name"] == "image_read"));
     }
 
     /// The same board has to produce the same bytes, or the provider's prompt cache
@@ -8835,7 +9097,7 @@ mod tests {
             assert!(!app.is_visible(gone), "{gone} survived a minimal start");
         }
         assert!(app.is_visible("gpio_write"), "the primitives must stay");
-        assert!(app.is_visible("manifest_apply"), "self-configuration must stay");
+        assert!(app.is_visible("manifest"), "self-configuration must stay");
 
         // Declaring them in the manifest brings the tools back — the whole point.
         let v = app
@@ -9000,7 +9262,9 @@ mod tests {
         )
         .expect("a manifest");
         app.rebuild();
-        assert!(app.is_visible("manifest_apply"), "the built-in disappeared on rebuild");
+        // The board's own `manifest` tool wins over the manifest entry of the same name, and
+        // the five old command names stay reachable through it.
+        assert!(app.is_visible("manifest"), "the built-in disappeared on rebuild");
         let v = app.call_tool("manifest_apply", &json!({ "manifest": { "tools": [] } })).unwrap();
         assert_eq!(v["applied"], true, "the built-in no longer applies: {v}");
     }
