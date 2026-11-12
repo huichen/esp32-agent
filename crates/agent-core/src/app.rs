@@ -771,6 +771,8 @@ impl App {
                 "name": self.firmware.name,
                 "version": self.firmware.version,
                 "build": self.firmware.build,
+                "commit": self.firmware.commit,
+                "built_at": self.firmware.built_at,
             },
             "board": {
                 "profile": self.profile.id,
@@ -4751,6 +4753,9 @@ fn pipe_text(op: &str, answer: &Value) -> std::result::Result<String, String> {
         // applies to its own answer applies here, so `| grep` sees words rather than tags.
         "curl" => text("body"),
         "wget" => text("body"),
+        // `jq` prints one value per line: that is exactly the text a `head` or a `grep`
+        // downstream wants, and the reason `curl api | jq .x | head` is the shape people type.
+        "jq" => text("out"),
         other => return Err(format!("`{other}` has no line form to hand down a pipe")),
     })
 }
