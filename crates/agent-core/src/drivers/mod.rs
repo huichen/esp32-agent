@@ -17,6 +17,7 @@ pub mod bdc_motor;
 pub mod bh1750;
 pub mod bme280;
 pub mod bme680;
+pub mod camera;
 pub mod encoder;
 pub mod expander;
 pub mod hx711;
@@ -214,10 +215,12 @@ pub static CATALOG: &[CatalogEntry] = &[
     CatalogEntry {
         kind: "camera",
         name: "OV2640 / OV3660 camera (DVP, esp32-camera)",
-        detection: "not implemented yet: needs DMA frame buffers in PSRAM and an I2C control channel",
-        status: "planned",
+        detection:
+            "declared only: SCCB ids 0x26/0x36 at the module's address, but the frame has to come \
+             through the platform, so a camera is never auto-adopted — 0x3C is also the OLED's",
+        status: "implemented",
         caps: &["camera"],
-        docs: "ROADMAP.md",
+        docs: "docs/capabilities.md",
     },
     CatalogEntry {
         kind: "bme680",
@@ -367,6 +370,7 @@ const DECLARABLE: &[&str] = &[
     "max7219",
     "rc522",
     "bme680",
+    "camera",
     "aht20",
     "bh1750",
     "ds3231",
@@ -831,6 +835,13 @@ pub fn instantiate(spec: &crate::manifest::DeviceSpec, hw: &mut dyn Hardware) ->
         }
         "bme280" => Box::new(bme280::Bme280::probe(hw, bus, needs_addr(addr)?, 1)?),
         "bme680" => Box::new(bme680::Bme680::probe(hw, bus, needs_addr(addr)?, 1)?),
+        // Declared, never scanned: the SCCB id would identify the part, but the frame has to
+        // come from the platform's capture path, and 0x3C is the OLED's address on most
+        // boards. A camera in the manifest is a person saying "there is one here".
+        "camera" => {
+            let opts = camera::Options::from_options(&spec.options)?;
+            Box::new(camera::Camera::probe(hw, bus, needs_addr(addr)?, opts, 1)?)
+        }
         "aht20" => Box::new(aht20::Aht20::probe(hw, bus, needs_addr(addr)?, 1)?),
         "bh1750" => Box::new(bh1750::Bh1750::probe(hw, bus, needs_addr(addr)?, 1)?),
         "ds3231" => Box::new(rtc::Ds3231::probe(hw, bus, needs_addr(addr)?, 1)?),
