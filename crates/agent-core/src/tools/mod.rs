@@ -494,8 +494,143 @@ pub fn system_tools() -> Vec<ToolDef> {
 /// One entry, because the language carries the generality: a script is how the model
 /// writes the loop it needs instead of asking for a new fixed tool every time.
 /// The tools the model gets but MCP does not: they need the app's own state.
+///
+/// Names follow the commands people already run — `read`, `write`, `edit`, `curl`, `wget`,
+/// `nslookup`, `nc`, `ifconfig`, `ping` — because a model knows those and a description it
+/// has to read for every one of them is a description in every request.
 pub fn agent_extra_specs() -> Value {
-    json!([{
+    json!([
+        {
+            "type": "function",
+            "function": {
+                "name": "read",
+                "description": "Read a text file from the board workspace. `/` is the root.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string", "description": "file path, e.g. `/notes/a.txt`" },
+                    },
+                    "required": ["path"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "write",
+                "description": "Create or overwrite a text file in the board workspace. Parent directories are created. A file is limited to 2048 bytes and the workspace to 8 KB.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string", "description": "file path to write" },
+                        "text": { "type": "string", "description": "complete new contents" },
+                    },
+                    "required": ["path", "text"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "edit",
+                "description": "Replace exactly one occurrence of `find` in a file. Fails when it occurs zero or several times, so an ambiguous edit never rewrites the wrong place.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string", "description": "file path to edit" },
+                        "find": { "type": "string", "description": "literal text, must occur exactly once" },
+                        "replace": { "type": "string", "description": "replacement text" },
+                    },
+                    "required": ["path", "find", "replace"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "curl",
+                "description": "Fetch a URL. GET by default; an HTML page is reduced to its text unless format=raw; send `data` to POST it. Returns up to 2048 bytes.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "url": { "type": "string", "description": "http:// or https:// URL" },
+                        "data": { "type": "string", "description": "body to POST; omit for GET" },
+                        "format": { "type": "string", "enum": ["text", "raw"], "description": "text (default) reduces an HTML page to its words" },
+                    },
+                    "required": ["url"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "wget",
+                "description": "Download a URL into the workspace as a file. Text is stored as it arrives; anything else is stored base64-encoded with `encoding: base64` in the result.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "url": { "type": "string", "description": "http:// or https:// URL" },
+                        "path": { "type": "string", "description": "where to save it, default `/downloads/<host><path>`" },
+                        "format": { "type": "string", "enum": ["text", "raw"], "description": "for HTML: text (default) saves the words, raw saves the document" },
+                    },
+                    "required": ["url"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "nslookup",
+                "description": "Resolve a hostname with the board's resolver. Use it when curl fails: name, route and TLS failures look identical from curl's error.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "host": { "type": "string", "description": "name to resolve, e.g. example.com" },
+                        "port": { "type": "integer", "minimum": 1, "maximum": 65535, "description": "port for the lookup, default 443" },
+                    },
+                    "required": ["host"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "nc",
+                "description": "Open a TCP connection to host:port and close it. Tells \"host up, service down\" apart from \"nothing there\".",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "host": { "type": "string", "description": "name or address" },
+                        "port": { "type": "integer", "minimum": 1, "maximum": 65535, "description": "port to try, default 80" },
+                        "timeout_ms": { "type": "integer", "minimum": 100, "maximum": 20000, "description": "give up after this, default 3000" },
+                    },
+                    "required": ["host"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "ping",
+                "description": "Send ICMP echo requests and report the replies: the one check that says whether a host is reachable at all, before any name or TLS question.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "host": { "type": "string", "description": "name or address" },
+                        "count": { "type": "integer", "minimum": 1, "maximum": 5, "description": "echo requests to send, default 3" },
+                    },
+                    "required": ["host"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "ifconfig",
+                "description": "The board's own network state: address, netmask, gateway, DNS servers, SSID, RSSI and MAC. Answers \"is the gateway I set actually in effect\".",
+                "parameters": { "type": "object", "properties": {}, "required": [] },
+            },
+        },{
         "type": "function",
         "function": {
             "name": "image_read",
