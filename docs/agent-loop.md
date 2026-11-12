@@ -65,13 +65,29 @@ hard-coding an endpoint has to be a deliberate act with a failing test to justif
 ## 4. Surviving a power cut
 
 Two mechanisms, one storage: `agent.persist_transcript` (default on) and the
-`agent.run_in_flight` marker.
+`run_in_flight` marker.
 
-The transcript is written as JSON Lines behind a header under `agent.transcript`,
-`agent.transcript.1`, … Each chunk is 3500 bytes with an FNV-1a checksum in its header,
+The transcript is written as JSON Lines behind a header under `transcript`,
+`transcript.1`, … Each chunk is 3500 bytes with an FNV-1a checksum in its header,
 because ESP-IDF refuses a string value above about 4000 bytes and the firmware's NVS
 adapter reads through a fixed 4096-byte buffer. A single 16 KB key would pass every host
 test and persist nothing on the board.
+
+A key name is a limit too: NVS keeps 15 bytes (`NVS_KEY_NAME_MAX_SIZE` is 16 with the
+terminator) and refuses a longer one with `ESP_ERR_NVS_KEY_TOO_LONG`, storing nothing.
+The names used to be `agent.transcript` (16 bytes) and `agent.run_in_flight` (19), so
+neither was ever written — see `docs/troubleshooting.md` §"a write was refused". Every key
+name now lives in `crates/agent-core/src/keys.rs`, where `all()` enumerates the shapes the
+assembly can produce (including a two-digit chunk number) and
+`every_key_the_board_can_generate_fits_nvs` fails on a longer prefix, a longer separator or
+a wider index.
+
+**There is no migration, and that is not an omission.** Both names were introduced already
+over the ceiling (`43b9f92`), and NVS refused the value before writing any of it, so no
+board ever had a byte under `agent.transcript` or `agent.run_in_flight` to migrate. Nothing
+reads the old names either: a key that never existed cannot hold a conversation, and a
+fallback for it would only hide the next such mistake. A simulator's state file is the one
+place an old name could exist — that is a developer's scratch state, not the board's.
 
 The stored copy is lossy on purpose: text over 300 bytes, reasoning over 200 and tool
 arguments over 256 are cut with the truncation marker, images are not stored at all, and
