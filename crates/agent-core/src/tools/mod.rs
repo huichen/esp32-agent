@@ -508,6 +508,7 @@ pub fn agent_extra_specs() -> Value {
                 "parameters": {
                     "type": "object",
                     "properties": {
+                    "help": { "type": "boolean", "description": "return the usage line instead of running" },
                         "path": { "type": "string", "description": "file path, e.g. `/notes/a.txt`" },
                     },
                     "required": ["path"],
@@ -522,6 +523,7 @@ pub fn agent_extra_specs() -> Value {
                 "parameters": {
                     "type": "object",
                     "properties": {
+                    "help": { "type": "boolean", "description": "return the usage line instead of running" },
                         "path": { "type": "string", "description": "file path to write" },
                         "text": { "type": "string", "description": "complete new contents" },
                     },
@@ -537,6 +539,7 @@ pub fn agent_extra_specs() -> Value {
                 "parameters": {
                     "type": "object",
                     "properties": {
+                    "help": { "type": "boolean", "description": "return the usage line instead of running" },
                         "path": { "type": "string", "description": "file path to edit" },
                         "find": { "type": "string", "description": "literal text, must occur exactly once" },
                         "replace": { "type": "string", "description": "replacement text" },
@@ -553,6 +556,7 @@ pub fn agent_extra_specs() -> Value {
                 "parameters": {
                     "type": "object",
                     "properties": {
+                    "help": { "type": "boolean", "description": "return the usage line instead of running" },
                         "url": { "type": "string", "description": "http:// or https:// URL" },
                         "data": { "type": "string", "description": "body to POST; omit for GET" },
                         "format": { "type": "string", "enum": ["text", "raw"], "description": "text (default) reduces an HTML page to its words" },
@@ -569,6 +573,7 @@ pub fn agent_extra_specs() -> Value {
                 "parameters": {
                     "type": "object",
                     "properties": {
+                    "help": { "type": "boolean", "description": "return the usage line instead of running" },
                         "url": { "type": "string", "description": "http:// or https:// URL" },
                         "path": { "type": "string", "description": "where to save it, default `/downloads/<host><path>`" },
                         "format": { "type": "string", "enum": ["text", "raw"], "description": "for HTML: text (default) saves the words, raw saves the document" },
@@ -585,6 +590,7 @@ pub fn agent_extra_specs() -> Value {
                 "parameters": {
                     "type": "object",
                     "properties": {
+                    "help": { "type": "boolean", "description": "return the usage line instead of running" },
                         "host": { "type": "string", "description": "name to resolve, e.g. example.com" },
                         "port": { "type": "integer", "minimum": 1, "maximum": 65535, "description": "port for the lookup, default 443" },
                     },
@@ -600,6 +606,7 @@ pub fn agent_extra_specs() -> Value {
                 "parameters": {
                     "type": "object",
                     "properties": {
+                    "help": { "type": "boolean", "description": "return the usage line instead of running" },
                         "host": { "type": "string", "description": "name or address" },
                         "port": { "type": "integer", "minimum": 1, "maximum": 65535, "description": "port to try, default 80" },
                         "timeout_ms": { "type": "integer", "minimum": 100, "maximum": 20000, "description": "give up after this, default 3000" },
@@ -616,6 +623,7 @@ pub fn agent_extra_specs() -> Value {
                 "parameters": {
                     "type": "object",
                     "properties": {
+                    "help": { "type": "boolean", "description": "return the usage line instead of running" },
                         "host": { "type": "string", "description": "name or address" },
                         "count": { "type": "integer", "minimum": 1, "maximum": 5, "description": "echo requests to send, default 3" },
                     },
@@ -628,7 +636,8 @@ pub fn agent_extra_specs() -> Value {
             "function": {
                 "name": "ifconfig",
                 "description": "The board's own network state: address, netmask, gateway, DNS servers, SSID, RSSI and MAC. Answers \"is the gateway I set actually in effect\".",
-                "parameters": { "type": "object", "properties": {}, "required": [] },
+                "parameters": { "type": "object", "properties": {
+                    "help": { "type": "boolean", "description": "return the usage line instead of running" },}, "required": [] },
             },
         },{
         "type": "function",
