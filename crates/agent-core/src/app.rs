@@ -178,6 +178,46 @@ impl Default for FwMeta {
     }
 }
 
+/// What a script's arguments look like to the language.
+///
+/// Two shapes, because two callers exist. A map (`{"pin": 12}`) is what an HTTP client sends
+/// when it knows the fields. An array is a command line, which is what a shell passes:
+/// bare words become `argv`, and `--name value` or `name=value` also land in `args`.
+fn script_arguments(given: Option<&serde_json::Value>) -> serde_json::Value {
+    match given {
+        Some(serde_json::Value::Array(items)) => {
+            let mut map = serde_json::Map::new();
+            let mut i = 0;
+            while i < items.len() {
+                let word = items[i].as_str().unwrap_or_default().to_string();
+                if let Some(rest) = word.strip_prefix("--") {
+                    // `--name value`, or `--name=value`.
+                    if let Some((k, v)) = rest.split_once('=') {
+                        map.insert(k.to_string(), serde_json::Value::String(v.to_string()));
+                    } else if let Some(next) = items.get(i + 1) {
+                        map.insert(rest.to_string(), next.clone());
+                        i += 1;
+                    } else {
+                        // A flag with no value is a boolean: `--verbose` means true.
+                        map.insert(rest.to_string(), serde_json::Value::Bool(true));
+                    }
+                } else if let Some((k, v)) = word.split_once('=') {
+                    if !k.is_empty() {
+                        map.insert(k.to_string(), serde_json::Value::String(v.to_string()));
+                    }
+                }
+                i += 1;
+            }
+            // `argv` keeps every word, flags included, so a script can walk the command line
+            // itself when the `--name value` convention does not fit.
+            let positional: Vec<serde_json::Value> = items.clone();
+            serde_json::json!({ "__argv": positional, "__args": map })
+        }
+        Some(other) => other.clone(),
+        None => serde_json::Value::Null,
+    }
+}
+
 /// One run submitted through `POST /api/script`.
 ///
 /// The board has one agent thread, so an asynchronous run is not a second thread: it is a
@@ -977,7 +1017,21 @@ impl App {
         // description is not a language.
         let help_section = crate::json::opt_str(args, "section").unwrap_or_default();
         let wants_help = crate::json::opt_bool(args, "help").unwrap_or(false) || !help_section.is_empty();
-        let source = crate::json::opt_str(args, "source").unwrap_or_default();
+        // Either inline `source` or a `path` in the workspace, the way a shell runs a file.
+        let mut source = crate::json::opt_str(args, "source").unwrap_or_default();
+        let path = crate::json::opt_str(args, "path").unwrap_or_default();
+        if source.trim().is_empty() && !path.trim().is_empty() {
+            let read = fs_tools::call(&mut self.workspace, "fs_read", &json!({ "path": path }))
+                .ok_or_else(|| McpError::invalid_params(format!("no script at `{path}`")))?
+                .map_err(McpError::invalid_params)?;
+            // `fs_read` answers with a JSON object (`{path, text, …}`), so the script is its
+            // `text` field — feeding the whole object to the parser is what made a one-line
+            // script fail with "unexpected token Colon".
+            source = serde_json::from_str::<Value>(&read)
+                .ok()
+                .and_then(|v| v.get("text").and_then(|t| t.as_str()).map(|t| t.to_string()))
+                .unwrap_or(read);
+        }
         if crate::json::opt_bool(args, "lint").unwrap_or(false) && !source.trim().is_empty() {
             let lint = crate::script::lint(&source);
             return Ok(json!({
@@ -1012,7 +1066,7 @@ impl App {
         // Arguments for the script: `{"source": …, "args": {"pin": 12}}`. They land in the
         // global scope as `args` (a map) and `argv` (its values, in order), which is what
         // makes one script usable for several pins.
-        let args = args.get("args").cloned().unwrap_or(serde_json::Value::Null);
+        let args = script_arguments(args.get("args"));
         let mut host = Host { app: self };
         let started = now_ms();
         match crate::script::run_with(&source, &mut host, &args) {
@@ -3401,6 +3455,13 @@ impl App {
         *self.tool_specs_cache.borrow_mut() = None;
     }
 
+    /// Turn what a caller passed into `args` into the two shapes a script sees.
+    ///
+    /// A map is passed through. An array is a command line: bare words become `argv`, and
+    /// `--name value` / `name=value` pairs also become entries of `args`, which is how a
+    /// shell hands arguments to a script. Positional arguments keep their order in `argv`
+    /// including the flags, so a script can read either view.
+    ///
     /// The array built from scratch: one pass over the disabled names, not 51.
     fn tool_specs_uncached(&self) -> Value {
         let disabled: std::collections::BTreeSet<&str> =
@@ -5672,6 +5733,43 @@ mod tests {
         // And the resumed turn is stored like any other, marker cleared.
         assert!(store.get(NVS_KEY_RUN_IN_FLIGHT).is_none());
         assert!(store.get(NVS_KEY_TRANSCRIPT).is_some());
+    }
+
+    #[test]
+    fn a_script_runs_from_a_file_with_a_command_line() {
+        let mut app = test_app();
+        // A script in the workspace, the way a shell has one on disk.
+        fs_tools::call(
+            &mut app.workspace,
+            "fs_write",
+            &json!({ "path": "/scripts/pin.bs", "text": "args.pin + \"\" + str(len(argv))" }),
+        )
+        .expect("the fs tool exists")
+        .expect("write");
+
+        // `path` + a command line: `--pin 12` fills `args.pin`, and `argv` keeps both words.
+        let out = app
+            .call_tool("script", &json!({ "path": "/scripts/pin.bs", "args": ["--pin", "12"] }))
+            .expect("runs");
+        assert_eq!(out["ok"], json!(true), "{out}");
+        assert_eq!(out["result"], json!("122"), "args.pin is 12, argv has 2 words: {out}");
+
+        // `name=value` works too, and a bare flag becomes true.
+        let out =
+            app.call_tool("script", &json!({ "source": "args.mode", "args": ["mode=fast"] })).expect("runs");
+        assert_eq!(out["result"], json!("fast"));
+        let out = app
+            .call_tool("script", &json!({ "source": "args.verbose", "args": ["--verbose"] }))
+            .expect("runs");
+        assert_eq!(out["result"], json!(true));
+
+        // A named map still works, and a missing path is an error that says so.
+        let out =
+            app.call_tool("script", &json!({ "source": "args.pin", "args": { "pin": 7 } })).expect("runs");
+        assert_eq!(out["result"], json!(7));
+        let err =
+            app.call_tool("script", &json!({ "path": "/scripts/nope.bs" })).expect_err("no such script");
+        assert!(err.message.contains("nope.bs"), "{}", err.message);
     }
 
     #[test]

@@ -1075,13 +1075,26 @@ pub fn run_with(
     let mut parser = Parser { toks, pos: 0 };
     let program = parser.program()?;
     let mut globals: BTreeMap<String, Val> = BTreeMap::new();
-    let map = match args {
+    // Two shapes arrive here: a plain map of named arguments, or the `{__args, __argv}` pair
+    // a command line is turned into. Both end up as the same two globals.
+    let (map_json, list_json) = match args {
+        serde_json::Value::Object(m) if m.contains_key("__args") || m.contains_key("__argv") => (
+            m.get("__args").cloned().unwrap_or(serde_json::Value::Null),
+            m.get("__argv").cloned().unwrap_or(serde_json::Value::Null),
+        ),
+        other => (other.clone(), serde_json::Value::Null),
+    };
+    let map = match &map_json {
         serde_json::Value::Object(m) => {
             m.iter().map(|(k, v)| (k.clone(), Val::from_json(v))).collect::<BTreeMap<String, Val>>()
         }
         _ => BTreeMap::new(),
     };
-    let list = map.values().cloned().collect::<Vec<Val>>();
+    let list = match &list_json {
+        serde_json::Value::Array(items) => items.iter().map(Val::from_json).collect::<Vec<Val>>(),
+        // Named arguments still fill `argv` with their values, in key order.
+        _ => map.values().cloned().collect::<Vec<Val>>(),
+    };
     globals.insert("args".into(), Val::Map(map));
     globals.insert("argv".into(), Val::List(list));
 
