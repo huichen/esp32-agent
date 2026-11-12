@@ -5,7 +5,7 @@ what is not done or not verified.
 
 ## Verified / unverified
 
-- ✅ `agent-core`: 704 unit tests and 14 integration tests (protocol, HTTP, manifest
+- ✅ `agent-core`: 705 unit tests and 14 integration tests (protocol, HTTP, manifest
   validation, driver conversion, capability filtering, auth, hot reload, the agent loop,
   shell and script, the file tools, sched, SSE streams, a streamed request body)
 - ✅ Simulator end to end: `scripts/smoke.ps1` and `scripts/smoke.sh`
@@ -22,8 +22,13 @@ what is not done or not verified.
 - ✅ Live journal over SSE (`/api/agent/stream`), `tool_progress`, `agent.tick_ms`
 - ⚠️ Not measured: WS2812/RMT, ADC/PWM values, boot time and power draw under a full
   sdkconfig; the portal's live console has only been driven with `curl -N`, not in a
-  browser; and `POST /audio/pcm` has only been played to the simulator — on the board the
-  claim that the amplifier's DMA paces the socket is untested
+  browser
+- ⚠️ `POST /audio/pcm` and `POST /av` have been played on the board since: a 30.00 s clip
+  with 362 frames completed in 30.19 s with the sound judged correct by ear, and its audio
+  alone in 30.03 s. What the 128×32 panel *shows* of a dithered video has not been judged
+  yet — the picture is dense enough that "noisy content" and "a wrong panel setup" look
+  alike — and the display dropped off the I²C scan once during those runs, returning after
+  a power cycle
 
 ## Near term
 

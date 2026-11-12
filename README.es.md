@@ -86,7 +86,7 @@ instrucción sirve para cada placa que pueda alcanzar. Sin ninguna clave, `base_
 
 | Parte | Estado |
 |---|---|
-| `agent-core` | 704 pruebas unitarias y 14 de integración pasan; `scripts/smoke.ps1` pasa de extremo a extremo |
+| `agent-core` | 705 pruebas unitarias y 14 de integración pasan; `scripts/smoke.ps1` pasa de extremo a extremo |
 | Simulador | la consola, MCP y el bucle de agente funcionan de extremo a extremo |
 | Firmware | grabado en una ESP32-S3-DevKitC-1 N16R8 (IDF v5.5.2): 42 herramientas, OLED 128×32, micrófono y amplificador I²S, WS2812, consola TLS, turnos del modelo por HTTPS |
 | No implementado | OTA, tarjeta SD, DHT11/22, cámara. Ver `ROADMAP.md` |

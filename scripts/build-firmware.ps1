@@ -127,6 +127,10 @@ try {
     $bin = Join-Path $env:CARGO_TARGET_DIR "$Target\release\esp32-agent"
     if (-not (Test-Path $bin)) { $bin = Join-Path $env:CARGO_TARGET_DIR "$Target\debug\esp32-agent" }
     $args = @('flash', '--monitor', $bin)
+    # §4: the partition table is passed to the flasher explicitly. Left out, espflash writes
+    # the stock single-app table and the image enumerates partitions that are not there.
+    $table = Join-Path $fw 'partitions.csv'
+    if (Test-Path $table) { $args += @('--partition-table', $table) }
     if ($Port) { $args += @('--port', $Port) }
     Write-Host "espflash $($args -join ' ')" -ForegroundColor Cyan
     & espflash @args
