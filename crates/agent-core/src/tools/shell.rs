@@ -373,7 +373,11 @@ pub fn pipe_stdio(op: &str) -> Option<Stdio> {
         | "xd" | "hexdump" | "base64enc" | "base64dec" | "sha256sum" | "md5sum" | "crc32" | "tee" => {
             Stdio::Reads
         }
-        "ls" | "jot" | "du" | "df" | "free" | "ps" | "uname" | "date" | "uptime" | "echo" => Stdio::Produces,
+        // A fetch is a producer: it has no stdin to read, and its body is exactly the text a
+        // `jq`, `grep` or `head` downstream wants. Refusing it made `curl api | jq .x` — the
+        // reason both commands exist — impossible.
+        "curl" | "wget" | "ls" | "jot" | "du" | "df" | "free" | "ps" | "uname" | "date" | "uptime"
+        | "echo" => Stdio::Produces,
         _ => return None,
     })
 }
@@ -381,6 +385,8 @@ pub fn pipe_stdio(op: &str) -> Option<Stdio> {
 /// The stages a pipeline may carry, as one line, for the error that refuses another command.
 pub fn pipe_commands() -> String {
     let mut names: Vec<&str> = [
+        "curl",
+        "wget",
         "cat",
         "grep",
         "sort",
@@ -1096,12 +1102,16 @@ mod tests {
     /// Only the line commands are stages, and the list the error prints is this list.
     #[test]
     fn only_the_line_commands_may_be_stages() {
-        for op in
-            ["cat", "grep", "sort", "uniq", "tr", "cut", "head", "tail", "wc", "echo", "ls", "jot", "tee"]
-        {
+        for op in [
+            "cat", "grep", "sort", "uniq", "tr", "cut", "head", "tail", "wc", "echo", "ls", "jot", "tee",
+            "curl", "wget",
+        ] {
             assert!(pipe_stdio(op).is_some(), "`{op}` should be a stage");
         }
-        for op in ["curl", "wget", "rm", "touch", "sleep", "script", "hostname", "ping"] {
+        // A fetch reads no stdin, so it may only start a pipeline.
+        assert_eq!(pipe_stdio("curl"), Some(Stdio::Produces));
+        assert_eq!(pipe_stdio("wget"), Some(Stdio::Produces));
+        for op in ["rm", "touch", "sleep", "script", "hostname", "ping"] {
             assert_eq!(pipe_stdio(op), None, "`{op}` must not be a stage");
         }
         assert_eq!(pipe_stdio("ls"), Some(Stdio::Produces));
