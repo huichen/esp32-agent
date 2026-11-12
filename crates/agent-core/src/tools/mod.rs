@@ -8,6 +8,7 @@ pub mod family;
 pub mod fs;
 pub mod knowledge;
 pub mod net;
+pub mod regex;
 pub mod shell;
 
 use crate::capability::{cap, CapSet};
