@@ -1,6 +1,6 @@
 //! SHA-256 and MD5, in a few dozen lines each.
 //!
-//! Both are here for `nsh sha256sum` / `nsh md5sum`: a board that can download a file
+//! Both are here for `shell sha256sum` / `shell md5sum`: a board that can download a file
 //! should be able to say what it is. Neither is security code — SHA-256 is used to name a
 //! file, not to sign one.
 

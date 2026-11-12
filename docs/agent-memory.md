@@ -63,10 +63,10 @@ the messages themselves:
 
 ```text
 ## Earlier in this conversation (compressed)
-- user: 把板载灯设成蓝色，然后读一次温度
+- user: set the on-board LED blue, then read the temperature once
 - called: board_status({})
 - result: {"board_name":"ESP32-S3 breadboard…","devices":6,…}
-- answer: 灯已经是蓝色，温度 25.1 °C
+- answer: the LED is blue, the temperature is 25.1 °C
 ```
 
 | Property | Why it matters on this board |

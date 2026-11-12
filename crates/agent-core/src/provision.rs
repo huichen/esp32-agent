@@ -29,7 +29,7 @@ pub enum ProvisionCmd {
 ///
 /// Returns `None` for anything that is not a provisioning line, so the caller can ignore
 /// log noise and keystrokes. The password may contain spaces (the rest of the line after
-/// the SSID), because a SSID with a space in it — `给力哥 的家` — would otherwise be
+/// the SSID), because a SSID with a space in it — `Home Network` — would otherwise be
 /// indistinguishable; an SSID with a space still works, the last word is simply taken as
 /// part of the password.
 pub fn parse_line(line: &str) -> Option<ProvisionCmd> {
