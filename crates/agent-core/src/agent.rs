@@ -178,6 +178,11 @@ impl Message {
 
 /// Everything the loop needs from the board, implemented by `App`.
 pub trait ToolHost {
+    /// The owner's own system-prompt text, or `None` when they have not written any.
+    fn custom_prompt(&self) -> Option<String> {
+        None
+    }
+
     /// OpenAI `tools` array.
     fn tool_specs(&self) -> Value;
     /// Run one tool call; the result is JSON text (<= 2 KB enforced here).
@@ -763,6 +768,15 @@ impl Agent {
 
     fn system_message(&self, host: &dyn ToolHost) -> String {
         let mut text = String::from(system_prompt());
+        // The owner's standing orders come before the machine-generated parts: they are
+        // the reason this board exists, and a reader (or a model) should meet them first.
+        if let Some(custom) = host.custom_prompt() {
+            let custom = custom.trim();
+            if !custom.is_empty() {
+                text.push_str("\n\n## Standing orders for this board\n");
+                text.push_str(custom);
+            }
+        }
         if let Some(instructions) = host.project_instructions() {
             text.push_str("\n\n## Project instructions (/AGENTS.md)\nThese are the rules for this installation; follow them.\n");
             text.push_str(&instructions);
