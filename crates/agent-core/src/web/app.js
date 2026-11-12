@@ -573,7 +573,10 @@ function trackViewport() {
 function init() {
   $("#menu-btn").onclick = () => {
     $("#sheet").hidden = false;
-    showPanel(S.panel);
+    // Always open on Devices: it is the page a person needs most often (what is this board,
+    // is anything missing), and remembering the last tab meant landing on Settings after
+    // one visit.
+    showPanel("devices");
   };
   $("#sheet-close").onclick = () => ($("#sheet").hidden = true);
   $$(".tabs button").forEach((b) => (b.onclick = () => showPanel(b.dataset.panel)));

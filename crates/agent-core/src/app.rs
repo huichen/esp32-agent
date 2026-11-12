@@ -3482,6 +3482,20 @@ mod tests {
     /// A script is how the model writes the loop the tool vocabulary cannot express — and
     /// `tool()` inside it goes through the same dispatcher, so it cannot reach further than
     /// the caller.
+    /// Opening the sheet always lands on Devices, whatever was open last time.
+    #[test]
+    fn the_board_sheet_opens_on_devices() {
+        assert!(
+            crate::web::INDEX_HTML.contains("data-panel=\"devices\" aria-selected=\"true\""),
+            "devices is the selected tab in the markup"
+        );
+        assert!(
+            crate::web::APP_JS.contains("showPanel(\"devices\")"),
+            "opening the sheet selects devices, it does not remember"
+        );
+        assert!(!crate::web::APP_JS.contains("showPanel(S.panel)"), "no restore of the last tab");
+    }
+
     /// `minimal` is the answer to "why are there still 27 tools on an empty board": it
     /// hides the nine that are conveniences, and keeps everything an empty board needs to
     /// rebuild itself.
