@@ -4483,14 +4483,34 @@ impl App {
     }
 
     /// `free`: heap, split the way this board actually splits it.
+    ///
+    /// The totals come first because they are what `free` prints everywhere, but on a board
+    /// with PSRAM the total is the wrong number for every question that matters: a stack, a
+    /// TLS record and a socket all need *internal* bytes, and those can be nearly gone while
+    /// the total still reads in the megabytes. The pools name which number answers which
+    /// request, so the note this used to carry ("free_kb includes PSRAM") is not needed.
     fn shell_free(&mut self) -> String {
         let info = self.hw.board_info();
-        serde_json::json!({
-            "heap_free_kb": info.free_heap_kb,
-            "heap_min_kb": info.min_free_heap_kb,
-            "note": "free_kb includes PSRAM; internal_kb in /api/status is the number that matters for sockets and TLS",
-        })
-        .to_string()
+        let internal = self.hw.heap_internal();
+        // One flat field per pool rather than a nested object: `free` prints the answer as
+        // `key value` lines (that is what a `grep dma` downstream reads), and a nested map
+        // would print as one line of JSON.
+        let mut out = serde_json::Map::new();
+        out.insert("heap_free_kb".into(), serde_json::json!(info.free_heap_kb));
+        out.insert("heap_min_kb".into(), serde_json::json!(info.min_free_heap_kb));
+        out.insert("internal_kb".into(), serde_json::json!(internal.map(|(free, _)| free / 1024)));
+        out.insert(
+            "largest_internal_kb".into(),
+            serde_json::json!(internal.map(|(_, largest)| largest / 1024)),
+        );
+        for pool in self.hw.heap_pools() {
+            let key = |what: &str| format!("{}_{}", pool.pool, what);
+            out.insert(key("total_kb"), serde_json::json!(pool.total_kb));
+            out.insert(key("free_kb"), serde_json::json!(pool.free_kb));
+            out.insert(key("largest_kb"), serde_json::json!(pool.largest_kb));
+            out.insert(key("min_free_kb"), serde_json::json!(pool.min_free_kb));
+        }
+        serde_json::Value::Object(out).to_string()
     }
 
     fn shell_uptime(&mut self) -> String {
@@ -8491,6 +8511,38 @@ mod tests {
         let resp = app.route(&post("/api/reboot", "{}"));
         assert_eq!(resp.status, 200, "the portal's restart must still answer");
         assert!(app.runtime.restart_requested, "the platform must be told to restart");
+    }
+
+    /// "How much RAM is free" has two answers on a board with PSRAM, and the status tool
+    /// used to give only the big one: asked in a real turn, the model read `free_heap_kb`
+    /// (7 864 kB, nearly all PSRAM) and answered "7 919 KB of free internal heap". The
+    /// numbers a stack, a socket or a TLS record has to fit in were not in the answer at all.
+    #[test]
+    fn board_status_names_the_internal_ram_and_agrees_with_the_pools() {
+        let mut app = test_app();
+        let status = app.call_tool("board", &json!({ "command": "status" })).unwrap();
+
+        let internal_kb =
+            status["internal_kb"].as_u64().unwrap_or_else(|| panic!("no internal_kb in {status}"));
+        let largest_kb = status["largest_internal_kb"]
+            .as_u64()
+            .unwrap_or_else(|| panic!("no largest_internal_kb in {status}"));
+        assert!(
+            status["free_heap_kb"].as_u64().unwrap() >= internal_kb,
+            "the total cannot be smaller than the part: {status}"
+        );
+        assert!(largest_kb <= internal_kb, "a block cannot exceed the pool: {status}");
+
+        // One source of truth: the same pool `/api/memory` lists, not a second measurement.
+        let (free, largest) = app.hw.heap_internal().expect("the board names its pools");
+        assert_eq!(internal_kb, (free / 1024) as u64, "{status}");
+        assert_eq!(largest_kb, (largest / 1024) as u64, "{status}");
+
+        // And `free` says the same thing, split by pool rather than explained in a note.
+        let free_out = app.call_tool("shell", &json!({ "command": "free" })).unwrap();
+        let text = free_out["stdout"].as_str().unwrap_or(&free_out.to_string()).to_string();
+        assert!(text.contains("internal_8bit_free_kb"), "{text}");
+        assert!(text.contains("spiram_free_kb"), "{text}");
     }
 
     #[test]

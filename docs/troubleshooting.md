@@ -197,6 +197,12 @@ The pools overlap on purpose: internal RAM is the DMA pool plus more, and PSRAM 
 of its own. `memory.free_heap_kb` in `/api/status` is the sum of them, which is how "8 MB of
 free heap" and "a thread stack did not fit" were both true at once.
 
+That sum is also why `board status` now reports `internal_kb` and `largest_internal_kb` next
+to `free_heap_kb`, and why `shell free` lists one line per pool. Asked "how much RAM is
+free", a model read the only number there was — 7 864 kB, nearly all of it PSRAM — and
+answered "7 919 KB of free internal heap". Both figures are named now, so the answer a model
+gives and the answer `/api/memory` gives are the same one.
+
 `/api/status.threads`, same run. The name is the FreeRTOS task name, which is what `ps`
 prints — it is set by `firmware/src/threads.rs`, not by `std::thread::Builder::name` (that
 one only sets the pthread name, which nothing here reads):
