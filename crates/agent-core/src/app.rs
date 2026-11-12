@@ -21,7 +21,7 @@ use crate::manifest::{Manifest, NVS_KEY_MANIFEST};
 use crate::protocol::{self, RpcIn};
 use crate::sched::{ScheduledTask, SensorRule};
 use crate::state::{make_session_id, ProbeReport, Runtime};
-use crate::store::KvStore;
+use crate::store::{self, KvStore};
 use crate::tool::{ToolCtx, ToolDef, ToolRegistry};
 use crate::tools as board_tools;
 use crate::tools::family::Family;
@@ -61,10 +61,28 @@ pub const NVS_KEY_RUN_IN_FLIGHT: &str = "agent.run_in_flight";
 /// asked for.
 pub const RESUME_SOURCE: &str = "resume";
 
-/// The file tools write into a RAM map that is persisted as one NVS blob, so the
+/// The file tools write into a RAM map that is persisted as one JSON blob, so the
 /// whole workspace has to stay small enough to serialise next to everything else.
 pub const WORKSPACE_FILE_MAX: usize = 2048;
 pub const WORKSPACE_TOTAL_MAX: usize = 8192;
+/// How the workspace blob is spread over the store.
+///
+/// Not one value under `ws`: ESP-IDF refuses a string above about 4000 bytes, and a
+/// workspace with a few files in it is already past that. The board then logged
+/// `nvs write 'ws': ESP_ERR_NVS_VALUE_TOO_LONG` while `write` answered `ok: true` and
+/// `read` served the file out of RAM until the next boot - a write that looked fine and
+/// silently was not. The blob is now `ws` (header: count, total length, one checksum per
+/// chunk) plus `ws.1`, `ws.2`, ... as the transcript is stored, with one difference: the
+/// header carries a checksum per chunk, so a rejected blob can name the value that
+/// disagrees.
+///
+/// Five values of 3500 bytes is 17,500 bytes of serialised JSON, against
+/// [`WORKSPACE_TOTAL_MAX`] of *text*: JSON escapes a newline to two bytes, so the same
+/// 8 KB of Markdown weighs about 10 KB stored. The ceiling is stated here rather than left
+/// to arithmetic in a log line; [`store::write_blob`] refuses the blob and says so when it
+/// is passed.
+pub const WORKSPACE_PLAN: store::Plan =
+    store::Plan { tag: "ws1", chunk_bytes: store::CHUNK_BYTES, chunks_max: 5 };
 
 /// The longest `sleep` / `usleep` waits this board will actually wait.
 ///
@@ -1710,15 +1728,69 @@ impl App {
                     .error("agent", format!("the stored schedule is unreadable ({e}); starting empty")),
             }
         }
-        if let Some(text) = self.store.get(NVS_KEY_WORKSPACE) {
-            match serde_json::from_str::<Value>(&text) {
-                Ok(v) => self.workspace = AppWorkspace::from_json(&v),
-                Err(e) => self.log.error("agent", format!("the stored workspace is unreadable ({e})")),
-            }
-        }
+        self.load_workspace();
         // Last, because resuming needs the config that decides whether anything was stored
         // at all, and the transcript a resumed turn continues from.
         self.load_transcript();
+    }
+
+    /// Restore the file workspace, migrating the one-value blob an older build wrote.
+    ///
+    /// Three outcomes, and the difference matters:
+    ///
+    /// * a blob this build wrote is taken chunk by chunk, each one checked against the
+    ///   header;
+    /// * a plain JSON value under `ws` is the old format: it is read, and then written back
+    ///   in the chunked one. Migration happens here rather than in a version bump because
+    ///   there is nothing to bump: the old value is complete on its own, so a board that
+    ///   upgrades mid-life keeps every file it had;
+    /// * a header or chunk that does not check out is logged and dropped whole. Half a
+    ///   workspace would come back as a file list no boot ever wrote, which is the same rule
+    ///   the transcript follows.
+    fn load_workspace(&mut self) {
+        let (text, legacy) = match store::read_blob(self.store.as_ref(), NVS_KEY_WORKSPACE, WORKSPACE_PLAN) {
+            store::BlobState::Missing => return,
+            store::BlobState::Stored(text) => (text, false),
+            store::BlobState::Legacy(text) => (text, true),
+            store::BlobState::Corrupt(why) => {
+                self.log.error(
+                    "agent",
+                    format!("the stored workspace does not check out ({why}); starting with an empty one"),
+                );
+                store::clear_blob(self.store.as_mut(), NVS_KEY_WORKSPACE, WORKSPACE_PLAN);
+                return;
+            }
+        };
+        match serde_json::from_str::<Value>(&text) {
+            Ok(v) => self.workspace = AppWorkspace::from_json(&v),
+            Err(e) => {
+                // The value cannot be read by this build or any other, so leaving it in
+                // flash only costs the space and hides the fact from the next boot.
+                self.log.error(
+                    "agent",
+                    format!("the stored workspace is unreadable ({e}); starting with an empty one"),
+                );
+                store::clear_blob(self.store.as_mut(), NVS_KEY_WORKSPACE, WORKSPACE_PLAN);
+                return;
+            }
+        }
+        if legacy {
+            let (files, bytes) = (self.workspace.len(), self.workspace.bytes());
+            match self.persist_workspace() {
+                Ok(()) => self.log.info(
+                    "agent",
+                    format!(
+                        "migrated the stored workspace from one value to chunks: {files} file(s), {bytes} bytes"
+                    ),
+                ),
+                // Not fatal: the old value is still there, untouched, because the header was
+                // never written. The next boot reads it again and tries once more.
+                Err(e) => self.log.error(
+                    "agent",
+                    format!("the workspace was read from the old single value but could not be re-written ({e})"),
+                ),
+            }
+        }
     }
 
     // ---------------------------------------------------------------- transcript
@@ -2111,10 +2183,44 @@ impl App {
         }
     }
 
-    fn persist_workspace(&mut self) {
+    /// Store the workspace, or say why it could not be stored.
+    ///
+    /// The return value is the point: a write that cannot be made durable must reach the
+    /// caller as an error, because the caller is the one about to answer `ok: true` to a
+    /// model or a person. `Err` carries the size and the ceiling, and the change that could
+    /// not be stored is undone by [`App::workspace_edit`].
+    fn persist_workspace(&mut self) -> std::result::Result<(), String> {
         let text = self.workspace.to_json().to_string();
-        if !self.store.set(NVS_KEY_WORKSPACE, &text) {
-            self.log.warn("agent", "could not save the file workspace");
+        match store::write_blob(self.store.as_mut(), NVS_KEY_WORKSPACE, &text, WORKSPACE_PLAN) {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                let why = format!("the file workspace was not saved: {e}");
+                self.log.error("agent", why.clone());
+                Err(why)
+            }
+        }
+    }
+
+    /// One change to the workspace, durable or undone.
+    ///
+    /// Every caller that changes a file goes through here, so that "the write failed" and
+    /// "the file is there" cannot both be true. Without the rollback a failed save left the
+    /// new text in RAM: `write` answered ok, `read` served the file, and the next boot came
+    /// back without it - the failure was only visible in a log line nobody was reading.
+    fn workspace_edit<T>(
+        &mut self,
+        change: impl FnOnce(&mut AppWorkspace) -> std::result::Result<T, String>,
+    ) -> std::result::Result<T, String> {
+        let before = self.workspace.clone();
+        let outcome = change(&mut self.workspace)?;
+        match self.persist_workspace() {
+            Ok(()) => Ok(outcome),
+            Err(e) => {
+                self.workspace = before;
+                Err(format!(
+                    "{e}. The change was dropped, so `read` shows the file as it was before this call"
+                ))
+            }
         }
     }
 
@@ -2141,8 +2247,12 @@ impl App {
             );
             // The workspace is one persisted blob; a skill that exists only in RAM would be
             // installed again next boot, and would be missing from what the portal and an
-            // MCP client read today.
-            self.persist_workspace();
+            // MCP client read today. Seeding is best effort - there is nothing to roll back
+            // to, since this is the boot that had no workspace - so a failure is a log line
+            // rather than an error nobody could act on.
+            if let Err(e) = self.persist_workspace() {
+                self.log.error("boot", format!("the seeded skills are in RAM only: {e}"));
+            }
         }
         wrote
     }
@@ -3694,12 +3804,18 @@ impl App {
     /// The `fs_*` and `net_*` handlers by name, shared by the tool host and `shell`.
     fn fs_or_net_call(&mut self, name: &str, arguments: &Value) -> std::result::Result<String, String> {
         if name.starts_with("fs_") {
-            let result = fs_tools::call(&mut self.workspace, name, arguments)
-                .ok_or_else(|| format!("`{name}` starts with fs_ but no such file tool exists"))?;
-            let text = result?;
-            if matches!(name, "fs_write" | "fs_edit" | "fs_rm" | "fs_cp" | "fs_mv") {
-                self.persist_workspace();
-            }
+            let call = |ws: &mut AppWorkspace| {
+                fs_tools::call(ws, name, arguments)
+                    .ok_or_else(|| format!("`{name}` starts with fs_ but no such file tool exists"))?
+            };
+            let text = if matches!(name, "fs_write" | "fs_edit" | "fs_rm" | "fs_cp" | "fs_mv") {
+                // A tool that changes a file answers only once the change is stored, or not at
+                // all: a `write` that said ok and lost the file at the next boot is the failure
+                // this branch is here to prevent.
+                self.workspace_edit(call)?
+            } else {
+                call(&mut self.workspace)?
+            };
             return Ok(text);
         }
         if name.starts_with("net_") {
@@ -4028,8 +4144,7 @@ impl App {
                 others + joined.len()
             ));
         }
-        fs_tools::Workspace::write(&mut self.workspace, &target.path, &joined)?;
-        self.persist_workspace();
+        self.workspace_edit(|ws| fs_tools::Workspace::write(ws, &target.path, &joined))?;
         Ok(json!({ "path": target.path, "bytes": joined.len(), "append": target.append }))
     }
 
@@ -4084,9 +4199,8 @@ impl App {
         });
         let text = crate::llm::truncate_bytes(&body, crate::tools::fs::MAX_FILE_BYTES);
         let truncated = text.len() < body.len();
-        fs_tools::Workspace::write(&mut self.workspace, &path, &text)
+        self.workspace_edit(|ws| fs_tools::Workspace::write(ws, &path, &text))
             .map_err(|e| format!("could not save `{path}`: {e}"))?;
-        self.persist_workspace();
         let mut out = json!({
             "path": path,
             "bytes": text.len(),
@@ -4163,6 +4277,13 @@ impl App {
             "file_limit_bytes": crate::tools::fs::MAX_FILE_BYTES,
             "workspace_limit_bytes": WORKSPACE_TOTAL_MAX,
             "free_bytes": WORKSPACE_TOTAL_MAX.saturating_sub(bytes),
+            // The ceiling the storage is responsible for, next to the one the tools are: text
+            // is what `write` counts, and the stored JSON is bigger than the text it holds,
+            // so a workspace within one of these numbers is not automatically within the
+            // other.
+            "stored_limit_bytes": WORKSPACE_PLAN.capacity(),
+            "stored_value_bytes": WORKSPACE_PLAN.chunk_bytes,
+            "stored_values": WORKSPACE_PLAN.chunks_max,
         })
         .to_string()
     }
@@ -4277,14 +4398,12 @@ impl App {
             let Some(target) = target else {
                 return Ok(serde_json::json!({ "text": decoded, "bytes": bytes.len() }).to_string());
             };
-            fs_tools::Workspace::write(&mut self.workspace, &target, &decoded)?;
-            self.persist_workspace();
+            self.workspace_edit(|ws| fs_tools::Workspace::write(ws, &target, &decoded))?;
             return Ok(serde_json::json!({ "path": target, "bytes": bytes.len() }).to_string());
         }
         let encoded = crate::util::b64_encode(text.as_bytes());
         if let Some(target) = out_path {
-            fs_tools::Workspace::write(&mut self.workspace, &target, &encoded)?;
-            self.persist_workspace();
+            self.workspace_edit(|ws| fs_tools::Workspace::write(ws, &target, &encoded))?;
             return Ok(serde_json::json!({ "path": target, "bytes": encoded.len() }).to_string());
         }
         Ok(serde_json::json!({ "path": path, "base64": encoded }).to_string())
@@ -4683,8 +4802,7 @@ impl App {
                     .into(),
             );
         }
-        fs_tools::Workspace::write(&mut self.workspace, &path, input)?;
-        self.persist_workspace();
+        self.workspace_edit(|ws| fs_tools::Workspace::write(ws, &path, input))?;
         Ok(json!({
             "path": path,
             "bytes": input.len(),
@@ -4700,8 +4818,7 @@ impl App {
         let path = App::shell_path(args, "touch")?;
         let exists = fs_tools::Workspace::read(&self.workspace, &path).is_ok();
         if !exists {
-            fs_tools::Workspace::write(&mut self.workspace, &path, "")?;
-            self.persist_workspace();
+            self.workspace_edit(|ws| fs_tools::Workspace::write(ws, &path, ""))?;
         }
         Ok(json!({
             "path": path,
@@ -5513,6 +5630,11 @@ impl AppWorkspace {
 
     pub fn len(&self) -> usize {
         self.files.len()
+    }
+
+    /// Total text bytes across every file: the number [`WORKSPACE_TOTAL_MAX`] is about.
+    pub fn bytes(&self) -> usize {
+        self.files.values().map(|text| text.len()).sum()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -9294,9 +9416,172 @@ mod tests {
         let read =
             ToolHost::call_tool(&mut app, "fs_read", &json!({ "path": "/notes/a.txt" })).expect("fs_read");
         assert!(read.contains("hello"), "got {read}");
-        // The workspace is persisted, so the file survives a reboot.
-        let blob = app.store.get(NVS_KEY_WORKSPACE).expect("the workspace was never saved");
-        assert!(blob.contains("/notes/a.txt"), "got {blob}");
+        // The workspace is persisted, so the file survives a reboot. It is not under the
+        // base key any more: `ws` holds the header, `ws.1` the first chunk of the blob.
+        match store::read_blob(app.store.as_ref(), NVS_KEY_WORKSPACE, WORKSPACE_PLAN) {
+            store::BlobState::Stored(blob) => assert!(blob.contains("/notes/a.txt"), "got {blob}"),
+            other => panic!("the workspace was never saved: {other:?}"),
+        }
+    }
+
+    // ------------------------------------------------- the workspace across a reboot
+
+    /// A store whose workspace writes always fail, which is what a full NVS looks like from
+    /// the App's side. Everything else is delegated, so only the `ws` keys are affected.
+    struct RefusingWorkspaceStore(SharedStore);
+
+    impl KvStore for RefusingWorkspaceStore {
+        fn get(&self, key: &str) -> Option<String> {
+            self.0.get(key)
+        }
+
+        fn set(&mut self, key: &str, value: &str) -> bool {
+            if key == NVS_KEY_WORKSPACE || key.starts_with(&format!("{}.", NVS_KEY_WORKSPACE)) {
+                return false;
+            }
+            self.0.set(key, value)
+        }
+
+        fn remove(&mut self, key: &str) -> bool {
+            self.0.remove(key)
+        }
+
+        fn keys(&self) -> Vec<String> {
+            self.0.keys()
+        }
+    }
+
+    /// Markdown with newlines, the shape a real workspace has: JSON escapes every one of
+    /// them to two bytes, which is why a workspace that fits `WORKSPACE_TOTAL_MAX` of text
+    /// still needs more than one stored value.
+    fn notes(bytes: usize) -> String {
+        "a line of notes for the board\n".repeat(bytes / 29 + 1)
+    }
+
+    #[test]
+    fn a_workspace_bigger_than_one_nvs_value_survives_a_reboot() {
+        let store = SharedStore::new();
+        let mut app = app_with(&store);
+        app.workspace = AppWorkspace::default();
+        let written = [
+            ("/notes/a.md", notes(1500)),
+            ("/notes/b.md", notes(1500)),
+            ("/skills/two/SKILL.md", notes(1500)),
+        ];
+        for (path, text) in &written {
+            ToolHost::call_tool(&mut app, "fs_write", &json!({ "path": path, "text": text }))
+                .unwrap_or_else(|e| panic!("fs_write {path}: {e}"));
+        }
+
+        // The blob is past the 4000-byte single-value ceiling: the size that used to be
+        // written nowhere while the tool answered ok.
+        let blob = match store::read_blob(&store.clone(), NVS_KEY_WORKSPACE, WORKSPACE_PLAN) {
+            store::BlobState::Stored(blob) => blob,
+            other => panic!("the workspace was never saved: {other:?}"),
+        };
+        assert!(blob.len() > store::VALUE_MAX, "{} bytes is one value", blob.len());
+        assert!(store.get("ws.2").is_some(), "a {} byte blob spans one value", blob.len());
+        assert!(store.get("ws").unwrap().starts_with("ws1 "), "{:?}", store.get("ws"));
+
+        // A reboot is a new App over the same keys.
+        let rebooted = app_with(&store);
+        for (path, text) in &written {
+            let back = fs_tools::Workspace::read(&rebooted.workspace, path)
+                .unwrap_or_else(|e| panic!("{path} after the reboot: {e}"));
+            assert_eq!(&back, text, "{path} came back different");
+        }
+    }
+
+    #[test]
+    fn a_write_that_cannot_be_stored_is_an_error_and_leaves_the_file_alone() {
+        let store = SharedStore::new();
+        let mut app = app_with(&store);
+        app.workspace = AppWorkspace::default();
+        ToolHost::call_tool(&mut app, "fs_write", &json!({ "path": "/a.txt", "text": "first" }))
+            .expect("the first write is stored");
+
+        // From here the workspace cannot be stored: the case that used to answer `ok: true`.
+        app.store = Box::new(RefusingWorkspaceStore(store.clone()));
+        let err = ToolHost::call_tool(&mut app, "fs_write", &json!({ "path": "/a.txt", "text": "second" }))
+            .expect_err("a write that cannot be stored must not answer ok");
+        assert!(err.contains("was not saved"), "{err}");
+        assert!(err.contains("ws"), "the error names the value that failed: {err}");
+        assert!(err.contains("The change was dropped"), "{err}");
+
+        // And `read` shows that: the file is what it was, not what the refused write carried.
+        let read = ToolHost::call_tool(&mut app, "fs_read", &json!({ "path": "/a.txt" }))
+            .expect("the file is still there");
+        assert!(read.contains("first"), "{read}");
+        assert!(!read.contains("second"), "{read}");
+    }
+
+    #[test]
+    fn a_workspace_written_as_one_value_by_an_older_build_is_migrated() {
+        let store = SharedStore::new();
+        // Exactly what the previous firmware wrote: one JSON value under `ws`.
+        let old = json!({
+            "version": 1,
+            "files": {
+                "/MEMORY.md": "- [pins](/memory/pins.md) — GPIO18 is the strip (2026-11-11)\n",
+                "/memory/pins.md": "# pins\nGPIO18 is the WS2812 strip, active high.\n",
+            }
+        })
+        .to_string();
+        assert!(store.clone().set(NVS_KEY_WORKSPACE, &old));
+
+        let (app, log) = app_with_log(&store);
+        assert_eq!(
+            fs_tools::Workspace::read(&app.workspace, "/memory/pins.md").unwrap(),
+            "# pins\nGPIO18 is the WS2812 strip, active high.\n",
+            "every file the old value held is still there"
+        );
+        assert!(fs_tools::Workspace::read(&app.workspace, "/MEMORY.md").unwrap().contains("pins"));
+        // The same boot wrote it back in the chunked format, and said so.
+        assert!(store.get("ws").unwrap().starts_with("ws1 "), "{:?}", store.get("ws"));
+        assert!(
+            log.tail(50, 0).iter().any(|l| l.message.contains("migrated the stored workspace")),
+            "{:?}",
+            log.tail(50, 0).iter().map(|l| &l.message).collect::<Vec<_>>()
+        );
+        match store::read_blob(&store.clone(), NVS_KEY_WORKSPACE, WORKSPACE_PLAN) {
+            store::BlobState::Stored(blob) => assert!(blob.contains("/memory/pins.md"), "{blob}"),
+            other => panic!("the migration did not reach the store: {other:?}"),
+        }
+
+        // A second boot reads the new format, so the migration was stored, not just served
+        // from RAM once.
+        let again = app_with(&store);
+        assert!(fs_tools::Workspace::read(&again.workspace, "/memory/pins.md").is_ok());
+        assert!(matches!(
+            store::read_blob(&store.clone(), NVS_KEY_WORKSPACE, WORKSPACE_PLAN),
+            store::BlobState::Stored(_)
+        ));
+    }
+
+    #[test]
+    fn a_torn_workspace_blob_starts_empty_and_says_why() {
+        let store = SharedStore::new();
+        let mut app = app_with(&store);
+        app.workspace = AppWorkspace::default();
+        for (path, text) in [("/notes/a.md", notes(1900)), ("/notes/b.md", notes(1900))] {
+            ToolHost::call_tool(&mut app, "fs_write", &json!({ "path": path, "text": text })).unwrap();
+        }
+        assert!(fs_tools::Workspace::read(&app.workspace, "/notes/a.md").unwrap().len() > 1000);
+        assert!(store.get("ws.2").is_some(), "the blob has to span two values for this test");
+
+        // A power cut in the middle of a save leaves a chunk that does not match the header.
+        store.clone().set("ws.2", "a chunk from a write that never finished");
+
+        let (rebooted, log) = app_with_log(&store);
+        assert!(
+            fs_tools::Workspace::read(&rebooted.workspace, "/notes/a.md").is_err(),
+            "half a workspace must not come back"
+        );
+        assert!(
+            log.tail(80, 0).iter().any(|l| l.level == "error" && l.message.contains("does not check out")),
+            "{:?}",
+            log.tail(80, 0).iter().map(|l| &l.message).collect::<Vec<_>>()
+        );
     }
 
     #[test]

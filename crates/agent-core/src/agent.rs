@@ -1420,16 +1420,13 @@ fn stored_message(line: &str) -> Option<Message> {
     })
 }
 
-/// FNV-1a over the body: one cheap pass, no dependency, and enough to tell a torn or
-/// half-overwritten blob from an intact one. It is an integrity check for a power cut,
-/// not a signature.
+/// The transcript's checksum: FNV-1a over the body, one cheap pass, no dependency, and
+/// enough to tell a torn or half-overwritten blob from an intact one. It is an integrity
+/// check for a power cut, not a signature. The function itself is
+/// [`crate::hash::fnv1a`], shared with the chunked storage in [`crate::store`], so the
+/// constant is written once.
 fn checksum(bytes: &[u8]) -> u64 {
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for byte in bytes {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    hash
+    crate::hash::fnv1a(bytes)
 }
 
 fn merge_sources(a: &str, b: &str) -> String {
