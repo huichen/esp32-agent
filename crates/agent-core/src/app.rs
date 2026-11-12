@@ -6715,6 +6715,23 @@ mod tests {
         assert!(err.message.contains("0..=100"), "{}", err.message);
     }
 
+    /// The tool closures on a driver's own tools are the only path a model's call takes
+    /// into it, so at least one device is driven through `tools()` rather than through
+    /// `Device::call` directly: the OLED the virtual board already has.
+    #[test]
+    fn a_drivers_own_tools_are_reachable_by_the_name_the_model_sees() {
+        let mut app = test_app();
+        let out = app.call_tool("oled_text", &json!({ "text": "OK", "line": 1 })).unwrap();
+        assert_eq!(out["chars"], 2, "{out}");
+        let out = app.call_tool("oled_read", &json!({})).unwrap();
+        assert!(out["text"].as_str().unwrap_or("").contains("OK"), "{out}");
+        app.call_tool("oled_rect", &json!({ "x": 0, "y": 0, "w": 4, "h": 4 })).unwrap();
+        app.call_tool("oled_bitmap", &json!({ "data_b64": crate::util::b64_encode(&vec![0u8; 1024]) }))
+            .unwrap();
+        app.call_tool("oled_contrast", &json!({ "value": 0x80 })).unwrap();
+        app.call_tool("oled_clear", &json!({})).unwrap();
+    }
+
     /// A manifest tool with a rate limit is the only thing standing between a looping model
     /// and a relay chattering at the speed of the network.
     #[test]

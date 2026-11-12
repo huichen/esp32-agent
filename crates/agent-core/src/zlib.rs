@@ -515,6 +515,21 @@ mod tests {
         assert!(err.contains("ran out of input"), "{err}");
     }
 
+    /// Length symbols 286 and 287 exist in the fixed table but are not lengths: a stream
+    /// that uses them is malformed, and treating one as a length would read the next bytes
+    /// as a distance.
+    #[test]
+    fn a_reserved_length_symbol_is_refused() {
+        for symbol in [286u16, 287] {
+            let mut w = Writer::default();
+            w.header(true, 1);
+            w.fixed_literal(symbol);
+            w.fixed_literal(256);
+            let err = inflate(&w.finish()).expect_err("286 and 287 are not lengths");
+            assert!(err.contains("bad length symbol"), "{symbol}: {err}");
+        }
+    }
+
     #[test]
     fn crc32_matches_the_reference() {
         assert_eq!(crc32(b"123456789"), 0xcbf4_3926);

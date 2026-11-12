@@ -189,6 +189,87 @@ mod tests {
         assert_eq!(String::from_utf8_lossy(&entries[0].1), "hello hello hello hello\n");
     }
 
+    /// An archive with a comment puts the end-of-directory record before the end of the
+    /// file, so the reader has to scan backwards for it. A file with no such record is not
+    /// a zip and has to say so instead of reading whatever is at the end.
+    #[test]
+    fn the_end_of_directory_record_is_found_behind_a_comment() {
+        let entries = vec![("a.txt".to_string(), b"hello".to_vec())];
+        let archive = write(&entries).expect("writes");
+        let mut commented = archive.clone();
+        commented.extend_from_slice(b"a comment");
+        assert_eq!(read(&commented).expect("a comment is allowed"), entries);
+
+        let err = read(b"PK but not really a zip, just some bytes").err().expect("not an archive");
+        assert!(err.contains("no end-of-central-directory"), "{err}");
+    }
+
+    /// The header fields are the only thing that says where the entries are, so a record
+    /// that points past the end, or a signature that is not there, has to be refused
+    /// rather than followed.
+    #[test]
+    fn a_header_that_points_at_nothing_is_refused() {
+        let entries = vec![("a.txt".to_string(), b"hello".to_vec())];
+        let archive = write(&entries).expect("writes");
+        let central = archive
+            .windows(4)
+            .position(|w| w == CENTRAL_HEADER.to_le_bytes())
+            .expect("a central directory record");
+        let eocd = archive.windows(4).position(|w| w == END_OF_CENTRAL.to_le_bytes()).expect("an end record");
+
+        let mut past_end = archive.clone();
+        past_end[eocd + 16..eocd + 20].copy_from_slice(&(archive.len() as u32 + 100).to_le_bytes());
+        let err = read(&past_end).err().expect("the directory is inside the file");
+        assert!(err.contains("past the end"), "{err}");
+
+        let mut bad_entry = archive.clone();
+        bad_entry[central] ^= 0xFF;
+        let err = read(&bad_entry).err().expect("a central entry starts with a signature");
+        assert!(err.contains("bad central directory entry"), "{err}");
+
+        let mut bad_local = archive.clone();
+        bad_local[0] ^= 0xFF;
+        let err = read(&bad_local).err().expect("so does a local header");
+        assert!(err.contains("bad local header"), "{err}");
+    }
+
+    /// The reader refuses an archive whose entries would not fit through a tool result
+    /// anyway: unpacking 10 kB to then throw it away is not worth the heap.
+    #[test]
+    fn an_archive_larger_than_the_tool_result_budget_is_refused() {
+        let entries = vec![("big.bin".to_string(), vec![0u8; MAX_TOTAL + 1])];
+        let archive = write(&entries).expect("writes");
+        let err = read(&archive).err().expect("too much to unpack");
+        assert!(err.contains("more than"), "{err}");
+    }
+
+    /// A path that is absolute, empty or climbs out of the archive is not a name inside it,
+    /// and a writer that accepted one would produce an archive whose extraction escapes the
+    /// directory it is unpacked into.
+    #[test]
+    fn a_name_outside_the_archive_is_refused_when_writing() {
+        for bad in ["", "/etc/passwd", "../secret", "a/../../b"] {
+            let err = write(&[(bad.to_string(), b"x".to_vec())]).err().expect("not a relative name");
+            assert!(err.contains("relative path"), "{bad}: {err}");
+        }
+    }
+
+    /// A method this build cannot decode is refused by name rather than returning the
+    /// compressed bytes as if they were the file.
+    #[test]
+    fn an_unsupported_compression_method_is_refused() {
+        let entries = vec![("a.txt".to_string(), b"hello".to_vec())];
+        let archive = write(&entries).expect("writes");
+        let mut corrupt = archive.clone();
+        let central = corrupt
+            .windows(4)
+            .position(|w| w == CENTRAL_HEADER.to_le_bytes())
+            .expect("a central directory record");
+        corrupt[central + 10] = 99; // the compression method the reader will see
+        let err = read(&corrupt).err().expect("method 99 is not supported");
+        assert!(err.contains("compression method 99"), "{err}");
+    }
+
     /// A payload that no longer matches the CRC in the header must not be handed back as if
     /// it were the file: a silently corrupted extraction is worse than a refused one.
     #[test]

@@ -520,6 +520,9 @@ mod tests {
 
         let err = r.call("relay_set", &json!({}), &mut hw).expect_err("on is required");
         assert_eq!(err.code, crate::error::code::INVALID_PARAMS);
+        let v = r.call("relay_set", &json!({ "on": true }), &mut hw).expect("on");
+        assert_eq!(v["on"], true);
+        assert_eq!(v["pin"], 5);
         let err = r.call("relay_toggle", &json!({}), &mut hw).expect_err("not a tool");
         assert_eq!(err.code, crate::error::code::NOT_FOUND);
     }
