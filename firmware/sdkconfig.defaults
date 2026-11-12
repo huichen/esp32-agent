@@ -100,8 +100,14 @@ CONFIG_FREERTOS_USE_TRACE_FACILITY=y
 # into no requests at all.
 CONFIG_SPIRAM_ALLOW_STACK_EXTERNAL_MEMORY=y
 
-# A TLS record buffer is 16 KB by default in each direction; the board answers with a
-# few kilobytes at a time and handshakes while internal SRAM is nearly gone. 4 KB is the
-# smallest that still carries a normal response, and it frees ~24 KB in one step.
-CONFIG_MBEDTLS_SSL_IN_CONTENT_LEN=4096
+# Outbound records are ours to size: mbedTLS splits what we send, so 4 KB is legal and
+# saves ~12 KB. Inbound is the *peer's* choice, and a peer that sends a 16 KB record is
+# within the protocol — a smaller buffer does not ask it to stop, it rejects the record:
+# `ssl_msg.c` answers `MBEDTLS_ERR_SSL_INVALID_RECORD` (-0x7200) when
+# `rec->data_len > MBEDTLS_SSL_IN_CONTENT_LEN`. That is what this board did with 4096 in
+# both directions: short model replies arrived, every reply longer than one 4 KB record
+# failed with a code `esp_err_to_name` printed as a flat `ERROR`, and the wrapper around it
+# blamed the 45 s timeout that had never elapsed. 16 KB is the protocol maximum and the
+# only value that does not depend on what the other end chooses.
+CONFIG_MBEDTLS_SSL_IN_CONTENT_LEN=16384
 CONFIG_MBEDTLS_SSL_OUT_CONTENT_LEN=4096
