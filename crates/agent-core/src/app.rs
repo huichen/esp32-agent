@@ -1041,6 +1041,37 @@ impl App {
             let text = self.run_shell(args).map_err(McpError::invalid_params)?;
             return Ok(serde_json::from_str(&text).unwrap_or_else(|_| json!({ "text": text })));
         }
+        // Familiar names, same handlers. `curl`/`wget`/`nslookup`/`nc` are what people
+        // already type; the fs_*/net_* names stay reachable from `script`.
+        if let Some(inner) = match name {
+            "read" => Some("fs_read"),
+            "write" => Some("fs_write"),
+            "edit" => Some("fs_edit"),
+            "nslookup" => Some("net_dns"),
+            "nc" => Some("net_tcp"),
+            _ => None,
+        } {
+            let text = self.fs_or_net_call(inner, args).map_err(McpError::invalid_params)?;
+            return Ok(serde_json::from_str(&text).unwrap_or_else(|_| json!({ "text": text })));
+        }
+        if name == "curl" || name == "wget" {
+            let text = self.run_curl(name, args).map_err(McpError::invalid_params)?;
+            return Ok(serde_json::from_str(&text).unwrap_or_else(|_| json!({ "text": text })));
+        }
+        if name == "ifconfig" {
+            return Ok(self.ifconfig_json());
+        }
+        if name == "ping" {
+            let host = args.get("host").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+            if host.is_empty() {
+                return Err(McpError::invalid_params("`host` is required"));
+            }
+            let count = args.get("count").and_then(|v| v.as_u64()).unwrap_or(3).clamp(1, 5) as u32;
+            return match self.hw.ping(&host, count) {
+                Ok(v) => Ok(v),
+                Err(e) => Err(McpError::unsupported(format!("ping: {}", e.message))),
+            };
+        }
         // `image_read` asks the model about an attachment, which means it needs the model
         // config and the transport — neither of which a `ToolCtx` carries.
         if name == "image_read" {
@@ -2914,6 +2945,76 @@ impl App {
             "shell_unzip" => self.shell_unzip(&inner),
             other => self.fs_or_net_call(other, &inner),
         }
+    }
+
+    /// `curl`: GET (with HTML reduced to text) or POST when `data` is given.
+    /// `wget`: the same fetch, saved into the workspace under `path`.
+    fn run_curl(&mut self, name: &str, args: &Value) -> std::result::Result<String, String> {
+        let url = args.get("url").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+        if url.is_empty() {
+            return Err("`url` is required".into());
+        }
+        let data = args.get("data").and_then(|v| v.as_str());
+        let mut inner = json!({ "url": url });
+        if let Some(f) = args.get("format") {
+            inner["format"] = f.clone();
+        }
+        let fetched = match data {
+            Some(body) => {
+                inner["body"] = json!(body);
+                self.fs_or_net_call("net_post", &inner)?
+            }
+            None => self.fs_or_net_call("net_get", &inner)?,
+        };
+        if name == "curl" {
+            return Ok(fetched);
+        }
+        // `wget`: the body goes into a file, the result reports where.
+        let parsed: Value = serde_json::from_str(&fetched).unwrap_or_else(|_| json!({ "body": fetched }));
+        let body = parsed.get("body").and_then(|b| b.as_str()).unwrap_or("").to_string();
+        if body.is_empty() {
+            return Err("the response carried no body to save".into());
+        }
+        let path = args.get("path").and_then(|p| p.as_str()).map(|p| p.to_string()).unwrap_or_else(|| {
+            let host = url.split("://").nth(1).unwrap_or(&url).split('/').next().unwrap_or("download");
+            let tail = url.rsplit('/').next().unwrap_or("index");
+            format!("/downloads/{host}-{tail}")
+        });
+        let text = crate::llm::truncate_bytes(&body, fs_tools::MAX_FILE_BYTES);
+        let truncated = text.len() < body.len();
+        fs_tools::Workspace::write(&mut self.workspace, &path, &text)
+            .map_err(|e| format!("could not save `{path}`: {e}"))?;
+        self.persist_workspace();
+        let mut out = json!({
+            "path": path,
+            "bytes": text.len(),
+            "truncated": truncated,
+            "url": url,
+        });
+        if truncated {
+            out["note"] = json!("the file holds the first 2048 bytes of the response");
+        }
+        Ok(out.to_string())
+    }
+
+    /// `ifconfig`: what the board thinks its network is, including the overrides.
+    fn ifconfig_json(&mut self) -> Value {
+        let wifi = self.hw.wifi_status();
+        let info = self.hw.board_info();
+        json!({
+            "interface": "wlan0",
+            "state": wifi.state,
+            "ip": wifi.ip,
+            "netmask": self.cfg.wifi.netmask,
+            "gateway": self.cfg.wifi.gateway,
+            "dns": [self.cfg.wifi.dns, self.cfg.wifi.dns2],
+            "ssid": wifi.ssid,
+            "rssi_dbm": wifi.rssi_dbm,
+            "mac": info.mac,
+            "hostname": self.cfg.wifi.hostname,
+            "ap": { "ssid": wifi.ap_ssid, "ip": wifi.ap_ip },
+            "note": "gateway and dns show the configured overrides; empty means the DHCP lease",
+        })
     }
 
     /// Pack `{name: text}` entries into an archive and return it as base64.
@@ -5036,14 +5137,14 @@ mod tests {
         // And the commands go through the same code the agent uses, over MCP.
         let write = app
             .handle_rpc(
-                r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"shell","arguments":{"op":"write","path":"/notes/a.txt","text":"from mcp"}}}"#,
+                r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"write","arguments":{"path":"/notes/a.txt","text":"from mcp"}}}"#,
                 None,
             )
             .unwrap();
         assert_eq!(write["result"]["isError"], json!(false), "{write}");
         let read = app
             .handle_rpc(
-                r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"shell","arguments":{"op":"cat","path":"/notes/a.txt"}}}"#,
+                r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"read","arguments":{"path":"/notes/a.txt"}}}"#,
                 None,
             )
             .unwrap();

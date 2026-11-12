@@ -197,6 +197,12 @@ pub trait Hardware: Send {
     fn chip_temp_c(&mut self) -> Option<f32> {
         None
     }
+
+    /// ICMP echo. The default refuses: a platform that cannot send one must say so rather
+    /// than report every host as unreachable, which is what a fake reply would mean.
+    fn ping(&mut self, _host: &str, _count: u32) -> Result<serde_json::Value> {
+        Err(McpError::unsupported("ping is not available on this platform"))
+    }
 }
 
 /// Convenience: a `Hardware` that answers nothing, for tests of code paths that
