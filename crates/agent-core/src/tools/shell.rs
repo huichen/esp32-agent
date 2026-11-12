@@ -369,8 +369,9 @@ pub enum Stdio {
 /// pipeline exists for, and `xd` is `hexdump` under its other name.
 pub fn pipe_stdio(op: &str) -> Option<Stdio> {
     Some(match op {
-        "cat" | "grep" | "sort" | "uniq" | "tr" | "cut" | "head" | "tail" | "wc" | "strings" | "od"
-        | "xd" | "hexdump" | "base64enc" | "base64dec" | "sha256sum" | "md5sum" | "crc32" | "tee" => {
+        // `jq` reads lines (a JSON document) and writes lines, which is what a stage does.
+        "jq" | "cat" | "grep" | "sort" | "uniq" | "tr" | "cut" | "head" | "tail" | "wc" | "strings"
+        | "od" | "xd" | "hexdump" | "base64enc" | "base64dec" | "sha256sum" | "md5sum" | "crc32" | "tee" => {
             Stdio::Reads
         }
         // A fetch is a producer: it has no stdin to read, and its body is exactly the text a
@@ -387,6 +388,7 @@ pub fn pipe_commands() -> String {
     let mut names: Vec<&str> = [
         "curl",
         "wget",
+        "jq",
         "cat",
         "grep",
         "sort",
