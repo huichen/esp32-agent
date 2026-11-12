@@ -56,10 +56,51 @@ def records(audio: bytes, frames: bytes, rate: int, fps: float):
     yield b"E" + struct.pack("<H", 0)
 
 
+def diagnostic_frame() -> bytes:
+    """The picture that says whether the panel and its driver agree.
+
+    A one-pixel border all the way round, a filled block at (8, 8)-(24, 16), and a diagonal
+    from (40, 4) to (80, 28) — three shapes whose position and orientation are hard to
+    mistake for dither noise. It is generated here rather than read from a file so it can be
+    put on the glass at any time, including after the board has been reflashed and whatever
+    media the bench had is gone.
+    """
+    w, h = 128, 32
+    px = [[0] * w for _ in range(h)]
+    for x in range(w):
+        px[0][x] = 1
+        px[h - 1][x] = 1
+    for y in range(h):
+        px[y][0] = 1
+        px[y][w - 1] = 1
+    for y in range(8, 17):
+        for x in range(8, 25):
+            px[y][x] = 1
+    for i in range(41):
+        y = 4 + i * 24 // 40
+        if 0 <= y < h:
+            px[y][40 + i] = 1
+    out = bytearray(512)
+    for page in range(4):
+        for x in range(w):
+            byte = 0
+            for bit in range(8):
+                if px[page * 8 + bit][x]:
+                    byte |= 1 << bit
+            out[page * w + x] = byte
+    return bytes(out)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Play a PCM file and a frame strip on the board together")
-    ap.add_argument("--audio", required=True, help="raw PCM16LE mono file")
-    ap.add_argument("--frames", required=True, help="512-byte 128x32 1-bpp frames, back to back")
+    ap.add_argument("--audio", help="raw PCM16LE mono file (not needed with --test-pattern)")
+    ap.add_argument("--frames", help="512-byte 128x32 1-bpp frames, back to back (not needed with --test-pattern)")
+    ap.add_argument(
+        "--test-pattern",
+        action="store_true",
+        help="send the diagnostic picture (border, block, diagonal) with silent audio, no media files",
+    )
+    ap.add_argument("--seconds", type=float, default=6.0, help="with --test-pattern: how long (default 6)")
     ap.add_argument("--host", default="192.168.3.7", help="board address (default 192.168.3.7)")
     ap.add_argument("--port", type=int, default=80)
     ap.add_argument("--rate", type=int, default=24000, help="sample rate of --audio (default 24000)")
@@ -69,8 +110,20 @@ def main() -> int:
     ap.add_argument("--dry-run", action="store_true", help="do not send; print the plan")
     args = ap.parse_args()
 
-    audio = open(args.audio, "rb").read()
-    frames = open(args.frames, "rb").read()
+    if args.test_pattern:
+        # Silence, so a wrong-looking screen is never confused with a wrong-sounding
+        # speaker; the frames are the whole message.
+        audio = bytes(int(args.seconds * args.rate) * 2)
+        frames = diagnostic_frame() * int(args.seconds * args.fps)
+        print(
+            "test pattern: border all round, a filled block at (8,8), a diagonal from (40,4)"
+            f" — {args.seconds:g} s of silence, {args.fps:g} fps"
+        )
+    else:
+        if not args.audio or not args.frames:
+            raise SystemExit("give --audio and --frames, or --test-pattern for the diagnostic picture")
+        audio = open(args.audio, "rb").read()
+        frames = open(args.frames, "rb").read()
     if args.limit > 0:
         audio = audio[: int(args.limit * args.rate) * 2]
         frames = frames[: int(args.limit * args.fps) * FRAME_BYTES]

@@ -71,7 +71,7 @@ CORS is on by default (`mcp.cors`), so a browser MCP client can connect directly
 | GET | `/` | Console (embedded HTML/CSS/JS, no external links) |
 | GET | `/healthz` | `{ok, uptime_s, devices}` |
 | GET | `/agent.json` | The map for an external agent: every route, the MCP surface, conventions and limits (`/sitemap.json` is an alias) |
-| GET | `/api/status` | Board, memory, WiFi, MCP, device count, counters |
+| GET | `/api/status` | Board, memory, WiFi, MCP, device count, counters, and `agent.thread` — `running`, `not started`, or `did not start: <why>` |
 | GET | `/api/tls` | The board's own certificate: `{enabled, port, fingerprint, error}` |
 | GET | `/api/config` | Configuration (secrets shown as `__set__`) |
 | POST | `/api/config` | Partial update (JSON of the same shape) |
