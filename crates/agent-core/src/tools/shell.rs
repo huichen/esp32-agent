@@ -26,6 +26,16 @@ pub const OPS: &[(&str, &str)] = &[
     ("grep", "fs_grep"),
     ("zip", "shell_zip"),
     ("unzip", "shell_unzip"),
+    // The commands a shell has for looking at itself. NuttX's `nsh` has all of these and
+    // they cost nothing here: the numbers are already in the app.
+    ("df", "shell_df"),
+    ("free", "shell_free"),
+    ("uptime", "shell_uptime"),
+    ("date", "shell_date"),
+    ("uname", "shell_uname"),
+    ("ps", "shell_ps"),
+    ("hexdump", "shell_hexdump"),
+    ("base64", "shell_base64"),
 ];
 
 /// How each command is written, in the order it takes its arguments.
@@ -42,6 +52,14 @@ pub fn usage(op: &str) -> Option<&'static str> {
         "grep" => "grep <pattern> [path]",
         "zip" => "zip --name <archive> [--files {name: text}] [--paths [path]]",
         "unzip" => "unzip --archive_b64 <base64>",
+        "df" => "df",
+        "free" => "free",
+        "uptime" => "uptime",
+        "date" => "date",
+        "uname" => "uname",
+        "ps" => "ps",
+        "hexdump" => "hexdump <path> [--width 16]",
+        "base64" => "base64 --path <path> [--decode] [--out <path>]",
         // The commands that are tools of their own. They share the table so `--help` and
         // the error suffix say the same thing wherever the model reaches them.
         "read" => "read <path>",
@@ -93,8 +111,11 @@ pub fn spec() -> ToolDef {
     .category("system")
     .schema(object_schema(
         &[
-            ("op", string("the command: ls, rm, cp, mv, grep, zip, unzip")),
-            ("path", string("file or directory, for ls/rm/grep")),
+            ("op", string("the command: ls, rm, cp, mv, grep, zip, unzip, df, free, uptime, date, uname, ps, hexdump, base64")),
+            ("path", string("file or directory, for ls/rm/grep/hexdump/base64")),
+            ("decode", json!({ "type": "boolean", "description": "for base64: decode instead of encode" })),
+            ("out", string("for base64: where to write the result, default is the return value")),
+            ("width", json!({ "type": "integer", "minimum": 4, "maximum": 32, "description": "for hexdump: bytes per line, default 16" })),
             ("from", string("source path, for cp/mv")),
             ("to", string("destination path, for cp/mv")),
             ("confirm", json!({ "type": "boolean", "description": "must be true for rm and mv" })),

@@ -75,3 +75,7 @@ CONFIG_MBEDTLS_HARDWARE_AES=n
 CONFIG_PARTITION_TABLE_CUSTOM=y
 CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
 
+# FreeRTOS task introspection for \shell ps\: uxTaskGetSystemState is compiled out
+# unless the trace facility is on, and with it off the linker fails on the symbol.
+# It costs a few bytes per task.
+CONFIG_FREERTOS_USE_TRACE_FACILITY=y
