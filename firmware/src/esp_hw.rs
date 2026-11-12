@@ -661,32 +661,29 @@ impl Hardware for EspHw {
             frames.push(*s);
             frames.push(*s);
         }
-        // One `i2s_channel_write` returns after its 1000 ms timeout with however much it
-        // managed to hand to the DMA, so a buffer longer than a second used to be silently
-        // truncated — the caller was told "short writes are normal" and the tail of a
-        // melody simply never played. Nothing had ever sent more than 43 ms before, so it
-        // was invisible. Loop until every frame is in: each iteration copies into the ring
-        // as the DMA drains it, so the ring is never empty between iterations and the audio
-        // is continuous across them.
-        let mut off: usize = 0;
-        while off < frames.len() {
+        // One call can be short: the driver returns as soon as the DMA has taken what it can,
+        // and a 1000 ms timeout ends the call even with audio still queued. Dropping the rest
+        // is not "normal under load" - it is a gap in the music - so keep writing until every
+        // sample is out.
+        let total = frames.len();
+        let mut done = 0usize;
+        while done < total {
             let mut written: usize = 0;
             let rc = unsafe {
                 sys::i2s_channel_write(
                     self.i2s_tx,
-                    frames.as_ptr().add(off) as *const core::ffi::c_void,
-                    (frames.len() - off) * core::mem::size_of::<i16>(),
+                    frames[done..].as_ptr() as *const core::ffi::c_void,
+                    (total - done) * core::mem::size_of::<i16>(),
                     &mut written,
                     1000,
                 )
             };
-            if written == 0 {
+            if written < core::mem::size_of::<i16>() {
                 return Err(McpError::hardware(format!(
-                    "i2s write stopped after {off} of {} samples (rc {rc})",
-                    frames.len()
+                    "i2s write stalled after {done} of {total} samples (rc {rc}, wrote {written} bytes)"
                 )));
             }
-            off += written / core::mem::size_of::<i16>();
+            done += written / core::mem::size_of::<i16>();
         }
         Ok(())
     }
@@ -752,13 +749,14 @@ fn i2s_channel(
         chan.id = if port == 0 { sys::i2s_port_t_I2S_NUM_0 } else { sys::i2s_port_t_I2S_NUM_1 };
         chan.role = sys::i2s_role_t_I2S_ROLE_MASTER;
         // The bench firmware that works on this hardware uses 8 descriptors of 512 frames;
-        // matching it removes one variable. It matters on transmit: a stream is written in
-        // one call per socket read, and anything else on the board (an OLED frame on the I2C
-        // bus, the App lock) runs between those calls. With 2 x 200 frames the ring holds
-        // 16.7 ms, which is less than one 128x32 frame takes to draw, so the ring runs dry
-        // and the last descriptor replays: the music repeats fragments instead of pausing.
-        // 4 x 512 frames is 85 ms of slack for 8 KB of internal RAM.
-        chan.dma_desc_num = if rx { 2 } else { 4 };
+        // matching it removes one variable. It matters most on transmit: a stream is written
+        // in one call per socket read, and anything else on the board (an OLED frame, a lock)
+        // runs between those calls. With 2 x 200 frames the ring holds 16.7 ms, which is less
+        // than one 128x32 frame on the bus, so the last descriptor is replayed and the music
+        // repeats fragments instead of pausing. 2 x 512 frames is 42.7 ms of slack for 4 KB
+        // of internal RAM - enough for a 9 ms frame draw, and this board has no 8 KB to spare
+        // (its internal heap sits at a few kilobytes once the agent and TLS are up).
+        chan.dma_desc_num = 2;
         chan.dma_frame_num = if rx { 200 } else { 512 };
         // A DMA descriptor keeps being replayed, so a tone whose writer went away loops
         // forever — the amplifier screams until someone sends silence. Clearing the TX
