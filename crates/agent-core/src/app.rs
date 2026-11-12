@@ -650,6 +650,18 @@ impl App {
     /// habit all still use the old names, so they keep working — the prompt, `help` and
     /// `tools/list` do not mention them. This list is the compatibility column, and the test
     /// below fails if one of them turns up backticked in the prompt.
+    /// Tools a person uses and a model does not.
+    ///
+    /// `reboot` restarts the board in the middle of a turn: the run that asked for it is the
+    /// one it destroys, and a restart is one click in the portal (`POST /api/reboot`, behind
+    /// the PIN) or one line from a person. So it is not offered — the prompt's "you cannot
+    /// reboot the board" is the same statement in words.
+    ///
+    /// `factory_reset` stays offered: it needs `confirm`, it is the only way a model can get
+    /// out of a manifest that has bricked the tool surface, and it is a reset of configuration
+    /// rather than of the run in progress.
+    const NEVER_OFFERED: &'static [&'static str] = &["reboot"];
+
     pub const ALIASES_ACCEPTED_BUT_NOT_ADVERTISED: &'static [&'static str] = &[
         // the board family's members
         "board_status",
@@ -753,6 +765,9 @@ impl App {
         // where to find it rather than pretending the ability is gone.
         if let Some(reached) = self.family_members.get(name) {
             return Some(format!("reachable as `{reached}`"));
+        }
+        if Self::NEVER_OFFERED.contains(&name) {
+            return Some("a person restarts the board, from the portal; a model does not".to_string());
         }
         // `minimal` hides conveniences, never capabilities: an HTTP route or a manifest can
         // do these, and a model rarely needs them. Discovery, manifest, GPIO and the file
@@ -7865,6 +7880,36 @@ mod tests {
         let mut injected = prompt.clone();
         injected.push_str(" Then call `frobnicate`.");
         assert_eq!(unadvertised_tool_names(&injected, &offered), vec!["frobnicate".to_string()]);
+    }
+
+    /// `reboot` is not something a model is given: it would restart the board in the middle of
+    /// the run that asked for it. It is not a command of `board` either, and the listing says
+    /// where it went; a person still restarts from the portal, behind the PIN.
+    #[test]
+    fn a_model_is_not_offered_a_restart_but_a_person_still_has_one() {
+        let mut app = test_app();
+
+        // Not in the family, and asking the family for it is an unknown command, not a run.
+        let help = app.call_tool("board", &json!({ "command": "help" })).unwrap();
+        let commands: Vec<String> =
+            help["commands"].as_array().unwrap().iter().map(|s| s.as_str().unwrap().to_string()).collect();
+        assert!(!commands.contains(&"reboot".to_string()), "{commands:?}");
+        let err = app.call_tool("board", &json!({ "command": "reboot" })).unwrap_err();
+        assert!(err.message.contains("no command"), "{err:?}");
+
+        // Not offered as a tool of its own either, and the reason is a sentence.
+        assert!(!app.is_visible("reboot"));
+        let why = app
+            .hidden_tools()
+            .into_iter()
+            .find(|t| t["name"] == "reboot")
+            .expect("`reboot` must be reported as hidden");
+        assert!(why["why"].as_str().unwrap_or("").contains("person"), "{why}");
+
+        // The portal's button is a route, not a tool: it keeps working.
+        let resp = app.route(&post("/api/reboot", "{}"));
+        assert_eq!(resp.status, 200, "the portal's restart must still answer");
+        assert!(app.runtime.restart_requested, "the platform must be told to restart");
     }
 
     #[test]

@@ -662,7 +662,9 @@ const BOARD_COMMANDS: &[&str] = &[
     "config_set",
     "chip_temp",
     "logs_tail",
-    "reboot",
+    // `reboot` is not here. It restarts the board mid-turn — a model that calls it loses the
+    // run it is in, and nothing it could learn from the restart is worth that. The tool still
+    // exists and still answers; `App::NEVER_OFFERED` is what keeps it out of the listing.
     "factory_reset",
     "delay",
     "inventory",
