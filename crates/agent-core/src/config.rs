@@ -204,7 +204,7 @@ pub struct AgentCfg {
     /// The static prompt says how to behave on this board; this field is where the owner
     /// says what *their* board is for — "the pump on GPIO12 waters the plants, never run
     /// it longer than two minutes" — without editing firmware. Read and written from the
-    /// portal, from `nsh system_prompt …`, and from `GET`/`POST /api/agent/prompt`.
+    /// portal, from `shell system_prompt …`, and from `GET`/`POST /api/agent/prompt`.
     pub system_prompt: String,
 }
 

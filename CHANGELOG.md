@@ -88,7 +88,7 @@ version numbering follows semantic versioning.
 
 ### Changed
 
-- **The portal is English only**: the `EN` / `中` switch is gone, and every label,
+- **The portal is English only**: the language switch is gone, and every label,
   placeholder, table header and client-side message is English, so there is one text to
   read and one to keep working. A test fails the build on any CJK character in
   `index.html`, `app.js` or `style.css`, and on a leftover `data-i18n` / `I18N` hook

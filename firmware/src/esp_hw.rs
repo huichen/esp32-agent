@@ -570,7 +570,7 @@ impl Hardware for EspHw {
     ///
     /// Microphone: 16 kHz, 32-bit slots, left channel only (the INMP441 sends 24 bits
     /// left-justified and the right slot stays zero). Amplifier: 24 kHz, 16-bit, Philips.
-    /// Both are master, no MCLK pin 鈥?the boards wire BCLK/WS and one data line.
+    /// Both are master, no MCLK pin: the boards wire BCLK/WS and one data line.
     fn i2s_setup(
         &mut self,
         mic: Option<esp32_agent_core::boards::I2sPins>,
@@ -602,7 +602,7 @@ impl Hardware for EspHw {
         }
         // The channel is stereo (see `i2s_channel`): 8 bytes per frame, the microphone's
         // data in the left word and zeros in the right. Read the frames and keep the left
-        // word 鈥?reading it as mono moves the bit alignment half a frame and turns every
+        // word; reading it as mono moves the bit alignment half a frame and turns every
         // sample into full scale, which is exactly what the first attempt did.
         let mut got: usize = 0;
         let mut raw = vec![0i32; out.len().saturating_mul(2)];
@@ -697,7 +697,7 @@ impl Hardware for EspHw {
 /// Create and start one standard-mode I2S channel.
 ///
 /// `bits` is the slot width: 32 for the microphone (24 bits left-justified in a 32-bit
-/// slot), 16 for the amplifier. Mono, Philips, master role, no MCLK pin 鈥?that is how
+/// slot), 16 for the amplifier. Mono, Philips, master role, no MCLK pin: that is how
 /// both parts are wired on this board.
 fn i2s_channel(
     rx: bool,
