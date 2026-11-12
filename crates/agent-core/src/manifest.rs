@@ -1215,6 +1215,12 @@ mod tests {
         let e = check_args(&t, &json!({})).unwrap_err();
         assert_eq!(e.code, code::FORBIDDEN);
         assert!(check_args(&t, &json!({ "confirm": true })).is_ok());
+        // The schema has to say so too, or the model is asked for a parameter it was never
+        // told about.
+        let schema = tool_schema(&t);
+        assert_eq!(schema["properties"]["confirm"]["type"], "boolean");
+        let required = schema["required"].as_array().expect("a required list");
+        assert!(required.iter().any(|r| r == "confirm"), "{schema}");
     }
 
     #[test]
@@ -1405,6 +1411,10 @@ mod tests {
         one_issue(
             tool(json!({ "type": "i2c_write", "addr": 60, "reg": 1, "data": "nope" })),
             "/tools/0/exec/data",
+        );
+        one_issue(
+            tool(json!({ "type": "i2c_write", "addr": 60, "reg": 300, "data": [1] })),
+            "/tools/0/exec/reg",
         );
         one_issue(tool(json!({ "type": "rgb", "pin": 2, "color": "red" })), "/tools/0/exec/color");
         one_issue(tool(json!({ "type": "delay", "ms": 6_000 })), "/tools/0/exec/ms");
@@ -1634,6 +1644,14 @@ mod tests {
         assert_eq!(merged.tools.len(), base.tools.len(), "and so is a tool");
         assert_eq!(merged.tools[0].exec, Exec::GpioWrite { pin: Num::lit(4), level: Num::lit(1) });
         assert_eq!(merged.version, MANIFEST_VERSION);
+
+        // A device the base does not have yet is appended, not merged into another.
+        let patch =
+            Manifest::from_json_str(r#"{"devices":[{"id":"fan","kind":"actuator","pins":{"out":7}}]}"#)
+                .unwrap();
+        let merged = base.merged_with(&patch);
+        assert_eq!(merged.devices.len(), base.devices.len() + 1);
+        assert_eq!(merged.devices.last().expect("the new device").id, "fan");
     }
 
     #[test]
