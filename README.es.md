@@ -12,9 +12,7 @@ herramientas y responde con ellas; se puede declarar un sensor nuevo en JSON con
 marcha.
 
 > El bucle de agente sigue a [FutureOS](https://github.com/futuregene/future-os): transcripción,
-> diario de herramientas, eventos de flujo, adaptadores de protocolo, índice de memoria. Donde
-> el firmware se aparta (kilobytes en lugar de gigabytes de RAM, sin resúmenes escritos por el
-> modelo) el código dice por qué.
+> diario de herramientas, eventos de flujo, adaptadores de protocolo, índice de memoria.
 
 | Qué | En detalle |
 |---|---|
@@ -25,7 +23,7 @@ marcha.
 | Una consola sobre HTTPS | Hablar con el modelo y configurar dispositivos, herramientas, programación, registros, WiFi y el modelo desde un teléfono; la placa emite su propio certificado. [Consola web](docs/web-console.md) |
 | Actúa sin nadie delante | Prompts temporizados y reglas de sensores que lanzan un prompt cuando una lectura cruza un umbral. [Trabajo programado](docs/scheduling.md) |
 | Un shell y un lenguaje de script | `shell` con 26 comandos con nombres de NuttX, y un intérprete para bucles sobre llamadas a herramientas. [Shell](docs/shell.md) · [Script](docs/scripting.md) |
-| Recuerda lo que se le dijo | Órdenes permanentes, `/AGENTS.md`, un índice `/memory.md` y habilidades, ensamblados en el prompt en cada turno. [Lo que el modelo ve en cada turno](docs/context.md) |
+| Recuerda lo que se le dijo | Órdenes permanentes, `/AGENTS.md`, un índice `/MEMORY.md` y habilidades, ensamblados en el prompt en cada turno. [Lo que el modelo ve en cada turno](docs/context.md) |
 | Sin nube en el camino | HTTPS desde la placa, un certificado que genera ella misma, un PIN para tres invocadores. [Autenticación](docs/security.md) |
 | Comprobable sin hardware | El simulador ejecuta el mismo `agent-core` contra una placa virtual. [Simulador](docs/simulator.md) |
 
@@ -54,169 +52,52 @@ abierto, así que un certificado malo cuesta una URL y no la placa. `GET /agent.
 interfaz como datos: 40 rutas con método, cuerpo, retorno y autenticación, más cada ajuste
 escribible con su tipo y su valor por defecto.
 
-## Consola web
+## Dale un modelo
 
-| Dónde | Qué se hace ahí |
-|---|---|
-| Chat (la página) | hablar con el modelo; las llamadas a herramientas y el razonamiento se pliegan en una línea por turno |
-| Devices | lo que encontró el sondeo, pines, direcciones, `Probe devices`, candidatos adoptables |
-| Tools | cada herramienta con su esquema de entrada, y por qué una está oculta |
-| Agent | endpoint, modelo, clave, protocolo, nivel de razonamiento, temperatura, tamaño de contexto y de salida |
-| Schedule | prompts temporizados y reglas de sensores |
-| Logs, Settings | el búfer circular; WiFi con overrides de gateway y DNS, el PIN, reinicio |
-
-Sin paso de compilación y sin cargar nada de internet: unos 58 KB de HTML, CSS y JavaScript
-compilados dentro y servidos con `Cache-Control: no-store`, así que una regrabación se ve en la
-siguiente recarga.
-
-## Cómo darle un modelo
+El modelo es un ajuste, no una compilación:
 
 ```bash
 curl -sS -X POST http://<board>/api/agent/config -H 'Content-Type: application/json' \
-  -d '{"base_url":"https://future-os.cn/api/v1/chat/completions",
-       "model":"deepseek-flash","api_key":"<key>"}'
+  -d '{"base_url":"https://your-provider/v1/chat/completions","model":"…","api_key":"…"}'
 curl -sS -X POST http://<board>/api/agent/message -H 'Content-Type: application/json' \
-  -d '{"text":"write HELLO on the OLED, set the LED blue, then scan I2C"}'
+  -d '{"text":"escribe HELLO en el OLED y pon el LED en azul"}'
 ```
 
-Tres protocolos: `chat` (chat completions de OpenAI), `responses` (API Responses de OpenAI) y
-`anthropic` (API Messages). Las imágenes de la consola salen como partes de contenido.
-`reasoning` fija el nivel de razonamiento, `max_steps` limita las llamadas al
-modelo por turno (0 = sin límite), `context_tokens` y `max_output_tokens` fijan la ventana y la
-reserva de respuesta, y la transcripción se compacta al 80% de la ventana. Sin clave, se puede
-apuntar `base_url` al `/selftest/chat/completions` de la propia placa y el bucle sigue
-funcionando.
+Tres protocolos (`chat`, `responses`, `anthropic`), un nivel de razonamiento, una ventana de
+contexto y un tope de salida, en el panel Agent de la consola o con el mismo `POST`. Sin clave,
+apunta `base_url` a `http://127.0.0.1/selftest/chat/completions` y el bucle funciona igual.
+[Model](docs/model.md) tiene la lista de campos y los tres protocolos en paralelo.
 
-## Lo que el modelo ve en cada turno
+## Uso
 
-Cuatro capas entran en el prompt del sistema, en este orden, en **cada** turno: lo que el propietario escribió una vez y lo que el agente ha aprendido después. Ninguna forma parte del transcript, así que cuestan lo mismo con una conversación de un mensaje que con una de mil.
-
-| Capa | Dónde vive | Qué llega al modelo | Quién la escribe |
-|---|---|---|---|
-| Órdenes permanentes | `agent.system_prompt` (NVS) | todo, con tope de 2 KB | el propietario, por HTTP o `shell` |
-| Instrucciones del proyecto | `/AGENTS.md` | los primeros 1 KB y una marca que dice que el resto está en el archivo | el propietario, con `fs_write` |
-| Memoria a largo plazo | `/memory.md`, un índice que apunta a `/memory/<tema>.md` | solo el índice, 24 líneas / 2 KB | el propio agente, según aprende |
-| Habilidades | `/skills/<nombre>/SKILL.md` y lo que haya al lado | una línea de cada una, nombre y descripción | cualquiera de los dos |
-
-```bash
-# Las órdenes del propietario: para qué existe esta placa y las reglas que van primero.
-curl -sS -X POST http://<board>/api/agent/prompt -H 'Content-Type: application/json' \
-  -d '{"action":"set","text":"El relé de la bomba está en GPIO12. Nunca más de dos minutos."}'
-
-# Lo que el modelo recibirá de verdad, con las cuatro capas: la única forma de comprobarlo.
-curl -sS http://<board>/api/agent/prompt | jq -r .system
-```
-
-`action` es `set`, `append` o `clear`; `system_prompt get` la vuelve a leer desde la placa y `system_prompt set …` la escribe del lado del agente. La memoria y las habilidades son archivos normales: `fs_write /memory/wiring.md "GPIO18 = tira de LED"` más una línea en `/memory.md` y ya hay un recuerdo; borrar el archivo lo olvida. Un archivo editado surte efecto en el turno siguiente, sin reiniciar, sin reflashear y sin reescribir el transcript.
-
-El reparto existe por el tamaño: una placa con unos pocos kilobytes de SRAM interna no puede llevar todo lo que sabe en cada petición, así que cada capa es un índice o un prefijo, y lo caro se lee con `fs_read` cuando un turno lo necesita. [docs/agent-memory.md](docs/agent-memory.md) y [docs/agent-skills.md](docs/agent-skills.md) tienen los detalles, incluido cómo se limita el índice.
-
-## Shell
-
-Todos los drivers del catálogo están documentados en [docs/capabilities.md](docs/capabilities.md):
-GPIO, ADC, PWM, I2C, 1-Wire, WS2812, SSD1306, BME280, SHT3x, INA219/226, MPU6050, ADS1115,
-PCF8574, DS18B20, HC-SR04, servo, relé, micrófono y amplificador I²S.
-
-Una sola zona escribible, 8 KB de texto en NVS. `read`, `write` y `edit` cubren los casos
-habituales; todo lo demás es una línea de comandos `shell`, analizada con palabras, comillas y
-`--flags`. Un resultado de herramienta está limitado a 2 KB y una respuesta a 8 KB: la placa
-tiene 8 MB de PSRAM y unos pocos kilobytes de SRAM interna, y el segundo número es el que
-manda:
-
-```text
-shell {"command":"ls /notes"}            shell {"command":"grep GPIO /"}
-shell {"command":"cp /a.txt /b.txt"}     shell {"command":"rm /a.txt --confirm"}
-shell {"command":"curl https://example.com/"}          # GET, HTML reduced to text
-shell {"command":"wget -o /dl/page.txt https://example.com/"}
-shell {"command":"ping -c 3 192.168.3.1"}   shell {"command":"nslookup example.com"}
-shell {"command":"ifconfig"}                # configured gateway and DNS, not the lease
-shell {"command":"df | free | uptime | date | uname | ps"}
-shell {"command":"sha256sum /notes/a.txt"}  shell {"command":"zip t.zip /a.txt"}
-```
-
-`edit` rechaza una coincidencia ambigua en lugar de reescribir el lugar equivocado; `rm` y `mv`
-necesitan `confirm`. Un comando mal escrito responde con su línea de uso, tomada de la misma
-tabla de la que sale el texto de ayuda, así que las dos no pueden discrepar: `rm sin --confirm`
-devuelve `usage: rm <path> --confirm`. `shell {"command":"help"}` lista los 26.
-
-## Script
-
-Para lo que las herramientas fijas no pueden expresar: un bucle sobre lecturas, una rama sobre
-un resultado.
-
-```text
-let scan = tool("i2c_scan", {})
-let i = 0
-while i < len(scan.addresses) { log(scan.addresses[i])  i = i + 1 }
-if i > 0 { "found " + str(i) } else { "nothing" }
-```
-
-Números, cadenas, booleanos, nil, listas, mapas; `let`, asignación, `if`/`else`, `while`,
-`break`; funciones integradas `len`, `str`, `num`, `type`, `log` y `tool(name, args)`, que llama
-a cualquier herramienta de la placa con los permisos del propio invocador (salvo
-`tool("script")`). `{"lint":true}` comprueba la sintaxis y los nombres desconocidos con línea y
-columna y nunca ejecuta; `{"help":true}` devuelve la referencia. Límites: 30 s, cinco millones
-de pasos, 32 bloques anidados, cadenas de 4 KB, 8 KB de código fuente. El reloj es el límite
-real: el intérprete corre en el hilo que atiende la consola.
-
-## Trabajo programado
-
-```bash
-curl -sS -X POST http://<board>/api/sched -H 'Content-Type: application/json' -d '{
-  "tasks":[{"id":"t1","prompt":"read the BME280","every_s":300}],
-  "rules":[{"id":"r1","tool":"bme280_read","path":"temperature_c","op":"gt","value":30,"prompt":"it is hot"}]}'
-```
-
-`at_hhmm` ejecuta a una hora de reloj UTC en su lugar, y cada respuesta va a la transcripción
-etiquetada `source: "schedule:t1"`. El agente puede programarse a sí mismo con
-`schedule {"action":"add", …}`. Las tareas sobreviven a un reinicio.
-
-## Manifiesto
-
-Un dispositivo que no necesita temporización ni calibración se declara, no se compila:
-
-```json
-{"devices":[{"id":"pump","kind":"actuator","pins":{"out":12},"note":"active-low relay"}],
- "tools":[{"name":"pump_pulse","description":"Energise the relay for `ms` ms",
-   "params":[{"name":"ms","type":"integer","min":10,"max":5000,"required":true}],
-   "exec":{"type":"sequence","steps":[
-     {"ms":0,"exec":{"type":"gpio_write","pin":12,"level":0}},
-     {"ms":0,"exec":{"type":"delay","ms":{"param":"ms"}}},
-     {"ms":0,"exec":{"type":"gpio_write","pin":12,"level":1}}]},
-   "safety":{"max_calls_per_min":20,"confirm":true}}]}
-```
-
-Tres caminos añaden hardware: un manifiesto (sin temporización ni máquina de estados, se aplica
-en caliente), un driver compilado (`drivers/<chip>.rs`, para máquinas de estados y temporización
-estricta), o un perfil de placa (hechos que no se pueden sondear, como qué pines usan el LED y
-los botones). Un driver solo se lista cuando el sondeo encuentra el dispositivo, así que uno a
-medio escribir no puede informar de hardware que no está. La validación se ejecuta en la placa:
-los rangos de los parámetros y un tope por minuto de `safety` se comprueban antes de que se mueva
-un pin, y una llamada fuera de rango devuelve el rango que aceptaría.
-[docs/adding-a-device.md](docs/adding-a-device.md) cubre los tres.
-
-## Autenticación
-
-| Invocador | Credencial |
+| Desde | Qué obtienes |
 |---|---|
-| Consola | `POST /api/auth {"pin":"…"}` devuelve un token bearer que la página guarda |
-| Script | `X-Portal-Pin: <pin>`, o el mismo token |
-| Cliente MCP | `Authorization: Bearer <mcp.token>`; se acepta el PIN cuando no hay token configurado |
-
-Con `auth.portal_pin` configurado, lo necesitan las escrituras y las lecturas que exponen la
-transcripción, el prompt, la configuración y los registros; estado, dispositivos, herramientas
-y `/agent.json` siguen abiertos. Los tokens viven en RAM, así que un reinicio los revoca. Por
-defecto no hay PIN, y `/agent.json` lo dice en su bloque `security`.
-
-## Simulador
+| `http://<board>/` en el móvil | hablar con el modelo, ver dispositivos y herramientas, cambiarlo todo |
+| `POST /mcp` desde un cliente MCP | las mismas herramientas que usa el agente de la placa |
+| `POST /api/script`, `POST /api/sched` | ejecutar un script ahora, o programarlo |
+| `GET /agent.json` | toda la interfaz como datos: rutas, ajustes, límites |
 
 ```bash
-cargo run -p esp32-agent-sim
+curl -sS -X POST http://<board>/mcp -H 'Content-Type: application/json' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/call",
+       "params":{"name":"shell","arguments":{"command":"ls /"}}}'
 ```
 
-El mismo `agent-core` contra una placa virtual en un puerto real. Solo cambia la implementación
-de `Hardware`, así que la consola, el endpoint MCP, los drivers, el motor de manifiestos y el
-bucle de agente son el código que corre en el chip.
+El agente de la placa también puede añadirse hardware (`manifest_apply`), memoria
+(`write /memory/…`) y shell: las mismas llamadas, el mismo PIN.
+
+## Notas de seguridad
+
+- **Las credenciales se quedan en la placa.** El WiFi va a NVS por `provision`, nunca a la
+  imagen; `api_key` es de solo escritura y se relee como `__set__`.
+- **Pon un PIN antes de que la placa salga de tu mesa.** `auth.portal_pin` protege todas las
+  escrituras y las lecturas que exponen el transcript, el prompt, la configuración y los registros.
+- **Compara el certificado.** El de la placa es autofirmado; su huella está en `GET /api/tls`.
+  El puerto 80 sigue abierto por defecto: un certificado malo cuesta una URL, no la placa; `mcp.plain_http: false` lo cierra, y entonces el cable USB es la única vuelta atrás.
+- **`shell`, `script` y las herramientas del manifiesto mueven pines.** Ese es el objetivo de la
+  placa; el PIN separa al agente haciendo su trabajo de un transeúnte haciéndolo.
+
+[Security](docs/security.md) dice qué no se defiende a propósito.
 
 ## Estructura del repositorio
 
@@ -254,7 +135,8 @@ restricción más ajustada aquí.
 [Arquitectura](docs/architecture.md) · [Manifiesto](docs/manifest.md) · [Capacidades](docs/capabilities.md) ·
 [API HTTP y MCP](docs/http-api.md) · [Añadir un dispositivo](docs/adding-a-device.md) · [Grabación](docs/flashing.md) ·
 [Solución de problemas](docs/troubleshooting.md) · [Bucle de agente](docs/agent-loop.md) · [Flujo](docs/agent-stream.md) ·
-[Skills](docs/agent-skills.md) · [Memoria](docs/agent-memory.md) · [Scripting](docs/scripting.md)
+[Skills](docs/agent-skills.md) · [Memoria](docs/agent-memory.md) · [Scripting](docs/scripting.md) ·
+[Model](docs/model.md) · [Web console](docs/web-console.md) · [Scheduling](docs/scheduling.md) · [Shell](docs/shell.md) · [Context layers](docs/context.md) · [Security](docs/security.md) · [Simulator](docs/simulator.md) · [Performance](docs/performance.md)
 
 ## Contribuir
 

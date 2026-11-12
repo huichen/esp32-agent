@@ -10,14 +10,14 @@ extra model call, and nothing that needs a host.
 ## 1. Memory is an index plus files
 
 ```text
-/memory.md              the index: one line per memory, each pointing at a file
+/MEMORY.md              the index: one line per memory, each pointing at a file
 /memory/<topic>.md      the memory itself, at most 2 KB (the workspace file limit)
 ```
 
 The **index** is what reaches the system prompt, every run, capped at 24 lines / 2 KB:
 
 ```text
-## Memory (/memory.md)
+## Memory (/MEMORY.md)
 … Open a topic with fs_read before relying on it …
 - [pins](/memory/pins.md) — GPIO18 is the strip, active high (2026-11-11)
 - [wifi](/memory/wifi.md) — the 5 GHz SSID is not visible (2026-11-10)
@@ -30,7 +30,7 @@ expensive part.
 
 Lines that are not pointers are dropped — a heading, a paragraph, a bullet with no path.
 A model that writes prose instead of an index therefore loses the budget, not the
-feature: `/memory.md` stays readable, and the prompt only carries what a reader can follow.
+feature: `/MEMORY.md` stays readable, and the prompt only carries what a reader can follow.
 
 ### Writing a memory
 
@@ -47,7 +47,7 @@ then one line appended to the index:
 
 ```json
 {"name":"fs_edit","arguments":{
-  "path":"/memory.md",
+  "path":"/MEMORY.md",
   "find":"- [wifi]",
   "replace":"- [pins](/memory/pins.md) — GPIO18 is the strip (2026-11-11)\n- [wifi]"}}
 ```
@@ -119,7 +119,7 @@ curl -sS -X POST http://<board>:80/mcp -H 'Content-Type: application/json' \
 curl -sS -X POST http://<board>:80/mcp -H 'Content-Type: application/json' \
   -d '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{
        "name":"fs_write","arguments":{
-         "path":"/memory.md","text":"- [pins](/memory/pins.md) — GPIO18 is the strip\n"}}}'
+         "path":"/MEMORY.md","text":"- [pins](/memory/pins.md) — GPIO18 is the strip\n"}}}'
 
 # what the model will be told
 curl -sS http://<board>:80/api/agent/prompt | jq -r .system | sed -n '/## Memory/,/^## /p'
