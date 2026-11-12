@@ -641,21 +641,33 @@ impl Hardware for EspHw {
             frames.push(*s);
             frames.push(*s);
         }
-        let mut written: usize = 0;
-        let bytes = frames.len() * core::mem::size_of::<i16>();
-        let rc = unsafe {
-            sys::i2s_channel_write(
-                self.i2s_tx,
-                frames.as_ptr() as *const core::ffi::c_void,
-                bytes,
-                &mut written,
-                1000,
-            )
-        };
-        if written == 0 {
-            return Err(McpError::hardware(format!("i2s write accepted nothing (rc {rc})")));
+        // One `i2s_channel_write` returns after its 1000 ms timeout with however much it
+        // managed to hand to the DMA, so a buffer longer than a second used to be silently
+        // truncated — the caller was told "short writes are normal" and the tail of a
+        // melody simply never played. Nothing had ever sent more than 43 ms before, so it
+        // was invisible. Loop until every frame is in: each iteration copies into the ring
+        // as the DMA drains it, so the ring is never empty between iterations and the audio
+        // is continuous across them.
+        let mut off: usize = 0;
+        while off < frames.len() {
+            let mut written: usize = 0;
+            let rc = unsafe {
+                sys::i2s_channel_write(
+                    self.i2s_tx,
+                    frames.as_ptr().add(off) as *const core::ffi::c_void,
+                    (frames.len() - off) * core::mem::size_of::<i16>(),
+                    &mut written,
+                    1000,
+                )
+            };
+            if written == 0 {
+                return Err(McpError::hardware(format!(
+                    "i2s write stopped after {off} of {} samples (rc {rc})",
+                    frames.len()
+                )));
+            }
+            off += written / core::mem::size_of::<i16>();
         }
-        // A short write is normal under load; the caller only needs to know it went out.
         Ok(())
     }
 
