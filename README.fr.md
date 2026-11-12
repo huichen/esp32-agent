@@ -24,7 +24,7 @@ répond avec eux ; un nouveau capteur peut être déclaré en JSON pendant que
 | Une console en HTTPS | Discutez et configurez périphériques, outils, planification, journaux, WiFi et modèle depuis un téléphone ; la carte émet son propre certificat. [Console web](#console-web) |
 | Il agit sans surveillance | Prompts à heure fixe et règles de capteur qui en déclenchent un quand un relevé franchit un seuil. [Planification](#planification) |
 | Un shell et un langage de script | `shell` avec 26 commandes nommées comme dans NuttX, et un interpréteur pour boucler sur des appels d’outils. [Shell](#shell) · [Script](#script) |
-| Consignes permanentes | 2 KB dans le prompt système pour ce à quoi cette carte sert, modifiable depuis la console, `shell` et HTTP. [Consignes permanentes](#consignes-permanentes) |
+| Il retient ce qu'on lui a dit | Consignes permanentes, `/AGENTS.md`, un index `/memory.md` et des compétences, assemblés dans le prompt à chaque tour. [Ce que le modèle voit à chaque tour](#ce-que-le-modèle-voit-à-chaque-tour) |
 | Aucun cloud sur le chemin | HTTPS servi par la carte, un certificat qu’elle génère, un seul PIN pour trois appelants. [Authentification](#authentification) |
 | Testable sans matériel | Le simulateur exécute le même `agent-core` contre une carte virtuelle. [Simulateur](#simulateur) |
 
@@ -86,20 +86,29 @@ règlent la fenêtre et la réserve de réponse, et la transcription se compacte
 fenêtre. Sans clé, pointez `base_url` vers le `/selftest/chat/completions` de la carte et la
 boucle tourne quand même.
 
-## Consignes permanentes
+## Ce que le modèle voit à chaque tour
 
-Un emplacement pour ce à quoi cette carte *sert*, écrit par son propriétaire et lu à
-chaque tour :
+Quatre couches entrent dans le prompt système, dans cet ordre, à **chaque** tour : ce que le propriétaire a écrit une fois, et ce que l'agent a appris depuis. Aucune ne fait partie du transcript, donc elles coûtent autant pour une conversation d'un message que de mille.
+
+| Couche | Où elle vit | Ce qui parvient au modèle | Qui l'écrit |
+|---|---|---|---|
+| Consignes permanentes | `agent.system_prompt` (NVS) | tout, plafonné à 2 KB | le propriétaire, par HTTP ou `shell` |
+| Instructions du projet | `/AGENTS.md` | le premier 1 KB, puis un repère disant que le reste est dans le fichier | le propriétaire, par `fs_write` |
+| Mémoire longue | `/memory.md`, un index pointant vers `/memory/<sujet>.md` | l'index seul, 24 lignes / 2 KB | l'agent lui-même, au fil de ses découvertes |
+| Compétences | `/skills/<nom>/SKILL.md` et les fichiers à côté | une ligne chacune, nom et description | l'un ou l'autre |
 
 ```bash
+# Les consignes du propriétaire : à quoi sert cette carte, et les règles qui passent avant tout.
 curl -sS -X POST http://<board>/api/agent/prompt -H 'Content-Type: application/json' \
-  -d '{"action":"set","text":"The pump relay is on GPIO12. Never run it past two minutes."}'
+  -d '{"action":"set","text":"Le relais de la pompe est sur GPIO12. Jamais plus de deux minutes."}'
+
+# Ce que le modèle recevra réellement, les quatre couches comprises : le seul moyen de vérifier.
+curl -sS http://<board>/api/agent/prompt | jq -r .system
 ```
 
-`action` vaut `set`, `append` ou `clear`, et `system_prompt get` le relit depuis la carte ;
-`GET /api/agent/prompt` montre le prompt que le modèle
-recevra, partie personnalisée comprise, et l’agent y accède avec
-`shell {"command":"system_prompt set …"}`. 2 KB en NVS, donc il survit à un redémarrage.
+`action` vaut `set`, `append` ou `clear` ; `system_prompt get` la relit depuis la carte et `system_prompt set …` l'écrit du côté de l'agent. La mémoire et les compétences sont des fichiers ordinaires : `fs_write /memory/wiring.md "GPIO18 = ruban"` plus une ligne dans `/memory.md`, et voilà une mémoire ; supprimer le fichier l'oublie. Un fichier modifié prend effet au tour suivant, sans redémarrage, sans reflashage, sans réécriture du transcript.
+
+La raison de ce découpage est la taille : une carte avec quelques kilo-octets de SRAM interne ne peut pas transporter tout ce qu'elle sait dans chaque requête, donc chaque couche est un index ou un préfixe, et le contenu coûteux est lu par `fs_read` quand un tour en a besoin. [docs/agent-memory.md](docs/agent-memory.md) et [docs/agent-skills.md](docs/agent-skills.md) donnent les détails, y compris la façon dont l'index est borné.
 
 ## Shell
 
