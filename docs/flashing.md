@@ -1,31 +1,33 @@
 # Flashing and first-time setup
 
-## 0. If you do not want to build at all
+## 0. The image you flash
 
-Every tagged release carries a merged image built from that tag, so the whole section below
-is optional:
+There is no prebuilt binary here: the repository contains no release workflow and publishes
+no image, so the build in section 1 is the only way to a `.bin`. Once you have built one,
+the merged image is written with:
 
 ```bash
 # espflash (Rust, any OS)
-espflash write-bin --chip esp32s3 --flash-size 16mb 0x0 esp32-agent-vX.Y.Z.bin
+espflash write-bin --chip esp32s3 --flash-size 16mb 0x0 esp32-agent.bin
 
 # or the Python tooling
-esptool.py --chip esp32s3 write_flash 0x0 esp32-agent-vX.Y.Z.bin
+esptool.py --chip esp32s3 write_flash 0x0 esp32-agent.bin
 ```
 
-Then jump to section 4: the board raises the `esp32-agent-setup` access point when it has no
-credentials, and provisioning is the same either way.
+If you would rather not merge, flash the ELF directly with the command in section 1 — that
+one passes the partition table explicitly, which matters (section 2).
+
+Either way, jump to section 4: the board raises the `esp32-agent-setup` access point when it
+has no credentials, and provisioning is the same.
 
 The image is the project's own build (`firmware/partitions.csv`, application partition
-`factory`), produced by `.github/workflows/release.yml` on every tag. If you are on a
-different flash size, or want a chip other than the esp32s3, build it yourself — the rest of
-this page is that path.
+`factory`). If you are on a different flash size, or want a chip other than the esp32s3,
+build it yourself — the rest of this page is that path.
 
 ## 1. Toolchain
 
-The `scripts/` helpers are PowerShell, so they are the Windows path. The toolchain itself is
-not Windows-specific; on macOS or Linux the three commands below are the same, and the only
-difference is the file `espup` writes for you to source:
+The toolchain is not Windows-specific; the only difference is the file `espup` writes for
+you to source:
 
 ```bash
 cargo install espup espflash ldproxy
@@ -43,18 +45,10 @@ espflash flash --chip esp32s3 --flash-size 16mb \
   target/xtensa-esp32s3-espidf/release/esp32-agent
 ```
 
-The PowerShell script does exactly that, plus the two workarounds documented in section 8
-(`LIBCLANG_PATH`, and the short output path esp-idf-sys insists on) — worth reading even
-when you are not on Windows, because the second one bites on any path with a long name.
-
-
-
-```bash
-cargo install espup espflash ldproxy
-espup install
-# then in every new shell, run the environment script espup generated (PowerShell):
-#   . $HOME\export-esp.ps1        Windows: C:\Users\<you>\export-esp.ps1
-```
+`scripts/build-firmware.ps1` and `scripts/build-firmware.sh` do exactly that, plus the two
+workarounds documented in section 8 (`LIBCLANG_PATH`, and the short output path esp-idf-sys
+insists on) — worth reading even when you are not on Windows, because the second one bites
+on any path with a long name.
 
 ESP-IDF v5.4+ is required (`firmware/.cargo/config.toml` pins `v5.5.2`). On the first
 build, `embuild`/`esp-idf-sys` downloads ESP-IDF and its tools itself (several GB,
@@ -70,16 +64,23 @@ powershell scripts/build-firmware.ps1
 powershell scripts/build-firmware.ps1 -Flash -Port COM3
 ```
 
-Another chip: change `target` and `MCU` in `firmware/.cargo/config.toml` and
-`firmware/sdkconfig.defaults` (for example `esp32c3` → `riscv32imc-esp-espidf`,
-`MCU=esp32c3`, and drop the PSRAM settings).
+```bash
+# the same two, on macOS or Linux
+bash scripts/build-firmware.sh
+bash scripts/build-firmware.sh --flash --port /dev/ttyACM0
+```
+
+Another chip: pass `-Mcpu esp32c3 -Target riscv32imc-esp-espidf` (`--mcpu esp32c3
+--target riscv32imc-esp-espidf`); the script rewrites `target` and `MCU` in
+`firmware/.cargo/config.toml` to match. `firmware/sdkconfig.defaults` is hand-edited (for
+example drop the PSRAM settings on a part without it).
 
 ### Do not let the flasher generate its own partition table
 
 Without `--partition-table`, `espflash flash <elf>` builds **its own single-partition
 table** and writes it into flash, overwriting the one `partitions.csv` defines. The boot
-log still looks normal, but `otadata`/`ota_0`/`ota_1` are gone. The correct command (the
-one the scripts use):
+log still looks normal, but `otadata`/`ota_0`/`ota_1` are gone. Flashing by hand, pass the
+table explicitly:
 
 ```powershell
 espflash flash --chip esp32s3 --port COM3 --baud 921600 --flash-size 16mb `
@@ -88,7 +89,11 @@ espflash flash --chip esp32s3 --port COM3 --baud 921600 --flash-size 16mb `
 ```
 
 The path is `<clone>\target\…` because that is where the build script keeps it; with
-`-TargetDir` elsewhere, use that directory instead.
+`-TargetDir` (`--target-dir`) elsewhere, use that directory instead.
+
+The scripts themselves run `espflash flash --monitor <elf>` and add `--port` when you give
+one, so read the flash log rather than assuming: if you passed `-Flash` / `--flash` and the
+seven entries do not appear, flash again with the explicit command above.
 
 After flashing, check the serial output: the bootloader's `Partition Table:` must list
 seven entries (`nvs`, `otadata`, `phy_init`, `factory`, `ota_0`, `ota_1`, `storage`), and
@@ -98,13 +103,14 @@ the firmware itself prints the real table again through `esp_partition_find`.
 
 `esp-idf-sys` rejects an output path longer than 88 characters, so build from a short
 clone (e.g. `D:\e`) rather than a deep directory: the path is canonicalised, so `subst`
-does not help. `scripts/build-firmware.ps1` handles the four traps this sets — it selects
-the `esp` toolchain, points `LIBCLANG_PATH` at the **directory** holding `esp-clang\bin`,
-keeps the artifacts in `<clone>\target` instead of `firmware\target` (pass
-`-TargetDir D:\t` if the clone path is still too long), and rewrites
-`firmware/.cargo/config.toml` only when a chip setting actually changed. A machine-level
-`rustc-wrapper = "sccache"` in the cargo config cannot spawn the ESP toolchain's rustc;
-move that config aside for the build and restore it afterwards.
+does not help. `scripts/build-firmware.ps1` and `scripts/build-firmware.sh` handle the four
+traps this sets — they select the `esp` toolchain, point `LIBCLANG_PATH` at the
+**directory** holding `esp-clang\bin`, keep the artifacts in `<clone>\target` instead of
+`firmware\target` (pass `-TargetDir D:\t` or `--target-dir D:\t` if the clone path is
+still too long), and rewrite `firmware/.cargo/config.toml` only when a chip setting
+actually changed. A machine-level `rustc-wrapper = "sccache"` in the cargo config cannot
+spawn the ESP toolchain's rustc; move that config aside for the build and restore it
+afterwards.
 
 What each of those looks like when it is wrong, so the next person recognises the error
 instead of re-deriving the fix:

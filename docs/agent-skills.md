@@ -29,18 +29,18 @@ Plain Markdown, written for a reader with no memory of your bench:
 ```
 
 The first 1024 bytes go into the system prompt with a marker where the cut happened, and
-the model is told to read the rest with `fs_read /AGENTS.md`. Editing the file takes
+the model is told to read the rest with `read /AGENTS.md`. Editing the file takes
 effect on the next turn: no restart, no transcript rewrite.
 
 Written from anywhere:
 
 ```bash
 # the agent itself, mid-turn
-fs_write {"path":"/AGENTS.md","text":"GPIO12 is the pump relay, active low."}
+write {"path":"/AGENTS.md","text":"GPIO12 is the pump relay, active low."}
 
 # a skill, written the same way
-fs_write {"path":"/skills/pulse_pump.md",
-          "text":"# pulse_pump\ndescription: switch the pump for a measured pulse\n1. confirm the request names a duration\n2. bench_pulse {ms}\n3. read power_read before and after\n"}
+write {"path":"/skills/pulse_pump.md",
+       "text":"# pulse_pump\ndescription: switch the pump for a measured pulse\n1. confirm the request names a duration\n2. bench_pulse {ms}\n3. read power_read before and after\n"}
 ```
 
 ## Skills
@@ -48,7 +48,7 @@ fs_write {"path":"/skills/pulse_pump.md",
 A skill is a **directory** (`/skills/<name>/`) with a `SKILL.md`, and whatever else it
 needs next to it. That is the shape the host uses, and it is the reason a skill is not
 just a paragraph: a pinout, a table of registers, an acceptance script the model runs by
-hand with `gpio_write` all belong to the procedure, and they are `fs_read` away.
+hand with `gpio_write` all belong to the procedure, and they are `read` away.
 
 ```markdown
 /skills/deploy/SKILL.md
@@ -56,8 +56,8 @@ hand with `gpio_write` all belong to the procedure, and they are `fs_read` away.
 name: deploy
 description: roll the portal forward without losing the transcript
 ---
-1. Read `/AGENTS.md` and confirm the board is not mid-goal.
-2. `fs_write` a note to `/notes/deploy-<date>.md` first.
+1. Read `/AGENTS.md` and confirm no turn is running.
+2. `write` a note to `/notes/deploy-<date>.md` first.
 3. Build, flash, then `board_status` and one `bme280_read`.
 The pinout to check after flashing is in `pinout.md` next to this file.
 
@@ -82,20 +82,20 @@ Rules, such as they are:
 - No includes, no scripts that run by themselves. A skill is a procedure and its
   attachments, read by an agent with the file and GPIO tools it already has.
 
-Write one with `fs_write` — there are no dedicated tools (see below).
+Write one with `write` — there are no dedicated tools (see below).
 
 ### No tools of their own
 
-Deliberately. `fs_ls`, `fs_read` and `fs_write` already reach both paths, and a wrapper
+Deliberately. `read`, `write`, `edit` and `shell` already reach both paths, and a wrapper
 per verb would add a definition to every request and one more choice for a small model.
 
 | Task | How |
 |---|---|
-| see the skills | `fs_ls {path:"/skills"}` — the prompt already names each one with its path |
-| load one | `fs_read {path:"/skills/deploy/SKILL.md"}`, and any file next to it |
-| add or change one | `fs_write {path:"/skills/deploy/SKILL.md", text}` — parent directories are created |
-| remove one | `fs_rm {path:"/skills/deploy/SKILL.md", confirm:true}`; the index drops it on the next turn |
-| change the instructions | `fs_write {path:"/AGENTS.md", text}` |
+| see the skills | `shell {"command":"ls /skills"}` — the prompt already names each one with its path |
+| load one | `read {path:"/skills/deploy/SKILL.md"}`, and any file next to it |
+| add or change one | `write {path:"/skills/deploy/SKILL.md", text}` — parent directories are created |
+| remove one | `shell {"command":"rm /skills/deploy/SKILL.md --confirm"}`; the index drops it on the next turn |
+| change the instructions | `write {path:"/AGENTS.md", text}` |
 
 What you give up without the wrappers: nothing checks a name, a header, or that a skill
 directory has a `SKILL.md`. The index is forgiving (front matter, then a `description:`
@@ -107,7 +107,7 @@ From an MCP client, the same call, since these paths are ordinary files:
 
 ```bash
 curl -sS -X POST http://<board>:80/mcp -H 'Content-Type: application/json' -d \
-  '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"fs_write","arguments":
+  '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"write","arguments":
     {"path":"/skills/deploy.md",
      "text":"# deploy\ndescription: roll the portal forward\n1. snapshot\n2. flash\n"}}}'
 ```

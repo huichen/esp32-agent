@@ -60,14 +60,14 @@ compensation itself.
 
 ## Documentation and examples
 
-- Examples must run: at least one `scripts/smoke.ps1` check must reference it.
+- Examples must run: at least one `scripts/smoke.ps1` (or `smoke.sh`) check must reference it.
 - Never write "should work": unverified behaviour goes into `ROADMAP.md`.
 
 ## Before committing
 
 ```bash
 cargo test -p esp32-agent-core
-powershell -File scripts/smoke.ps1
+powershell -File scripts/smoke.ps1        # or: bash scripts/smoke.sh
 cargo clippy -p esp32-agent-core -p esp32-agent-sim -- -D warnings
 cargo fmt --all --check
 ```

@@ -12,7 +12,7 @@ Two buildable units and one firmware project:
 | Path | Contents | Verifiable here |
 |---|---|---|
 | `crates/agent-core/` | everything board-independent (protocol, HTTP, manifest, drivers, validation, web assets) | ✅ `cargo test` |
-| `crates/agent-sim/` | host simulator: the same services on a virtual board | ✅ `cargo run` / `scripts/smoke.ps1` |
+| `crates/agent-sim/` | host simulator: the same services on a virtual board | ✅ `cargo run` / `scripts/smoke.ps1`, `scripts/smoke.sh` |
 | `firmware/` | ESP-IDF firmware (WiFi, NVS, buses, entry point) | ⚠️ needs the ESP-IDF toolchain, see `docs/flashing.md` |
 | `docs/`, `README.md` | documentation | ✅ reviewed together with the code |
 
@@ -63,12 +63,17 @@ cargo clippy -p esp32-agent-core -p esp32-agent-sim -- -D warnings
 cargo fmt --all --check
 ```
 
+On macOS or Linux the smoke step is `bash scripts/smoke.sh`, which runs the same commands
+in the same order (and needs `python3` for two of its checks). After editing any `.sh`,
+`bash -n` every one of them: the parse check is the only part a Windows machine can run.
+
 For documentation-only changes, step 1 still runs (to prove nothing else broke).
 
 Extra requirement for `firmware/`:
 
 ```bash
 powershell -File scripts/build-firmware.ps1      # needs espup + ESP-IDF, see docs/flashing.md
+bash scripts/build-firmware.sh                   # the same, on macOS or Linux
 ```
 
 Without the toolchain on this machine, **do not claim the firmware is verified**: say
@@ -84,7 +89,7 @@ suspicious. The bench board and the exact flash command are described in
   unverified.
 - After a merge, clean up worktrees and branches (§2). Do not leave stale branches.
 
-## 7. Translations
+## 6. Translations
 
 `README.md` is the source. Five translations sit beside it (`README.zh.md`, `README.fr.md`,
 `README.es.md`, `README.ru.md`, `README.ar.md`) and are updated **in the same commit** as the
@@ -104,7 +109,7 @@ English. The README does not say this; this file does.
 - Check mechanically, not by eye: same `##` heading count, same fenced-block count, same
   table-row count, and every in-page link resolves.
 
-## 8. Do not
+## 7. Do not
 
 - Put WiFi passwords or tokens into code, examples or tests. `__set__` in a config or
   manifest is a redaction placeholder, not a value.

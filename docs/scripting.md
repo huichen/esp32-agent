@@ -68,7 +68,7 @@ if n > 0 { "found" } else { "nothing" }  # the last expression is the result
 | Values | number, string, bool, nil, list, map |
 | Statements | `let`, assignment (`x = …`, `l[0] = …`, `m.k = …`), `if`/`else`, `while`, `break`, blocks |
 | Operators | `+ - * / %`, `== != < <= > >=`, `and or not`, unary `-` |
-| Builtins | `len`, `str`, `num`, `type`, `log`, `tool(name, args)` |
+| Builtins | `len`, `str`, `num`, `type`, `log`, `print`, `echo`, `tool(name, args)` |
 | Comments | `#` and `//` |
 | Maps | `{a: 1}` reads like JSON; `{a = 1}` also parses |
 
@@ -81,7 +81,8 @@ out of stack.
 
 | Limit | Value | Why |
 |---|---|---|
-| Steps | 50 000 | a runaway `while` stops with a message instead of a reboot |
+| Wall clock | 30 s | a runaway `while` stops with a message instead of a hung board |
+| Steps | 5 000 000 | the backstop when a loop does nothing but compute |
 | Nesting | 32 blocks | the interpreter recurses on the call stack |
 | String / list / map | 4 KB / 256 / 64 | these live in internal RAM |
 | Log lines | 64 | the result travels as a tool result (2 KB) |
@@ -92,6 +93,23 @@ out of stack.
 ```json
 {"ok": true, "result": <last expression as JSON>, "output": ["…"], "steps": 244}
 ```
+
+## Running one over HTTP
+
+The same interpreter is a route, for a client that would rather not wrap it in JSON-RPC:
+
+```bash
+curl -sS -X POST http://<board>:80/api/script -H 'Content-Type: application/json' \
+  -d '{"source":"1 + 2"}'
+# {"id":"s1","state":"done","async":false,"ok":true,"result":3,"output":[],"steps":3,"ms":2}
+```
+
+`POST /api/script` requires the PIN, takes `{source, async?}` and uses the same 8 KB source
+limit. Without `async` it waits for the run and answers with `result`, `output`, `steps`,
+`ms` and `error`. With `"async": true` it answers at once with `{id, state, poll}` and the
+work runs in the background; poll `GET /api/script/<id>` for `state`, the result and the
+error. The tool (`script`) is the same code with a smaller wrapper — a script reaches the
+same dispatcher, so nothing a script can do here is out of reach of the tool.
 
 Integers stay integers across the boundary (`address: 60`, never `60.0`), because a script
 that copies a number out of a tool result and back into `manifest_apply` would otherwise be

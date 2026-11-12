@@ -9,8 +9,8 @@ One page, served by the board, no build step and nothing fetched from the intern
 | `https://<board>/` | the same routes over TLS, certificate generated on the board |
 
 Both stay open by default. Port 80 is the way back in when a certificate is wrong, so a TLS
-misconfiguration costs a URL and not the board. \mcp.plain_http: false\ closes it (see
-[security](security.md)); with it off, only \https://<board>/\ answers.
+misconfiguration costs a URL and not the board. `mcp.plain_http: false` closes it (see
+[security](security.md)); with it off, only `https://<board>/` answers.
 
 ## Panels
 
@@ -22,7 +22,7 @@ misconfiguration costs a URL and not the board. \mcp.plain_http: false\ closes i
 | Agent | endpoint, model, key, protocol, thinking level, temperature, context and output size |
 | Schedule | timed prompts and sensor rules |
 | Logs | the ring buffer, newest first |
-| Settings | WiFi with gateway and DNS overrides, the portal PIN, reboot, factory reset |
+| Settings | WiFi with gateway and DNS overrides, the portal PIN, reboot |
 
 The page keeps a bearer token from `POST /api/auth` and retries once when a write is refused,
 so the PIN is asked for once per session and not per click.

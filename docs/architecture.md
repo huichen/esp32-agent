@@ -92,9 +92,13 @@ change reports `restart_required: true` rather than quietly keeping the old wiri
 
 - **Blocking HTTP, no async**: ESP-IDF's std networking is enough; MCP request volume is
   low and a single tool call is serial anyway.
-- **One thread per connection**: at most six connections on the board; 512 KB of stack per
-  thread on the host, 10 KB on the board (see `cfg` in `http.rs`). The board figure is
-  dictated by internal RAM, which PSRAM cannot supply for stacks.
+- **One stack, not one thread per connection**: a request is answered on the accept
+  thread — 20 KB of stack on the board, 256 KB on the host, because it carries the
+  heaviest handler (`/api/tools` serialises every tool descriptor). Only a streaming
+  response gets a thread of its own (6 KB on the board, 512 KB on the host), because it
+  outlives the request. At most six connections are open at once, and a parked keep-alive
+  socket costs a descriptor rather than a stack (see `cfg` in `http.rs`). The board figures
+  are dictated by internal RAM, which PSRAM cannot supply for stacks.
 - **Manifests are validated on the board**: the schema is a manual for the model; what
   actually rejects a call is `check_args` plus `safety`.
 - **SSE only where it pays**: `GET /mcp` still answers 405, which the spec allows. The
