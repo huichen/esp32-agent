@@ -98,7 +98,7 @@ I²C стабильно на 8 прогонах; внутренняя SRAM 5–6
 [HTTP и MCP](docs/http-api.md) · [Добавление устройства](docs/adding-a-device.md) · [Прошивка](docs/flashing.md) ·
 [Диагностика](docs/troubleshooting.md) · [Цикл агента](docs/agent-loop.md) · [Поток](docs/agent-stream.md) ·
 [Skills](docs/agent-skills.md) · [Память](docs/agent-memory.md) · [Scripting](docs/scripting.md) ·
-[Model](docs/model.md) · [Web console](docs/web-console.md) · [Scheduling](docs/scheduling.md) · [Shell](docs/shell.md) · [Context layers](docs/context.md) · [Security](docs/security.md) · [Simulator](docs/simulator.md) · [Performance](docs/performance.md)
+[Model](docs/model.md) · [Web console](docs/web-console.md) · [Scheduling](docs/scheduling.md) · [Shell](docs/shell.md) · [Context layers](docs/context.md) · [Security](docs/security.md) · [Simulator](docs/simulator.md) · [Audio](docs/audio.md)
 
 ## Участие в проекте
 
