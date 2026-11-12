@@ -1,8 +1,26 @@
-//! SHA-256 and MD5, in a few dozen lines each.
+//! SHA-256, MD5 and FNV-1a.
 //!
-//! Both are here for `shell sha256sum` / `shell md5sum`: a board that can download a file
-//! should be able to say what it is. Neither is security code — SHA-256 is used to name a
-//! file, not to sign one.
+//! The first two are here for `shell sha256sum` / `shell md5sum`: a board that can download
+//! a file should be able to say what it is. Neither is security code — SHA-256 is used to
+//! name a file, not to sign one.
+//!
+//! [`fnv1a`] is the cheap one, and the only one used on the power-cut path: a stored value
+//! it covers is 3500 bytes, and an integrity check that costs a hash table is a check a
+//! board may decide not to run. It tells a torn or half-overwritten value from an intact
+//! one; it is not a signature.
+
+/// FNV-1a over the bytes: one pass, no state, no dependency.
+///
+/// Used by the chunked storage ([`crate::store`]) and the stored transcript
+/// ([`crate::agent`]) to notice a value a power cut cut in half.
+pub fn fnv1a(bytes: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
 
 /// Upper-case-hex digest helpers keep the output the shape `sha256sum` prints.
 fn hex(digest: &[u8]) -> String {
@@ -134,6 +152,16 @@ pub fn md5(data: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fnv1a_matches_its_reference_vectors() {
+        // The published FNV-1a 64-bit vectors, so a change to the constant is caught.
+        assert_eq!(fnv1a(b""), 0xcbf2_9ce4_8422_2325);
+        assert_eq!(fnv1a(b"a"), 0xaf63_dc4c_8601_ec8c);
+        assert_eq!(fnv1a(b"foobar"), 0x85944171f73967e8);
+        // One flipped bit is a different value: that is the whole point of storing it.
+        assert_ne!(fnv1a(b"abc"), fnv1a(b"abd"));
+    }
 
     #[test]
     fn the_reference_digests_match() {
