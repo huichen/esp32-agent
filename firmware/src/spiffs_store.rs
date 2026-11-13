@@ -7,7 +7,7 @@
 //!
 //! The split is not cosmetic. A write to either backend is an `spi_flash` operation with both
 //! caches off, so it has to happen on the one task whose stack is in internal RAM — the
-//! `nvs-writer` task in `main.rs`. That is why this type is a `KvStore` like any other and not
+//! `store-writer` task in `main.rs`. That is why this type is a `KvStore` like any other and not
 //! a second code path: the queue in front of it does not care which filesystem answers.
 
 use esp32_agent_core::store::{KvStore, StoreError, StoreSpace};
@@ -323,14 +323,9 @@ impl KvStore for SpiffsStore {
         if total == 0 {
             return None;
         }
-        Some(StoreSpace {
-            // A filesystem has no entries: the byte numbers are the answer.
-            used_entries: 0,
-            free_entries: 0,
-            total_entries: 0,
-            total_bytes: Some(total),
-            used_bytes: Some(used),
-        })
+        // Bytes and nothing else: a filesystem has no entries, and reporting zeros for them made
+        // `free_entries: 0` read as "full" on a partition with 11 MB left.
+        Some(StoreSpace::Bytes { used, total })
     }
 
     /// A file is as long as the partition allows, so a blob goes in as one value. That is the
