@@ -215,7 +215,7 @@ one only sets the pthread name, which nothing here reads):
 | `radio` | `wifi.rs` | 12 kB | 6.5 kB | 5.5 kB |
 | `provision` | `console.rs` | 6 kB | 4.7 kB | 1.3 kB |
 | `dns` | `dns.rs` | 4 kB **in PSRAM** | 2.1 kB | 1.9 kB |
-| `nvs-writer` | `nvs_writer.rs` | 6 kB | 4.7 kB | 1.3 kB |
+| `store-writer` | `nvs_writer.rs` | 6 kB | 4.7 kB | 1.3 kB |
 
 A name is a fact about one thread and is never inherited. `esp_pthread_set_cfg` is read by
 `pthread_create` from the **creating** thread, so the name, the size and the stack
@@ -346,7 +346,7 @@ a board with no serial terminal attached can still be read:
 
 The number and the name come from the same call, so they cannot drift apart. Each refusal is
 also one `store` log line per key — key, operation, code, name and `at_ms` — written by the
-`nvs-writer` task as it drains the queue, not one line for all of them: a count says
+`store-writer` task as it drains the queue, not one line for all of them: a count says
 something is wrong, and only the key says what.
 
 **The case that produced this section.** Every write of `agent.transcript`,

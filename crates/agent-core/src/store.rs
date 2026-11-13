@@ -11,7 +11,7 @@
 //! task doing it must have its stack in internal RAM. On this board some threads get a
 //! PSRAM stack, and a write from one of those asserts in
 //! `spi_flash_disable_interrupts_caches_and_other_cpu (esp_task_stack_is_sane_cache_disabled())`
-//! and reboots the board — see the `nvs-writer` task in the firmware.
+//! and reboots the board — see the `store-writer` task in the firmware.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -441,21 +441,55 @@ pub struct Refusal {
     pub at_ms: u64,
 }
 
-/// Room left in the backing store.
+/// Room left in the backing store, in the unit that backend actually has.
 ///
-/// Two units, because two backends answer the question differently. NVS thinks in entries
-/// (32 bytes each, 126 per 4 KB page), and a blob is spread over them by [`write_blob`], so
-/// `free_entries` is what says whether the next chunk fits. A filesystem thinks in bytes and
-/// has no such idea, so it fills `total_bytes`/`used_bytes` instead. A reader that wants
-/// "is it full?" wants the bytes; a reader debugging chunking wants the entries.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct StoreSpace {
-    pub used_entries: usize,
-    pub free_entries: usize,
-    pub total_entries: usize,
-    /// Set by a backend that has a byte budget (SPIFFS, a filesystem), `None` on NVS.
-    pub total_bytes: Option<usize>,
-    pub used_bytes: Option<usize>,
+/// The two backends answer a different question, and conflating them produced a number that
+/// lied: a filesystem has no entries, so reporting `free_entries: 0` for one read as "the store
+/// is full" - and `/api/status.store` is what the board's own agent reads when it wonders why a
+/// write was refused. `null` and `0` are different answers here: "not applicable" and "nothing
+/// left". So the variant carries whichever unit applies, and the JSON for it carries only the
+/// keys that mean something.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StoreSpace {
+    /// A key-value store counted in entries: NVS, 32 bytes each and 126 per 4 KB page, which is
+    /// what [`write_blob`] spreads a value over.
+    Entries {
+        used: usize,
+        free: usize,
+        total: usize,
+        /// The same three numbers as bytes, so "is there room?" can be asked of either backend
+        /// with one expression.
+        used_bytes: usize,
+        total_bytes: usize,
+    },
+    /// A filesystem: bytes, and no notion of entries at all.
+    Bytes { used: usize, total: usize },
+}
+
+impl StoreSpace {
+    /// The JSON this space becomes in `/api/status.store.space`.
+    ///
+    /// One place, so "the filesystem reports no entries" is a property of the code and not of
+    /// each caller remembering.
+    pub fn to_json(self) -> serde_json::Value {
+        match self {
+            StoreSpace::Entries { used, free, total, used_bytes, total_bytes } => {
+                serde_json::json!({
+                    "used_entries": used,
+                    "free_entries": free,
+                    "total_entries": total,
+                    "used_bytes": used_bytes,
+                    "free_bytes": free.saturating_mul(32),
+                    "total_bytes": total_bytes,
+                })
+            }
+            StoreSpace::Bytes { used, total } => serde_json::json!({
+                "used_bytes": used,
+                "free_bytes": total.saturating_sub(used),
+                "total_bytes": total,
+            }),
+        }
+    }
 }
 
 /// One queued operation: `Some` is a write, `None` is a removal.
