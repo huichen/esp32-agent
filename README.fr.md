@@ -87,7 +87,7 @@ pour chaque carte qu'il peut joindre. Sans aucune clé, `base_url` sur
 
 | Partie | État |
 |---|---|
-| `agent-core` | 761 tests unitaires et 5 tests d’intégration passent ; `scripts/smoke.ps1` passe de bout en bout |
+| `agent-core` | 763 tests unitaires et 5 tests d’intégration passent ; `scripts/smoke.ps1` passe de bout en bout |
 | Simulateur | console, MCP et la boucle d’agent fonctionnent de bout en bout |
 | Firmware | flashé sur un ESP32-S3-DevKitC-1 N16R8 (IDF v5.5.2) : 42 outils, OLED 128×32, micro et ampli I²S, WS2812, console TLS, tours de modèle en HTTPS |
 | Non implémenté | OTA, carte SD, DHT11/22, caméra. Voir `ROADMAP.md` |
