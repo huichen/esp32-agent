@@ -3381,27 +3381,34 @@ impl App {
     /// As [`Self::handle_rpc`], but knowing which listener answered. `initialize` quotes
     /// an endpoint, and quoting the wrong scheme sends the next agent to a dead port.
     pub fn handle_rpc_with(&mut self, body: &str, session: Option<&str>, scheme: &str) -> Option<Value> {
-        let messages = match protocol::parse(body) {
+        let frame = match protocol::parse_frame(body) {
             Ok(m) => m,
             Err((id, code_n, message)) => {
                 self.runtime.counters.bad_requests += 1;
                 return Some(protocol::err(id, code_n, &message, None));
             }
         };
-        let single = messages.len() == 1;
         let mut out = Vec::new();
-        for msg in messages {
-            if let Some(v) = self.handle_one(msg, session, scheme) {
-                out.push(v);
+        for message in frame.messages {
+            match message {
+                Ok(msg) => {
+                    if let Some(v) = self.handle_one(msg, session, scheme) {
+                        out.push(v);
+                    }
+                }
+                Err((id, code_n, message)) => {
+                    self.runtime.counters.bad_requests += 1;
+                    out.push(protocol::err(id, code_n, &message, None));
+                }
             }
         }
         self.settle();
         if out.is_empty() {
             None
-        } else if single {
-            out.pop()
-        } else {
+        } else if frame.is_batch {
             Some(Value::Array(out))
+        } else {
+            out.pop()
         }
     }
 
@@ -3415,10 +3422,11 @@ impl App {
                         entry.initialized = true;
                     }
                 }
+                return None;
             }
-            return None;
+        } else {
+            self.runtime.counters.requests += 1;
         }
-        self.runtime.counters.requests += 1;
         let result = match msg.method.as_str() {
             "initialize" => Ok(self.on_initialize(&msg.params, session, scheme)),
             "ping" => Ok(json!({})),
@@ -3441,10 +3449,10 @@ impl App {
             )),
         };
         match result {
-            Ok(v) => Some(protocol::ok(id, v)),
+            Ok(v) => (!msg.is_notification).then(|| protocol::ok(id, v)),
             Err(e) => {
                 self.log.warn("rpc", format!("{}: {}", msg.method, e.message));
-                Some(protocol::err(id, e.code, &e.message, e.data))
+                (!msg.is_notification).then(|| protocol::err(id, e.code, &e.message, e.data))
             }
         }
     }
@@ -8643,6 +8651,64 @@ mod tests {
 
     /// The board's own agent can put work on the board's schedule: a task, on an interval
     /// or at a daily time, into the same queue a user message uses.
+    #[test]
+    fn rpc_batches_keep_valid_peers_errors_and_array_responses() {
+        let mut app = test_app();
+        let reply = app.handle_rpc(r#"[{"jsonrpc":"2.0","id":1,"method":"ping"}]"#, None).unwrap();
+        assert_eq!(reply.as_array().unwrap().len(), 1);
+        assert_eq!(reply[0]["id"], 1);
+        let reply = app
+            .handle_rpc(
+                r#"[
+            {"jsonrpc":"2.0","id":"first","method":"ping"},
+            17,
+            {"jsonrpc":"2.0","method":"ping"},
+            {"jsonrpc":"2.0","id":{},"method":"tools/call","params":{"name":"reboot"}},
+            {"jsonrpc":"2.0","id":null,"method":"ping"},
+            {"id":"bad-version","method":"tools/call","params":{"name":"reboot"}}
+        ]"#,
+                None,
+            )
+            .unwrap();
+        assert_eq!(reply.as_array().unwrap().len(), 5);
+        assert_eq!(reply[0]["id"], "first");
+        assert!(reply[0].get("result").is_some());
+        assert_eq!(reply[1]["error"]["code"], code::INVALID_REQUEST);
+        assert_eq!(reply[1]["id"], Value::Null);
+        assert_eq!(reply[2]["error"]["code"], code::INVALID_REQUEST);
+        assert_eq!(reply[2]["id"], Value::Null);
+        assert_eq!(reply[3]["id"], Value::Null);
+        assert!(reply[3].get("result").is_some());
+        assert_eq!(reply[4]["id"], "bad-version");
+        assert_eq!(reply[4]["error"]["code"], code::INVALID_REQUEST);
+        assert_eq!(app.runtime.counters.bad_requests, 3);
+        assert_eq!(app.runtime.counters.notifications, 1);
+        assert!(!app.runtime.restart_requested, "invalid requests must not execute");
+        assert!(app.handle_rpc(r#"[{"jsonrpc":"2.0","method":"ping"}]"#, None).is_none());
+        let error = app.handle_rpc("[", None).unwrap();
+        assert_eq!(error["error"]["code"], code::PARSE_ERROR);
+        let error = app.handle_rpc("[]", None).unwrap();
+        assert_eq!(error["error"]["code"], code::INVALID_REQUEST);
+        assert!(error.is_object());
+    }
+
+    #[test]
+    fn valid_rpc_notifications_execute_without_a_response() {
+        let mut app = test_app();
+        let notification = json!({"jsonrpc":"2.0","method":"tools/call","params":{
+            "name":"schedule","arguments":{"action":"add","prompt":"notification task","every_s":86400}
+        }});
+        assert!(app.handle_rpc(&notification.to_string(), None).is_none());
+        assert_eq!(app.tasks.len(), 1);
+        assert_eq!(app.tasks[0].prompt, "notification task");
+        let mut invalid = notification;
+        invalid["jsonrpc"] = json!("1.0");
+        invalid["params"]["arguments"]["prompt"] = json!("invalid task");
+        let error = app.handle_rpc(&invalid.to_string(), None).unwrap();
+        assert_eq!(error["error"]["code"], code::INVALID_REQUEST);
+        assert_eq!(app.tasks.len(), 1, "invalid notifications must not execute");
+    }
+
     #[test]
     fn the_agent_can_schedule_its_own_work() {
         let mut app = test_app();
