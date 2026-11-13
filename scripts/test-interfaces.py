@@ -1650,7 +1650,7 @@ def main():
               "selected_areas": selected, "elapsed_s": round(time.monotonic() - started, 3),
               "passed": passed, "failed": failed, "checks": len(rec.checks), "assertions": rec.checks,
               "area_summary": rec.area_summary, "coverage": rec.coverage(), "tool_inventory": rec.inventory,
-              "unverified": ["firmware not built/verified", "real boards/electrical behavior",
+              "unverified": ["firmware build/runtime is not validated by this host harness", "real boards/electrical behavior",
               "real providers/TLS/credits", "unmodeled hardware drivers", "SSE lifetime and real-time radio/power-loss behavior"]}
     if args.report:
         args.report.parent.mkdir(parents=True, exist_ok=True)
