@@ -91,23 +91,30 @@ mod tests {
         };
         assert!(panel("agent").contains("sched-list"), "the schedule belongs to the agent panel");
         assert!(panel("settings").contains("id=\"logs\""), "the log belongs to settings");
-        assert!(panel("files").contains("files-list") && panel("files").contains("files-viewer"));
+        assert!(
+            panel("files").contains("files-tree") && panel("files").contains("files-viewer"),
+            "the files panel needs the tree and the viewer"
+        );
     }
 
-    /// The Files tab reads the workspace and writes nothing: every write stays behind the
-    /// `write` tool, which is where the 8 KB budget and the NVS blob are enforced.
+    /// The Files tab reads the workspace as one tree and writes nothing: every write stays
+    /// behind the `write` tool, which is where the 8 KB budget and the NVS blob are enforced.
     #[test]
     fn the_files_tab_only_reads() {
-        assert!(APP_JS.contains("/api/files?path="));
+        assert!(APP_JS.contains("/api/files/tree"));
         assert!(APP_JS.contains("/api/files/read?path="));
         for writer in ["method: \"POST\"", "method: \"PUT\"", "method: \"DELETE\""] {
             let segment = APP_JS
-                .split("async function loadFiles")
+                .split("async function loadTree")
                 .nth(1)
                 .and_then(|s| s.split("async function loadLogs").next())
                 .expect("the files functions");
             assert!(!segment.contains(writer), "the files tab must not write ({writer})");
         }
+
+        // A tree, not a list: nested directories render as folds, and the CSS says so.
+        assert!(APP_JS.contains("tree-dir") && APP_JS.contains("tree-kids"));
+        assert!(STYLE_CSS.contains(".tree .tree-kids"), "the nesting needs a style");
     }
 
     /// Tool calls collapse into one line and expand on tap, like the rest of the chat.

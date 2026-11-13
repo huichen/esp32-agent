@@ -2571,6 +2571,52 @@ impl App {
     /// a run would show nothing until the model answered — and look like it dropped
     /// the message. The pending turn is appended here, flagged, and disappears once
     /// the run appends the real one.
+    /// `GET /api/files/tree`: the whole workspace in one answer.
+    ///
+    /// The workspace is at most 8 KB of text, so a directory-at-a-time view costs a round
+    /// trip per level for a tree that fits in one response. Every file brings its path, and
+    /// the directories are the prefixes of those paths — the same rule `list` uses, so the
+    /// tree and `ls` cannot disagree about what a directory is.
+    fn files_tree_json(&self) -> Value {
+        let mut files: Vec<(String, usize)> =
+            self.workspace.paths().map(|(path, text)| (path.clone(), text.len())).collect();
+        files.sort();
+
+        let mut dirs: std::collections::BTreeSet<String> = Default::default();
+        for (path, _) in &files {
+            let mut prefix = String::new();
+            for part in path.trim_start_matches('/').split('/') {
+                prefix.push('/');
+                prefix.push_str(part);
+                // The last segment is the file itself, not a directory.
+                if prefix.as_str() != path.as_str() {
+                    dirs.insert(prefix.clone());
+                }
+            }
+        }
+
+        let mut entries: Vec<Value> = dirs
+            .iter()
+            .map(|path| {
+                let name = path.rsplit('/').next().unwrap_or(path);
+                json!({ "name": name, "path": path, "dir": true })
+            })
+            .collect();
+        entries.extend(files.into_iter().map(|(path, bytes)| {
+            let name = path.rsplit('/').next().unwrap_or(&path).to_string();
+            json!({ "name": name, "path": path, "dir": false, "size_bytes": bytes })
+        }));
+
+        json!({
+            "ok": true,
+            "count": entries.len(),
+            "entries": entries,
+            "total_bytes": self.workspace.bytes(),
+            "total_max": WORKSPACE_TOTAL_MAX,
+            "file_max": WORKSPACE_FILE_MAX,
+        })
+    }
+
     /// `GET /api/files?path=/dir`: one directory of the workspace, directories first.
     ///
     /// Shaped like the `ls` tool on purpose — one workspace, one meaning of `size_bytes` —
@@ -3640,6 +3686,12 @@ impl App {
                 }
                 let path = req.query_get("path").unwrap_or("/");
                 Response::json(&self.files_json(path))
+            }
+            ("GET", "/api/files/tree") => {
+                if let Err(r) = self.require_read(req) {
+                    return r;
+                }
+                Response::json(&self.files_tree_json())
             }
             ("GET", "/api/files/read") => {
                 if let Err(r) = self.require_read(req) {
@@ -5963,6 +6015,11 @@ impl AppWorkspace {
 
     pub fn len(&self) -> usize {
         self.files.len()
+    }
+
+    /// Every file, path and text: the tree view and the NVS blob both want the whole map.
+    pub fn paths(&self) -> impl Iterator<Item = (&String, &String)> {
+        self.files.iter()
     }
 
     /// Total text bytes across every file: the number [`WORKSPACE_TOTAL_MAX`] is about.
@@ -12039,5 +12096,45 @@ mod tests {
         let resp = app.route(&get("/api/files?path=/../etc"));
         let body: Value = serde_json::from_slice(&resp.body).expect("json");
         assert_eq!(body["ok"], false, "{body}");
+    }
+
+    /// The tree: every file in one answer, and the directories derived from the paths. One
+    /// request for the whole workspace, because the whole workspace is 8 KB.
+    #[test]
+    fn the_files_tree_lists_directories_and_files() {
+        use crate::tools::fs::Workspace as _;
+        let mut app = test_app();
+        app.workspace.write("/notes/deep/one.md", "hello").expect("a nested file");
+        app.workspace.write("/top.md", "# title").expect("a root file");
+
+        let resp = app.route(&get("/api/files/tree"));
+        assert_eq!(resp.status, 200, "{resp:?}");
+        let body: Value = serde_json::from_slice(&resp.body).expect("json");
+        let entries = body["entries"].as_array().expect("entries");
+        let find = |path: &str| {
+            entries
+                .iter()
+                .find(|e| e["path"] == path)
+                .unwrap_or_else(|| panic!("{path} is missing from {body}"))
+                .clone()
+        };
+
+        // A directory that holds only a directory is still a directory.
+        for dir in ["/notes", "/notes/deep"] {
+            assert_eq!(find(dir)["dir"], true, "{dir}: {body}");
+            assert_eq!(find(dir)["size_bytes"], Value::Null, "a directory has no size");
+        }
+        let file = find("/notes/deep/one.md");
+        assert_eq!(file["dir"], false, "{body}");
+        assert_eq!(file["name"], "one.md", "the name is the last segment");
+        assert_eq!(file["size_bytes"], 5, "{body}");
+        assert_eq!(find("/top.md")["size_bytes"], 7, "{body}");
+
+        // Nothing invented: a file's own path is not also listed as a directory.
+        assert!(
+            !entries.iter().any(|e| e["path"] == "/top.md" && e["dir"] == true),
+            "a file became a directory: {body}"
+        );
+        assert_eq!(body["total_max"], WORKSPACE_TOTAL_MAX, "{body}");
     }
 }
