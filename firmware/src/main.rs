@@ -15,10 +15,10 @@
 mod console;
 mod dns;
 mod esp_hw;
+mod file_store;
 mod nvs_store;
 mod nvs_writer;
 mod runner;
-mod file_store;
 mod threads;
 mod tls_server;
 mod wifi;
@@ -43,14 +43,8 @@ use std::sync::{Arc, Mutex};
 fn mem(label: &str) {
     unsafe {
         let free = sys::esp_get_free_internal_heap_size() as u32;
-        let largest =
-            sys::heap_caps_get_largest_free_block(sys::MALLOC_CAP_INTERNAL | sys::MALLOC_CAP_8BIT);
-        let msg = format!(
-            "{}: internal free {} kB, largest block {} kB",
-            label,
-            free / 1024,
-            largest / 1024
-        );
+        let largest = sys::heap_caps_get_largest_free_block(sys::MALLOC_CAP_INTERNAL | sys::MALLOC_CAP_8BIT);
+        let msg = format!("{}: internal free {} kB, largest block {} kB", label, free / 1024, largest / 1024);
         log::info!("{}", msg);
     }
 }
@@ -236,9 +230,9 @@ fn run() -> anyhow::Result<()> {
         if let Some((bus, sda, scl, n)) = answered {
             let (current, _) = esp32_agent_core::boards::resolve(&cfg.board, &info);
             if !current.i2c.iter().any(|h| h.sda == sda && h.scl == scl) {
-                let owner = esp32_agent_core::boards::PROFILES.iter().find(|p| {
-                    p.soc == info.soc && p.i2c.iter().any(|h| h.sda == sda && h.scl == scl)
-                });
+                let owner = esp32_agent_core::boards::PROFILES
+                    .iter()
+                    .find(|p| p.soc == info.soc && p.i2c.iter().any(|h| h.sda == sda && h.scl == scl));
                 if let Some(profile) = owner {
                     log::info!(
                         "I2C answered on bus {bus} (SDA {sda}, SCL {scl}): {n} device(s); adopting board profile `{}` over `{}`",
@@ -345,12 +339,7 @@ fn run() -> anyhow::Result<()> {
                     identity.handshake(),
                 )
             } else {
-                Server::start_tls_only(
-                    &tls_bind,
-                    make_routes(app.clone()),
-                    log.clone(),
-                    identity.handshake(),
-                )
+                Server::start_tls_only(&tls_bind, make_routes(app.clone()), log.clone(), identity.handshake())
             };
             match started {
                 Ok(s) => {
@@ -362,14 +351,20 @@ fn run() -> anyhow::Result<()> {
                         };
                     }
                     log::info!("https server listening on 0.0.0.0:{}", tls_server::TLS_PORT);
-                    log.info("boot", format!("https on port {} (certificate {fingerprint})", tls_server::TLS_PORT));
+                    log.info(
+                        "boot",
+                        format!("https on port {} (certificate {fingerprint})", tls_server::TLS_PORT),
+                    );
                     s
                 }
                 Err(e) => {
                     if let Ok(mut guard) = app.lock() {
                         guard.tls = TlsInfo { port: 0, fingerprint: String::new(), error: format!("{e}") };
                     }
-                    log.error("boot", format!("https: could not listen on {}: {e}; http only", tls_server::TLS_PORT));
+                    log.error(
+                        "boot",
+                        format!("https: could not listen on {}: {e}; http only", tls_server::TLS_PORT),
+                    );
                     Server::start(&addr, make_routes(app.clone()), log.clone())?
                 }
             }
@@ -392,7 +387,6 @@ fn run() -> anyhow::Result<()> {
         let mut guard = app.lock().map_err(|_| anyhow::anyhow!("app lock poisoned"))?;
         guard.lan_url = String::new(); // resolved from the WiFi status at runtime
     }
-
 
     // The scheduler's `at_hhmm` tasks, every message timestamp and — less obviously —
     // every TLS handshake need a wall clock: the board's RTC starts at the epoch, and a
@@ -462,7 +456,10 @@ fn run() -> anyhow::Result<()> {
             // without the task. Flush here, on this thread, which has been writing NVS since
             // boot — and let `flush_now` refuse if that is ever no longer true.
             if !nvs_writer::flush_now(&app, &log, "mcp-main") {
-                log.warn("system", "store flush was refused or had backend failures; restarting may lose unsaved changes");
+                log.warn(
+                    "system",
+                    "store flush was refused or had backend failures; restarting may lose unsaved changes",
+                );
             }
             FreeRtos::delay_ms(200);
             esp_idf_svc::hal::reset::restart();

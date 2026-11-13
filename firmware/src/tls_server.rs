@@ -19,7 +19,7 @@ use std::time::Duration;
 
 use esp32_agent_core::http::{Handshake, Stream};
 use esp32_agent_core::store::KvStore;
-use esp_idf_svc::sys as sys;
+use esp_idf_svc::sys;
 use esp_idf_svc::tls::{EspTls, ServerConfig, Socket, X509};
 
 /// NVS keys. Two separate strings rather than one blob: a partial write then costs the
@@ -183,14 +183,8 @@ unsafe fn generate_with(key: &mut sys::mbedtls_pk_context) -> Result<(String, St
             sys::mbedtls_x509write_crt_set_serial_raw(&mut crt, serial.as_mut_ptr(), serial.len()),
         )?;
         let name = b"CN=esp32-agent,O=esp32-agent,C=CN\0";
-        check(
-            "crt_set_subject",
-            sys::mbedtls_x509write_crt_set_subject_name(&mut crt, name.as_ptr()),
-        )?;
-        check(
-            "crt_set_issuer",
-            sys::mbedtls_x509write_crt_set_issuer_name(&mut crt, name.as_ptr()),
-        )?;
+        check("crt_set_subject", sys::mbedtls_x509write_crt_set_subject_name(&mut crt, name.as_ptr()))?;
+        check("crt_set_issuer", sys::mbedtls_x509write_crt_set_issuer_name(&mut crt, name.as_ptr()))?;
         // Fixed dates, deliberately wider than any clock this board can have. Waiting for
         // SNTP would give https that arrives minutes late; issuing from a 1970 clock would
         // give a certificate no correct client accepts.
@@ -209,7 +203,13 @@ unsafe fn generate_with(key: &mut sys::mbedtls_pk_context) -> Result<(String, St
         let mut cbuf = vec![0u8; 4096];
         check(
             "crt_write_pem",
-            sys::mbedtls_x509write_crt_pem(&mut crt, cbuf.as_mut_ptr(), cbuf.len(), Some(rng), std::ptr::null_mut()),
+            sys::mbedtls_x509write_crt_pem(
+                &mut crt,
+                cbuf.as_mut_ptr(),
+                cbuf.len(),
+                Some(rng),
+                std::ptr::null_mut(),
+            ),
         )?;
         Ok(tail(cbuf))
     })();
@@ -226,19 +226,13 @@ fn fingerprint(cert_pem: &str) -> Result<String, String> {
     unsafe {
         let mut crt: sys::mbedtls_x509_crt = std::mem::zeroed();
         sys::mbedtls_x509_crt_init(&mut crt);
-        let parsed = check(
-            "x509_crt_parse",
-            sys::mbedtls_x509_crt_parse(&mut crt, with_nul.as_ptr(), with_nul.len()),
-        );
+        let parsed =
+            check("x509_crt_parse", sys::mbedtls_x509_crt_parse(&mut crt, with_nul.as_ptr(), with_nul.len()));
         let out = parsed.map(|_| {
             let der = std::slice::from_raw_parts(crt.raw.p as *const u8, crt.raw.len);
             let mut digest = [0u8; 32];
             let rc = sys::mbedtls_sha256(der.as_ptr(), der.len(), digest.as_mut_ptr(), 0);
-            let hex = digest
-                .iter()
-                .map(|b| format!("{b:02x}"))
-                .collect::<Vec<_>>()
-                .join(":");
+            let hex = digest.iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(":");
             if rc == 0 {
                 Ok(hex)
             } else {

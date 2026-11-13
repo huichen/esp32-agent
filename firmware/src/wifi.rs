@@ -1,4 +1,4 @@
-﻿//! WiFi control: one thread owns the radio, everything else talks to it.
+//! WiFi control: one thread owns the radio, everything else talks to it.
 //!
 //! Two modes matter for the product:
 //!
@@ -16,8 +16,8 @@ use esp_idf_svc::eventloop::EspSystemEventLoop;
 use esp_idf_svc::hal::modem::Modem;
 use esp_idf_svc::ipv4;
 use esp_idf_svc::netif::{EspNetif, NetifConfiguration};
-use esp_idf_svc::sys;
 use esp_idf_svc::nvs::EspDefaultNvsPartition;
+use esp_idf_svc::sys;
 use esp_idf_svc::wifi::{AccessPointConfiguration, AuthMethod, ClientConfiguration, Configuration, EspWifi};
 use std::sync::mpsc::{channel, Sender};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -91,12 +91,9 @@ pub fn scan() -> Result<Vec<WifiAp>> {
         let Some(sender) = guard.as_ref() else {
             return Err(McpError::hardware("the WiFi thread is not running yet"));
         };
-        sender
-            .send(WifiCmd::Scan(tx))
-            .map_err(|_| McpError::hardware("WiFi thread gone"))?;
+        sender.send(WifiCmd::Scan(tx)).map_err(|_| McpError::hardware("WiFi thread gone"))?;
     }
-    rx.recv_timeout(Duration::from_secs(20))
-        .map_err(|_| McpError::hardware("WiFi scan timed out"))?
+    rx.recv_timeout(Duration::from_secs(20)).map_err(|_| McpError::hardware("WiFi scan timed out"))?
 }
 
 /// Start the radio thread. It owns the driver for its whole life.
@@ -205,11 +202,7 @@ fn run(
     }
     log::info!(
         "radio up: access point `{ap_ssid}` on http://192.168.4.1/, station {}",
-        if ssid.is_empty() {
-            "not configured".to_string()
-        } else {
-            format!("joining `{ssid}`")
-        }
+        if ssid.is_empty() { "not configured".to_string() } else { format!("joining `{ssid}`") }
     );
 
     let mut last_state = String::new();
@@ -325,13 +318,7 @@ fn run(
 /// Re-applied periodically because lwIP's DHCP client writes the lease's DNS servers back
 /// into the resolver list on renewal — a one-shot override would survive until the next
 /// lease and then quietly stop being true.
-fn apply_network_overrides(
-    gateway: &str,
-    dns: &str,
-    dns2: &str,
-    netif: &EspNetif,
-    log: &Arc<LogBuf>,
-) {
+fn apply_network_overrides(gateway: &str, dns: &str, dns2: &str, netif: &EspNetif, log: &Arc<LogBuf>) {
     // `RawHandle::handle` is the only way to the underlying esp_netif_t in this version.
     let raw = esp_idf_svc::handle::RawHandle::handle(netif);
     unsafe {
@@ -397,10 +384,7 @@ fn ap_netif_config() -> NetifConfiguration {
     conf.key = "WIFI_AP_SETUP".try_into().unwrap();
     conf.description = "apset".try_into().unwrap();
     conf.ip_configuration = Some(ipv4::Configuration::Router(ipv4::RouterConfiguration {
-        subnet: ipv4::Subnet {
-            gateway: ipv4::Ipv4Addr::new(192, 168, 4, 1),
-            mask: ipv4::Mask(24),
-        },
+        subnet: ipv4::Subnet { gateway: ipv4::Ipv4Addr::new(192, 168, 4, 1), mask: ipv4::Mask(24) },
         dhcp_enabled: true,
         dns: Some(ipv4::Ipv4Addr::new(192, 168, 4, 1)),
         secondary_dns: Some(ipv4::Ipv4Addr::new(192, 168, 4, 1)),
@@ -436,12 +420,7 @@ fn ap_config(ssid: &str, password: &str) -> AccessPointConfiguration {
     let mut cfg = AccessPointConfiguration::default();
     cfg.ssid = ssid.try_into().unwrap_or_default();
     cfg.password = password.try_into().unwrap_or_default();
-    cfg.auth_method = if password.is_empty() {
-        AuthMethod::None
-    } else {
-        AuthMethod::WPA2Personal
-    };
+    cfg.auth_method = if password.is_empty() { AuthMethod::None } else { AuthMethod::WPA2Personal };
     cfg.channel = 6;
     cfg
 }
-

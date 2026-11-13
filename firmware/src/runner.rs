@@ -128,7 +128,8 @@ fn clamp_timeout(seconds: u32) -> u32 {
 
 impl ChatTransport for EspHttpTransport {
     fn set_timeout(&mut self, timeout: Duration) {
-        self.timeout_s.store(clamp_timeout(timeout.as_secs().min(u64::from(u32::MAX)) as u32), Ordering::Relaxed);
+        self.timeout_s
+            .store(clamp_timeout(timeout.as_secs().min(u64::from(u32::MAX)) as u32), Ordering::Relaxed);
     }
 
     fn post_json(&mut self, url: &str, headers: &[(&str, &str)], body: &str) -> Result<String, String> {
