@@ -947,6 +947,13 @@ def scripts(rec, sim, fake):
     rec.equal("lint-no-side-effect", sim.get("/api/files/read?path=/lint.txt")["ok"], False)
     lint = content(sim.call("script", {"lint": True, "source": "let = 3"}))
     rec.check("lint-line-and-column", lint.get("ok") is False and "line 1" in short(lint) and "column" in short(lint), short(lint))
+    lint = success(rec, sim, "lint-hoisted-functions", "script", {"lint": True, "source": "even(4)\nfn even(n) { if n == 0 { return true } return odd(n - 1) }\nfn odd(n) { if n == 0 { return false } return even(n - 1) }"})
+    rec.equal("lint-declared-function-warnings", lint.get("warnings", []), [])
+    lint = success(rec, sim, "lint-literal-tool-recursion", "script", {"lint": True, "source": 'tool("script", {})'})
+    rec.check("lint-refused-tool-warning", any("refused" in warning for warning in lint.get("warnings", [])), short(lint))
+    returned = success(rec, sim, "return-from-while", "script", {"source": 'let n = 1\nwhile n > 0 { n = n - 1; return 7 }\ntool("write", {path: "/after-return.txt", text: "must not execute"})'})
+    rec.equal("while-return-value", returned.get("result"), 7)
+    rec.equal("while-return-skips-later-tool-effects", sim.get("/api/files/read?path=/after-return.txt")["ok"], False)
     for case, source, expected in [("precedence", "1 + 2 * 3", 7),
                                   ("loop-and-assignment", "let n = 0\nwhile n < 3 { n = n + 1 }\nn", 3),
                                   ("arguments", "args.value + 2", 5),
