@@ -234,7 +234,7 @@ window.__esp32Clear = async function () {
   const f = {
     messages: old.slice(), head: 80, requests: [], streams: [], confirmations: [], accept: true,
     resetMode: "success", resetGate: null, historyGate: null, messageGate: null, eventsFail: false,
-    authRequired: false, issued: "fixture-" + Math.random(),
+    authRequired: false, issued: "fixture-" + Math.random(), rpc: [],
     journal: [
       { kind: "message_start", seq: 70 },
       { kind: "text_delta", seq: 71, text: "OLD REPLAY ANSWER" },
@@ -255,7 +255,7 @@ window.__esp32Clear = async function () {
     if (!["/api/agent/history", "/api/agent/events", "/api/agent/reset", "/api/agent/forget",
           "/api/agent/cancel",
           "/api/agent/message", "/api/auth", "/api/agent/config", "/api/agent/prompt",
-          "/api/sched", "/api/devices"].includes(path)) return nativeFetch(url, opts);
+          "/api/sched", "/api/devices", "/mcp"].includes(path)) return nativeFetch(url, opts);
     f.requests.push({ path, method: opts.method || "GET", body: opts.body || "",
       authorization: (opts.headers || {}).Authorization || "",
       contentType: (opts.headers || {})["Content-Type"] || "" });
@@ -305,6 +305,36 @@ window.__esp32Clear = async function () {
       const gate = f.deviceGate;
       if (gate) await gate.promise;
       return response({ devices: [], candidates: [], unidentified: [] });
+    }
+    if (path === "/mcp") {
+      // The terminal's one transport. What the page sends is what an external agent sends,
+      // so the fixture answers the way the board does: structuredContent beside the text
+      // block, and the answer shaped like the tool that was called.
+      const body = JSON.parse(opts.body || "{}");
+      const call = (body.params && body.params.name) || "";
+      const args = (body.params && body.params.arguments) || {};
+      f.rpc.push({ name: call, command: args.command || "" });
+      if (call !== "shell") {
+        return response({ jsonrpc: "2.0", id: body.id, result: { isError: false,
+          content: [{ type: "text", text: JSON.stringify({ command: args.command, ok: true }) }],
+          structuredContent: { command: args.command, ok: true } } });
+      }
+      const command = String(args.command || "");
+      const answer = command.startsWith("ls")
+        ? { path: "/", count: 2, entries: [{ dir: true, name: "notes", path: "/notes" },
+                                            { dir: false, name: "MEMORY.md", path: "/MEMORY.md" }] }
+        : command.startsWith("cat")
+        ? { path: "/MEMORY.md", size_bytes: 9, text: "memory ok" }
+        : command === "boom"
+        ? null
+        : { text: command.replace(/^echo\s+/, "") };
+      if (answer === null) {
+        return response({ jsonrpc: "2.0", id: body.id,
+          error: { code: -32602, message: "no command `boom` here" } });
+      }
+      return response({ jsonrpc: "2.0", id: body.id,
+        result: { isError: false, content: [{ type: "text", text: JSON.stringify(answer) }],
+                  structuredContent: answer } });
     }
     return response({ devices: [], candidates: [], unidentified: [] });
   };
@@ -600,6 +630,60 @@ window.__esp32Clear = async function () {
     out.memory.allBody = posts("/api/agent/forget")[1].body;
     out.memory.allClean = clean(); out.memory.allRendered = S.rendered; out.memory.allCursor = S.lastEvent;
     out.memory.mutations = f.requests.filter((r) => r.method === "POST").map((r) => r.path);
+
+    // The terminal: a command goes out as `shell` over /mcp and its answer lands on the
+    // screen; `help` and `clear` are the page's own and never reach the board.
+    q('[data-panel="terminal"]').click();
+    const termInput = q("#term-input");
+    const runTerm = async (line) => {
+      termInput.value = line;
+      q("#term-form").dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
+      await until(() => !TERM.busy);
+    };
+    await runTerm("echo hello");
+    await runTerm("ls /");
+    await runTerm("cat /MEMORY.md");
+    await runTerm("boom");
+    const beforeHelp = f.rpc.length;
+    await runTerm("help");
+    const helpCalls = f.rpc.length - beforeHelp;
+    termInput.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowUp" }));
+    const recalled = termInput.value;
+    termInput.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowDown" }));
+    const forward = termInput.value;
+    // `!name {json}` is the terminal's other door: any tool, not only shell.
+    await runTerm('!indicators {"command":"led_set","arguments":{"color":"#00ff00"}}');
+    const maybeRect = (sel) => { const el = q(sel); return el ? rect(el) : { left: 0, right: 0, top: 0, bottom: 0, width: 0, height: 0 }; };
+    const css = (sel, prop) => { const el = q(sel); return el ? getComputedStyle(el)[prop] : null; };
+    const screenRect = maybeRect("#term-screen");
+    const outRect = maybeRect("#term-out");
+    const termText = (q("#term-out") || { textContent: "" }).textContent;
+    const colours = { echo: css(".term-echo .term-cmd", "color"),
+      err: css(".term-text.term-err", "color"),
+      note: css(".term-text", "color"),
+      background: css("#term-screen", "backgroundColor") };
+    const beforeClear = q("#term-out").children.length;
+    const echoes = q("#term-out").querySelectorAll(".term-echo").length;
+    const errors = q("#term-out").querySelectorAll(".term-text.term-err").length;
+    // Measured while there is still output: `clear` is the last thing the fixture does.
+    const scrolls = q("#term-screen").scrollHeight > q("#term-screen").clientHeight;
+    await runTerm("clear");
+    out.terminal = {
+      selected: q('[data-panel="terminal"]').getAttribute("aria-selected"),
+      shown: !q("#panel-terminal").hidden,
+      calls: f.rpc.map((c) => c.name + " " + c.command),
+      lastTool: f.rpc[f.rpc.length - 1].name,
+      echoCount: echoes,
+      errors: errors,
+      helpCalls, recalled, forward, text: termText,
+      screenH: screenRect.height, screenW: screenRect.width, outH: outRect.height,
+      scrolls: scrolls,
+      busy: TERM.busy, state: (q("#term-state") || { textContent: "" }).textContent, colours,
+      beforeClear, afterClear: (q("#term-out") || { children: [] }).children.length,
+      // What the panel actually contains, so a failure names the element that is missing
+      // instead of only the number it failed on.
+      parts: Array.from(document.querySelectorAll("#panel-terminal [id]")).map((e) => e.id),
+    };
     return out;
   } catch (e) {
     out.error = String(e.stack || e);
@@ -1111,6 +1195,78 @@ fn assert_conversation_clear(metrics: &Value, width: u32) {
         ]
         .contains(&path.as_str().unwrap_or(""))),
         "{width} px: clearing wrote to settings or the workspace: {mutations:?}"
+    );
+
+    // The terminal: the shipped tab, input and transport, measured as DOM.
+    let term = &clear["terminal"];
+    assert_eq!(term["selected"], json!("true"), "{width} px: the terminal tab did not open");
+    assert_eq!(term["shown"], json!(true), "{width} px: the terminal panel stayed hidden");
+    let calls: Vec<&str> =
+        term["calls"].as_array().map(|a| a.iter().filter_map(|v| v.as_str()).collect()).unwrap_or_default();
+    assert_eq!(
+        calls.first().copied(),
+        Some("shell echo hello"),
+        "{width} px: a typed command has to reach /mcp as a `shell` call: {calls:?}"
+    );
+    for expected in ["shell ls /", "shell cat /MEMORY.md", "shell boom"] {
+        assert!(calls.contains(&expected), "{width} px: `{expected}` never left the page: {calls:?}");
+    }
+    assert_eq!(
+        term["helpCalls"],
+        json!(0),
+        "{width} px: `help` is the page's own text and must not cost a tool call"
+    );
+    assert_eq!(
+        term["lastTool"],
+        json!("indicators"),
+        "{width} px: `!name {{json}}` has to reach that tool, not `shell`"
+    );
+    let printed = term["text"].as_str().unwrap_or("");
+    for expected in ["echo hello", "hello", "notes/", "MEMORY.md", "memory ok", "no command `boom` here"] {
+        assert!(printed.contains(expected), "{width} px: the screen is missing `{expected}`: {printed}");
+    }
+    assert_eq!(term["errors"], json!(1), "{width} px: one refused command, in red: {term:?}");
+    assert_eq!(
+        term["echoCount"],
+        json!(6),
+        "{width} px: every command, including the refused one, is echoed: {term:?}"
+    );
+    assert_eq!(term["recalled"], json!("help"), "{width} px: up-arrow must recall the last line");
+    assert_eq!(
+        term["forward"],
+        json!(""),
+        "{width} px: down-arrow past the newest line returns the empty line being typed"
+    );
+    let screen_h = term["screenH"].as_f64().unwrap_or(f64::NAN);
+    assert!(
+        screen_h > 120.0 && screen_h <= 421.0,
+        "{width} px: the screen is {screen_h} px tall — it has to be a scrolled box, not the page"
+    );
+    assert!(
+        term["screenW"].as_f64().unwrap_or(f64::NAN) <= width as f64,
+        "{width} px: the screen is wider than the phone"
+    );
+    assert!(
+        term["outH"].as_f64().unwrap_or(0.0) > screen_h,
+        "{width} px: the output did not outgrow the screen, so nothing was scrolled"
+    );
+    assert_eq!(term["scrolls"], json!(true), "{width} px: the screen does not scroll its own output");
+    assert_eq!(term["busy"], json!(false), "{width} px: the terminal is still busy after its last answer");
+    assert_eq!(term["state"], json!("shell"), "{width} px: the header has to say it is ready");
+    assert!(
+        term["beforeClear"].as_u64().unwrap_or(0) > 0 && term["afterClear"] == json!(0),
+        "{width} px: `clear` has to empty the screen: {term:?}"
+    );
+    // The two things that make it read as a terminal rather than a log: the command and its
+    // answer are different colours, and an error is not the same colour as either.
+    let colour = |key: &str| term["colours"][key].as_str().unwrap_or("").to_string();
+    assert!(!colour("echo").is_empty(), "{width} px: no colour was computed for the echo: {term:?}");
+    assert_ne!(colour("echo"), colour("note"), "{width} px: the command and its answer look the same");
+    assert_ne!(colour("err"), colour("note"), "{width} px: an error is not marked as one");
+    assert_ne!(
+        colour("background"),
+        "rgba(0, 0, 0, 0)",
+        "{width} px: the screen has no background of its own"
     );
 }
 
