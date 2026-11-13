@@ -30,7 +30,7 @@ works towards an objective on its own between turns.
   `agent.max_steps` model calls per turn (`0` = no limit, capped at 200 when set),
   `agent.tick_ms` clamped to 200-5000 (default 1000).
 - **Storage is a filesystem.** The transcript and the file workspace are files on the 12 MB
-  `storage` partition (SPIFFS); NVS keeps the configuration and the secrets, and nothing
+  `storage` partition (LittleFS); NVS keeps the configuration and the secrets, and nothing
   that grows. A workspace file may be 256 KB and the whole workspace 4 MB. See section 4
   for the layout and what a reboot can and cannot lose.
 

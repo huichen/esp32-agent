@@ -134,7 +134,7 @@ instead of re-deriving the fix:
 | `factory` | app | 0x20000 | 3 MB |
 | `ota_0` | app | 0x320000 | 3 MB |
 | `ota_1` | app | 0x620000 | 3 MB |
-| `storage` | data/spiffs | 0x920000 | 1 MB |
+| `storage` | data/littlefs | 0x410000 | 11.94 MB |
 
 OTA is not implemented yet, but the slots are reserved. `storage` is held for future
 static web assets and fonts.
