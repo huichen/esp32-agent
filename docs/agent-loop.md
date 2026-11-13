@@ -34,8 +34,12 @@ works towards an objective on its own between turns.
   and retained-turn selection use the same estimate for text, reasoning and tool
   arguments; image token costs remain provider-dependent. Trimming and turn selection
   scan the history linearly. The separate 96-entry journal stores only 512-byte text
-  excerpts (truncation marker included), and the compressed index keeps at most 40 lines
-  with role-specific excerpt limits, distinct from the journal's 512-byte cap.
+  excerpts (truncation marker included). The compressed index is similarly a set of
+  **truncated** excerpts, not a saving summary: the last 40 dropped lines, older ones cut
+  to 2 KiB, the newest question to 32 KiB, and the whole index to 96 KiB of text — the
+  count alone used to allow 40 × 32 KiB ≈ 1.25 MB. All three numbers are byte caps, not
+  character counts, and the largest line is the newest one precisely because a resumed
+  conversation needs it first.
   Byte trimming deliberately keeps one oversized newest message; the payload ceiling
   excludes allocator overhead, request copies and the archive index, so it is not a
   measured peak-RAM guarantee. Saved JSONL is serialized newest-first into one capped
