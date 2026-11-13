@@ -255,14 +255,17 @@ impl Hardware for EspHw {
                 return Vec::new();
             }
             items.set_len(filled as usize);
+            let labels = crate::threads::task_labels();
             items
                 .iter()
                 .map(|t| {
-                    let name = if t.pcTaskName.is_null() {
-                        String::new()
-                    } else {
-                        std::ffi::CStr::from_ptr(t.pcTaskName).to_string_lossy().to_string()
-                    };
+                    // Only scalar snapshot fields are lifetime-safe after the kernel
+                    // releases its task-list lock. Never dereference pcTaskName or
+                    // query xHandle: a request worker may have exited meanwhile.
+                    let label = labels.get(&(t.xTaskNumber as u32));
+                    let name = label
+                        .map(|(name, _)| name.clone())
+                        .unwrap_or_else(|| format!("task-{}", t.xTaskNumber));
                     let state = match t.eCurrentState {
                         0 => "running",
                         1 => "ready",
@@ -279,11 +282,12 @@ impl Hardware for EspHw {
                         // high-water mark is already a byte count. Calling it "words" sent
                         // one reading of this table to the wrong conclusion.
                         "stack_free_bytes": t.usStackHighWaterMark,
-                        // Which core the task is on right now. `TaskStatus_t` in this
-                        // binding has no core field, so ask the scheduler with the handle;
-                        // without it `ps` cannot answer "who is where", which is the first
-                        // question when two peripherals are run at once.
-                        "core": sys::xTaskGetCoreID(t.xHandle),
+                        "task_id": t.xTaskNumber,
+                        // xTaskGetCoreID reports affinity, not the currently executing
+                        // core. Known labels capture it from the live task itself;
+                        // unknown IDF/request tasks report null, not a stale handle read.
+                        "core": label.map(|(_, affinity)| *affinity),
+                        "core_known": label.is_some(),
                     })
                 })
                 .collect()

@@ -5,7 +5,7 @@ what is not done or not verified.
 
 ## Verified / unverified
 
-- ✅ `agent-core`: 918 unit tests and 5 integration tests (protocol, HTTP, manifest
+- ✅ `agent-core`: 938 unit tests and 5 integration tests (protocol, HTTP, manifest
   validation, driver conversion, capability filtering, auth, hot reload, the agent loop,
   shell and script, the file tools, sched, SSE streams, a streamed request body)
 - ✅ Simulator end to end: the PowerShell smoke gate; `scripts/smoke.sh` is the Unix
@@ -22,6 +22,13 @@ what is not done or not verified.
   This does not verify arbitrary power cuts, and it predates today's flash
 - ✅ Model latency is outside the `App` lock: a turn in flight no longer queues the
   portal (historical bench: `/api/status` ≤ 253 ms while a 2.5 s model call runs)
+- ✅ Independent status/health/cancellation plane and reusable HTTP workers, verified
+  on the board (2026-11-14): 570 s of continuous slow tools, 252 script calls and
+  1,026 control reads, stable 21 tasks and 83 KiB minimum internal heap. Control
+  handler time was at most 15 ms; client latency p95 134 ms / max 1,502 ms passed
+  an explicit 2 s bound, **not** the default 1 s target. Three warm resets recovered.
+  Shared device/workspace tools still serialize. See [lock ownership and exact board
+  evidence](docs/concurrency.md).
 - ✅ Live journal over SSE (`/api/agent/stream`), `tool_progress`, `agent.tick_ms`
 - ✅ Bench board flashed on 2026-11-13 (`built_at 2026-11-13T15:20:17Z`) and running the image
   from that tree: 3,007,840-byte app = 71.71% of the 4 MiB `factory` slot; 35 warnings, 20
@@ -88,8 +95,11 @@ what is not done or not verified.
 6. **Audio beyond the current bounded calls**: change the I2S TX rate at runtime (only
    24000 Hz is wired), permit overlapping uploads, add a background score/media worker.
    Clips (below) remove the *result-size* wall — a take lives in PSRAM and plays in one
-   call — but playback is still synchronous, so nothing plays while the board does
-   something else, and nothing is recorded longer than one tool budget. `media_play` paces
+   call — but playback is still synchronous and competes for shared tool/device
+   resources. Further tool parallelism needs separate device/workspace ownership and
+   resource locks; the shared `Mutex<App>` has not been removed. Public
+   status/cancellation reads have an independent control plane;
+   this is not background media, and recording still has one tool budget. `media_play` paces
    a bounded score and OLED frames in one synchronous call; it is not background playback.
    On-board Opus/ADPCM encoding is
    deferred pending an actual build and measurements; the old 5–6 kB SRAM reading is not

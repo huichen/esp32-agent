@@ -1,8 +1,8 @@
 //! A small blocking HTTP/1.1 server.
 //!
 //! Written against `std::net` only, because that is what ESP-IDF's std shim
-//! provides (lwIP sockets) and what the host simulator provides. No async, no TLS
-//! — the board is a LAN device and the MCP spec allows plain HTTP for local use.
+//! provides (lwIP sockets) and what the host simulator provides. No async runtime;
+//! TLS handshakes are injected by the platform. Plain HTTP remains available for LAN use.
 //!
 //! What it does implement matters for MCP clients: keep-alive, chunked request
 //! bodies (Node's fetch sends them), `Expect: 100-continue`, HEAD, and a hard
@@ -13,6 +13,7 @@ use std::collections::BTreeMap;
 use std::io::Read;
 use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::mpsc::{sync_channel, SyncSender};
 use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -22,9 +23,12 @@ pub const MAX_BODY_BYTES: usize = 1024 * 1024;
 pub const MAX_CONNECTIONS: usize = 6;
 const IDLE_TIMEOUT: Duration = Duration::from_secs(20);
 
-/// Sockets accepted but not yet sending. A browser warming connections can hold several,
-/// and they cost one descriptor each instead of a thread stack.
-const MAX_PENDING: usize = 8;
+/// Four preallocated request/handshake/stream stacks, shared by both listeners.
+/// Idle keep-alive sockets hold connection slots but never occupy a worker.
+const MAX_REQUEST_WORKERS: usize = 4;
+// Reserve one plaintext control worker; ordinary/TLS/SSE work uses at most three.
+const MAX_NORMAL_WORKERS: usize = MAX_REQUEST_WORKERS - 1;
+const _: () = assert!(MAX_REQUEST_WORKERS <= MAX_CONNECTIONS);
 /// How long a silent socket may sit in that list before it is closed.
 const PENDING_TTL: Duration = Duration::from_secs(30);
 
@@ -119,28 +123,20 @@ impl Drop for EventStreamSlot {
 /// megabytes and a debug build with deep serde_json frames — so the numbers
 /// differ by target rather than by wishful thinking.
 #[cfg(target_os = "espidf")]
-// Requests are served on the accept thread — one stack instead of one per connection — so
-// this stack carries the heaviest handler. `/api/tools` serialises 41 tool descriptors and
-// overflowed a 6 kB stack with a `***ERROR*** A stack overflow in task pthread` and a
-// reboot, which is why this number was 16 kB + 4 kB for the TLS handshake that also runs
-// here. The measured reading at 20 kB is 13.5 kB free — 6.5 kB peak — over a run that
-// included `/api/tools`, the portal, `/api/status` (which carries the heap split), and an
-// https request (the handshake is the costly part, and it is on this thread). max(2 x 6.5, 6.5 + 4) =
-// 13.0 kB, so 16 kB is the floor the rule allows and 4 kB goes back to the heap.
+// Keep the existing listener allocation until its reduced readiness-only workload
+// has been measured on hardware. Parsing, handlers and TLS now run on workers.
 const ACCEPT_STACK: usize = 16 * 1024;
 #[cfg(not(target_os = "espidf"))]
 const ACCEPT_STACK: usize = 256 * 1024;
 
 #[cfg(target_os = "espidf")]
-// 10 kB per connection could not be paid for out of the ~40 kB the board has left once
-// the radio is up, and six of them are what a browser opening the portal asks for. The
-// handlers are a request parse plus a JSON body; the body itself is built on the heap.
-const CONN_STACK: usize = 6 * 1024;
+// A worker parses, runs the handler (or TLS handshake), and writes its response.
+// Four stacks cost at most 64 KiB; hardware headroom must be measured on the board.
+const CONN_STACK: usize = 16 * 1024;
 #[cfg(not(target_os = "espidf"))]
 const CONN_STACK: usize = 512 * 1024;
 
-/// How long a client may take to finish its handshake. Short, because the loop is
-/// serialised: one silent socket must not hold every other client.
+/// How long a client may take to finish its handshake without occupying a worker forever.
 const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone)]
@@ -877,6 +873,8 @@ pub struct Server {
     scheme: &'static str,
     join: Option<JoinHandle<()>>,
     log: Arc<LogBuf>,
+    #[cfg(test)]
+    budget: WorkerBudget,
 }
 
 impl Server {
@@ -890,7 +888,7 @@ impl Server {
 
     /// https only, on one port.
     ///
-    /// The same accept thread and the same inline handshake as [`Server::start_with_tls`],
+    /// The same bounded workers as [`Server::start_with_tls`],
     /// with the plaintext socket simply absent. Used when `mcp.plain_http` is false; the
     /// board calls it only with a certificate in hand, because with none it would listen on
     /// nothing at all.
@@ -909,13 +907,9 @@ impl Server {
 
     /// http and https on two ports, served by **one** accept thread.
     ///
-    /// That is not a shortcut, it is the only shape that fits. A TLS connection needs a
-    /// stack before its handshake can start; six of those at once (what a browser asks
-    /// for) do not fit in this board's internal RAM, and the failure arrives as
-    /// ERR_CONNECTION_RESET. One listener thread that does the handshake inline costs a
-    /// single stack and nothing per connection. The consequence is honest and bounded:
-    /// while one TLS client is being served, another waits in the listen backlog for the
-    /// duration of one request.
+    /// Both listeners share the connection budget and bounded request workers. TLS
+    /// handshakes and long handlers never execute on the accept thread. Saturated
+    /// connections are closed rather than allocating an unbounded number of stacks.
     pub fn start_with_tls(
         http_addr: &str,
         tls_addr: &str,
@@ -956,12 +950,25 @@ impl Server {
         let stop = Arc::new(AtomicBool::new(false));
         let stop_thread = stop.clone();
         let log_thread = log.clone();
+        let budget = WorkerBudget::default();
+        let budget_thread = budget.clone();
+        // Allocate request stacks once, before reporting a live listener. Repeated
+        // pthread creation exhausted the real board under sustained request churn.
+        let pool = WorkerPool::new(&budget)?;
         let join = std::thread::Builder::new()
             .name("httpd".into())
             .stack_size(ACCEPT_STACK)
-            .spawn(move || accept_loop(listeners, routes, stop_thread, log_thread))?;
+            .spawn(move || accept_loop(listeners, routes, stop_thread, log_thread, budget_thread, pool))?;
         log.info("http", format!("listening on {scheme}://{local}/"));
-        Ok(Self { stop, addr: local, scheme, join: Some(join), log })
+        Ok(Self {
+            stop,
+            addr: local,
+            scheme,
+            join: Some(join),
+            log,
+            #[cfg(test)]
+            budget,
+        })
     }
 
     pub fn local_addr(&self) -> SocketAddr {
@@ -1003,92 +1010,177 @@ fn bind(addr: &str) -> std::io::Result<TcpListener> {
     Err(last.unwrap_or_else(|| std::io::Error::new(std::io::ErrorKind::AddrNotAvailable, "no address")))
 }
 
+/// A count follows its owner through spawn failure, panic and socket return.
+struct Permit(Arc<AtomicUsize>);
+impl Permit {
+    fn take(counter: &Arc<AtomicUsize>, limit: usize) -> Option<Self> {
+        let mut count = counter.load(Ordering::SeqCst);
+        while count < limit {
+            match counter.compare_exchange_weak(count, count + 1, Ordering::SeqCst, Ordering::SeqCst) {
+                Ok(_) => return Some(Self(counter.clone())),
+                Err(actual) => count = actual,
+            }
+        }
+        None
+    }
+}
+impl Drop for Permit {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+#[derive(Clone, Default)]
+struct WorkerBudget {
+    connections: Arc<AtomicUsize>,
+    workers: Arc<AtomicUsize>,
+    normal_workers: Arc<AtomicUsize>,
+    control_workers: Arc<AtomicUsize>,
+    #[cfg(test)]
+    fail_spawn: Arc<AtomicBool>,
+    #[cfg(test)]
+    thread_starts: Arc<AtomicUsize>,
+}
+
+type WorkerJob = Box<dyn FnOnce() + Send + 'static>;
+
+struct WorkerPool {
+    budget: WorkerBudget,
+    normal: SyncSender<WorkerJob>,
+    control: SyncSender<WorkerJob>,
+}
+impl WorkerPool {
+    fn new(budget: &WorkerBudget) -> std::io::Result<Self> {
+        let (normal, normal_rx) = sync_channel::<WorkerJob>(MAX_NORMAL_WORKERS);
+        let (control, control_rx) = sync_channel::<WorkerJob>(1);
+        let normal_rx = Arc::new(std::sync::Mutex::new(normal_rx));
+        let control_rx = Arc::new(std::sync::Mutex::new(control_rx));
+        for index in 0..MAX_REQUEST_WORKERS {
+            let rx = if index == MAX_NORMAL_WORKERS { control_rx.clone() } else { normal_rx.clone() };
+            let name = if index == MAX_NORMAL_WORKERS {
+                "http-control".into()
+            } else {
+                format!("http-work-{index}")
+            };
+            std::thread::Builder::new().name(name).stack_size(CONN_STACK).spawn(move || loop {
+                // Release the receiver lock before executing: the other normal
+                // workers must be able to accept their own jobs concurrently.
+                let job = rx.lock().unwrap_or_else(|p| p.into_inner()).recv();
+                let Ok(job) = job else { break };
+                // On unwind-capable hosts a failed handler must not permanently
+                // remove a worker. ESP-IDF panic=abort still resets the board.
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job));
+            })?;
+            #[cfg(test)]
+            budget.thread_starts.fetch_add(1, Ordering::SeqCst);
+        }
+        Ok(Self { budget: budget.clone(), normal, control })
+    }
+    fn submit(&self, control: bool, job: WorkerJob) -> std::io::Result<()> {
+        let tx = if control { &self.control } else { &self.normal };
+        tx.try_send(job).map_err(|_| std::io::Error::other("request worker queue unavailable"))
+    }
+}
+impl WorkerBudget {
+    fn submit(
+        &self,
+        pool: &WorkerPool,
+        control: bool,
+        body: impl FnOnce() + Send + 'static,
+    ) -> std::io::Result<()> {
+        #[cfg(test)]
+        if self.fail_spawn.swap(false, Ordering::SeqCst) {
+            return Err(std::io::Error::other("injected request admission failure"));
+        }
+        pool.submit(control, Box::new(body))
+    }
+}
+struct PendingConnection {
+    stream: TcpStream,
+    peer: String,
+    idle_since: std::time::Instant,
+    prefix: Vec<u8>,
+    _connection: Permit,
+}
+
 fn accept_loop(
     listeners: Vec<(TcpListener, Option<Handshake>)>,
     routes: Routes,
     stop: Arc<AtomicBool>,
     log: Arc<LogBuf>,
+    budget: WorkerBudget,
+    pool: WorkerPool,
 ) {
-    let active = Arc::new(AtomicUsize::new(0));
-    // Requests are answered on this thread — one stack instead of one per connection — but
-    // only once a socket actually has something to say. A browser opens idle sockets to
-    // warm the connection (and keeps them alive between page loads); reading one of those
-    // inline would park every other client for the whole read timeout, which on the bench
-    // is indistinguishable from the board being dead. So accepted sockets wait in this
-    // list until `peek` reports data.
-    let mut pending: Vec<(TcpStream, String, std::time::Instant, Vec<u8>)> = Vec::new();
+    // One bounded return channel per listener generation; old workers cannot
+    // return sockets to a new server after this receiver has been dropped.
+    let (returned, returns) = sync_channel(MAX_CONNECTIONS);
+    let mut pending: Vec<PendingConnection> = Vec::new();
     while !stop.load(Ordering::SeqCst) {
+        while let Ok(conn) = returns.try_recv() {
+            pending.push(conn);
+        }
         for (listener, tls) in &listeners {
-            loop {
+            // Bound each pass so a flood cannot starve the other listener.
+            for _ in 0..MAX_CONNECTIONS {
                 match listener.accept() {
-                    Ok((stream, peer)) => match tls {
-                        // A TLS socket cannot be probed for readiness without speaking
-                        // TLS, so it is served here and now.
-                        Some(handshake) => serve_tls(stream, peer, handshake, &routes, &log, &active),
-                        None => {
-                            if stream.set_nonblocking(true).is_err() {
-                                continue;
-                            }
-                            if pending.len() >= MAX_PENDING {
-                                log.warn("http", format!("{peer}: {MAX_PENDING} sockets waiting, dropping"));
-                                continue;
-                            }
-                            pending.push((stream, peer.to_string(), std::time::Instant::now(), Vec::new()));
+                    Ok((stream, peer)) => {
+                        let Some(connection) = Permit::take(&budget.connections, MAX_CONNECTIONS) else {
+                            continue; // Saturated: close without parsing or blocking writes.
+                        };
+                        let conn = PendingConnection {
+                            stream,
+                            peer: peer.to_string(),
+                            idle_since: std::time::Instant::now(),
+                            prefix: Vec::new(),
+                            _connection: connection,
+                        };
+                        if let Some(handshake) = tls {
+                            let _ = dispatch(
+                                conn,
+                                Some(handshake.clone()),
+                                &routes,
+                                &log,
+                                &stop,
+                                &pool,
+                                &returned,
+                            );
+                        } else if conn.stream.set_nonblocking(true).is_ok() {
+                            pending.push(conn);
                         }
-                    },
+                    }
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
                     Err(e) => {
                         log.warn("http", format!("accept failed: {e}"));
-                        std::thread::sleep(Duration::from_millis(50));
                         break;
                     }
                 }
             }
         }
-
         let now = std::time::Instant::now();
         let mut index = 0;
         while index < pending.len() {
-            // Bytes left over from the previous request on this socket count as ready:
-            // a pipelined request must not wait for more input that will never come.
-            let state = if !pending[index].3.is_empty() {
-                Ready::Data(std::mem::take(&mut pending[index].3))
-            } else {
-                // A non-blocking read is the readiness probe: `TcpStream::peek` is not
-                // available on this platform's std, and treating its error as "closed"
-                // dropped every connection the moment it was accepted. The bytes read here
-                // are handed to the parser instead of being thrown away.
-                let mut first = [0u8; 1024];
-                match pending[index].0.read(&mut first) {
-                    Ok(0) => Ready::Closed,
-                    Ok(n) => Ready::Data(first[..n].to_vec()),
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Ready::Idle,
-                    Err(_) => Ready::Closed,
-                }
-            };
-            let expired = now.duration_since(pending[index].2) > PENDING_TTL;
+            if now.duration_since(pending[index].idle_since) > PENDING_TTL {
+                pending.swap_remove(index);
+                continue;
+            }
+            // Pipelined bytes count as ready even when the socket is now idle.
+            let state = probe_request_line(&mut pending[index]);
             match state {
                 Ready::Data(prefix) => {
-                    let (stream, peer, _, _) = pending.remove(index);
-                    stream.set_nonblocking(false).ok();
-                    match serve_until_stream(stream, prefix, &peer, "http", true, &routes, &log) {
-                        Serve::Done | Serve::Failed => {}
-                        Serve::KeepAlive(stream, rest) => {
-                            if stream.set_nonblocking(true).is_ok() {
-                                pending.push((stream, peer, std::time::Instant::now(), rest));
-                            }
-                        }
-                        Serve::Stream(conn, resp, body, head_only) => {
-                            spawn_stream(conn, resp, body, head_only, &log, &active);
-                        }
+                    let mut conn = pending.swap_remove(index);
+                    conn.prefix = prefix;
+                    if let Some(conn) = dispatch(conn, None, &routes, &log, &stop, &pool, &returned) {
+                        // A bounded pending socket waits for a worker instead of losing
+                        // a normal browser burst. Leave capacity for control workers.
+                        pending.push(conn);
+                        index += 1;
                     }
                 }
                 Ready::Closed => {
-                    pending.remove(index);
+                    pending.swap_remove(index);
                 }
                 Ready::Idle => {
-                    if expired {
-                        pending.remove(index);
+                    if now.duration_since(pending[index].idle_since) > PENDING_TTL {
+                        pending.swap_remove(index);
                     } else {
                         index += 1;
                     }
@@ -1097,59 +1189,136 @@ fn accept_loop(
         }
         std::thread::sleep(Duration::from_millis(5));
     }
+    // Pending sockets/returns close here. Busy workers finish their existing
+    // request; the stop flag prevents their next keep-alive handoff.
 }
 
-/// Hand a streaming response to a thread of its own, so the listener can accept again.
-fn spawn_stream<S: Stream + 'static>(
-    mut conn: BufferedReader<S>,
-    resp: Response,
-    body: StreamBody,
-    head_only: bool,
+// Classification only reserves capacity: the complete request still goes through
+// the normal parser, body limits and authenticated handler, never a bypass.
+fn is_control_prefix(prefix: &[u8]) -> bool {
+    let Some(line) = prefix.split(|b| *b == b'\n').next() else {
+        return false;
+    };
+    let Ok(line) = std::str::from_utf8(line) else {
+        return false;
+    };
+    let mut words = line.split_ascii_whitespace();
+    let method = words.next().unwrap_or("");
+    let path = words.next().unwrap_or("").split('?').next().unwrap_or("");
+    matches!((method, path), ("GET", "/api/status" | "/healthz") | ("POST", "/api/agent/cancel"))
+}
+
+fn probe_request_line(conn: &mut PendingConnection) -> Ready {
+    if conn.prefix.contains(&b'\n') {
+        return Ready::Data(std::mem::take(&mut conn.prefix));
+    }
+    if conn.prefix.len() >= MAX_HEADER_BYTES {
+        return Ready::Closed;
+    }
+    let mut first = [0u8; 1024];
+    let cap = first.len().min(MAX_HEADER_BYTES - conn.prefix.len());
+    match conn.stream.read(&mut first[..cap]) {
+        Ok(0) => Ready::Closed,
+        Ok(n) => {
+            conn.prefix.extend_from_slice(&first[..n]);
+            if conn.prefix.contains(&b'\n') {
+                Ready::Data(std::mem::take(&mut conn.prefix))
+            } else {
+                Ready::Idle
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Ready::Idle,
+        Err(_) => Ready::Closed,
+    }
+}
+
+fn dispatch(
+    conn: PendingConnection,
+    handshake: Option<Handshake>,
+    routes: &Routes,
     log: &Arc<LogBuf>,
-    active: &Arc<AtomicUsize>,
-) {
-    if active.load(Ordering::SeqCst) >= MAX_CONNECTIONS {
-        log.warn("http", "too many streams, dropping");
-        return;
+    stop: &Arc<AtomicBool>,
+    pool: &WorkerPool,
+    returned: &SyncSender<PendingConnection>,
+) -> Option<PendingConnection> {
+    let budget = &pool.budget;
+    let control = handshake.is_none() && is_control_prefix(&conn.prefix);
+    let lane = if control {
+        Permit::take(&budget.control_workers, 1)
+    } else {
+        Permit::take(&budget.normal_workers, MAX_NORMAL_WORKERS)
+    };
+    let Some(lane) = lane else {
+        return Some(conn);
+    };
+    let Some(worker) = Permit::take(&budget.workers, MAX_REQUEST_WORKERS) else {
+        return Some(conn); // Keep within the bounded pending socket budget.
+    };
+    let routes = Routes { request: routes.request.clone(), body: routes.body.clone() };
+    let log_worker = log.clone();
+    let stop = stop.clone();
+    let returned = returned.clone();
+    let submitted = budget.submit(pool, control, move || {
+        let _worker = worker;
+        let _lane = lane;
+        if stop.load(Ordering::SeqCst) {
+            return;
+        }
+        conn.stream.set_nonblocking(false).ok();
+        if let Some(handshake) = handshake {
+            serve_tls(conn, &handshake, &routes, &log_worker, &stop);
+            return;
+        }
+        let PendingConnection { stream, peer, prefix, _connection, .. } = conn;
+        match serve_until_stream(stream, prefix, &peer, "http", true, &routes, &log_worker) {
+            Serve::Done | Serve::Failed => {}
+            Serve::KeepAlive(stream, prefix) => {
+                if !stop.load(Ordering::SeqCst) && stream.set_nonblocking(true).is_ok() {
+                    let conn = PendingConnection {
+                        stream,
+                        peer,
+                        prefix,
+                        idle_since: std::time::Instant::now(),
+                        _connection,
+                    };
+                    // Release the worker before advertising a ready pipeline.
+                    // try_send never blocks shutdown and drops failed returns.
+                    drop(_worker);
+                    drop(_lane);
+                    let _ = returned.try_send(conn);
+                }
+            }
+            Serve::Stream(mut conn, resp, body, head_only) => {
+                // Reuse this worker and both permits for the whole stream.
+                if !stop.load(Ordering::SeqCst) {
+                    let _ = write_stream_response(&mut conn.stream, &resp, body, head_only);
+                }
+            }
+        }
+    });
+    // Failed queue admission drops the closure (socket and both permits).
+    // Unwinding a handler/handshake/stream also drops those RAII guards.
+    if submitted.is_err() {
+        log.error("http", "could not admit request to worker pool");
     }
-    active.fetch_add(1, Ordering::SeqCst);
-    let log_conn = log.clone();
-    let active_conn = active.clone();
-    let spawned =
-        std::thread::Builder::new().name("http-stream".into()).stack_size(CONN_STACK).spawn(move || {
-            let _ = write_stream_response(&mut conn.stream, &resp, body, head_only);
-            drop(log_conn);
-            active_conn.fetch_sub(1, Ordering::SeqCst);
-        });
-    if spawned.is_err() {
-        active.fetch_sub(1, Ordering::SeqCst);
-        log.error("http", "could not spawn stream thread");
-    }
+    None
 }
 
-/// Serve one TLS connection on the accept thread: handshake, one request, close.
+/// TLS handshake/request run on one bounded worker, never on the accept thread.
 fn serve_tls(
-    stream: TcpStream,
-    peer: std::net::SocketAddr,
+    conn: PendingConnection,
     handshake: &Handshake,
     routes: &Routes,
     log: &Arc<LogBuf>,
-    active: &Arc<AtomicUsize>,
+    stop: &AtomicBool,
 ) {
-    // Blocking mode is what a handshake wants. The read timeout is short because this
-    // thread is also the plaintext listener: a client that connects and says nothing must
-    // not hold everybody else for the full idle timeout.
-    stream.set_nonblocking(false).ok();
+    let PendingConnection { stream, peer, _connection, .. } = conn;
     stream.set_read_timeout(Some(TLS_HANDSHAKE_TIMEOUT)).ok();
     stream.set_write_timeout(Some(IDLE_TIMEOUT)).ok();
     stream.set_nodelay(true).ok();
     let conn = match handshake(stream) {
         Some(c) => c,
         None => {
-            // A browser opens speculative TLS connections and drops the ones it does not
-            // need; a phone on the LAN does the same when a page is refreshed. Logging
-            // each one at warn fills the ring with the same line and buries the failures
-            // that matter. Count them, say it the first few times, then once a minute.
             let n = TLS_FAILS.fetch_add(1, Ordering::Relaxed) + 1;
             let now = (crate::app::now_ms() / 1000) as u32;
             let last = TLS_FAIL_AT_S.load(Ordering::Relaxed);
@@ -1160,13 +1329,16 @@ fn serve_tls(
             return;
         }
     };
-    let peer = peer.to_string();
-    // No keep-alive: one request per TLS connection, because each one occupies the
-    // listener while it lasts.
-    match serve_until_stream(conn, Vec::new(), &peer, "https", false, routes, log) {
-        Serve::Done | Serve::Failed | Serve::KeepAlive(..) => {}
-        Serve::Stream(conn, resp, body, head_only) => {
-            spawn_stream(conn, resp, body, head_only, log, active);
+    if stop.load(Ordering::SeqCst) {
+        return;
+    }
+    // Preserve TLS's close-after-one-request policy: encrypted idle sockets
+    // cannot use the plaintext readiness probe.
+    if let Serve::Stream(mut conn, resp, body, head_only) =
+        serve_until_stream(conn, Vec::new(), &peer, "https", false, routes, log)
+    {
+        if !stop.load(Ordering::SeqCst) {
+            let _ = write_stream_response(&mut conn.stream, &resp, body, head_only);
         }
     }
 }
@@ -1190,7 +1362,7 @@ enum Serve<S> {
     Done,
     /// The socket died mid-request.
     Failed,
-    /// The response streams, so the socket moves to a thread of its own.
+    /// The response streams; the owning request worker writes it on its own stack.
     Stream(BufferedReader<S>, Response, StreamBody, bool),
     /// One request answered, the client may send another: hand the socket back to the
     /// waiting list instead of parking the accept thread in a second read. Chrome keeps
@@ -1266,9 +1438,8 @@ fn serve_until_stream<S: Stream>(
                     return Serve::Failed;
                 }
             }
-            // A listener may refuse keep-alive outright. TLS does: its connections own
-            // a stack each, and holding one open for an idle browser socket costs internal
-            // RAM that the next handshake needs.
+            // A listener may refuse keep-alive outright. TLS retains its existing
+            // close-after-one-request policy; plain sockets return to readiness polling.
             let keep_alive = allow_keep_alive
                 && match req.header("connection") {
                     Some(v) => !v.eq_ignore_ascii_case("close"),
@@ -1277,7 +1448,11 @@ fn serve_until_stream<S: Stream>(
             let head_only = req.method == "HEAD";
             let started = std::time::Instant::now();
             let mut resp = (routes.request)(&req);
-            if started.elapsed().as_millis() > 500 {
+            // Distinguish handler time from queueing, parsing, socket writes and
+            // LAN/client delay; end-to-end latency alone cannot diagnose App locks.
+            let handler_ms = started.elapsed().as_millis();
+            resp = resp.with_header("Server-Timing", &format!("handler;dur={handler_ms}"));
+            if handler_ms > 500 {
                 log.warn(
                     "http",
                     format!("{} {} took {} ms", req.method, req.path, started.elapsed().as_millis()),
@@ -1402,6 +1577,300 @@ mod tests {
             })
             .unwrap_or(0);
         out.len() - (split + 4) >= len
+    }
+
+    fn wait_until(mut condition: impl FnMut() -> bool) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while !condition() {
+            assert!(std::time::Instant::now() < deadline, "condition did not become true");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    struct ReleaseWorkers(Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>);
+
+    impl Drop for ReleaseWorkers {
+        fn drop(&mut self) {
+            *self.0 .0.lock().unwrap() = true;
+            self.0 .1.notify_all();
+        }
+    }
+
+    #[test]
+    fn a_slow_handler_does_not_block_another_response() {
+        let gate = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let release = ReleaseWorkers(gate.clone());
+        let (entered, entry) = std::sync::mpsc::channel();
+        let handler: Handler = Arc::new(move |req| {
+            if req.path == "/slow" {
+                entered.send(()).unwrap();
+                let mut ready = gate.0.lock().unwrap();
+                while !*ready {
+                    ready = gate.1.wait(ready).unwrap();
+                }
+            }
+            Response::text("done")
+        });
+        let server = Server::start("127.0.0.1:0", Routes::new(handler), LogBuf::new(16)).unwrap();
+        let addr = server.local_addr();
+        let slow = std::thread::spawn(move || {
+            raw_request(addr, "GET /slow HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+        });
+        entry.recv_timeout(Duration::from_secs(3)).unwrap();
+        let start = std::time::Instant::now();
+        let fast = raw_request(addr, "GET /fast HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+        drop(release);
+        assert!(fast.contains("done"), "{fast:?}");
+        assert!(start.elapsed() < Duration::from_secs(1));
+        assert!(slow.join().unwrap().contains("done"));
+        wait_until(|| server.budget.workers.load(Ordering::SeqCst) == 0);
+    }
+
+    #[test]
+    fn request_workers_are_preallocated_and_reused_across_connection_churn() {
+        let handler: Handler = Arc::new(|_| Response::text("reused"));
+        let server = Server::start("127.0.0.1:0", Routes::new(handler), LogBuf::new(16)).unwrap();
+        assert_eq!(server.budget.thread_starts.load(Ordering::SeqCst), MAX_REQUEST_WORKERS);
+        for index in 0..200 {
+            let path = if index % 2 == 0 { "/api/status" } else { "/ordinary" };
+            let response = raw_request(
+                server.local_addr(),
+                &format!("GET {path} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"),
+            );
+            assert!(response.contains("reused"), "request {index} was lost");
+            assert!(response.contains("Server-Timing: handler;dur="), "handler timing is missing");
+        }
+        wait_until(|| server.budget.workers.load(Ordering::SeqCst) == 0);
+        assert_eq!(
+            server.budget.thread_starts.load(Ordering::SeqCst),
+            MAX_REQUEST_WORKERS,
+            "request churn must not create additional pthread stacks"
+        );
+    }
+
+    #[test]
+    fn request_pool_is_bounded_and_recovers_after_saturation() {
+        let gate = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let release = ReleaseWorkers(gate.clone());
+        let (entered, entry) = std::sync::mpsc::channel();
+        let handler: Handler = Arc::new(move |req| {
+            if req.path == "/api/status" {
+                return Response::text("control-ready");
+            }
+            entered.send(()).unwrap();
+            let mut ready = gate.0.lock().unwrap();
+            while !*ready {
+                ready = gate.1.wait(ready).unwrap();
+            }
+            Response::text("done")
+        });
+        let server = Server::start("127.0.0.1:0", Routes::new(handler), LogBuf::new(16)).unwrap();
+        let mut clients = Vec::new();
+        for _ in 0..MAX_NORMAL_WORKERS {
+            let mut client = TcpStream::connect(server.local_addr()).unwrap();
+            client.write_all(b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n").unwrap();
+            clients.push(client);
+            entry.recv_timeout(Duration::from_secs(3)).unwrap();
+        }
+        assert_eq!(server.budget.workers.load(Ordering::SeqCst), MAX_NORMAL_WORKERS);
+        // Even a fragmented control request line must retain its reserved lane.
+        let start = std::time::Instant::now();
+        let mut control = TcpStream::connect(server.local_addr()).unwrap();
+        control.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+        control.write_all(b"GET /api/sta").unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+        control.write_all(b"tus HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n").unwrap();
+        let mut response = String::new();
+        control.read_to_string(&mut response).unwrap();
+        assert!(response.contains("control-ready"), "{response}");
+        assert!(start.elapsed() < Duration::from_secs(1));
+        drop(control);
+        let mut queued = TcpStream::connect(server.local_addr()).unwrap();
+        queued.set_read_timeout(Some(Duration::from_millis(100))).unwrap();
+        queued.write_all(b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n").unwrap();
+        let mut byte = [0u8; 1];
+        let error = queued.read(&mut byte).unwrap_err();
+        assert!(matches!(error.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut));
+        assert!(entry.try_recv().is_err(), "a fourth ordinary handler ran");
+        drop(release);
+        drop(clients);
+        queued.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        let mut queued_response = String::new();
+        queued.read_to_string(&mut queued_response).unwrap();
+        assert!(queued_response.contains("done"), "queued burst was lost");
+        drop(queued);
+        wait_until(|| {
+            server.budget.workers.load(Ordering::SeqCst) == 0
+                && server.budget.connections.load(Ordering::SeqCst) == 0
+        });
+        let recovered =
+            raw_request(server.local_addr(), "GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+        assert!(recovered.contains("done"));
+    }
+
+    #[test]
+    fn panic_and_spawn_failure_release_both_budgets() {
+        let handler: Handler = Arc::new(|req| {
+            assert_ne!(req.path, "/panic", "injected handler panic");
+            Response::text("recovered")
+        });
+        let server = Server::start("127.0.0.1:0", Routes::new(handler), LogBuf::new(16)).unwrap();
+        let panic_response =
+            raw_request(server.local_addr(), "GET /panic HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+        assert!(panic_response.is_empty());
+        wait_until(|| {
+            server.budget.workers.load(Ordering::SeqCst) == 0
+                && server.budget.connections.load(Ordering::SeqCst) == 0
+        });
+        server.budget.fail_spawn.store(true, Ordering::SeqCst);
+        let failed =
+            raw_request(server.local_addr(), "GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+        assert!(failed.is_empty());
+        wait_until(|| {
+            !server.budget.fail_spawn.load(Ordering::SeqCst)
+                && server.budget.workers.load(Ordering::SeqCst) == 0
+                && server.budget.connections.load(Ordering::SeqCst) == 0
+        });
+        assert!(raw_request(server.local_addr(), "GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+            .contains("recovered"));
+    }
+
+    #[test]
+    fn a_pipeline_returns_to_readiness_without_reordering_or_extra_workers() {
+        let (server, _) = start_test_server();
+        let mut client = TcpStream::connect(server.local_addr()).unwrap();
+        client.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        client
+            .write_all(
+                b"GET / HTTP/1.1\r\nHost: x\r\n\r\nGET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+            )
+            .unwrap();
+        let mut result = String::new();
+        client.read_to_string(&mut result).unwrap();
+        assert_eq!(result.matches("HTTP/1.1 200 OK").count(), 2, "{result}");
+        assert_eq!(result.matches("hello").count(), 2);
+        wait_until(|| {
+            server.budget.workers.load(Ordering::SeqCst) == 0
+                && server.budget.connections.load(Ordering::SeqCst) == 0
+        });
+    }
+
+    #[test]
+    fn streaming_reuses_the_request_worker_and_releases_its_connection() {
+        let handler: Handler = Arc::new(|_| {
+            let request_thread = std::thread::current().id();
+            Response::streamed(
+                200,
+                "text/event-stream",
+                Box::new(move |sink| {
+                    assert_eq!(
+                        std::thread::current().id(),
+                        request_thread,
+                        "streaming must not spawn another thread for this socket"
+                    );
+                    sink.send(b"data: same worker\n\n")
+                }),
+            )
+        });
+        let server = Server::start("127.0.0.1:0", Routes::new(handler), LogBuf::new(16)).unwrap();
+        let response = raw_request_until_close(
+            server.local_addr(),
+            "GET /stream HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+        );
+        assert!(response.contains("data: same worker"), "{response:?}");
+        wait_until(|| {
+            server.budget.workers.load(Ordering::SeqCst) == 0
+                && server.budget.connections.load(Ordering::SeqCst) == 0
+        });
+    }
+
+    #[test]
+    fn idle_sockets_share_the_connection_cap_without_taking_workers() {
+        let (server, _) = start_test_server();
+        let idle: Vec<_> =
+            (0..MAX_CONNECTIONS).map(|_| TcpStream::connect(server.local_addr()).unwrap()).collect();
+        wait_until(|| server.budget.connections.load(Ordering::SeqCst) == MAX_CONNECTIONS);
+        assert_eq!(server.budget.workers.load(Ordering::SeqCst), 0);
+        assert!(raw_request(server.local_addr(), "GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+            .is_empty());
+        drop(idle);
+        wait_until(|| server.budget.connections.load(Ordering::SeqCst) == 0);
+        assert!(raw_request(server.local_addr(), "GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+            .contains("hello"));
+    }
+
+    #[test]
+    fn stop_discards_a_busy_workers_keepalive_pipeline() {
+        let gate = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let release = ReleaseWorkers(gate.clone());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let handler_calls = calls.clone();
+        let (entered, entry) = std::sync::mpsc::channel();
+        let handler: Handler = Arc::new(move |_| {
+            handler_calls.fetch_add(1, Ordering::SeqCst);
+            entered.send(()).unwrap();
+            let mut ready = gate.0.lock().unwrap();
+            while !*ready {
+                ready = gate.1.wait(ready).unwrap();
+            }
+            Response::text("old")
+        });
+        let mut server = Server::start("127.0.0.1:0", Routes::new(handler), LogBuf::new(16)).unwrap();
+        let mut client = TcpStream::connect(server.local_addr()).unwrap();
+        client.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        client.write_all(b"GET / HTTP/1.1\r\nHost: x\r\n\r\nGET / HTTP/1.1\r\nHost: x\r\n\r\n").unwrap();
+        entry.recv_timeout(Duration::from_secs(3)).unwrap();
+        server.stop();
+        drop(release);
+        let mut result = String::new();
+        let _ = client.read_to_string(&mut result);
+        wait_until(|| {
+            server.budget.workers.load(Ordering::SeqCst) == 0
+                && server.budget.connections.load(Ordering::SeqCst) == 0
+        });
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn stalled_tls_handshake_does_not_block_plain_http_and_failure_recovers() {
+        let gate = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let release = ReleaseWorkers(gate.clone());
+        let (entered, entry) = std::sync::mpsc::channel();
+        let handshake: Handshake = Arc::new(move |_| {
+            entered.send(()).unwrap();
+            let mut ready = gate.0.lock().unwrap();
+            while !*ready {
+                ready = gate.1.wait(ready).unwrap();
+            }
+            None
+        });
+        let http = bind("127.0.0.1:0").unwrap();
+        let tls = bind("127.0.0.1:0").unwrap();
+        let local = http.local_addr().unwrap();
+        let tls_addr = tls.local_addr().unwrap();
+        http.set_nonblocking(true).unwrap();
+        tls.set_nonblocking(true).unwrap();
+        let handler: Handler = Arc::new(|_| Response::text("plain"));
+        let server = Server::spawn_with(
+            vec![(http, None), (tls, Some(handshake))],
+            Routes::new(handler),
+            LogBuf::new(16),
+            "http",
+            local,
+        )
+        .unwrap();
+        let tls_client = TcpStream::connect(tls_addr).unwrap();
+        entry.recv_timeout(Duration::from_secs(3)).unwrap();
+        let start = std::time::Instant::now();
+        let plain = raw_request(local, "GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+        drop(release);
+        assert!(plain.contains("plain"));
+        assert!(start.elapsed() < Duration::from_secs(1));
+        drop(tls_client);
+        wait_until(|| {
+            server.budget.workers.load(Ordering::SeqCst) == 0
+                && server.budget.connections.load(Ordering::SeqCst) == 0
+        });
     }
 
     /// A socket that connects and says nothing must not hold up anybody else.
