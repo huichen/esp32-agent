@@ -4,6 +4,7 @@
 //! WiFi) plus the ones that manage the config. Device-specific tools live with
 //! their driver in [`crate::drivers`].
 
+pub mod bitmap;
 pub mod clip;
 pub mod family;
 pub mod fs;

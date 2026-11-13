@@ -18,6 +18,7 @@
 
 pub mod agent;
 pub mod app;
+pub mod bitmap;
 pub mod boards;
 pub mod capability;
 pub mod clips;

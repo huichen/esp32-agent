@@ -319,6 +319,57 @@ Background playback needs a media worker, still on [the roadmap](../ROADMAP.md#m
 Host simulator tests cover this tool; firmware not built/verified, and physical timing
 has not been measured on the bench.
 
+#### Compressing bitmap page bytes: `bitmap_pack` / `bitmap_unpack`
+
+A 128×32 frame is **512 raw bytes / 684 base64 characters**; 30 frames are **15,360
+raw bytes** before compression. `bitmap_pack {data_b64}` compresses those already
+bit-packed **page-format bytes**, not text, base64 characters or individual pixels.
+It returns `{packed_b64, raw_bytes, packed_bytes, ratio, runs}`. `ratio` is
+`packed_bytes / raw_bytes` (lower is better; `null` for empty input); `runs` counts
+emitted repeat pairs, not literal blocks. Frames can be concatenated before packing.
+
+The headerless **`bitmap-rle-v1`** stream uses a control byte whose low seven bits
+are `count - 1`, for **1–128 bytes**. Controls `0x00`–`0x7f` precede `count` literal
+bytes; controls `0x80`–`0xff` precede one value byte to repeat `count` times. The
+encoder uses repeat pairs only for runs of at least three bytes and keeps shorter
+runs in literal blocks. There is no terminator, padding, checksum or stored length;
+this is not TIFF PackBits (`0x80` is a one-byte repeat, not a no-op). Worst-case
+size is **`n + ceil(n / 128)`**, just **4 extra bytes for a 512-byte noise frame**.
+
+Host tests measure and assert these full 128×32 frame results:
+
+| Pattern | Raw bytes | Packed bytes | Ratio (packed/raw) | Repeat pairs | Packed base64 characters |
+|---|---:|---:|---:|---:|---:|
+| Solid `0x00` | 512 | 8 | 0.015625 | 4 | 12 |
+| `HELLO BOARD`, one line of the board's 6×8 glyphs | 512 | 67 | 0.130859375 | 9 | 92 |
+| xorshift32 noise, seed `0x12345678` | 512 | 516 | 1.0078125 | 0 | 688 |
+
+The same test packs 30 concatenated solid frames: **15,360 → 240 bytes**, ratio
+**0.015625**, or **20,480 → 320 base64 characters**. That is a solid-pattern
+measurement, not a promised animation ratio.
+
+The text fixture re-renders the bench text/readback recorded in commit `2187401`
+through the current SSD1306 driver and font; these are host codec measurements,
+not a new bench capture. Compression depends on content: the noise case grows by
+**0.78125%** and still round-trips every byte. Reproduce the printed measurements
+with `cargo test -p esp32-agent-core bitmap::tests:: -- --nocapture`.
+
+`bitmap_unpack {packed_b64, bytes}` returns `{data_b64, raw_bytes}` and requires
+`bytes` to be the **exact original decoded length**, not the base64 length. It
+refuses truncated run pairs/literals, a stream missing complete final blocks,
+trailing blocks, or any run/literal exceeding that length. Decoded packed input is
+capped at **64 KiB** before allocation. Both tools limit raw data to **32 KiB**:
+worst-case packing produces at most 33,024 bytes / 44,032 base64 characters, leaving
+room for JSON inside the separate 64 KiB tool-result ceiling. The independent Rust
+API, `esp32_agent_core::bitmap::{pack, unpack}`, accepts up to 64 KiB of packed
+input and raw output when unpacking; `pack` itself is caller-bounded.
+
+Both tools are read-only, need no OLED, and do not store or draw anything.
+**`media_play` still takes raw `bitmap_b64`: unpack first**, then pass the returned
+`data_b64` as that frame field. There is no automatic unpacking or `compress: true`
+frame option. The existing bitmap encoding and playback contract are unchanged.
+Firmware not built/verified for the codec.
+
 ## 8. Sound with a picture: `POST /av`
 
 The bench board played a 30 s clip with its animation on the 128x32 OLED: PCM down one TCP
