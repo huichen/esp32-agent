@@ -10,8 +10,8 @@ providers, credentials, hardware, or processes belonging to the operator are use
 Assertions are not xfailed: a confirmed regression makes the process exit 1.
 The JSON report records every assertion, exercised routes/methods/tools, and gaps.
 Schemas/limits come from agent.json, tools/list, files/tree and the owning Rust
-modules. Protocol edge expectations follow JSON-RPC 2.0 batch/id rules; tolerant
-legacy aliases are intentionally exercised, not mistaken for advertised tools.
+modules. Protocol edge expectations follow JSON-RPC 2.0 batch/id rules;
+removed REST routes are refusal-tested; functional coverage uses supported tools.
 """
 
 import argparse
@@ -266,7 +266,16 @@ class Simulator:
         return [t["name"] for t in self.rpc("tools/list").json()["result"]["tools"]]
 
     def drain(self):
-        return wait_for(lambda: self.get("/api/status")["store"], lambda s: s["pending"] == 0, 8)
+        # board status is read under the App lock, not the sampled HTTP view.
+        # Idle and queue admission are not acknowledgement: require a flushed store
+        # with no failed publication before killing the child for a restart.
+        wait_for(lambda: self.get("/api/status")["agent"],
+                 lambda a: not a["run_active"] and a["active_tool"] is None, 8)
+        store = wait_for(lambda: content(self.call("board", {"command": "status"}))["store"],
+                         lambda s: s["pending"] == 0, 8)
+        if store["failed"] or store["last_failure"] is not None:
+            raise RuntimeError("store did not acknowledge publication: " + short(store))
+        return store
 
     def raw(self, wire, finish=True):
         with socket.create_connection(("127.0.0.1", self.port), timeout=bounded_timeout(4)) as conn:
@@ -482,7 +491,12 @@ def run_turn(sim, text="audit question", attachments=None, seconds=8):
 def finish_turn(sim, after, seconds=8, runs=1):
     events = wait_for(lambda: sim.get("/api/agent/events?after=" + str(after)),
                       lambda v: sum(e["event"] == "run_end" for e in v["events"]) >= runs, seconds)
-    history = sim.get("/api/agent/history")
+    # run_end can be visible in the detached journal before the worker publishes
+    # its transcript. The gate is live even when pending/runs in status are cached.
+    wait_for(lambda: sim.get("/api/status")["agent"],
+             lambda a: not a["run_active"] and a["active_tool"] is None, seconds)
+    history = wait_for(lambda: sim.get("/api/agent/history"),
+                       lambda h: not any(m.get("pending") for m in h["messages"]), seconds)
     names = {c["id"]: c["name"] for m in history["messages"] for c in m.get("tool_calls", [])}
     sim.rec.model_requested_tools[sim.rec.area].update(names.values())
     for message in history["messages"]:
@@ -513,12 +527,14 @@ def paired(messages):
 
 def discovery(rec, sim, fake):
     doc = sim.get("/agent.json")
-    endpoints = doc["endpoints"]
+    endpoints = doc["endpoints"] + doc["portal_endpoints"]
     inventory = {(e["method"], e["path"]) for e in endpoints}
-    rec.equal("inventory-count", len(endpoints), doc["counts"]["endpoints"])
+    rec.equal("inventory-count", len(doc["endpoints"]), doc["counts"]["endpoints"])
+    rec.equal("portal-inventory-count", len(doc["portal_endpoints"]), doc["counts"]["portal_endpoints"])
+    rec.check("portal-tool-mappings", all(isinstance(e.get("mcp"), str) and e["mcp"] for e in doc["portal_endpoints"]))
     rec.equal("inventory-unique", len(inventory), len(endpoints))
     rec.equal("discovered-base-url", doc["dynamic"]["base_url"], sim.url)
-    rec.equal("sitemap-alias", sim.get("/sitemap.json")["endpoints"], endpoints)
+    rec.equal("sitemap-captive-redirect", (sim.request("GET", "/sitemap.json").status, sim.request("GET", "/sitemap.json").headers.get("location")), (302, "/"))
     rec.check("inventory-descriptions", all(e.get("tag") and e.get("summary") and e.get("returns") and "auth" in e for e in endpoints))
     for name, expected in [("tool_result_bytes", 65536), ("reply_bytes", 32768),
                            ("history_bytes", 2097152), ("history_messages", 1024),
@@ -529,12 +545,10 @@ def discovery(rec, sim, fake):
     specs = sim.rpc("tools/list", {}).json()["result"]["tools"]
     write_description = next(t["description"] for t in specs if t["name"] == "write")
     rec.check("write-description-shares-file-budgets", all(str(tree[k]) + " bytes" in write_description for k in ["file_max", "total_max"]), write_description)
-    job = sim.post("/api/script", {"source": "1 + 2"})
     sim.call("write", {"path": "/map-fixture.txt", "text": "discovery fixture"})
     sim.post("/api/agent/message", {"text": "attachment discovery fixture", "attachments": [
         {"name": "map.bin", "mime": "application/octet-stream", "data_b64": "Zml4dHVyZQ=="}]})
-    concrete = {"/api/script/<id>": "/api/script/" + job["id"],
-                "/api/attachment/<name>": "/api/attachment/map.bin",
+    concrete = {"/api/attachment/<name>": "/api/attachment/map.bin",
                 "/api/files/read": "/api/files/read?path=/map-fixture.txt"}
     skips = {"/api/agent/stream", "/selftest/chat/completions"}
     for e in endpoints:
@@ -545,20 +559,19 @@ def discovery(rec, sim, fake):
         rec.check("body:" + e["path"], bool(reply.body) and bool(reply.headers.get("content-type")))
     # Contract regressions: the old map advertised GET selftest and omitted live routes.
     rec.check("selftest-advertises-POST", ("POST", "/selftest/chat/completions") in inventory, short(sorted(inventory)))
-    for method, path in [("POST", "/api/tools"), ("GET", "/api/files"), ("GET", "/api/files/tree"),
+    for method, path in [("POST", "/api/tools"), ("GET", "/api/files/tree"),
                          ("GET", "/api/files/read"), ("POST", "/api/sched/run")]:
         rec.check("implemented-route-in-map:" + path, (method, path) in inventory,
                   "implemented in app.rs but absent from /agent.json")
     posts = {
         "/api/agent/prompt": {"action": "set", "text": "audit standing order"},
         "/api/config": {"device_name": "interface-audit"},
-        "/api/manifest": {"manifest": {"version": 1, "tools": []}},
         "/api/tools": {"disabled": []},
         "/api/devices/probe": {}, "/api/wifi/connect": {"ssid": "fixture-network", "password": ""},
-        "/api/wifi/forget": {}, "/api/agent/message": {"text": "no provider is configured"},
+        "/api/agent/message": {"text": "no provider is configured"},
         "/api/agent/reset": {}, "/api/agent/forget": {"keep": 0}, "/api/agent/config": {"model": ""},
-        "/api/script": {"source": "1 + 2"}, "/api/sched": {"kind": "task", "op": "add", "task": {"id": "map", "script": "1", "every_s": 86400}},
-        "/api/auth": {"pin": ""}, "/api/reboot": {}, "/api/factory-reset": {},
+        "/api/sched": {"kind": "task", "op": "add", "task": {"id": "map", "script": "1", "every_s": 86400}},
+        "/api/auth": {"pin": ""},
         "/mcp": {"jsonrpc": "2.0", "id": "map", "method": "ping"},
     }
     for e in endpoints:
@@ -573,14 +586,21 @@ def discovery(rec, sim, fake):
     http_case(rec, sim, "wrong-api-method", "PATCH", "/api/config", {}, 404)
     rec.equal("captive-redirect", sim.request("GET", "/generate_204").headers.get("location"), "/")
     http_case(rec, sim, "favicon", "GET", "/favicon.ico", status=204)
-    for path in ["/api/config", "/api/tools", "/api/manifest", "/api/agent/config", "/api/script", "/api/sched", "/api/wifi/connect"]:
+    for method, path in [("GET", "/api/manifest"), ("GET", "/api/manifest/schema"),
+                         ("POST", "/api/manifest"), ("PUT", "/api/manifest"),
+                         ("POST", "/api/script"), ("GET", "/api/script/s1"),
+                         ("POST", "/api/factory-reset"), ("GET", "/api/files"),
+                         ("GET", "/api/sessions"), ("GET", "/api/catalog"),
+                         ("POST", "/api/reboot"), ("POST", "/api/wifi/forget")]:
+        rec.check("removed-not-advertised:" + method + path, (method, path) not in inventory)
+        http_case(rec, sim, "removed-route:" + method + path, method, path, {} if method != "GET" else MISSING, 404)
+    for path in ["/api/config", "/api/tools", "/api/agent/config", "/api/sched", "/api/wifi/connect"]:
         http_case(rec, sim, "invalid-json:" + path, "POST", path, b"{", 400)
     reply = sim.request("OPTIONS", "/mcp", headers={"Origin": "http://fixture.invalid"})
     rec.equal("cors-preflight", reply.status, 204)
     rec.equal("cors-origin", reply.headers.get("access-control-allow-origin"), "*")
     rec.check("cors-auth-headers", "X-Portal-Pin" in reply.headers.get("access-control-allow-headers", ""))
     rec.equal("PUT-config-alias", sim.request("PUT", "/api/config", {"device_name": "put-audit"}).status, 200)
-    rec.equal("PUT-manifest-alias", sim.request("PUT", "/api/manifest", {"manifest": {}}).status, 200)
     before = sim.get("/api/config")
     for i, value in enumerate([None, [], 42, "settings", {"mode": "generik"}, {"mode": 12},
                                {"mode": "generic", "disabled": "oops"},
@@ -602,7 +622,7 @@ def rpc(rec, sim, fake):
     notification = sim.request("POST", "/mcp", {"jsonrpc": "2.0", "method": "notifications/initialized"}, {"Mcp-Session-Id": sim.sid})
     rec.equal("notification-status", notification.status, 202)
     rec.equal("notification-no-body", notification.body, b"")
-    session = next(s for s in sim.get("/api/sessions")["sessions"] if s["id"] == sim.sid)
+    session = next(s for s in content(sim.call("shell", {"command": "netstat"}))["sessions"] if s["id"] == sim.sid)
     rec.equal("initialized-session", session["initialized"], True)
     for method, field in [("ping", None), ("prompts/list", "prompts"), ("resources/templates/list", "resourceTemplates"),
                           ("logging/setLevel", None), ("completion/complete", "completion")]:
@@ -618,10 +638,10 @@ def rpc(rec, sim, fake):
                   or result.get("result", {}).get("isError") is True, short(result))
     for case, value in [("string-id", "identifier"), ("integer-id", 42), ("fractional-id", 4.5)]:
         rec.equal(case + ".echo", sim.rpc("ping", ident=value).json()["id"], value)
-    before = sim.get("/api/status")["counters"]["notifications"]
+    before = content(sim.call("board", {"command": "status"}))["counters"]["notifications"]
     reply = sim.request("POST", "/mcp", {"jsonrpc": "2.0", "method": "audit/unknown"})
     rec.equal("unknown-notification-no-response", (reply.status, reply.body), (202, b""))
-    rec.equal("notification-counter", sim.get("/api/status")["counters"]["notifications"], before + 1)
+    rec.equal("notification-counter", content(sim.call("board", {"command": "status"}))["counters"]["notifications"], before + 1)
     for case, message, code in [("bad-json", b"{", -32700), ("empty-batch", [], -32600),
                                  ("scalar-message", 7, -32600), ("missing-method", {"jsonrpc": "2.0", "id": 4}, -32600),
                                  ("wrong-version", {"jsonrpc": "1.0", "id": 5, "method": "ping"}, -32600)]:
@@ -659,11 +679,12 @@ def rpc(rec, sim, fake):
     http_case(rec, sim, "PUT-MCP-refused", "PUT", "/mcp", {}, 405)
     old = sim.sid
     http_case(rec, sim, "DELETE-session", "DELETE", "/mcp", status=204, headers={"Mcp-Session-Id": old})
-    rec.check("deleted-session-gone", all(s["id"] != old for s in sim.get("/api/sessions")["sessions"]))
+    sim.sid = None  # Inspection must not recreate the deleted id by reusing it.
+    rec.check("deleted-session-gone", all(s["id"] != old for s in content(sim.call("shell", {"command": "netstat"}))["sessions"]))
     sim.post("/api/config", {"mcp": {"max_sessions": 2}})
     for n in range(3):
         sim.request("POST", "/mcp", {"jsonrpc": "2.0", "id": n, "method": "ping"})
-    rec.equal("session-cap", len(sim.get("/api/sessions")["sessions"]), 2)
+    rec.equal("session-cap", sim.get("/api/status")["mcp"]["sessions"], 2)
     sim.post("/api/config", {"mcp": {"enabled": False}})
     rec.equal("MCP-service-disabled", sim.rpc("ping").status, 503)
     rec.equal("portal-survives-disabled-MCP", sim.request("GET", "/healthz").status, 200)
@@ -674,9 +695,24 @@ def rpc(rec, sim, fake):
     rec.note("TTL expiry (minimum 30 s) is not waited out; allocation, reuse, initialization, deletion and the configured session cap are exercised.")
 
 
+def fixture_order(names):
+    # Clip/file dependencies must hold for MCP and for every model dialect.
+    first = [n for n in ["write", "read", "edit", "clip_new", "clip_append", "clip_record", "clip_play", "clip_list", "clip_drop"] if n in names]
+    return first + [n for n in names if n not in first]
+
+
 def default_tool_arguments(path="/tool.txt"):
-    """Safe default-board calls, shared by external MCP and each internal adapter."""
-    return {"board": {"command": "status"}, "bus": {"command": "i2c_scan"}, "manifest": {"command": "get"},
+    """Safe virtual-media-board calls, shared by MCP and each internal adapter."""
+    return {"audio": {"command": "mic_level", "arguments": {"ms": 10}},
+            "bitmap_pack": {"data_b64": "AA=="},
+            "bitmap_unpack": {"packed_b64": "AAA=", "bytes": 1},
+            "clip_new": {"name": "audit-clip", "kind": "pcm", "rate_hz": 16000, "bytes": 8192},
+            "clip_append": {"name": "audit-clip", "data_b64": "AAA="},
+            "clip_record": {"name": "audit-clip", "ms": 100},
+            "clip_play": {"name": "audit-clip", "volume": 0},
+            "clip_list": {}, "clip_drop": {"name": "audit-clip"},
+            "media_play": {"frames": [{"at_ms": 0, "text": "FIXTURE"}]},
+            "board": {"command": "status"}, "bus": {"command": "i2c_scan"}, "manifest": {"command": "get"},
             "display": {"command": "oled_text", "arguments": {"text": "AUDIT", "line": 0}},
             "indicators": {"command": "led_set", "arguments": {"color": "#002010"}},
             "schedule": {"action": "list"}, "script": {"source": "1 + 2"}, "shell": {"command": "echo fixture"},
@@ -686,24 +722,46 @@ def default_tool_arguments(path="/tool.txt"):
 
 
 def tools(rec, sim, fake):
+    default_names = sim.names()
+    rec.inventory["default"] = {"visible": default_names, "detected_devices": sim.get("/api/devices")}
+    refusal(rec, sim, "default-no-mic-record-refusal", "clip_record", {"name": "absent-mic", "ms": 100}, contains="microphone")
+    rec.note("Visibility gap on the default board: clip_record is advertised without a microphone, while clip_play is hidden despite a detected OLED (oled capability versus display guard). A virtual I2S profile below supplies both dependencies for success coverage.")
+    # Local virtual I2S profile makes public clip_record/clip_play executable.
+    # This configuration and its persistence are confined to this area's temp dir.
+    sim.post("/api/config", {"board": "esp32s3-xiaozhi-bread"})
     specs = sim.rpc("tools/list").json()["result"]["tools"]
     names = [t["name"] for t in specs]
     portal = sim.get("/api/tools")
-    catalog, devices = sim.get("/api/catalog"), sim.get("/api/devices")
-    rec.inventory["default"] = {"visible": names,
+    catalog = content(sim.call("manifest", {"command": "describe", "arguments": {"section": "drivers"}}))["drivers"]
+    devices = sim.get("/api/devices")
+    rec.inventory["virtual-media"] = {"visible": names,
         "hidden": [{"name": t["name"], "why": t.get("why"), "missing": t.get("missing", [])}
                    for t in portal["tools"] if not t["visible"]],
         "detected_devices": devices, "catalog_kinds_not_on_default_board": [d["kind"] for d in catalog
-            if d["kind"] not in {"ssd1306", "bme280", "sht3x", "ina219", "led", "buttons"}]}
+            if d["kind"] not in {device["kind"] for device in rec.inventory["default"]["detected_devices"]["devices"]}]}
     rec.equal("stable-alphabetical-order", names, sorted(set(names)))
     rec.equal("portal-MCP-visible-set", sorted(t["name"] for t in portal["tools"] if t["visible"]), names)
-    rec.equal("status-visible-count", sim.get("/api/status")["mcp"]["tools_visible"], len(names))
+    rec.equal("status-visible-count", wait_for(lambda: sim.get("/api/status")["mcp"]["tools_visible"], lambda n: n == len(names)), len(names))
     rec.check("advertised-schemas", all(t["inputSchema"]["type"] == "object" and t.get("description") for t in specs))
+    portal_specs = {t["name"]: t for t in portal["tools"] if t["visible"]}
+    for spec in specs:
+        rec.equal("portal-MCP-schema:" + spec["name"], spec["inputSchema"], portal_specs[spec["name"]]["input_schema"])
+        schema = spec["inputSchema"]
+        rec.check("schema-required-declared:" + spec["name"], set(schema.get("required", [])) <= set(schema.get("properties", {})))
     safe = default_tool_arguments()
     # Writes precede read/edit, regardless of the advertised alphabetic order.
-    for name in ["write", "read", "edit"] + [n for n in names if n not in {"write", "read", "edit"}]:
+    for name in fixture_order(names):
         rec.check("safe-fixture-exists:" + name, name in safe or next(t for t in specs if t["name"] == name)["inputSchema"].get("required", []) == [], name)
         success(rec, sim, "enabled:" + name, name, safe.get(name, {}))
+    packed = success(rec, sim, "bitmap-pack-roundtrip", "bitmap_pack", {"data_b64": base64.b64encode(bytes(1024)).decode()})
+    raw = success(rec, sim, "bitmap-unpack-roundtrip", "bitmap_unpack", {"packed_b64": packed["packed_b64"], "bytes": 1024})
+    rec.equal("bitmap-independent-decoded-bytes", base64.b64decode(raw["data_b64"], validate=True), bytes(1024))
+    refusal(rec, sim, "bitmap-invalid-base64", "bitmap_pack", {"data_b64": "!"})
+    refusal(rec, sim, "bitmap-wrong-raw-length", "bitmap_unpack", {"packed_b64": packed["packed_b64"], "bytes": 1023})
+    refusal(rec, sim, "clip-append-needs-existing", "clip_append", {"name": "missing", "data_b64": "AAA="})
+    refusal(rec, sim, "clip-record-needs-name", "clip_record", {})
+    refusal(rec, sim, "clip-play-needs-existing", "clip_play", {"name": "missing"})
+    refusal(rec, sim, "media-empty-frames", "media_play", {"frames": []})
     commands = {
         "board": [("inventory", {}), ("config_get", {}), ("config_set", {"patch": {"device_name": "tool-audit"}}),
                   ("chip_temp", {}), ("logs_tail", {"n": 2}), ("delay", {"ms": 1})],
@@ -712,7 +770,7 @@ def tools(rec, sim, fake):
                 ("i2c_write", {"addr": 60, "data": [0, 174]}), ("i2c_identify", {"addr": 118})],
         "display": [("oled_clear", {}), ("oled_text", {"text": "CHECK", "line": 0}), ("oled_read", {}),
                     ("oled_rect", {"x": 0, "y": 16, "w": 2, "h": 2, "fill": True}),
-                    ("oled_bitmap", {"data_b64": base64.b64encode(bytes(512)).decode(), "width": 128, "height": 32}),
+                    ("oled_bitmap", {"data_b64": base64.b64encode(bytes(1024)).decode(), "width": 128, "height": 64}),
                     ("oled_contrast", {"value": 100})],
         "indicators": [("buttons_read", {}), ("button_wait", {"timeout_ms": 10}),
                        ("led_blink", {"color": "#000000", "times": 1, "ms": 20})],
@@ -777,11 +835,14 @@ def permissions(rec, sim, fake):
     sim.post("/api/config", {"auth": {"portal_pin": pin, "mcp_token": token},
                              "wifi": {"password": token, "ap_password": token}})
     credential = {"X-Portal-Pin": pin}
-    for path in ["/api/config", "/api/agent/history", "/api/agent/prompt", "/api/agent/events", "/api/agent/stream", "/api/logs", "/api/script/missing", "/api/files", "/api/files/tree", "/api/files/read", "/api/attachment/x"]:
+    for method, path in [("GET", "/api/script/missing"), ("GET", "/api/files"),
+                         ("POST", "/api/manifest"), ("POST", "/api/script"), ("POST", "/api/factory-reset")]:
+        rec.equal("removed-route-with-PIN:" + method + path, sim.request(method, path, {} if method == "POST" else MISSING).status, 404)
+    for path in ["/api/config", "/api/agent/history", "/api/agent/prompt", "/api/agent/events", "/api/agent/stream", "/api/logs", "/api/files/tree", "/api/files/read", "/api/attachment/x"]:
         rec.equal("private-read:" + path, sim.request("GET", path).status, 401)
     for path in ["/healthz", "/agent.json", "/api/status", "/api/tools", "/api/sched"]:
         rec.equal("public-read:" + path, sim.request("GET", path).status, 200)
-    for path in ["/api/config", "/api/tools", "/api/manifest", "/api/script", "/api/agent/reset", "/api/sched/run", "/api/factory-reset"]:
+    for path in ["/api/config", "/api/tools", "/api/agent/reset", "/api/sched/run"]:
         rec.equal("mutation-auth:" + path, sim.request("POST", path, {}).status, 401)
     rec.equal("wrong-PIN", sim.request("POST", "/api/auth", {"pin": pin + "x"}).status, 401)
     login = sim.post("/api/auth", {"pin": pin})
@@ -854,7 +915,7 @@ def files(rec, sim, fake):
     refusal(rec, sim, "missing-path", "read", {})
     success(rec, sim, "empty-file", "write", {"path": "/audit/empty.txt", "text": ""})
     success(rec, sim, "nested-file", "write", {"path": "/audit/deep/item.txt", "text": "中文 alpha"})
-    listing = sim.get("/api/files?path=/audit")
+    listing = success(rec, sim, "directory-list", "shell", {"command": "ls /audit"})
     rec.equal("directories-before-files", [r["name"] for r in listing["entries"]], ["deep", "empty.txt", "notes.txt"])
     tree = sim.get("/api/files/tree")
     rec.equal("tree-total-from-file-rows", tree["total_bytes"], sum(e.get("size_bytes", 0) for e in tree["entries"]))
@@ -891,18 +952,25 @@ def files(rec, sim, fake):
 
 
 def manifest(rec, sim, fake):
-    schema = sim.get("/api/manifest/schema")
-    rec.check("manifest-schema-and-primitives", isinstance(schema.get("manifest_schema"), dict) and bool(schema.get("primitives")))
+    schema = success(rec, sim, "manifest-schema", "manifest", {"command": "describe", "arguments": {"section": "schema"}})
+    primitives = success(rec, sim, "manifest-primitives", "manifest", {"command": "describe", "arguments": {"section": "exec"}})
+    rec.check("manifest-schema-and-primitives", isinstance(schema.get("manifest_schema"), dict) and bool(primitives.get("primitives")))
+    def get_manifest():
+        return content(sim.call("manifest", {"command": "get"}))
+
+    def apply(arguments):
+        return sim.call("manifest", {"command": "apply", "arguments": arguments})
     tool = {"name": "audit_level", "description": "Safe virtual GPIO12 level", "params": [{"name": "level", "type": "integer", "min": 0, "max": 1, "required": True}],
             "exec": {"type": "gpio_write", "pin": 12, "level": {"param": "level"}}, "safety": {"confirm": True}}
     document = {"version": 1, "tools": [tool]}
-    before = sim.get("/api/manifest")
-    dry = sim.request("POST", "/api/manifest", {"manifest": document, "mode": "merge", "dry_run": True})
-    rec.equal("dry-run-report", dry.json().get("dry_run"), True)
-    rec.equal("dry-run-no-change", sim.get("/api/manifest"), before)
+    before = get_manifest()
+    revision = sim.get("/api/status")["mcp"]["manifest_revision"]
+    dry = apply({"manifest": document, "mode": "merge", "dry_run": True})
+    rec.equal("dry-run-report", content(dry).get("dry_run"), True)
+    rec.equal("dry-run-no-change", get_manifest(), before)
     rec.check("dry-run-no-tool", "audit_level" not in sim.names())
-    applied = http_case(rec, sim, "live-apply", "POST", "/api/manifest", {"manifest": document, "mode": "merge"})
-    rec.equal("revision-moved", applied["revision"], before["revision"] + 1)
+    applied = success(rec, sim, "live-apply", "manifest", {"command": "apply", "arguments": {"manifest": document, "mode": "merge"}})
+    rec.equal("revision-moved", applied["revision"], revision + 1)
     rec.equal("no-restart", applied["restart_required"], False)
     rec.check("new-tool-discovered", "audit_level" in sim.names())
     refusal(rec, sim, "manifest-confirmation", "audit_level", {"level": 1})
@@ -912,7 +980,7 @@ def manifest(rec, sim, fake):
             args["level"] = value
         refusal(rec, sim, "manifest-argument:" + case, "audit_level", args)
     success(rec, sim, "manifest-invocation", "audit_level", {"level": 1, "confirm": True})
-    rec.equal("virtual-pin-pullup-read", success(rec, sim, "manifest-pin-read", "gpio_read", {"pin": 12})["level"], 1)
+    rec.equal("virtual-pin-pullup-read", success(rec, sim, "manifest-pin-read", "bus", {"command": "gpio_read", "arguments": {"pin": 12}})["level"], 1)
     url = fake.fixture("/manifest-agent", [model_reply(text="", calls=[("live-manifest", "audit_level", {"level": 0, "confirm": True})]), model_reply()], dialect="chat")
     sim.post("/api/agent/config", {"base_url": url, "model": "fixture", "max_steps": 3})
     hist, _ = run_turn(sim, "invoke newly installed virtual tool")
@@ -925,20 +993,21 @@ def manifest(rec, sim, fake):
                       ("unknown-field", {"typo": 1}), ("reserved-name", {"tools": [{"name": "board", "exec": {"type": "gpio_read", "pin": 0}}]}),
                       ("bad-pin", {"tools": [{"name": "invalid", "exec": {"type": "gpio_read", "pin": 99}}]}),
                       ("duplicate-name", {"tools": [tool, tool]}), ("unknown-primitive", {"tools": [{"name": "invalid", "exec": {"type": "nonsense"}}]})]:
-        old = sim.get("/api/manifest")
-        response = sim.request("POST", "/api/manifest", {"manifest": doc})
-        rec.check("refused:" + case, response.status in {400, 422} and not response.json().get("applied"), short(response.json()))
-        rec.equal("refusal-is-atomic:" + case, sim.get("/api/manifest"), old)
+        old = get_manifest()
+        response = apply({"manifest": doc})
+        value = content(response)
+        rec.check("refused:" + case, response.get("isError") is True or value.get("applied") is False and bool(value.get("issues")), short(response))
+        rec.equal("refusal-is-atomic:" + case, get_manifest(), old)
     too_many = {"tools": [{"name": "audit_n" + str(n), "exec": {"type": "gpio_read", "pin": 0}} for n in range(49)]}
-    rec.equal("max-48-manifest-tools", sim.request("POST", "/api/manifest", {"manifest": too_many}).status, 422)
+    rec.check("max-48-manifest-tools", bool(content(apply({"manifest": too_many})).get("issues")))
     rate = {"name": "audit_rate", "exec": {"type": "gpio_read", "pin": 0}, "safety": {"max_calls_per_min": 1}}
-    sim.post("/api/manifest", {"mode": "merge", "manifest": {"tools": [rate]}})
+    success(rec, sim, "apply-rate-policy", "manifest", {"command": "apply", "arguments": {"mode": "merge", "manifest": {"tools": [rate]}}})
     success(rec, sim, "rate-first-call", "audit_rate")
     refusal(rec, sim, "rate-second-call", "audit_rate")
     sim.restart()
     rec.check("persisted-manifest-tool", "audit_level" in sim.names())
     success(rec, sim, "persisted-tool-invocation", "audit_level", {"level": 0, "confirm": True})
-    sim.post("/api/manifest", {"manifest": {}})
+    success(rec, sim, "replace-manifest", "manifest", {"command": "apply", "arguments": {"manifest": {}}})
     rec.check("replace-removes-tools-live", "audit_level" not in sim.names() and "audit_rate" not in sim.names())
     refusal(rec, sim, "removed-tool-refused", "audit_level", {"level": 1, "confirm": True})
 
@@ -962,7 +1031,7 @@ def scripts(rec, sim, fake):
     for case, source, expected in [("precedence", "1 + 2 * 3", 7),
                                   ("loop-and-assignment", "let n = 0\nwhile n < 3 { n = n + 1 }\nn", 3),
                                   ("arguments", "args.value + 2", 5),
-                                  ("integer-roundtrip", 'tool("gpio_read", {pin: 12}).pin', 12)]:
+                                  ("integer-roundtrip", 'tool("bus", {command: "gpio_read", arguments: {pin: 12}}).pin', 12)]:
         value = success(rec, sim, case, "script", {"source": source, "args": {"value": 3}})
         rec.equal(case + ".value", value.get("result"), expected)
     value = success(rec, sim, "stdout", "script", {"source": 'print("中文"); echo("two"); 4'})
@@ -972,26 +1041,24 @@ def scripts(rec, sim, fake):
     refusal(rec, sim, "unknown-builtin", "script", {"source": "unknown_function()"})
     refusal(rec, sim, "source-ceiling", "script", {"source": "#" + "x" * 8192})
     refusal(rec, sim, "log-line-ceiling", "script", {"source": 'let i = 0; while i < 65 { print("x"); i = i + 1 }'})
-    http_case(rec, sim, "HTTP-missing-source", "POST", "/api/script", {}, 400)
-    http_case(rec, sim, "HTTP-source-size", "POST", "/api/script", {"source": "#" + "x" * 8192}, 413)
-    inline = http_case(rec, sim, "inline", "POST", "/api/script", {"source": 'print("inline"); 6 * 7'})
-    rec.equal("inline-result-output", (inline["state"], inline["result"], inline["output"]), ("done", 42, ["inline"]))
-    bad = sim.post("/api/script", {"source": "let = 3"})
-    rec.check("inline-syntax-error", bad.get("ok") is False and bad.get("state") == "failed" and "line" in bad.get("error", ""), short(bad))
-    queued = sim.post("/api/script", {"source": 'print("background"); 7 * 8', "async": True})
-    rec.check("async-job-handle", queued.get("state") in {"queued", "running", "done"} and queued.get("poll") == "/api/script/" + queued["id"])
-    try:
-        done = wait_for(lambda: sim.get(queued["poll"]), lambda j: j["state"] in {"done", "failed"}, seconds=3)
-    except DeadlineExpired:
-        raise
-    except TimeoutError:
-        done = sim.get(queued["poll"])
-    rec.equal("background-result", (done["state"], done["result"], done["output"]), ("done", 56, ["background"]))
-    http_case(rec, sim, "unknown-job", "GET", "/api/script/s999999", status=404)
-    first = sim.post("/api/script", {"source": "1"})["id"]
-    for n in range(4):
-        sim.post("/api/script", {"source": str(n)})
-    rec.equal("job-history-bounded-to-four", sim.request("GET", "/api/script/" + first).status, 404)
+    reference = success(rec, sim, "missing-source-is-reference", "script", {})
+    rec.equal("missing-source-reference-section", reference["section"], "overview")
+    http_case(rec, sim, "removed-HTTP-script", "POST", "/api/script", {}, 404)
+    http_case(rec, sim, "removed-HTTP-source-size", "POST", "/api/script", {"source": "#" + "x" * 8192}, 404)
+    inline = success(rec, sim, "inline", "script", {"source": 'print("inline"); 6 * 7'})
+    rec.equal("inline-result-output", (inline["ok"], inline["result"], inline["output"]), (True, 42, ["inline"]))
+    refusal(rec, sim, "inline-syntax-error", "script", {"source": "let = 3"}, contains="line")
+    # Script execution is synchronous now. Background work belongs to the
+    # supported agent queue/scheduler, not a removed REST job pool.
+    specs = next(t for t in sim.rpc("tools/list").json()["result"]["tools"] if t["name"] == "script")
+    rec.check("script-no-async-contract", "async" not in specs["inputSchema"]["properties"])
+    url = fake.fixture("/background-script", [model_reply(text="", calls=[("background-script", "script", {"source": 'print("background"); 7 * 8'})]), model_reply(text="background done")], dialect="chat", delay=0.1)
+    sim.post("/api/agent/config", {"base_url": url, "model": "fixture"})
+    hist, events = run_turn(sim, "run a script on the agent worker")
+    done = json.loads(next(m["text"] for m in hist["messages"] if m.get("tool_call_id") == "background-script"))
+    rec.equal("background-result", (done["ok"], done["result"], done["output"]), (True, 56, ["background"]))
+    rec.check("background-completion-journal", paired(hist["messages"]) and any(e["event"] == "run_end" for e in events))
+    http_case(rec, sim, "removed-job-poll", "GET", "/api/script/s999999", status=404)
     value = success(rec, sim, "shell-pipeline", "shell", {"command": "echo alpha | tr a A | wc"})
     rec.check("pipeline-stdio", len(value.get("stages", [])) == 3 and bool(value.get("stdout")), short(value))
     success(rec, sim, "shell-redirection", "shell", {"command": "echo first > /redirect.txt"})
@@ -1000,12 +1067,12 @@ def scripts(rec, sim, fake):
     for case, command in [("six-stages", "echo x | cat | cat | cat | cat | cat"),
                           ("command-substitution", "echo $(id)"), ("shell-traversal", "echo x > /../escape")]:
         refusal(rec, sim, case, "shell", {"command": command})
-    rec.note("Runaway wall-time/5-million-step limits and the per-call tool budget (including a sleep longer than what is left) are unit-tested, not spent again live; sync, background, lint, stdout, bounded job history and dispatch are exercised here.")
+    rec.note("Runaway wall-time/5-million-step limits and the per-call tool budget (including a sleep longer than what is left) are unit-tested, not spent again live; sync, agent-worker background execution, lint, stdout and dispatch are exercised here; the removed job pool/poll routes are explicitly refused.")
 
 
 def sched(rec, sim, fake):
     rec.equal("initial-schedule", (sim.get("/api/sched")["tasks"], sim.get("/api/sched")["rules"]), ([], []))
-    task = {"id": "audit-task", "prompt": "fixture scheduled prompt", "script": 'print("scheduled"); 20 + 22', "every_s": 86400}
+    task = {"id": "audit-task", "prompt": "fixture scheduled prompt", "script": 'print("scheduled"); tool("write", {path: "/scheduled.txt", text: "42"}); 20 + 22', "every_s": 86400}
     added = sim.post("/api/sched", {"kind": "task", "op": "add", "task": task})
     rec.equal("task-added", added["tasks"][0]["id"], "audit-task")
     clock = added["tasks"][0]["last_run_ms"]
@@ -1015,8 +1082,10 @@ def sched(rec, sim, fake):
         rec.equal("task-" + op, result["tasks"][0]["enabled"], op == "enable")
     run = sim.post("/api/sched/run", {"id": task["id"]})
     rec.equal("script-wins-over-prompt", run["kind"], "script")
-    job = sim.get("/api/script/" + run["job"])
-    rec.equal("manual-script-result", (job["result"], job["output"]), (42, ["scheduled"]))
+    rec.check("manual-script-inline-job-id", isinstance(run.get("job"), str) and run["job"].startswith("s"), short(run))
+    rec.equal("manual-script-side-effect", sim.get("/api/files/read?path=/scheduled.txt")["text"], "42")
+    http_case(rec, sim, "manual-job-has-no-poll-route", "GET", "/api/script/" + run["job"], status=404)
+    rec.note("Contract gap: /api/sched/run advertises a script result but returns only {id, job, kind, source}; job has no poll route. Execution is verified by the script's file effect, not invented job state.")
     rec.equal("manual-run-keeps-clock", sim.get("/api/sched")["tasks"][0]["last_run_ms"], clock)
     for case, body in [("unknown-kind", {"kind": "unknown", "op": "add"}),
                        ("no-task-action", {"kind": "task", "op": "add", "task": {"every_s": 1}}),
@@ -1073,7 +1142,7 @@ def sched(rec, sim, fake):
     ran = sim.get("/api/sched")["tasks"][0]["last_run_ms"]
     rec.check("real-tick-advances-clock-after-interval", ran >= born + 1000, str((born, ran)))
     sim.post("/api/sched", {"kind": "task", "op": "delete", "id": timed["id"]})
-    # /api/sched advertises replacement, but the implementation currently only accepts kind/op.
+    # Replacement and individual kind/op mutations are both supported.
     rec.equal("advertised-schedule-replacement", sim.request("POST", "/api/sched", {"tasks": [], "rules": []}).status, 200)
     one = success(rec, sim, "schedule-tool-add-one", "schedule", {"action": "add", "prompt": "one", "every_s": 86400})
     two = success(rec, sim, "schedule-tool-add-two", "schedule", {"action": "add", "prompt": "two", "every_s": 86400})
@@ -1273,6 +1342,7 @@ def agent(rec, sim, fake):
 
 
 def transport(rec, sim, fake):
+    sim.post("/api/config", {"board": "esp32s3-xiaozhi-bread"})
     key = secrets.token_hex(16)  # ephemeral dummy, never a provider key
     catalog_specs = sim.rpc("tools/list").json()["result"]["tools"]
     catalog_names = sorted(t["name"] for t in catalog_specs)
@@ -1320,8 +1390,7 @@ def transport(rec, sim, fake):
         for spec in catalog_specs:
             rec.check(protocol + ".catalog-fixture:" + spec["name"], spec["name"] in safe
                       or spec["inputSchema"].get("required", []) == [], spec["name"])
-        order = [n for n in ["write", "read", "edit"] if n in catalog_names]
-        order += [n for n in catalog_names if n not in {"write", "read", "edit"}]
+        order = fixture_order(catalog_names)
         calls = [(protocol + "-catalog-" + name, name, safe.get(name, {})) for name in order]
         final = protocol + " catalog complete"
         url = fake.fixture(catalog_path, [model_reply(protocol, text="", calls=calls),
