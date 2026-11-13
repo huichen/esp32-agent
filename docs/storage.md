@@ -217,8 +217,11 @@ board heap measurements remain unverified.
   storage. Checksums detect torn multi-key writes; they do not preserve the preceding blob.
 - ZIP reading permits stored/deflated, non-encrypted, single-disk ZIP32 entries. Payloads
   total at most **3,072 bytes**, with at most **128 entries** and **3,072 bytes of names**.
-  Directory/local-header bounds, relative names, declared output lengths and CRCs are checked.
-  ZIP64 and non-UTF-8 names are not supported.
+  The stored-entry writer checks the same admission budgets before CRCs or output copies
+  and borrows central-directory names. The shell's smaller **1,400-byte archive** cap
+  (before base64) is checked against ZIP overhead before cloning workspace text; it is independent
+  of the 64 KiB tool-result ceiling. Directory/local-header bounds, relative names,
+  declared output lengths and CRCs are checked. ZIP64 and non-UTF-8 names are not supported.
 - Raw inflate has a **1 MiB** default output cap; ZIP passes its smaller remaining budget.
   Literal, match and stored-block paths check space **before** appending. Oversubscribed
   Huffman tables and overflowing code-length repeats are refused.

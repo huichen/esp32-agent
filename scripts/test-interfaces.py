@@ -22,6 +22,7 @@ import fnmatch
 import hashlib
 import http.client
 import http.server
+import io
 import json
 import math
 import os
@@ -37,6 +38,7 @@ import threading
 import time
 import traceback
 import urllib.parse
+import zipfile
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -871,6 +873,11 @@ def files(rec, sim, fake):
     refusal(rec, sim, "file-past-byte-ceiling", "write", {"path": "/over.txt", "text": large + "x"})
     rec.equal("oversized-write-left-no-file", sim.get("/api/files/read?path=/over.txt")["ok"], False)
     rec.equal("file-ceiling-exact", sim.get("/api/files/read?path=/ceiling.txt")["size_bytes"], cap)
+    packed = success(rec, sim, "ZIP32-inline", "shell", {"command": "zip notes.zip /audit/notes.txt"})
+    with zipfile.ZipFile(io.BytesIO(base64.b64decode(packed["archive_b64"], validate=True))) as archive:
+        rec.equal("ZIP32-filenames", archive.namelist(), ["audit/notes.txt"])
+        rec.equal("ZIP32-independent-reader", archive.read("audit/notes.txt").decode("utf-8"), text)
+    refusal(rec, sim, "ZIP-inline-budget-not-global-result-cap", "shell", {"command": "zip over.zip /ceiling.txt"}, contains="inline archive limit is 1400 bytes before base64")
     sim.restart()
     rec.equal("persisted-UTF8-edit", sim.get("/api/files/read?" + query)["text"], text)
     rec.equal("persisted-large-file", sim.get("/api/files/read?path=/ceiling.txt")["text"], large)

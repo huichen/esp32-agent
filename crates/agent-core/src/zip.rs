@@ -2,16 +2,16 @@
 //!
 //! `read` handles what other tools produce — stored **and** deflated entries — because an
 //! archive that cannot be opened is not an archive. `write` produces *stored* entries: a
-//! correct ZIP that any unzip accepts, without a compressor (the workspace is 8 kB of text,
-//! so the few bytes a deflate would save are not worth the match finder).
+//! correct ZIP that any unzip accepts, without a compressor. The archive tools retain
+//! their own compact budgets; these are not the workspace's RAM/storage limits.
 
 use crate::zlib;
 
 const LOCAL_HEADER: u32 = 0x0403_4b50;
 const CENTRAL_HEADER: u32 = 0x0201_4b50;
 const END_OF_CENTRAL: u32 = 0x0605_4b50;
-/// Refuse anything that would not fit through a 2 KB tool result anyway, with room for
-/// the base64 wrapper.
+/// Compact archive payload/name budgets, independent of the 64 KiB tool-result ceiling.
+/// Writers check these before constructing the archive; readers before extraction.
 const MAX_TOTAL: usize = 3 * 1024;
 /// Empty entries and long names consume memory too, independently of payload size.
 const MAX_ENTRIES: usize = 128;
@@ -34,15 +34,35 @@ fn u32_at(data: &[u8], at: usize) -> Option<u32> {
 
 /// Build a ZIP from `(name, bytes)` pairs, stored.
 pub fn write(entries: &[(String, Vec<u8>)]) -> Result<Vec<u8>, String> {
-    let mut out = Vec::with_capacity(4096);
-    let mut central: Vec<(String, u32, u32, u32)> = Vec::new(); // name, crc, size, offset
+    if entries.len() > MAX_ENTRIES {
+        return Err(format!("zip: more than {MAX_ENTRIES} entries"));
+    }
+    let mut total = 0usize;
+    let mut names_total = 0usize;
     for (name, bytes) in entries {
+        if name.len() > u16::MAX as usize {
+            return Err("zip: name exceeds the ZIP32 format".into());
+        }
         if !valid_name(name) {
             return Err(format!("`{name}` is not a relative path inside the archive"));
         }
-        if name.len() > u16::MAX as usize || entries.len() > u16::MAX as usize {
-            return Err("zip: name or entry count exceeds the ZIP32 format".into());
+        total = total.saturating_add(bytes.len());
+        names_total = names_total.saturating_add(name.len());
+        if total > MAX_TOTAL {
+            return Err(format!("zip: more than {MAX_TOTAL} payload bytes"));
         }
+        if names_total > MAX_TOTAL {
+            return Err(format!("zip: more than {MAX_TOTAL} name bytes"));
+        }
+    }
+    // ZIP32 stored entries have 30 local + 46 central bytes and two copies of each
+    // name; all arithmetic is bounded by admission above, before CRCs or payload copies.
+    let encoded_bytes = 22 + 76 * entries.len() + 2 * names_total + total;
+    let mut out = Vec::new();
+    out.try_reserve_exact(encoded_bytes).map_err(|_| "zip: cannot reserve the archive buffer")?;
+    let mut central: Vec<(&str, u32, u32, u32)> = Vec::new(); // borrowed name, crc, size, offset
+    central.try_reserve_exact(entries.len()).map_err(|_| "zip: cannot reserve directory metadata")?;
+    for (name, bytes) in entries {
         let offset = u32::try_from(out.len()).map_err(|_| "zip: archive exceeds ZIP32")?;
         let crc = zlib::crc32(bytes);
         let size = u32::try_from(bytes.len()).map_err(|_| "zip: entry exceeds ZIP32")?;
@@ -59,7 +79,7 @@ pub fn write(entries: &[(String, Vec<u8>)]) -> Result<Vec<u8>, String> {
         out.extend_from_slice(&0u16.to_le_bytes()); // extra
         out.extend_from_slice(name.as_bytes());
         out.extend_from_slice(bytes);
-        central.push((name.clone(), crc, size, offset));
+        central.push((name.as_str(), crc, size, offset));
     }
     let central_start = u32::try_from(out.len()).map_err(|_| "zip: archive exceeds ZIP32")?;
     for (name, crc, size, offset) in &central {
@@ -295,12 +315,13 @@ mod tests {
         assert!(err.contains("bad local header"), "{err}");
     }
 
-    /// The reader refuses an archive whose entries would not fit through a tool result
-    /// anyway: unpacking 10 kB to then throw it away is not worth the heap.
+    /// Declared and actual output lengths both respect the independent extraction budget.
     #[test]
-    fn an_archive_larger_than_the_tool_result_budget_is_refused() {
-        let entries = vec![("big.bin".to_string(), vec![0u8; MAX_TOTAL + 1])];
-        let archive = write(&entries).expect("writes");
+    fn an_archive_larger_than_the_extraction_budget_is_refused() {
+        let entries = vec![("big.bin".to_string(), vec![0u8; MAX_TOTAL])];
+        let mut archive = write(&entries).expect("writes at the payload boundary");
+        let central = archive.windows(4).position(|w| w == CENTRAL_HEADER.to_le_bytes()).unwrap();
+        archive[central + 24..central + 28].copy_from_slice(&((MAX_TOTAL + 1) as u32).to_le_bytes());
         let err = read(&archive).err().expect("too much to unpack");
         assert!(err.contains("more than"), "{err}");
 
@@ -316,13 +337,38 @@ mod tests {
         raw.extend_from_slice(&len.to_le_bytes());
         raw.extend_from_slice(&(!len).to_le_bytes());
         raw.extend_from_slice(&vec![b'x'; len as usize]);
-        let mut bomb = write(&[("a.txt".to_string(), raw)]).unwrap();
-        let central = bomb.windows(4).position(|w| w == CENTRAL_HEADER.to_le_bytes()).unwrap();
+        // Build the malicious wire fixture from an empty, valid archive: the bounded
+        // writer itself must no longer encode an oversized input on behalf of this test.
+        let mut bomb = write(&[("a.txt".to_string(), Vec::new())]).unwrap();
+        let payload_at = 30 + "a.txt".len();
+        let raw_len = raw.len();
+        bomb.splice(payload_at..payload_at, raw);
+        let central = payload_at + raw_len;
+        let eocd = bomb.len() - 22;
         bomb[8..10].copy_from_slice(&8u16.to_le_bytes());
+        bomb[18..22].copy_from_slice(&(raw_len as u32).to_le_bytes());
+        bomb[22..26].copy_from_slice(&1u32.to_le_bytes());
         bomb[central + 10..central + 12].copy_from_slice(&8u16.to_le_bytes());
+        bomb[central + 20..central + 24].copy_from_slice(&(raw_len as u32).to_le_bytes());
         bomb[central + 24..central + 28].copy_from_slice(&1u32.to_le_bytes());
+        bomb[eocd + 16..eocd + 20].copy_from_slice(&(central as u32).to_le_bytes());
         let err = read(&bomb).err().expect("deflate expansion is bounded even with a lying header");
         assert!(err.contains("output larger than 3072"), "{err}");
+    }
+
+    #[test]
+    fn writer_admission_bounds_payload_names_and_empty_entries() {
+        let payload = vec![("big.bin".to_string(), vec![0; MAX_TOTAL + 1])];
+        let err = write(&payload).expect_err("refuse before encoding the oversized payload");
+        assert!(err.contains("more than"), "{err}");
+        let names = vec![("n".repeat(MAX_TOTAL + 1), Vec::new())];
+        let err = write(&names).expect_err("empty files still spend the name budget");
+        assert!(err.contains("name"), "{err}");
+        let entries: Vec<_> = (0..=MAX_ENTRIES).map(|i| (format!("{i}.txt"), Vec::new())).collect();
+        let err = write(&entries).expect_err("empty files still spend metadata slots");
+        assert!(err.contains("entries"), "{err}");
+        let boundary = vec![("ok.bin".to_string(), vec![0; MAX_TOTAL])];
+        assert_eq!(read(&write(&boundary).unwrap()).unwrap(), boundary);
     }
 
     /// A path that is absolute, empty or climbs out of the archive is not a name inside it,
