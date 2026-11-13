@@ -62,6 +62,14 @@ with no body. Batch arrays are handled as JSON-RPC batches.
 
 `GET /mcp` → `405` (use POST); `DELETE /mcp` → end that session.
 
+HTTP framing is checked before dispatch: duplicate length/transfer headers, both
+`Content-Length` and `Transfer-Encoding`, invalid lengths, unsupported transfer encodings,
+and incomplete headers are refused. Chunked bodies require valid hexadecimal sizes, each
+chunk's CRLF, and the final blank line; trailers share the 8 KB header budget. A malformed
+or interrupted upload is not a completed recording or playback. Buffered bodies are at
+most 1 MB, held once rather than copied through another full-size receive buffer; `/audio/pcm`
+and `/av` stream through a small receive buffer and apply their own media limits.
+
 CORS is on by default (`mcp.cors`), so a browser MCP client can connect directly.
 
 ## 2. Web and configuration REST
