@@ -1855,7 +1855,7 @@ impl App {
         }
         value["saved"] = json!(false);
         value["queued"] = json!(true);
-        value["persistence_note"] = json!("applied in RAM; queue admission is not storage acknowledgement. This call did not wait for publication; check the store object in GET /api/status for outcomes");
+        value["persistence_note"] = json!("applied in RAM; queue admission is not storage acknowledgement. This call did not wait for publication: `board status` reports the store's `pending`, `failed` and `last_failure`");
         value
     }
 
@@ -1904,6 +1904,13 @@ impl App {
         };
         let elapsed = started.elapsed().as_millis() as u64;
         let result = self.note_tool_overrun(name, result, budget, elapsed);
+        // Counted here, not inside the dispatch: a call that takes a fast path (a file, the
+        // shell, a script, a clip) returns before `call_tool_inner`'s tail, so every one of
+        // those eleven tools was invisible in `counters` and `per_tool` — a board that had
+        // served 100 calls reported 70, and the missing ones were exactly the tools a caller
+        // watches. An overrun counts as a failure, because that is what the caller got.
+        self.runtime.record_tool_call(name, result.is_ok());
+        self.settle();
         // The outer deadline comes back whatever the result was, or a refused call would
         // leave the next one with a budget that has already been spent.
         self.tool_deadline = outer;
@@ -2158,9 +2165,35 @@ impl App {
             };
             (def.handler)(&mut ctx, args)
         };
-        self.runtime.record_tool_call(name, out.is_ok());
-        self.settle();
         out
+    }
+
+    /// Take the store's own counters, without the backend lock.
+    ///
+    /// `pending`, `written`, `failed` and `last_failure` are the queue's own state; `space`
+    /// is left out on purpose, because that one is sampled on the writer's thread
+    /// ([`StoreSpaceSample`]) to keep the lock order one-way (store, then App).
+    fn sample_store(&mut self) {
+        let queue = &self.store_queue;
+        let pending = queue.pending();
+        let written = queue.written();
+        let failed = queue.failed();
+        let last_failure = match queue.last_failure() {
+            Some(refusal) => json!({
+                "key": refusal.key,
+                "op": refusal.op.as_str(),
+                "err": refusal.code,
+                "err_name": refusal.name,
+                "at_ms": refusal.at_ms,
+            }),
+            None => Value::Null,
+        };
+        self.runtime.store_stats = json!({
+            "pending": pending,
+            "written": written,
+            "failed": failed,
+            "last_failure": last_failure,
+        });
     }
 
     /// Queue the config for the store writer.
@@ -2197,6 +2230,11 @@ impl App {
     /// Work owed after a call or a request: persist, rebuild, notice a restart.
     pub fn settle(&mut self) {
         self.invalidate_tool_specs();
+        // A tool that writes (a file, the config, the schedule) answers "queued" and leaves the
+        // outcome to the store writer. Nothing else samples it for the tools, so the reading is
+        // taken here, on the only thread that owns both — `board status` then has an answer to
+        // "did the change reach flash?" that an MCP caller can actually see.
+        self.sample_store();
         let manifest_changed = self.runtime.manifest_dirty;
         if manifest_changed {
             self.runtime.manifest_dirty = false;
@@ -14670,6 +14708,62 @@ mod tests {
     /// Every thread in `/api/status` carries the stack it has left at its deepest point —
     /// the reading that decides whether a stack constant can come down. Without it the
     /// answer is "guess and watch for a reboot".
+    /// Counting has to cover every tool, not only the ones that reach the registry.
+    ///
+    /// `call_tool_inner` returns early for the file, shell, script and clip tools, so those
+    /// eleven returned before the counter was incremented: a board that had served about a
+    /// hundred calls reported 70, and the names missing from `per_tool` were exactly the ones
+    /// an operator watches.
+    #[test]
+    fn every_tool_call_reaches_the_counters() {
+        let mut app = test_app();
+        let calls: [(&str, Value); 5] = [
+            ("write", json!({"path": "/counted.txt", "text": "one"})),
+            ("read", json!({"path": "/counted.txt"})),
+            ("edit", json!({"path": "/counted.txt", "find": "one", "replace": "two"})),
+            ("shell", json!({"command": "echo counted"})),
+            ("script", json!({"source": "1 + 1"})),
+        ];
+        let before = app.runtime.counters_json();
+        for (name, args) in &calls {
+            app.call_tool(name, args).unwrap_or_else(|e| panic!("{name}: {e:?}"));
+        }
+        let after = app.runtime.counters_json();
+        for (name, _) in &calls {
+            assert!(
+                after["per_tool"][name].as_u64().unwrap_or(0)
+                    > before["per_tool"][name].as_u64().unwrap_or(0),
+                "`{name}` was served but is missing from the counters: {}",
+                after["per_tool"]
+            );
+        }
+        assert_eq!(
+            after["tool_calls"].as_u64().unwrap() - before["tool_calls"].as_u64().unwrap(),
+            calls.len() as u64,
+            "the aggregate disagrees with `per_tool`: {after}"
+        );
+    }
+
+    /// The one reading a writing tool leaves open: did the queued change reach flash?
+    ///
+    /// `write` and `edit` answer `saved: false` and point at the store's own counters. Those
+    /// lived on `/api/status` only, which is a portal route — an agent driving the board
+    /// through MCP was told to check something it had no way to read.
+    #[test]
+    fn board_status_reports_what_the_store_owes() {
+        let mut app = test_app();
+        app.call_tool("write", &json!({"path": "/saved.txt", "text": "x"})).unwrap();
+        let status = app.call_tool("board", &json!({"command": "status"})).unwrap();
+        let store = &status["store"];
+        assert!(store["pending"].is_number(), "board_status has no store reading: {status}");
+        assert!(store["failed"].is_number(), "{status}");
+        assert!(store["written"].is_number(), "{status}");
+        assert!(
+            store["pending"].as_u64().unwrap() >= 1,
+            "a write that was only queued has to show as owed work: {store}"
+        );
+    }
+
     #[test]
     fn status_reports_each_threads_stack_headroom() {
         let mut app = test_app();
