@@ -36,7 +36,10 @@
 </form>
 
 <div id="toast" class="toast" role="status" aria-live="polite" aria-atomic="true"></div>
-<div id="pull-hint" role="status" aria-live="polite">Pull down to refresh</div>
+<div id="pull-hint" role="status" aria-live="polite">
+  <span class="spinner" aria-hidden="true"></span>
+  <span id="pull-label">Pull down to refresh</span>
+</div>
 
 <!-- One dialog for every "are you sure": the browser's own confirm() renders its
      buttons in the device's language and cannot be styled, which made an English page
