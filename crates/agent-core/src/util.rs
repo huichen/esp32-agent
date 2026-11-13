@@ -67,7 +67,8 @@ pub fn b64_decode_limit(s: &str, out: &mut Vec<u8>, max_bytes: usize) -> Result<
     if bytes > max_bytes {
         return Err(McpError::invalid_params(format!(
             "base64: decoded length is {bytes} bytes; the limit is {max_bytes}"
-        )));
+        ))
+        .with_data(serde_json::json!({"decoded_bytes": bytes, "limit_bytes": max_bytes})));
     }
     out.try_reserve_exact(bytes)
         .map_err(|_| McpError::invalid_params("base64: output allocation was refused"))?;

@@ -294,6 +294,9 @@ pub struct App {
     /// Files attached to the most recent message. Replaced, never accumulated: an
     /// attachment belongs to one turn, and the heap is the scarcest thing here.
     pub attachments: Vec<crate::agent::Attachment>,
+    /// The running turn's image inputs. A newer queued message may replace the
+    /// download list while the current model call is in flight.
+    active_attachments: Option<Vec<crate::agent::Attachment>>,
     /// The board's own certificate, when it serves https on a second port. The
     /// fingerprint is what a person compares against the browser's warning page —
     /// it is the only proof that this board, and not something on the path, answered.
@@ -473,6 +476,7 @@ impl App {
             firmware,
             lan_url: String::new(),
             attachments: Vec::new(),
+            active_attachments: None,
             tls: TlsInfo::default(),
             agent: Agent::new(),
             llm: LlmConfig::default(),
@@ -1006,10 +1010,15 @@ impl App {
             return Some("switched off in `mcp.disabled_tools`".to_string());
         }
         match name {
-            // A camera is a driver and a DVP bus. Without them `image_read` can only answer
-            // "a camera is not available on this board", so it is not a tool the model can
-            // use - it is a tool that teaches the model to waste a turn.
-            "image_read" if !self.caps.contains("camera") => Some("no camera on this board".to_string()),
+            "image_read" if !self.llm.vision => {
+                Some("vision is disabled for the configured model".to_string())
+            }
+            "image_read"
+                if !self.caps.contains("camera")
+                    && !self.tool_attachments().iter().any(|a| a.mime.starts_with("image/")) =>
+            {
+                Some("no camera or image attachment on this board".to_string())
+            }
             _ => None,
         }
     }
@@ -1608,35 +1617,50 @@ impl App {
         }
     }
 
+    fn tool_attachments(&self) -> &[crate::agent::Attachment] {
+        self.active_attachments.as_deref().unwrap_or(&self.attachments)
+    }
+
     /// Ask the configured model about an attached image.
     ///
-    /// This is a **second** model call, made inside a tool: the board has no OCR engine and
-    /// no image pipeline, so the only reader it has is the model the user configured. That
-    /// costs a round trip and tokens, which is why the tool description says so.
-    ///
-    /// It always uses the chat-completions shape: image parts are OpenAI's
-    /// `image_url` blocks there, Anthropic's `image` blocks in the Messages API, and the
-    /// Responses API wants input items — three shapes for one question, and this tool
-    /// answers only the shape it can be sure of.
+    /// This is a **second** model call, made inside a tool, with the configured
+    /// Chat, Responses or Anthropic adapter. It costs a round trip and tokens;
+    /// an uploaded image needs neither a camera driver nor an on-board OCR engine.
     fn image_read(&mut self, args: &Value) -> Result<Value> {
         let prompt = args
             .get("prompt")
             .and_then(|v| v.as_str())
-            .unwrap_or("Transcribe every piece of text in this image exactly, then describe what it shows.")
-            .to_string();
+            .unwrap_or("Transcribe every piece of text in this image exactly, then describe what it shows.");
         let wanted = args.get("name").and_then(|v| v.as_str()).unwrap_or("");
 
-        let attachment = match self.attachments.iter().find(|a| wanted.is_empty() || a.name == wanted) {
+        if prompt.len() > AGENT_TEXT_MAX {
+            return Err(McpError::invalid_params(format!("image prompt exceeds {AGENT_TEXT_MAX} bytes")));
+        }
+        if !self.llm.vision {
+            return Err(McpError::unsupported("the configured model has vision disabled"));
+        }
+        let images = self.tool_attachments();
+        let attachment = match images
+            .iter()
+            .find(|a| a.mime.starts_with("image/") && (wanted.is_empty() || a.name == wanted))
+        {
             Some(a) => a.clone(),
             None => {
-                return Err(McpError::invalid_params(if self.attachments.is_empty() {
-                    "no image attached to the last message; attach one in the portal first".to_string()
-                } else {
-                    format!(
-                        "no attachment named `{wanted}`; the last message carried: {}",
-                        self.attachments.iter().map(|a| a.name.clone()).collect::<Vec<_>>().join(", ")
-                    )
-                }))
+                return Err(McpError::invalid_params(
+                    if !images.iter().any(|a| a.mime.starts_with("image/")) {
+                        "no image attached to the last message; attach one in the portal first".to_string()
+                    } else {
+                        format!(
+                            "no attachment named `{wanted}`; the last message carried: {}",
+                            images
+                                .iter()
+                                .filter(|a| a.mime.starts_with("image/"))
+                                .map(|a| a.name.clone())
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        )
+                    },
+                ))
             }
         };
         if self.llm.base_url.trim().is_empty() || self.llm.model.trim().is_empty() {
@@ -1648,9 +1672,7 @@ impl App {
             return Err(McpError::unsupported("no HTTP transport attached"));
         };
 
-        let mut cfg = self.llm.clone();
-        cfg.protocol = "chat".into();
-        cfg.vision = true;
+        let cfg = self.llm.clone();
         let messages = json!([{
             "role": "user",
             "content": [
@@ -2447,6 +2469,7 @@ impl App {
     pub fn agent_begin(&mut self) -> Option<AgentStep> {
         // Nothing queued is not an error, it is "no work": an idle tick calls this.
         let source = self.agent.pending.as_ref().map(|pending| pending.source.clone())?;
+        self.active_attachments = self.agent.pending.as_ref().map(|pending| pending.attachments.clone());
         let max_steps = self.llm.max_steps;
         let (context_tokens, max_output_tokens) = (self.llm.context_tokens, self.llm.max_output_tokens);
         // Before the run, not after: the marker is what tells the next boot that this turn
@@ -2468,6 +2491,7 @@ impl App {
     pub fn agent_reply(&mut self, reply: std::result::Result<llm::ModelReply, String>) -> AgentStep {
         let step = self.with_agent(move |agent, host| agent.apply(host, reply, now_ms));
         if matches!(&step, AgentStep::Done(_)) {
+            self.active_attachments = None;
             // The turn is over, so a reboot from here must not ask it again. Clearing the
             // marker before the final save means the worst case is a lost reply, never a
             // reply the board repeats.
@@ -2779,52 +2803,83 @@ impl App {
         };
         let mut text = body.get("text").and_then(|t| t.as_str()).unwrap_or("").to_string();
 
-        // Attachments: a name, a mime type and base64 bytes. The board cannot show an
-        // image and the model here is text-only, so what the model gets is a line naming
-        // the file; the bytes are served back at `/api/attachment/<name>` for whoever can
-        // use them. Refusing quietly would be worse than this: the user would attach a
-        // screenshot and never learn it went nowhere.
+        // Admit the whole candidate before replacing the download list or queued
+        // message. Otherwise a rejected second attachment loses the previous image.
+        let mut attachments: Vec<crate::agent::Attachment> = Vec::new();
         let mut notes: Vec<String> = Vec::new();
-        if let Some(list) = body.get("attachments").and_then(|v| v.as_array()) {
+        if let Some(given) = body.get("attachments") {
+            let Some(list) = given.as_array() else {
+                return Response::error_json(400, "`attachments` must be an array");
+            };
             if list.len() > MAX_ATTACHMENTS {
                 return Response::json_status(
                     413,
                     &json!({ "error": format!("{} attachments; the limit is {MAX_ATTACHMENTS}", list.len()) }),
                 );
             }
-            self.attachments.clear();
             for item in list {
-                let name = item.get("name").and_then(|v| v.as_str()).unwrap_or("attachment").to_string();
-                let mime = item
-                    .get("mime")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("application/octet-stream")
-                    .to_string();
-                let mut bytes = Vec::new();
-                let encoded = item.get("data_b64").and_then(|v| v.as_str()).unwrap_or("");
-                if let Err(e) = crate::util::b64_decode(encoded, &mut bytes) {
-                    return Response::json_status(
+                if !item.is_object() {
+                    return Response::error_json(400, "each attachment must be an object");
+                }
+                for field in ["name", "mime", "data_b64"] {
+                    if item.get(field).is_some_and(|v| !v.is_string()) {
+                        return Response::error_json(400, &format!("attachment `{field}` must be a string"));
+                    }
+                }
+                let name = item.get("name").and_then(Value::as_str).unwrap_or("attachment");
+                if name.is_empty() || name.len() > 128 || name.chars().any(char::is_control) {
+                    return Response::error_json(
                         400,
-                        &json!({ "error": format!("`{name}`: base64: {}", e.message) }),
+                        "attachment name must be 1..=128 bytes without control characters",
                     );
                 }
-                if bytes.len() > MAX_ATTACHMENT_BYTES {
-                    return Response::json_status(
-                        413,
-                        &json!({
-                            "error": format!(
-                                "`{name}` is {} bytes; an attachment is limited to {MAX_ATTACHMENT_BYTES}",
-                                bytes.len()
-                            )
-                        }),
+                if attachments.iter().any(|a| a.name == name) {
+                    return Response::error_json(400, "attachment names must be unique");
+                }
+                let mime = item.get("mime").and_then(Value::as_str).unwrap_or("application/octet-stream");
+                let token = |part: &str| {
+                    !part.is_empty()
+                        && part.bytes().all(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b))
+                };
+                if mime.len() > 128
+                    || !mime.split_once('/').is_some_and(|(kind, subtype)| token(kind) && token(subtype))
+                {
+                    return Response::error_json(
+                        400,
+                        "attachment mime must be a bare type/subtype of at most 128 bytes",
                     );
+                }
+                let mut bytes = Vec::new();
+                let encoded = item.get("data_b64").and_then(Value::as_str).unwrap_or("");
+                if let Err(e) = crate::util::b64_decode_limit(encoded, &mut bytes, MAX_ATTACHMENT_BYTES) {
+                    let status = if e.data.as_ref().is_some_and(|data| data.get("decoded_bytes").is_some()) {
+                        413
+                    } else {
+                        400
+                    };
+                    return Response::json_status(
+                        status,
+                        &json!({ "error": format!("`{name}`: {}", e.message) }),
+                    );
+                }
+                let mut path = String::new();
+                for byte in name.bytes() {
+                    if byte.is_ascii_alphanumeric() || b"-._~".contains(&byte) {
+                        path.push(byte as char);
+                    } else {
+                        use std::fmt::Write as _;
+                        let _ = write!(path, "%{byte:02X}");
+                    }
                 }
                 notes.push(format!(
-                    "[attached: {name}, {mime}, {} kB — fetch with GET /api/attachment/{name}]",
+                    "[attached: {name}, {mime}, {} kB — fetch with GET /api/attachment/{path}]",
                     bytes.len().div_ceil(1024)
                 ));
-                let data_b64 = crate::util::b64_encode(&bytes);
-                self.attachments.push(crate::agent::Attachment { name, mime, data_b64 });
+                attachments.push(crate::agent::Attachment {
+                    name: name.to_string(),
+                    mime: mime.to_ascii_lowercase(),
+                    data_b64: crate::util::b64_encode(&bytes),
+                });
             }
             if !notes.is_empty() {
                 text.push_str("\n\n");
@@ -2840,18 +2895,16 @@ impl App {
                 &json!({ "error": format!("`text` is {} bytes; the limit is {AGENT_TEXT_MAX}", text.len()) }),
             );
         }
-        // Kept twice on purpose: the app serves the bytes back, the message sends them.
-        // Vecs over 512 bytes live in PSRAM and an attachment is capped at 24 kB.
-        let attachments = self.attachments.clone();
         self.agent.vision = self.llm.vision;
         if !self.agent.push_user(&text, "http", now_ms()) {
             return Response::json_status(400, &json!({ "error": "`text` is required" }));
         }
-        // Attachments belong to the message, not to the app: the request that carries
-        // them and the transcript that reports them must not be able to disagree.
+        // A text-only message intentionally replaces the list with an empty one.
+        // The running turn keeps its own snapshot if another message is queued.
         if let Some(message) = self.agent.pending.as_mut() {
-            message.attachments = attachments;
+            message.attachments = attachments.clone();
         }
+        self.attachments = attachments;
         // The index this message will occupy once the run appends it: the queue is
         // depth 1, so a second trigger coalesces into the same slot.
         let seq = self.agent.history.len() + usize::from(self.agent.pending.is_some());
@@ -3282,6 +3335,7 @@ impl App {
             return Ok(String::new());
         }
         let cfg = self.llm.clone();
+        self.active_attachments = self.agent.pending.as_ref().map(|pending| pending.attachments.clone());
         // The source of the queued message, which the journal and the transcript record.
         let source = self.agent.pending.as_ref().map(|p| p.source.clone()).unwrap_or_default();
         // This runner takes the whole turn in one call (`run_pending`), so its transcript
@@ -3305,6 +3359,7 @@ impl App {
         };
         self.model_transport = transport;
         self.agent = agent;
+        self.active_attachments = None;
         // Only a turn that actually ran ends here: a missing transport leaves the
         // message queued for a later attempt and keeps the run-in-flight marker, so the
         // next boot resumes it instead of forgetting it.
@@ -3754,6 +3809,8 @@ impl App {
                     return r;
                 }
                 let (removed, kept) = self.agent.forget(0);
+                self.attachments.clear();
+                self.active_attachments = None;
                 self.persist_transcript();
                 self.log.info("agent", "transcript cleared from the portal");
                 Response::json(&json!({ "reset": true, "removed": removed, "kept": kept }))
@@ -3767,6 +3824,10 @@ impl App {
                 let body: Value = serde_json::from_str(&req.body_str()).unwrap_or(Value::Null);
                 let keep = body.get("keep").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
                 let (removed, kept) = self.agent.forget(keep);
+                if keep == 0 {
+                    self.attachments.clear();
+                    self.active_attachments = None;
+                }
                 // Forgetting has to reach flash, or the conversation comes back after a
                 // reboot - the one outcome nobody asking for `forget` would accept.
                 self.persist_transcript();
@@ -4395,6 +4456,8 @@ impl App {
         let mut h = std::collections::hash_map::DefaultHasher::new();
         self.cfg.mcp.profile.hash(&mut h);
         self.cfg.mcp.tools_mode.hash(&mut h);
+        self.llm.vision.hash(&mut h);
+        self.tool_attachments().iter().any(|a| a.mime.starts_with("image/")).hash(&mut h);
         for name in &self.cfg.mcp.disabled_tools {
             name.hash(&mut h);
         }
@@ -9172,7 +9235,7 @@ mod tests {
     /// assertion fail, and so does putting a deprecated alias back in backticks.
     #[test]
     fn the_prompt_names_only_tools_the_model_is_offered() {
-        let mut app = test_app();
+        let app = test_app();
         let prompt = app.agent.prompt_text(&app).clone();
         let offered: Vec<String> = ToolHost::tool_specs(&app)
             .as_array()
@@ -12267,9 +12330,120 @@ mod tests {
     }
 
     /// A device the board does not have is not a tool, and the sentence explains it.
-    ///
-    /// `image_read` is the live case: a camera is a driver on a DVP bus, and a board with
-    /// neither can only answer "a camera is not available on this board".
+    /// Attachments are replaced only after all metadata, encodings and message limits pass.
+    #[test]
+    fn attachments_are_admitted_atomically_and_belong_to_one_message() {
+        let image = json!({"name": "old.png", "mime": "image/png", "data_b64": "eA=="});
+        for invalid in [
+            json!({"text": "x".repeat(AGENT_TEXT_MAX + 1), "attachments": [image.clone()]}),
+            json!({"text": "new", "attachments": [{"name": "new.png", "mime": "image/png", "data_b64": "eQ=="}, {"name": "bad", "data_b64": "?"}]}),
+            json!({"text": "new", "attachments": [{"name": "bad", "mime": "image/png\r\nInjected: yes", "data_b64": "eA=="}]}),
+            json!({"text": "new", "attachments": [image.clone(), image.clone()]}),
+            json!({"text": "new", "attachments": "not an array"}),
+            json!({"text": "new", "attachments": [{"name": 42, "data_b64": "eA=="}]}),
+            json!({"text": "new", "attachments": [{"mime": ["image/png"], "data_b64": "eA=="}]}),
+            json!({"text": "new", "attachments": [{"data_b64": false}]}),
+            json!({"text": "new", "attachments": [{"name": "x".repeat(129), "data_b64": "eA=="}]}),
+            json!({"text": "new", "attachments": [{"name": "big", "data_b64": crate::util::b64_encode(&vec![0; MAX_ATTACHMENT_BYTES + 1])}]}),
+        ] {
+            let mut app = test_app();
+            assert_eq!(
+                app.route(&post(
+                    "/api/agent/message",
+                    &json!({"text": "look", "attachments": [image.clone()]}).to_string()
+                ))
+                .status,
+                202
+            );
+            let original = app.agent.pending.as_ref().unwrap().text.clone();
+            let resp = app.route(&post("/api/agent/message", &invalid.to_string()));
+            assert!((400..500).contains(&resp.status), "accepted invalid attachments: {}", body_json(&resp));
+            assert_eq!(app.attachments.len(), 1, "refused input changed the download list");
+            assert_eq!(app.attachments[0].name, "old.png", "refused input replaced the old image");
+            assert_eq!(app.agent.pending.as_ref().unwrap().text, original);
+        }
+        let mut app = test_app();
+        assert_eq!(
+            app.route(&post(
+                "/api/agent/message",
+                &json!({"text": "look", "attachments": [image]}).to_string()
+            ))
+            .status,
+            202
+        );
+        assert_eq!(app.route(&post("/api/agent/message", r#"{"text":"text only"}"#)).status, 202);
+        assert!(app.attachments.is_empty(), "a text-only message retained the previous download");
+        assert!(
+            app.agent.pending.as_ref().unwrap().attachments.is_empty(),
+            "a text-only turn resent an old image"
+        );
+
+        assert_eq!(app.route(&post("/api/agent/message", &json!({"text": "look", "attachments": [{"name": "running.png", "mime": "image/png", "data_b64": "eA=="}]}).to_string())).status, 202);
+        point_at_the_stub(&mut app);
+        assert!(matches!(app.agent_begin(), Some(AgentStep::Ask { .. })));
+        assert_eq!(app.route(&post("/api/agent/message", r#"{"text":"next text-only turn"}"#)).status, 202);
+        assert!(app.attachments.is_empty());
+        app.tool_transport = Some(Box::new(Scripted::new(vec![Scripted::answer("the running image")])));
+        assert_eq!(
+            app.call_tool("image_read", &json!({})).unwrap()["name"],
+            "running.png",
+            "a newer queued message replaced the running turn's image"
+        );
+        assert!(matches!(
+            app.agent_reply(Ok(llm::ModelReply { content: "done".into(), ..Default::default() })),
+            AgentStep::Done(_)
+        ));
+        assert!(app.call_tool("image_read", &json!({})).is_err(), "a finished turn retained an active image");
+        assert_eq!(app.route(&post("/api/agent/reset", "{}")).status, 200);
+        assert!(app.attachments.is_empty());
+    }
+
+    #[test]
+    fn image_read_uses_the_configured_adapter_without_a_camera() {
+        for protocol in ["responses", "anthropic", "chat"] {
+            let mut app = test_app();
+            point_at_the_stub(&mut app);
+            app.llm.protocol = protocol.into();
+            app.attachments = vec![crate::agent::Attachment {
+                name: "photo.png".into(),
+                mime: "image/png".into(),
+                data_b64: "eA==".into(),
+            }];
+            let response = match protocol {
+                "responses" => json!({"output": [{"type": "message", "content": [{"type": "output_text", "text": "a photo"}]}]}).to_string(),
+                "anthropic" => json!({"content": [{"type": "text", "text": "a photo"}]}).to_string(),
+                _ => Scripted::answer("a photo"),
+            };
+            let transport = Scripted::new(vec![response]);
+            let seen = transport.seen.clone();
+            app.tool_transport = Some(Box::new(transport));
+            let answer = app.call_tool("image_read", &json!({"prompt": "describe"})).expect(protocol);
+            assert_eq!(answer["text"], "a photo");
+            let body: Value = serde_json::from_str(&seen.lock().unwrap()[0]).unwrap();
+            match protocol {
+                "responses" => {
+                    assert_eq!(body["input"][0]["content"][1]["type"], "input_image");
+                    assert_eq!(body["input"][0]["content"][1]["image_url"], "data:image/png;base64,eA==");
+                }
+                "anthropic" => assert_eq!(body["messages"][0]["content"][1]["source"]["data"], "eA=="),
+                _ => assert_eq!(
+                    body["messages"][0]["content"][1]["image_url"]["url"],
+                    "data:image/png;base64,eA=="
+                ),
+            }
+            assert!(
+                tool_names(&mut app).contains(&"image_read".into()),
+                "an uploaded image does not require a camera"
+            );
+            app.llm.vision = false;
+            assert!(app.call_tool("image_read", &json!({})).unwrap_err().message.contains("vision"));
+            assert_eq!(seen.lock().unwrap().len(), 1, "disabled vision still contacted the model");
+            app.llm.vision = true;
+            app.attachments[0].mime = "application/pdf".into();
+            assert!(app.call_tool("image_read", &json!({})).is_err(), "a PDF was sent as an image");
+        }
+    }
+
     #[test]
     fn a_tool_with_no_device_behind_it_is_hidden_and_says_why() {
         let mut app = test_app();
