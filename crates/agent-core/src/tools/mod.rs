@@ -64,8 +64,7 @@ pub fn board_tools() -> Vec<ToolDef> {
             let info = ctx.hw.board_info();
             let wifi = ctx.hw.wifi_status();
             let internal = ctx.hw.heap_internal();
-            Ok(json!({
-                "device_name": ctx.cfg.device_name,
+            Ok(json!({                "device_name": ctx.cfg.device_name,
                 "board_profile": ctx.profile.id,
                 "board_name": ctx.profile.name,
                 "soc": info.soc,
@@ -95,6 +94,9 @@ pub fn board_tools() -> Vec<ToolDef> {
                 "capabilities": ctx.caps.to_json(),
                 "session_count": ctx.runtime.sessions.len(),
                 "counters": ctx.runtime.counters_json(),
+                // "Did the write reach flash?" — the one reading a tool that answers "queued"
+                // leaves open. Sampled by `App::settle` after every call.
+                "store": ctx.runtime.store_stats,
             }))
         }),
         ToolDef::new(
