@@ -7,11 +7,30 @@
 index `ws.index` maps each path to a short `ws.<12 hex digits>` key. The workspace
 still occupies RAM; a filesystem partition is not additional application heap.
 
-`QueuedStore::set` acknowledges a **queued request**, not a completed flash write.
+`QueuedStore::set` acknowledges **queue admission**, not a completed flash write.
+Admission is bounded to **2,304 pending keys** and **6 MiB of charged bytes** (value
+and key strings plus a 128-byte bookkeeping charge per operation). The budgets cover
+4 MiB of workspace text, 1,024 files, an escaped filename index, 512 KiB of transcript,
+obsolete-file removals and configuration metadata. They are not a heap-availability
+or backend-capacity guarantee. Budget checks happen before copying a value or
+growing the queue; subsequent large string/vector reservations are fallible.
+A budget/allocation refusal returns `false`, preserves an earlier queued request
+and records `STORE_QUEUE_FULL`/`STORE_QUEUE_ALLOC` in the failure diagnostics.
+
 The writer drains every 100 ms on an internal-RAM stack. Inspect
-`/api/status.store.pending`, `failed` and `last_failure` to distinguish accepted
-requests from durable writes. A streamed write executes synchronously on the
-calling thread and therefore requires an internal-RAM stack too.
+`/api/status.store.pending`, `failed` and `last_failure` to distinguish admitted
+requests from durable writes. Backend refusals are drained once, not automatically
+retried forever. A streamed write executes synchronously on the calling thread and
+therefore requires an internal-RAM stack too. A successful stream supersedes any
+older queued write/removal for that key; a failed stream leaves it intact and is
+counted in the same failure diagnostics.
+
+`get`, `read_at` and streaming readers all see pending writes/removals before the
+backend. Pending range reads copy only the requested bytes, not the entire value.
+Readers distinguish an absent key from an empty value and use the caller's buffer
+(up to 8 KiB per pull), without the former extra 64 KiB buffer. A reader is not a
+snapshot across concurrent mutations. A backend using the default `read_at` may
+still materialize its stored value; the filesystem and in-memory store override it.
 
 The simulator uses one JSON object on disk. It serializes through a buffered writer,
 syncs the temporary file and then renames it. A failed save restores the previous

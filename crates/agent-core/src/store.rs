@@ -56,6 +56,18 @@ pub const ERR_KEY_TOO_LONG_NAME: &str = "ESP_ERR_NVS_KEY_TOO_LONG";
 /// count of the rest is kept in [`StoreQueue::refused_other`].
 pub const REFUSED_KEYS_MAX: usize = 16;
 
+/// Queue admission budgets, including key strings and a per-operation bookkeeping charge.
+/// Two workspaces' worth of names permit replacing 1,024 paths before old values are removed;
+/// the byte budget covers 4 MiB of file text, a 512 KiB transcript and escaped index/metadata.
+/// These are queue ceilings, not promises of available heap or backend capacity.
+pub const PENDING_KEYS_MAX: usize = 2 * crate::app::WORKSPACE_FILES_MAX + 256;
+pub const PENDING_BYTES_MAX: usize = 6 * 1024 * 1024;
+const PENDING_ENTRY_BYTES: usize = 128;
+
+/// Queue-local errors are deliberately negative, not ESP-IDF error numbers.
+pub const ERR_QUEUE_FULL: i32 = -1;
+pub const ERR_QUEUE_ALLOC: i32 = -2;
+
 /// How one blob is spread over values, and how to tell it from one written before it was
 /// chunked.
 #[derive(Debug, Clone, Copy)]
@@ -540,6 +552,30 @@ impl StoreSpace {
 /// One queued operation: `Some` is a write, `None` is a removal.
 type Pending = Vec<(String, Option<String>)>;
 
+fn request_cost(key: &str, value: Option<&str>) -> usize {
+    PENDING_ENTRY_BYTES.saturating_add(key.len()).saturating_add(value.map_or(0, str::len))
+}
+
+fn pending_cost((key, value): &(String, Option<String>)) -> usize {
+    PENDING_ENTRY_BYTES
+        .saturating_add(key.capacity())
+        .saturating_add(value.as_ref().map_or(0, String::capacity))
+}
+
+fn copy_string(text: &str) -> std::result::Result<String, ()> {
+    let mut copy = String::new();
+    copy.try_reserve_exact(text.len()).map_err(|_| ())?;
+    copy.push_str(text);
+    Ok(copy)
+}
+
+fn copy_range(bytes: &[u8], offset: usize, out: &mut [u8]) -> usize {
+    let available = bytes.get(offset..).unwrap_or_default();
+    let count = available.len().min(out.len());
+    out[..count].copy_from_slice(&available[..count]);
+    count
+}
+
 /// What one [`StoreQueue::flush`] did.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct FlushReport {
@@ -599,6 +635,8 @@ struct StoreStats {
     /// Refusals whose key did not fit [`REFUSED_KEYS_MAX`]; counted, not enumerated.
     refused_other: u32,
     space: Option<StoreSpace>,
+    /// The most recent operation's error, separate from the historical last refusal.
+    last_error: Option<StoreError>,
 }
 
 impl StoreStats {
@@ -609,6 +647,7 @@ impl StoreStats {
             refused_keys: BTreeMap::new(),
             refused_other: 0,
             space,
+            last_error: None,
         }
     }
 
@@ -617,8 +656,9 @@ impl StoreStats {
     }
 
     fn note(&mut self, refusal: Refusal) {
+        self.last_error = Some(StoreError { code: refusal.code, name: refusal.name.clone() });
         if let Some(count) = self.refused_keys.get_mut(&refusal.key) {
-            *count += 1;
+            *count = count.saturating_add(1);
         } else if self.refused_keys.len() < REFUSED_KEYS_MAX {
             self.refused_keys.insert(refusal.key.clone(), 1);
         } else {
@@ -656,17 +696,132 @@ impl StoreQueue {
     /// Note a write (`Some`) or a removal (`None`). A key queued twice keeps the
     /// position and value of its latest request. Coalescing still costs one operation,
     /// but a blob header rewritten after a newly added chunk must move behind it.
-    fn enqueue(&self, key: &str, value: Option<String>) -> bool {
+    fn enqueue(&self, key: &str, value: Option<&str>) -> bool {
         let mut pending = match self.pending.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         };
-        let key = match pending.iter().position(|(queued, _)| queued == key) {
-            Some(index) => pending.remove(index).0,
-            None => key.to_string(),
+        let previous = pending.iter().position(|(queued, _)| queued == key);
+        let keys = pending.len() + usize::from(previous.is_none());
+        let before = pending.iter().map(pending_cost).sum::<usize>();
+        let replaced = previous.map_or(0, |index| pending_cost(&pending[index]));
+        let bytes = before.saturating_sub(replaced).saturating_add(request_cost(key, value));
+        if keys > PENDING_KEYS_MAX || bytes > PENDING_BYTES_MAX {
+            self.refuse(
+                key,
+                if value.is_some() { StoreOp::Set } else { StoreOp::Remove },
+                StoreError {
+                    code: ERR_QUEUE_FULL,
+                    name: format!(
+                        "STORE_QUEUE_FULL: request needs {keys} keys / {bytes} charged bytes; limits are {PENDING_KEYS_MAX} / {PENDING_BYTES_MAX}; previous queue unchanged"
+                    ),
+                },
+            );
+            return false;
+        }
+        // No large value copy or vector growth happens until admission has passed. Allocate
+        // fallibly before replacing anything, so even an allocation refusal keeps the old value.
+        let allocated = (|| {
+            let key = copy_string(key)?;
+            let value = value.map(copy_string).transpose()?;
+            if previous.is_none() {
+                pending.try_reserve(1).map_err(|_| ())?;
+            }
+            Ok::<_, ()>((key, value))
+        })();
+        let Ok(entry) = allocated else {
+            self.refuse(
+                key,
+                if value.is_some() { StoreOp::Set } else { StoreOp::Remove },
+                StoreError {
+                    code: ERR_QUEUE_ALLOC,
+                    name: "STORE_QUEUE_ALLOC: previous queue unchanged".into(),
+                },
+            );
+            return false;
         };
-        pending.push((key, value));
+        if let Some(index) = previous {
+            pending.remove(index);
+        }
+        pending.push(entry);
+        self.clear_error();
         true
+    }
+
+    fn clear_error(&self) {
+        match self.stats.lock() {
+            Ok(mut stats) => stats.last_error = None,
+            Err(poisoned) => poisoned.into_inner().last_error = None,
+        }
+    }
+
+    fn refuse(&self, key: &str, op: StoreOp, error: StoreError) {
+        let mut stats = match self.stats.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        // An untrusted, enormous key must not bypass the admission bound via diagnostics.
+        let diagnostic_key: String = key.chars().take(128).collect();
+        let refusal =
+            Refusal { key: diagnostic_key, op, code: error.code, name: error.name, at_ms: stats.now_ms() };
+        self.failed.fetch_add(1, Ordering::Relaxed);
+        stats.note(refusal);
+    }
+
+    /// Copy only the requested range of a pending value. Do not call `get` for each pull:
+    /// that would duplicate a 256 KiB file to answer an 8 KiB read.
+    fn read_at(&self, key: &str, offset: usize, out: &mut [u8]) -> Option<usize> {
+        let pending = match self.pending.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if let Some((_, value)) = pending.iter().rev().find(|(queued, _)| queued == key) {
+            return value.as_ref().map(|text| copy_range(text.as_bytes(), offset, out));
+        }
+        drop(pending);
+        self.with_inner(|inner| inner.read_at(key, offset, out))
+    }
+
+    /// A successful synchronous stream supersedes an older request for this key; a refused
+    /// stream leaves that request alone. Lock in the same order as `flush` for both cases.
+    fn set_stream(
+        &self,
+        key: &str,
+        fill: &mut dyn FnMut(&mut dyn std::io::Write) -> std::io::Result<()>,
+    ) -> bool {
+        let mut pending = match self.pending.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if key.len() > KEY_MAX {
+            self.refuse(
+                key,
+                StoreOp::Set,
+                StoreError { code: ERR_KEY_TOO_LONG, name: ERR_KEY_TOO_LONG_NAME.into() },
+            );
+            return false;
+        }
+        let mut inner = match self.inner.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let ok = inner.set_stream(key, fill);
+        if ok {
+            pending.retain(|(queued, _)| queued != key);
+            self.written.fetch_add(1, Ordering::Relaxed);
+            self.clear_error();
+        } else {
+            self.refuse(
+                key,
+                StoreOp::Set,
+                inner.last_error().unwrap_or_else(|| StoreError { code: 0, name: "refused".into() }),
+            );
+        }
+        match self.stats.lock() {
+            Ok(mut stats) => stats.space = inner.space(),
+            Err(poisoned) => poisoned.into_inner().space = inner.space(),
+        }
+        ok
     }
 
     /// The value `key` will have once the queue is drained: the queued one if there is
@@ -760,6 +915,7 @@ impl StoreQueue {
                 None => {
                     report.written += 1;
                     self.written.fetch_add(1, Ordering::Relaxed);
+                    stats.last_error = None;
                 }
             }
             report.keys.push(key);
@@ -797,6 +953,21 @@ impl StoreQueue {
         match self.pending.lock() {
             Ok(guard) => guard.len(),
             Err(poisoned) => poisoned.into_inner().len(),
+        }
+    }
+
+    /// Charged pending bytes: values, names and per-operation metadata, not backend usage.
+    pub fn pending_bytes(&self) -> usize {
+        match self.pending.lock() {
+            Ok(guard) => guard.iter().map(pending_cost).sum(),
+            Err(poisoned) => poisoned.into_inner().iter().map(pending_cost).sum(),
+        }
+    }
+
+    fn last_error(&self) -> Option<StoreError> {
+        match self.stats.lock() {
+            Ok(stats) => stats.last_error.clone(),
+            Err(poisoned) => poisoned.into_inner().last_error.clone(),
         }
     }
 
@@ -894,7 +1065,7 @@ impl QueuedStore {
 
     /// A reader over a stored value, pulling `chunk` bytes at a time through the queue.
     pub fn reader<'a>(&'a self, key: &str, chunk: usize) -> QueueReader<'a> {
-        QueueReader { store: self, key: key.to_string(), offset: 0, buf: vec![0; chunk], len: chunk }
+        QueueReader { store: self, key: key.to_string(), offset: 0, chunk: chunk.max(1) }
     }
 }
 
@@ -903,11 +1074,11 @@ impl KvStore for QueuedStore {
         self.queue.read(key)
     }
 
-    /// Always true: the write is accepted into the queue. Whether NVS takes it is known
-    /// only after the writer runs, and is reported by [`StoreQueue::failed`] and the log
-    /// line the writer emits — not by this return value.
+    /// `true` means queue admission, not durability. A queue-budget/allocation refusal
+    /// returns `false` without replacing an earlier request. Backend validation (including
+    /// NVS's key-length rule) still happens when the writer drains the request.
     fn set(&mut self, key: &str, value: &str) -> bool {
-        self.queue.enqueue(key, Some(value.to_string()))
+        self.queue.enqueue(key, Some(value))
     }
 
     /// Streamed *through the queue's lock*, on this thread.
@@ -921,24 +1092,33 @@ impl KvStore for QueuedStore {
         key: &str,
         fill: &mut dyn FnMut(&mut dyn std::io::Write) -> std::io::Result<()>,
     ) -> bool {
-        self.queue.with_inner(|inner| inner.set_stream(key, fill))
+        self.queue.set_stream(key, fill)
     }
     /// Whether the key exists *now*: a queued value counts, a queued removal does not.
+    /// A refused removal leaves the queue untouched; `last_error` distinguishes that from absence.
     fn remove(&mut self, key: &str) -> bool {
-        let had = self.queue.read(key).is_some();
-        self.queue.enqueue(key, None);
-        had
+        let had = self.queue.read_at(key, 0, &mut []).is_some();
+        self.queue.enqueue(key, None) && had
+    }
+
+    fn last_error(&self) -> Option<StoreError> {
+        self.queue.last_error()
+    }
+
+    fn read_at(&self, key: &str, offset: usize, out: &mut [u8]) -> Option<usize> {
+        self.queue.read_at(key, offset, out)
     }
 
     fn keys(&self) -> Vec<String> {
         self.queue.keys()
     }
 
-    /// Reads are streamed too: the reader pulls chunks through the queue, so loading a
-    /// workspace does not need it as one `String` first. 64 KB per pull, because each one is a
-    /// file open and a seek.
+    /// Pending writes/removals participate in streaming reads too. A zero-byte probe
+    /// distinguishes absence from an empty value without copying queued text. Pulls use
+    /// the consumer's buffer directly, capped at 8 KiB; there is no extra 64 KiB allocation.
     fn reader(&self, key: &str) -> Option<Box<dyn std::io::Read + '_>> {
-        Some(Box::new(QueuedStore::reader(self, key, 64 * 1024)))
+        self.queue.read_at(key, 0, &mut [])?;
+        Some(Box::new(QueuedStore::reader(self, key, 8 * 1024)))
     }
 
     /// Forwarded, not defaulted: the App asks this before it decides whether a blob is one
@@ -966,8 +1146,7 @@ pub struct QueueReader<'a> {
     store: &'a QueuedStore,
     key: String,
     offset: usize,
-    buf: Vec<u8>,
-    len: usize,
+    chunk: usize,
 }
 
 impl std::fmt::Debug for QueueReader<'_> {
@@ -981,13 +1160,13 @@ impl std::io::Read for QueueReader<'_> {
         if out.is_empty() {
             return Ok(0);
         }
-        let want = self.len.min(out.len());
+        let want = self.chunk.min(out.len());
         let got = self
             .store
-            .with_inner(|inner| inner.read_at(&self.key, self.offset, &mut self.buf[..want]))
+            .queue
+            .read_at(&self.key, self.offset, &mut out[..want])
             .ok_or_else(|| std::io::Error::other("the stored value cannot be read"))?;
         self.offset += got;
-        out[..got].copy_from_slice(&self.buf[..got]);
         Ok(got)
     }
 }
@@ -1062,6 +1241,11 @@ impl MemoryStore {
 impl KvStore for MemoryStore {
     fn get(&self, key: &str) -> Option<String> {
         self.map.lock().ok()?.get(key).cloned()
+    }
+
+    fn read_at(&self, key: &str, offset: usize, out: &mut [u8]) -> Option<usize> {
+        let map = self.map.lock().ok()?;
+        Some(copy_range(map.get(key)?.as_bytes(), offset, out))
     }
 
     fn set(&mut self, key: &str, value: &str) -> bool {
@@ -1550,6 +1734,140 @@ mod tests {
         // A second flush has nothing to do and does not count anything.
         assert!(queue.flush().is_empty());
         assert_eq!(queue.written(), 1);
+    }
+
+    #[test]
+    fn a_streamed_write_supersedes_the_pending_write_or_removal() {
+        let inner = Shared::default();
+        let queue = StoreQueue::new(Box::new(inner.clone()));
+        let mut store = QueuedStore::new(queue.clone());
+        assert!(store.set("ws", "queued old"));
+        assert!(store.set("other", "unrelated"));
+        assert!(store.set_stream("ws", &mut |out| out.write_all(b"streamed new")));
+        assert_eq!(store.get("ws").as_deref(), Some("streamed new"));
+        assert_eq!(queue.flush().keys, vec!["other".to_string()]);
+        assert_eq!(inner.get("ws").as_deref(), Some("streamed new"));
+
+        assert!(store.remove("ws"));
+        assert!(store.set_stream("ws", &mut |out| out.write_all(b"newer")));
+        assert!(queue.flush().is_empty(), "an old removal cannot erase a newer stream");
+        assert_eq!(inner.get("ws").as_deref(), Some("newer"));
+    }
+
+    #[test]
+    fn a_queue_reader_reads_pending_bytes_instead_of_the_backend() {
+        use std::io::Read as _;
+        let inner = Shared::default();
+        inner.clone().set("ws", "old on storage");
+        let queue = StoreQueue::new(Box::new(inner));
+        let mut store = QueuedStore::new(queue.clone());
+        let latest = "界é".repeat(8192);
+        assert!(store.set("ws", &latest));
+        let mut text = String::new();
+        KvStore::reader(&store, "ws").unwrap().read_to_string(&mut text).unwrap();
+        assert!(text == latest, "reader and get must agree before a flush");
+        let mut bytes = [0u8; 7];
+        assert_eq!(store.read_at("ws", 3, &mut bytes), Some(7));
+        assert_eq!(&bytes, &latest.as_bytes()[3..10]);
+        assert_eq!(store.read_at("ws", usize::MAX, &mut bytes), Some(0));
+        assert!(store.remove("ws"));
+        assert!(KvStore::reader(&store, "ws").is_none(), "queued removal is absence");
+        assert_eq!(store.read_at("ws", 0, &mut bytes), None);
+        queue.flush();
+    }
+
+    #[test]
+    fn a_queue_reader_distinguishes_an_absent_key_from_an_empty_value() {
+        use std::io::Read as _;
+        let inner = Shared::default();
+        inner.clone().set("empty", "");
+        let store = QueuedStore::new(StoreQueue::new(Box::new(inner)));
+        assert!(KvStore::reader(&store, "missing").is_none());
+        let mut text = String::new();
+        KvStore::reader(&store, "empty").unwrap().read_to_string(&mut text).unwrap();
+        assert_eq!(text, "");
+    }
+
+    #[test]
+    fn a_failed_stream_keeps_the_queued_value_and_reports_the_refusal() {
+        let inner = Shared::default();
+        let queue = StoreQueue::new(Box::new(inner.clone()));
+        let mut store = QueuedStore::new(queue.clone());
+        assert!(store.set("ws", "still wanted"));
+        assert!(!store.set_stream("ws", &mut |_| Err(std::io::Error::other("fill refused"))));
+        assert_eq!(store.get("ws").as_deref(), Some("still wanted"));
+        assert_eq!(queue.failed(), 1, "synchronous streaming failures must not disappear");
+        assert_eq!(queue.last_failure().unwrap().key, "ws");
+        assert_eq!(queue.flush().written, 1);
+        assert_eq!(inner.get("ws").as_deref(), Some("still wanted"));
+        assert!(queue.flush().is_empty(), "no infinite retry");
+    }
+
+    #[test]
+    fn queue_byte_admission_keeps_the_previous_value_when_growth_is_refused() {
+        let queue = StoreQueue::new(Box::new(MemoryStore::new()));
+        let mut store = QueuedStore::new(queue.clone());
+        assert!(store.set("keep", "old"));
+        let remaining = PENDING_BYTES_MAX - queue.pending_bytes() - request_cost("bulk", None);
+        assert!(store.set("bulk", &"x".repeat(remaining)));
+        let before = queue.pending_bytes();
+        assert!(before <= PENDING_BYTES_MAX);
+        assert!(!store.set("keep", "new and larger"));
+        assert_eq!(queue.pending_bytes(), before);
+        assert_eq!(queue.pending(), 2);
+        assert_eq!(store.get("keep").as_deref(), Some("old"));
+        assert_eq!(store.last_error().unwrap().code, ERR_QUEUE_FULL);
+        assert!(queue.last_failure().unwrap().name.contains("previous queue unchanged"));
+        assert!(!store.set("extra", ""));
+        assert_eq!(queue.pending(), 2);
+        // Replacements/removals that reduce the charge still fit at the ceiling.
+        assert!(store.remove("bulk"));
+        assert!(store.set("extra", "now fits"));
+        assert!(store.last_error().is_none());
+        assert_eq!(queue.flush().failed, 0);
+        assert!(queue.flush().is_empty());
+    }
+
+    #[test]
+    fn queue_key_admission_refuses_new_keys_without_discarding_old_requests() {
+        let queue = StoreQueue::new(Box::new(MemoryStore::new()));
+        let mut store = QueuedStore::new(queue.clone());
+        for index in 0..PENDING_KEYS_MAX {
+            assert!(store.set(&format!("k{index}"), ""));
+        }
+        let before = queue.pending_bytes();
+        assert!(!store.set("one_more", ""));
+        assert_eq!(queue.pending(), PENDING_KEYS_MAX);
+        assert_eq!(queue.pending_bytes(), before);
+        assert_eq!(queue.failed(), 1);
+        assert_eq!(queue.last_failure().unwrap().code, ERR_QUEUE_FULL);
+        assert_eq!(store.get("k0").as_deref(), Some(""));
+        assert!(store.set("k0", "replacement"), "existing keys do not consume a new slot");
+        assert_eq!(queue.pending(), PENDING_KEYS_MAX);
+        assert_eq!(queue.flush().failed, 0);
+        assert_eq!(store.get("k0").as_deref(), Some("replacement"));
+    }
+
+    #[test]
+    fn queue_admission_covers_full_shipped_text_and_index_metadata_budgets() {
+        let queue = StoreQueue::new(Box::new(MemoryStore::new()));
+        let mut store = QueuedStore::new(queue.clone());
+        let file = "x".repeat(crate::app::WORKSPACE_TOTAL_MAX / crate::app::WORKSPACE_FILES_MAX);
+        for index in 0..crate::app::WORKSPACE_FILES_MAX {
+            assert!(store.set(&format!("ws.{index:012x}"), &file));
+            assert!(store.set(&format!("old{index}"), ""));
+            assert!(store.remove(&format!("old{index}")));
+        }
+        // JSON may escape each filename byte to six bytes, plus quotes, key, colon and comma.
+        let index_max = 2 + 6 * crate::app::WORKSPACE_NAMES_MAX + 22 * crate::app::WORKSPACE_FILES_MAX;
+        assert!(store.set(crate::keys::WORKSPACE_INDEX, &"i".repeat(index_max)));
+        assert!(store.set(crate::keys::TRANSCRIPT, &"t".repeat(crate::agent::MAX_SAVED_BYTES)));
+        for key in [crate::keys::CONFIG, crate::keys::MANIFEST, crate::keys::AGENT, crate::keys::SCHED] {
+            assert!(store.set(key, &"m".repeat(VALUE_MAX)));
+        }
+        assert!(queue.pending_bytes() <= PENDING_BYTES_MAX);
+        assert!(queue.pending() <= PENDING_KEYS_MAX);
+        assert_eq!(queue.flush().failed, 0);
     }
 
     #[test]
