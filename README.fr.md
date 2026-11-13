@@ -99,7 +99,7 @@ pour chaque carte qu'il peut joindre. Sans aucune clé, `base_url` sur
 | `agent-core` | 839 tests unitaires et 5 tests d’intégration passent ; `scripts/smoke.ps1` passe de bout en bout |
 | Simulateur | console, MCP et la boucle d’agent fonctionnent de bout en bout |
 | Firmware | firmware historique du banc sur un ESP32-S3-DevKitC-1 N16R8 (IDF v5.5.2) : 42 outils, OLED 128×32, micro et ampli I²S, WS2812, console TLS, tours de modèle en HTTPS ; modifications de l’audit non vérifiées sur carte |
-| Non implémenté / non vérifié | OTA et capture DVP du firmware non implémentés. Les pilotes SD par secteurs bruts et DHT11/22 ont des tests sur hôte, pas de vérification sur carte. Voir `ROADMAP.md` |
+| Non implémenté / non vérifié | La capture DVP du firmware n’est pas implémentée. Les pilotes SD par secteurs bruts et DHT11/22 ont des tests sur hôte, pas de vérification sur carte. Voir `ROADMAP.md` |
 
 Chiffres historiques sur banc : un tour à quatre outils en 13,7 s ; la console en TLS en 0,55 s ;
 scan I²C stable sur 8 exécutions. L’ancienne mesure de 5–6 kB de SRAM interne libre après une page TLS
