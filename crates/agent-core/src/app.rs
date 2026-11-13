@@ -882,6 +882,7 @@ impl App {
         }
         tools.register(board_tools::board_family());
         tools.register(board_tools::bus_family());
+        tools.register_all(board_tools::bitmap::tools());
         for def in self.devices.tool_defs().into_iter().chain(board_tools::media::tools(&self.devices)) {
             if !owned.contains(&def.spec.name) {
                 tools.register(def);
