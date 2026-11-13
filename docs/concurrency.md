@@ -84,7 +84,10 @@ dereferences those pointers after enumeration. Firmware-owned tasks register an
 owned label and affinity from their own live task; unknown tasks use `task-<id>`
 and `core: null`, `core_known: false`. A known `core` means affinity, **not** the core
 executing a task at the instant of the HTTP request. Stack high-water marks and
-numeric task IDs come from the scalar snapshot.
+numeric task IDs come from the scalar snapshot. Owned labels use the live task's
+`vTaskGetInfo().xTaskNumber`, matching the system snapshot trace/creation ID.
+`uxTaskGetTaskNumber()` is a separate application tag (normally zero), not this
+lookup key.
 
 ## Reproduce the real-server checks
 
@@ -92,9 +95,10 @@ numeric task IDs come from the scalar snapshot.
 python scripts/test-concurrency.py --host http://192.168.3.7 --agent --soak 600
 ```
 
-The script exercises shell sleep, script sleep plus a nested tool, two serialized
-long tools, five seconds of buffered silent PCM, status/health responsiveness,
-real Agent-loop interruption, and uptime during a soak. It creates and drops only
+The script exercises shell sleep, script sleep plus a nested tool, two and three
+serialized long tools, five seconds of buffered silent PCM, status/health
+responsiveness, real Agent-loop interruption, and uptime during a soak with
+repeated real script calls in flight. It creates and drops only
 its own `_mutex_probe` clip. `--agent` adds one test turn and temporarily points
 three public model settings at the **board's own** scripted endpoint, then restores
 them in `finally`; it never reads a credential file or sends the existing model key
