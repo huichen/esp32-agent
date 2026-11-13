@@ -250,7 +250,11 @@ fn run(
         let sta_ip = wifi.sta_netif().get_ip_info().ok().map(|i| i.ip);
         let sta_connected = sta_ip.map(|ip| !ip.is_unspecified()).unwrap_or(false);
         let ap_ip = wifi.ap_netif().get_ip_info().ok().map(|i| i.ip);
-        let ap_up = ap_ip.is_some();
+        // `ap_netif` keeps its address after the interface is stopped, so `Some` here only
+        // means "it had one". Once the AP is closed the status must say so; a board that
+        // reports `ap+sta` with 192.168.4.1 after closing the AP is the kind of lie this
+        // whole session keeps tripping over.
+        let ap_up = ap_ip.is_some() && !ap_closed;
         // The access point exists to get the board onto a network. Once the station has an
         // address it is closed — the portal shows that address, so there is nothing left for
         // the AP to do. `wifi.keep_ap` asks for both networks on purpose.
@@ -285,9 +289,10 @@ fn run(
         publish(|s| {
             s.state = state.clone();
             s.ip = sta_ip.map(|ip| ip.to_string()).unwrap_or_default();
-            if let Some(ip) = ap_ip {
-                s.ap_ip = ip.to_string();
-            }
+            s.ap_ip = match ap_ip {
+                Some(ip) if !ap_closed => ip.to_string(),
+                _ => String::new(),
+            };
             s.ap_ssid = ap_ssid.clone();
             s.ssid = ssid.clone();
             s.hostname = "esp32-agent".into();
