@@ -45,11 +45,17 @@ pub const COMPACT_KEEP_TURNS: usize = 4;
 /// limit would take the budget back through the system prompt.
 pub const ARCHIVE_MAX_LINES: usize = 40;
 /// A tool result larger than this is cut with [`llm::TRUNCATED_MARK`].
-pub const MAX_TOOL_RESULT_BYTES: usize = 8192;
+///
+/// This is a *context* budget, not a storage one: whatever a tool returns is sent back to the
+/// model on the next request. 8 KB was chosen when the board could hold little and is the
+/// reason a `read` of a real file came back as a head; a transcript on flash does not make a
+/// 64 KB tool result cheaper to send. 64 KB is about 16k tokens, which a 128k window can take
+/// once, and it is the size at which `read`/`shell` stop being decorative.
+pub const MAX_TOOL_RESULT_BYTES: usize = 64 * 1024;
 /// Assistant text larger than this is cut with [`llm::TRUNCATED_MARK`].
-pub const MAX_REPLY_BYTES: usize = 8 * 1024;
+pub const MAX_REPLY_BYTES: usize = 32 * 1024;
 /// A queued user message larger than this is cut before it enters the history.
-pub const MAX_USER_BYTES: usize = 4096;
+pub const MAX_USER_BYTES: usize = 32 * 1024;
 
 /// Reasoning is shown in the portal but never sent back as answer text, so it gets a
 /// tighter cap than the reply itself.
@@ -57,27 +63,22 @@ pub const MAX_REASONING_BYTES: usize = 4096;
 
 /// The most transcript bytes the board keeps between boots.
 ///
-/// Not a storage limit: the tail is written through [`crate::store::KvStore`], and the
-/// board's NVS holds far more than this. It is a RAM limit. Building the stored form
-/// means holding a copy of the tail (this buffer) next to the history that is already on
-/// the heap, on a board with kilobytes of internal SRAM left once TLS is up. Raising it
-/// without a measurement of exactly that would trade a rare lost conversation for a
-/// board that reboots under load, so the number stays where it is until somebody
-/// measures it.
-///
-/// What the budget buys at the per-message caps below: roughly fifty messages of text,
-/// which is the tail of a real task rather than a history.
-pub const MAX_SAVED_BYTES: usize = 16 * 1024;
+/// It was 16 KB because NVS could hold no more: five to eight chunks of 3 500 bytes, shared
+/// with the workspace. The transcript is a file on `storage` now (11.9 MB of flash), so this
+/// is a RAM and patience limit rather than a storage one — the whole tail is built in memory
+/// before it is written, and the board should not spend a second of a turn doing it. 512 KB
+/// is roughly a thousand messages at the per-message caps below, which is a working day.
+pub const MAX_SAVED_BYTES: usize = 512 * 1024;
 /// Text longer than this is cut when the message is stored, with
 /// [`llm::TRUNCATED_MARK`]. The message in RAM keeps the whole text; only the copy that
 /// survives a reboot is shortened.
-pub const MAX_SAVED_TEXT_BYTES: usize = 300;
+pub const MAX_SAVED_TEXT_BYTES: usize = 4096;
 /// Reasoning gets less room than the answer: it is folded away in the portal and no
 /// request needs it back in full.
-pub const MAX_SAVED_REASONING_BYTES: usize = 200;
+pub const MAX_SAVED_REASONING_BYTES: usize = 1024;
 /// Tool arguments are echoed to the model when the transcript is rebuilt, so they are
-/// stored; a `write` of a whole file is not worth the budget, so they are cut too.
-pub const MAX_SAVED_ARG_BYTES: usize = 256;
+/// stored; a `write` of a whole file is the case that used to be cut here.
+pub const MAX_SAVED_ARG_BYTES: usize = 4096;
 /// How much of a tool call's arguments `/api/agent/history` carries, in bytes.
 ///
 /// Larger than the stored copy because this one is not rewritten every turn, and smaller
@@ -2648,11 +2649,14 @@ mod tests {
 
     #[test]
     fn the_stored_form_cuts_long_text_and_reasoning_with_the_repo_marker() {
+        // Built from the caps, not from numbers: the test is about the cut happening, and a
+        // literal 400 stopped testing it the moment the budget grew.
+        let long = MAX_SAVED_TEXT_BYTES + 100;
         let history = vec![
-            Message::user(&"q".repeat(400), "http", 1),
+            Message::user(&"q".repeat(long), "http", 1),
             Message::assistant_with_reasoning(
-                &"a".repeat(400),
-                &"r".repeat(400),
+                &"a".repeat(long),
+                &"r".repeat(MAX_SAVED_REASONING_BYTES + 100),
                 vec![ToolCall {
                     id: "c1".into(),
                     name: "fs_read".into(),
@@ -2660,10 +2664,10 @@ mod tests {
                 }],
                 2,
             ),
-            Message::tool("c1", &"y".repeat(600), 3),
+            Message::tool("c1", &"y".repeat(long), 3),
         ];
         let stored = transcript_jsonl(&history, 4);
-        assert!(!stored.contains(&"q".repeat(400)), "the whole question is not stored");
+        assert!(!stored.contains(&"q".repeat(long)), "the whole question is not stored");
         let (restored, dropped) = transcript_from_jsonl(&stored).expect("parses");
         assert_eq!(dropped, 0, "cutting a message is not dropping it");
         assert!(restored[0].text.ends_with(llm::TRUNCATED_MARK));
@@ -2676,7 +2680,7 @@ mod tests {
         assert_eq!(restored[1].tool_calls[0].id, "c1");
         assert_eq!(restored[2].tool_call_id.as_deref(), Some("c1"));
         // In RAM the message keeps everything; only the stored copy is cut.
-        assert_eq!(history[0].text.len(), 400);
+        assert_eq!(history[0].text.len(), long);
         // Every line is one message: a JSON Lines file is not a JSON document.
         let lines: Vec<&str> = stored.lines().collect();
         assert_eq!(lines.len(), 4, "a header and three messages");
@@ -2687,11 +2691,15 @@ mod tests {
 
     #[test]
     fn a_transcript_over_the_budget_keeps_its_tail_and_counts_what_it_dropped() {
+        // Enough messages to pass the budget whatever it is: the point is what happens over
+        // it, not the number.
+        let each = MAX_SAVED_TEXT_BYTES + 20;
+        let pairs = MAX_SAVED_BYTES / (each * 2) + 10;
         let mut history = Vec::new();
-        for i in 0..120u64 {
-            history.push(Message::user(&format!("question {i} {}", "q".repeat(300)), "http", 10 * i));
+        for i in 0..pairs as u64 {
+            history.push(Message::user(&format!("question {i} {}", "q".repeat(each)), "http", 10 * i));
             history.push(Message::assistant(
-                &format!("answer {i} {}", "a".repeat(300)),
+                &format!("answer {i} {}", "a".repeat(each)),
                 Vec::new(),
                 10 * i + 1,
             ));

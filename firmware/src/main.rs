@@ -18,6 +18,7 @@ mod esp_hw;
 mod nvs_store;
 mod nvs_writer;
 mod runner;
+mod spiffs_store;
 mod threads;
 mod tls_server;
 mod wifi;
@@ -170,6 +171,11 @@ fn run() -> anyhow::Result<()> {
     // The namespace is a name NVS has to hold too, so it comes from the same table that
     // every key does (`agent-core/src/keys.rs`) and is under the same 15-byte assertion.
     let mut store = nvs_store::NvsStore::open(keys::NAMESPACE, nvs.clone())?;
+    // The transcript and the workspace are files on `storage`; everything else stays in NVS.
+    // Mounting before the first config read costs nothing and makes a partition that will not
+    // mount a boot-time error rather than a surprise on the first turn.
+    let files = spiffs_store::mount()?;
+    let mut store = spiffs_store::SplitStore::new(files, store);
     // Read the config once before touching hardware: it says which pins the I2C
     // buses live on.
     let mut cfg = store

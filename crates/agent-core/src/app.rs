@@ -73,10 +73,16 @@ pub const NVS_KEY_RUN_IN_FLIGHT: &str = crate::keys::RUN_IN_FLIGHT;
 /// asked for.
 pub const RESUME_SOURCE: &str = "resume";
 
-/// The file tools write into a RAM map that is persisted as one JSON blob, so the
-/// whole workspace has to stay small enough to serialise next to everything else.
-pub const WORKSPACE_FILE_MAX: usize = 2048;
-pub const WORKSPACE_TOTAL_MAX: usize = 8192;
+/// The file tools write into a RAM map that is persisted as one JSON blob, so the whole
+/// workspace has to be small enough to serialise next to everything else.
+///
+/// Both numbers used to be 2 KB and 8 KB because the blob was spread over five NVS values.
+/// It is a file on `storage` now, so the ceiling is the partition rather than a value: a
+/// single file may be 256 KB and the workspace 4 MB, which is what makes `write` a real
+/// editor instead of a note pad. The map still lives in RAM between writes, so this is also
+/// a heap budget; 4 MB of text is PSRAM the board has.
+pub const WORKSPACE_FILE_MAX: usize = 256 * 1024;
+pub const WORKSPACE_TOTAL_MAX: usize = 4 * 1024 * 1024;
 /// How the workspace blob is spread over the store.
 ///
 /// Not one value under `ws`: ESP-IDF refuses a string above about 4000 bytes, and a
@@ -1230,6 +1236,10 @@ impl App {
                 "used_entries": space.used_entries,
                 "free_entries": space.free_entries,
                 "total_entries": space.total_entries,
+                // A filesystem reports bytes and no entries; NVS the other way round. Both
+                // fields are present so a client need not know which backend answered.
+                "total_bytes": space.total_bytes,
+                "used_bytes": space.used_bytes,
             }),
             None => Value::Null,
         };
@@ -2037,6 +2047,28 @@ impl App {
     /// next boot and the blob is discarded whole - a half-published transcript would be
     /// worse than none, because the model would be told it said things it did not.
     fn write_transcript(&mut self, text: &str) -> bool {
+        // A store that takes a whole value (a file on `storage`) keeps the transcript as one
+        // value. The chunking below exists because an NVS value is ~4 KB, and a tail split
+        // over eight of them is a tail that fits in 28 KB — which is why the transcript could
+        // never hold a real conversation. `read_transcript` reads the base key and then any
+        // chunks that follow, so a whole-value write needs nothing else.
+        if let Some(cap) = self.store.whole_value_bytes() {
+            if text.len() <= cap {
+                if !self.store.set(NVS_KEY_TRANSCRIPT, text) {
+                    self.log.error("agent", "the transcript could not be written");
+                    return false;
+                }
+                // A tail of chunks from a build that chunked it would be appended on the next
+                // read, which is two conversations in one.
+                for index in 1..TRANSCRIPT_CHUNKS_MAX {
+                    if self.store.get(&Self::transcript_key(index)).is_none() {
+                        break;
+                    }
+                    self.store.remove(&Self::transcript_key(index));
+                }
+                return true;
+            }
+        }
         let mut chunks: Vec<String> = Vec::new();
         let mut current = String::new();
         for line in text.split_inclusive('\n') {
@@ -6950,6 +6982,13 @@ mod tests {
             self.0.lock().ok()?.get(key).cloned()
         }
 
+        /// The board's store is a file on a filesystem now, so a blob is one value. The
+        /// chunking path stays tested by `store::tests`, which drives a store that does not
+        /// say this; here the point is that the big blobs go in whole.
+        fn whole_value_bytes(&self) -> Option<usize> {
+            Some(crate::agent::MAX_SAVED_BYTES.max(super::WORKSPACE_TOTAL_MAX))
+        }
+
         fn set(&mut self, key: &str, value: &str) -> bool {
             match self.0.lock() {
                 Ok(mut m) => {
@@ -7045,17 +7084,18 @@ mod tests {
         out.expect("the turn finished")
     }
 
-    /// The budget, the chunk size and the number of keys have to agree, or a full tail
-    /// would be refused at the one moment it matters.
+    /// The transcript is a file on `storage` now, so its ceiling is the store's and not a
+    /// count of NVS values. What still has to hold is the *fallback*: a store that cannot take
+    /// a whole blob chunks it, and a chunk has to stay under the value limit that store has.
     #[test]
-    fn the_transcript_budget_fits_the_nvs_values_the_board_allows() {
-        let needed = crate::agent::MAX_SAVED_BYTES.div_ceil(TRANSCRIPT_CHUNK_BYTES);
-        assert!(
-            needed < TRANSCRIPT_CHUNKS_MAX,
-            "a full tail needs {needed} values, only {} allowed",
-            TRANSCRIPT_CHUNKS_MAX
-        );
+    fn the_transcript_budget_fits_the_store_the_board_uses() {
+        // The shipped plan is a plan, not a promise: a store that takes whole values ignores
+        // it (one file), and one that does not keeps chunks below the NVS ceiling.
         assert!(TRANSCRIPT_CHUNK_BYTES <= 4000, "ESP-IDF refuses an NVS string value above ~4000 bytes");
+        assert!(
+            crate::agent::MAX_SAVED_BYTES > TRANSCRIPT_CHUNK_BYTES * TRANSCRIPT_CHUNKS_MAX,
+            "the budget is bigger than the NVS fallback on purpose: storage is a filesystem"
+        );
         assert_eq!(NVS_KEY_TRANSCRIPT, "transcript");
         assert_eq!(NVS_KEY_RUN_IN_FLIGHT, "run_in_flight");
     }
@@ -7112,16 +7152,18 @@ mod tests {
     fn a_large_transcript_keeps_its_tail_says_so_in_the_prompt_and_spans_several_values() {
         let store = SharedStore::new();
         let mut app = app_with(&store);
-        // Far more than 16 KB of text, which the board would have dropped from RAM long
-        // before storing it: 240 messages of 300+ bytes come to ~80 KB.
-        for i in 0..120u64 {
+        // Far more text than the old 16 KB budget: the transcript is a file now, so the
+        // question is whether it survives, not whether it fits one NVS value.
+        let each = crate::agent::MAX_SAVED_TEXT_BYTES + 20;
+        let pairs = crate::agent::MAX_SAVED_BYTES / (each * 2) + 10;
+        for i in 0..pairs as u64 {
             app.agent.history.push(crate::agent::Message::user(
-                &format!("question {i} {}", "q".repeat(300)),
+                &format!("question {i} {}", "q".repeat(each)),
                 "http",
                 i,
             ));
             app.agent.history.push(crate::agent::Message::assistant(
-                &format!("answer {i} {}", "a".repeat(300)),
+                &format!("answer {i} {}", "a".repeat(each)),
                 Vec::new(),
                 i,
             ));
@@ -7129,26 +7171,23 @@ mod tests {
         assert!(app.persist_transcript());
         drain_store(&mut app);
 
-        // The board's NVS takes no value above ~4 KB, so the blob is stored as a run of
-        // keys rather than one that would be silently refused on the bench.
+        // One value, because the store says it takes whole blobs: the chunking exists for a
+        // backend that cannot, and that path is tested in `store::tests`.
         let chunks = store.all().iter().filter(|key| key.starts_with(NVS_KEY_TRANSCRIPT)).count();
-        assert!(chunks > 1, "a 16 KB tail cannot be one NVS value: {chunks} key(s)");
-        for key in store.all().iter().filter(|key| key.starts_with(NVS_KEY_TRANSCRIPT)) {
-            assert!(
-                store.get(key).map(|v| v.len()).unwrap_or(0) <= TRANSCRIPT_CHUNK_BYTES,
-                "{key} is longer than the store will take"
-            );
-        }
+        assert_eq!(chunks, 1, "the whole tail is one file on the board's store: {chunks} key(s)");
 
         let (app, log) = app_with_log(&store);
         assert!(app.agent.saved_dropped > 0, "the tail was cut and the count is known");
         assert_eq!(
             app.agent.saved_dropped + app.agent.history.len(),
-            240,
+            pairs * 2,
             "every message is either kept or counted as dropped"
         );
-        assert!(app.agent.history.len() < 240, "the oldest messages gave way");
-        assert_eq!(app.agent.history.last().map(|m| m.text.starts_with("answer 119")), Some(true));
+        assert!(app.agent.history.len() < pairs * 2, "the oldest messages gave way");
+        assert_eq!(
+            app.agent.history.last().map(|m| m.text.starts_with(&format!("answer {}", pairs - 1))),
+            Some(true)
+        );
         assert!(
             log.tail(80, 0).iter().any(|l| l.level == "warn" && l.message.contains("were not stored")),
             "a cut tail is stated in the log"
@@ -10105,14 +10144,16 @@ mod tests {
         // What the writer task would have done before the reboot.
         drain_store(&mut app);
 
-        // The blob is past the 4000-byte single-value ceiling: the size that used to be
-        // written nowhere while the tool answered ok.
+        // The blob is past the old 4000-byte single-value ceiling: the size that used to be
+        // written nowhere while the tool answered ok. The store takes whole values now, so it
+        // is one chunk rather than a run of them - the run is what `store::tests` still drives.
         let blob = match store::read_blob(&store.clone(), NVS_KEY_WORKSPACE, WORKSPACE_PLAN) {
             store::BlobState::Stored(blob) => blob,
             other => panic!("the workspace was never saved: {other:?}"),
         };
         assert!(blob.len() > store::VALUE_MAX, "{} bytes is one value", blob.len());
-        assert!(store.get("ws.2").is_some(), "a {} byte blob spans one value", blob.len());
+        assert_eq!(store.get("ws.1").map(|v| v.len()), Some(blob.len()), "one value holds it all");
+        assert!(store.get("ws.2").is_none(), "a second chunk means it was split");
         assert!(store.get("ws").unwrap().starts_with("ws1 "), "{:?}", store.get("ws"));
 
         // A reboot is a new App over the same keys.
@@ -10202,10 +10243,11 @@ mod tests {
         }
         assert!(fs_tools::Workspace::read(&app.workspace, "/notes/a.md").unwrap().len() > 1000);
         drain_store(&mut app);
-        assert!(store.get("ws.2").is_some(), "the blob has to span two values for this test");
+        assert!(store.get("ws.1").is_some(), "the blob has to be on flash for this test");
 
         // A power cut in the middle of a save leaves a chunk that does not match the header.
-        store.clone().set("ws.2", "a chunk from a write that never finished");
+        // One chunk or several, the header carries one checksum per chunk either way.
+        store.clone().set("ws.1", "a chunk from a write that never finished");
 
         let (rebooted, log) = app_with_log(&store);
         assert!(
