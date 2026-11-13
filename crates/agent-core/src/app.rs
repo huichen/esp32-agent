@@ -7069,7 +7069,7 @@ fn audio_route(app: &Shared, req: &Request) -> crate::http::BodyRoute {
     // The bytes are played at the amplitude they carry, so the content type has to say what
     // they are: a misdirected JSON POST would otherwise be screamed into the speaker.
     let content_type = req.header("content-type").unwrap_or("").to_ascii_lowercase();
-    if !content_type.starts_with("audio/pcm") {
+    if content_type.split(';').next().unwrap_or("").trim() != "audio/pcm" {
         return BodyRoute::Answer(Response::error_json(
             415,
             "Content-Type must be audio/pcm; the body is raw PCM16LE mono at 24000 Hz (docs/audio.md)",
@@ -7186,6 +7186,12 @@ impl AvReader {
                         format!("unknown record tag 0x{:02x}", self.tag),
                     ));
                 }
+                if self.tag == b'E' && self.need != 0 {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "an end record must have length 0",
+                    ));
+                }
                 if self.need == 0 {
                     if self.tag != b'E' {
                         // An empty audio or frame record is a host bug, not a pause.
@@ -7223,6 +7229,7 @@ struct AvSink {
     frames: usize,
     received: usize,
     failed: Option<String>,
+    invalid: Option<String>,
 }
 
 impl AvSink {
@@ -7237,6 +7244,7 @@ impl AvSink {
             frames: 0,
             received: 0,
             failed: None,
+            invalid: None,
         }
     }
 }
@@ -7244,16 +7252,15 @@ impl AvSink {
 impl crate::http::BodySink for AvSink {
     fn push(&mut self, bytes: &[u8]) -> std::io::Result<()> {
         if self.received + bytes.len() > AV_MAX_BODY_BYTES {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("more than {AV_MAX_BODY_BYTES} bytes in one body"),
-            ));
+            let message = format!("more than {AV_MAX_BODY_BYTES} bytes in one body");
+            self.invalid = Some(message.clone());
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, message));
         }
         self.received += bytes.len();
         // Split the borrow: the reader needs `&mut self.reader` while the callback writes
         // to the other fields.
         let shared = Arc::clone(&self.app);
-        let AvSink { reader, audio, audio_bytes, samples, frames, failed, .. } = self;
+        let AvSink { reader, audio, audio_bytes, samples, frames, failed, invalid, .. } = self;
         let mut on = |tag: u8, payload: &[u8]| -> std::io::Result<()> {
             match tag {
                 b'E' => Ok(()),
@@ -7315,7 +7322,13 @@ impl crate::http::BodySink for AvSink {
                 )),
             }
         };
-        reader.feed(bytes, &mut on)
+        let result = reader.feed(bytes, &mut on);
+        if let Err(err) = &result {
+            if failed.is_none() {
+                *invalid = Some(err.to_string());
+            }
+        }
+        result
     }
 
     fn finish(self: Box<Self>, complete: bool) -> Response {
@@ -7340,9 +7353,14 @@ impl crate::http::BodySink for AvSink {
             body["error"] = json!(e);
             return Response::json_status(500, &body);
         }
-        if !complete {
+        if let Some(error) = self.invalid {
             body["ok"] = json!(false);
-            body["error"] = json!("the upload ended before its body did: the rest was not played");
+            body["error"] = json!(error);
+            return Response::json_status(400, &body);
+        }
+        if !complete || !self.reader.head.is_empty() || self.reader.need != 0 {
+            body["ok"] = json!(false);
+            body["error"] = json!("the upload or its final AV record ended early: the rest was not played");
             return Response::json_status(400, &body);
         }
         Response::json(&body)
@@ -7363,9 +7381,10 @@ fn av_route(app: &Shared, req: &Request) -> crate::http::BodyRoute {
         ));
     }
     let content_type = req.header("content-type").unwrap_or("").to_ascii_lowercase();
-    if !(content_type.starts_with("application/x-esp32-av")
-        || content_type.starts_with("application/octet-stream"))
-    {
+    if !matches!(
+        content_type.split(';').next().unwrap_or("").trim(),
+        "application/x-esp32-av" | "application/octet-stream"
+    ) {
         return BodyRoute::Answer(Response::error_json(
             415,
             "Content-Type must be application/x-esp32-av (or application/octet-stream); the body is `tag|u16le len|payload` records (docs/audio.md)",
@@ -8418,6 +8437,23 @@ mod tests {
         // A frame that is neither 128x32 nor 128x64 is not a frame.
         let err = sink.push(b"F\x10\x00aaaaaaaaaaaaaaaa").expect_err("wrong frame size");
         assert!(err.to_string().contains("512"), "{err}");
+
+        for body in [b"A\x04".as_slice(), b"A\x04\x00\x01", b"E\x01\x00\x00"] {
+            let mut sink = match router(&req) {
+                BodyRoute::Sink(s) => s,
+                _ => panic!("a fresh sink"),
+            };
+            // HTTP completed, but the inner record did not (or E carried a payload).
+            let _ = sink.push(body);
+            let resp = sink.finish(true);
+            assert_eq!(resp.status, 400, "accepted malformed AV body {body:?}");
+            assert_eq!(body_json(&resp)["ok"], false);
+        }
+        let sink = match router(&req) {
+            BodyRoute::Sink(s) => s,
+            _ => panic!("a fresh sink"),
+        };
+        assert_eq!(sink.finish(true).status, 200, "an empty complete body has no torn record");
     }
 
     /// A board whose own agent loop is dead looked exactly like a quiet board: the only
