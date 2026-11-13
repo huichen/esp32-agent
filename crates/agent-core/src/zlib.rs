@@ -1,9 +1,8 @@
-//! Deflate/inflate, small enough for a board with a few kB of heap.
+//! A compact DEFLATE decoder with bounded output.
 //!
-//! Only the **decoder** is here: `unzip` on a real archive is useless without it (every
-//! zip tool deflates by default), while a compressor would need a match finder and a
-//! window that cost more than the 8 kB workspace is worth. `zip` therefore writes *stored*
-//! entries — valid archives that any unzip reads — and says so in the tool result.
+//! Only the **decoder** is implemented. `unzip` needs it for ordinary compressed archives;
+//! the ZIP writer emits *stored* entries without a compressor. This is an implementation
+//! choice, not a claim that a compressor cannot fit in the board's PSRAM.
 //!
 //! The decode follows the reference (`puff.c`): canonical Huffman codes held as counts and
 //! offsets, decoded a bit at a time, which is slower than a table and needs a fraction of
@@ -52,9 +51,19 @@ impl Huffman {
     fn new(lengths: &[u8]) -> Result<Self, String> {
         let mut counts = [0u16; MAX_BITS + 1];
         for &len in lengths {
+            if len as usize > MAX_BITS {
+                return Err("deflate: Huffman code length exceeds 15 bits".into());
+            }
             counts[len as usize] += 1;
         }
         counts[0] = 0;
+        let mut left = 1i32;
+        for count in counts.iter().skip(1) {
+            left = (left << 1) - i32::from(*count);
+            if left < 0 {
+                return Err("deflate: oversubscribed Huffman table".into());
+            }
+        }
         let mut offsets = [0u16; MAX_BITS + 2];
         for len in 1..=MAX_BITS {
             offsets[len + 1] = offsets[len] + counts[len];
@@ -76,8 +85,12 @@ impl Huffman {
         for len in 1..=MAX_BITS {
             code |= bits.bits(1)? as i32;
             let count = self.counts[len] as i32;
-            if code - first < count {
-                return Ok(self.symbols[(index + (code - first)) as usize]);
+            if code >= first && code - first < count {
+                return self
+                    .symbols
+                    .get((index + code - first) as usize)
+                    .copied()
+                    .ok_or_else(|| "deflate: bad Huffman code".into());
             }
             index += count;
             first = (first + count) << 1;
@@ -102,6 +115,12 @@ const DIST_EXTRA: [u8; 30] =
 
 /// Inflate a raw deflate stream (no zlib header, no gzip wrapper).
 pub fn inflate(data: &[u8]) -> Result<Vec<u8>, String> {
+    inflate_limited(data, 1_048_576)
+}
+
+/// Inflate without ever appending more than `max_output` bytes, including stored
+/// blocks. Archive callers pass their remaining budget, not a megabyte they discard later.
+pub fn inflate_limited(data: &[u8], max_output: usize) -> Result<Vec<u8>, String> {
     let mut out: Vec<u8> = Vec::new();
     let mut bits = Bits::new(data);
     loop {
@@ -115,6 +134,7 @@ pub fn inflate(data: &[u8]) -> Result<Vec<u8>, String> {
                 if len != (!nlen & 0xffff) {
                     return Err("deflate: stored block length mismatch".into());
                 }
+                room(&out, len, max_output)?;
                 for _ in 0..len {
                     out.push(bits.bits(8)? as u8);
                 }
@@ -131,11 +151,11 @@ pub fn inflate(data: &[u8]) -> Result<Vec<u8>, String> {
                 }
                 let literals = Huffman::new(&lengths)?;
                 let distances = Huffman::new(&[5u8; 30])?;
-                decode_block(&mut bits, &literals, &distances, &mut out)?;
+                decode_block(&mut bits, &literals, &distances, &mut out, max_output)?;
             }
             2 => {
                 let (literals, distances) = dynamic_tables(&mut bits)?;
-                decode_block(&mut bits, &literals, &distances, &mut out)?;
+                decode_block(&mut bits, &literals, &distances, &mut out, max_output)?;
             }
             _ => return Err("deflate: reserved block type".into()),
         }
@@ -150,6 +170,9 @@ fn dynamic_tables(bits: &mut Bits) -> Result<(Huffman, Huffman), String> {
     let hlit = bits.bits(5)? as usize + 257;
     let hdist = bits.bits(5)? as usize + 1;
     let hclen = bits.bits(4)? as usize + 4;
+    if hlit > 286 {
+        return Err("deflate: too many literal/length codes".into());
+    }
     const ORDER: [usize; 19] = [16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15];
     let mut code_lengths = [0u8; 19];
     for &slot in ORDER.iter().take(hclen) {
@@ -172,21 +195,33 @@ fn dynamic_tables(bits: &mut Bits) -> Result<(Huffman, Huffman), String> {
                 }
                 let prev = lengths[i - 1];
                 let repeat = 3 + bits.bits(2)? as usize;
-                for _ in 0..repeat.min(lengths.len() - i) {
+                if repeat > lengths.len() - i {
+                    return Err("deflate: code length repeat exceeds the alphabet".into());
+                }
+                for _ in 0..repeat {
                     lengths[i] = prev;
                     i += 1;
                 }
             }
             17 => {
                 let repeat = 3 + bits.bits(3)? as usize;
-                i = (i + repeat).min(lengths.len());
+                if repeat > lengths.len() - i {
+                    return Err("deflate: code length repeat exceeds the alphabet".into());
+                }
+                i += repeat;
             }
             18 => {
                 let repeat = 11 + bits.bits(7)? as usize;
-                i = (i + repeat).min(lengths.len());
+                if repeat > lengths.len() - i {
+                    return Err("deflate: code length repeat exceeds the alphabet".into());
+                }
+                i += repeat;
             }
             _ => return Err("deflate: bad code length symbol".into()),
         }
+    }
+    if lengths[256] == 0 {
+        return Err("deflate: bad Huffman code table has no end-of-block symbol".into());
     }
     let literals = Huffman::new(&lengths[..hlit])?;
     let distances = Huffman::new(&lengths[hlit..])?;
@@ -198,11 +233,15 @@ fn decode_block(
     literals: &Huffman,
     distances: &Huffman,
     out: &mut Vec<u8>,
+    max_output: usize,
 ) -> Result<(), String> {
     loop {
         let symbol = literals.decode(bits)?;
         match symbol {
-            0..=255 => out.push(symbol as u8),
+            0..=255 => {
+                room(out, 1, max_output)?;
+                out.push(symbol as u8);
+            }
             256 => return Ok(()),
             257..=285 => {
                 let index = (symbol - 257) as usize;
@@ -215,6 +254,7 @@ fn decode_block(
                 if distance == 0 || distance > out.len() {
                     return Err("deflate: distance past the start of the output".into());
                 }
+                room(out, length, max_output)?;
                 // Overlapping copy is the point of LZ77: copy byte by byte.
                 let start = out.len() - distance;
                 for k in 0..length {
@@ -224,9 +264,14 @@ fn decode_block(
             }
             _ => return Err(format!("deflate: bad length symbol {symbol}")),
         }
-        if out.len() > 1_048_576 {
-            return Err("deflate: output larger than 1 MiB".into());
-        }
+    }
+}
+
+fn room(out: &[u8], additional: usize, max_output: usize) -> Result<(), String> {
+    if additional > max_output.saturating_sub(out.len()) {
+        Err(format!("deflate: output larger than {max_output} bytes"))
+    } else {
+        Ok(())
     }
 }
 
@@ -357,6 +402,13 @@ mod tests {
         w.stored(false, b"hello");
         w.stored(true, b" world");
         assert_eq!(inflate(&w.finish()).expect("stored blocks"), b"hello world");
+
+        let mut w = Writer::default();
+        for i in 0..17 {
+            w.stored(i == 16, &vec![b'x'; 65_535]);
+        }
+        let err = inflate(&w.finish()).err().expect("stored blocks obey the same 1 MiB cap");
+        assert!(err.contains("output"), "{err}");
     }
 
     #[test]
@@ -528,6 +580,12 @@ mod tests {
             let err = inflate(&w.finish()).expect_err("286 and 287 are not lengths");
             assert!(err.contains("bad length symbol"), "{symbol}: {err}");
         }
+    }
+
+    #[test]
+    fn oversubscribed_huffman_tables_are_refused() {
+        assert!(Huffman::new(&[1, 1, 1]).is_err(), "three one-bit codes cannot exist");
+        assert!(Huffman::new(&[16]).is_err(), "a code length is at most 15 bits");
     }
 
     #[test]

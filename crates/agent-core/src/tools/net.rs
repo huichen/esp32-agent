@@ -5,21 +5,17 @@
 //! has one HTTP client, the host simulator has another, and a tool that opened its
 //! own connection would be untestable on the host and unbounded on the board.
 //!
-//! What that costs: the trait has one verb, `post_json`, so both tools issue a
-//! POST. `net_post` sends its body with `Content-Type: application/json`;
-//! `net_get` sends an empty body as a cache-friendly request. A server that
-//! insists on a real GET answers 405 and the model sees that as a tool error
-//! rather than an empty body. Widening `ChatTransport` with a `get()` is the
-//! follow-up in `llm.rs`; inventing a parallel struct here would be worse.
+//! `net_get` issues a real GET and `net_post` sends JSON with POST. The serialized
+//! result, including its metadata and JSON escaping, fits the agent's tool budget;
+//! otherwise the agent would cut valid JSON into an unusable fragment.
 
-use crate::llm::{body_prefix, truncate_bytes, ChatTransport};
+use crate::llm::{body_prefix, truncate_bytes, ChatTransport, TRUNCATED_MARK};
 use serde_json::{json, Value};
 use std::net::ToSocketAddrs;
 
-/// Response bodies larger than this are cut, with [`TRUNCATED_MARK`] appended.
-/// The agent truncates tool results at the same size; doing it here keeps the
-/// marker and the byte count honest instead of losing the tail silently.
-pub const MAX_BODY_BYTES: usize = 65536;
+/// The result's wire budget. The body gets what remains after metadata and JSON
+/// escaping, with [`TRUNCATED_MARK`] appended when a prefix is returned.
+pub const MAX_BODY_BYTES: usize = crate::agent::MAX_TOOL_RESULT_BYTES;
 
 /// Longest URL a tool call may pass. The board's header buffer is small, and a
 /// model pasting a data: URI must fail fast.
@@ -56,7 +52,7 @@ pub fn specs() -> Value {
             "Fetch a URL from the board's network and return up to 65536 bytes. An HTML page is reduced to its text (title, headings, list items, paragraphs) so the bytes are content rather than markup; send format=\"raw\" for the document itself. http:// and https:// are both carried; the certificate chain is checked against the board's bundle.",
             params(
                 json!({
-                    "url": { "type": "string", "description": "http:// URL" },
+                    "url": { "type": "string", "description": "http:// or https:// URL" },
                     "format": {
                         "type": "string",
                         "enum": ["text", "raw"],
@@ -119,7 +115,7 @@ fn get(transport: &mut dyn ChatTransport, args: &Value) -> Result<String, String
     // A real GET, not a POST with an empty body: half the web answers 405 to the latter,
     // and the model has no way to tell the difference from the tool result.
     let body = transport.request("GET", &url, &[], "").map_err(transport_error)?;
-    // Tags are not content. A page fetched raw is 2 KB of `<div class=…>` and the answer
+    // Tags are not content. A page fetched raw can be mostly `<div class=…>` and the answer
     // is somewhere past the cut; so an HTML response is reduced to its text before it is
     // measured — the same tool then works for any site, which is the point of a general
     // fetch rather than a per-site one.
@@ -132,7 +128,7 @@ fn get(transport: &mut dyn ChatTransport, args: &Value) -> Result<String, String
                 "method": "GET",
                 "request_bytes": 0,
                 "format": "text",
-                "title": page.title,
+                "title": truncate_bytes(&page.title, 256),
             }),
             &page.text,
         ));
@@ -248,7 +244,11 @@ fn post(transport: &mut dyn ChatTransport, args: &Value) -> Result<String, Strin
 /// Does this look like a document rather than JSON or plain text?
 fn looks_like_html(body: &str) -> bool {
     let head = body.trim_start();
-    let head = &head[..head.len().min(512)];
+    let mut end = head.len().min(512);
+    while !head.is_char_boundary(end) {
+        end -= 1;
+    }
+    let head = head[..end].to_ascii_lowercase();
     head.starts_with('<')
         && (head.contains("<html")
             || head.contains("<!doctype")
@@ -363,7 +363,7 @@ fn decode_entities(text: &str) -> String {
     while let Some(pos) = rest.find('&') {
         out.push_str(&rest[..pos]);
         rest = &rest[pos..];
-        let semi = match rest[..rest.len().min(12)].find(';') {
+        let semi = match rest.as_bytes().iter().take(12).position(|&b| b == b';') {
             Some(p) => p,
             None => {
                 out.push('&');
@@ -382,7 +382,14 @@ fn decode_entities(text: &str) -> String {
             "mdash" => Some('\u{2014}'),
             "ndash" => Some('\u{2013}'),
             "hellip" => Some('\u{2026}'),
-            other => other.strip_prefix('#').and_then(|n| n.parse::<u32>().ok()).and_then(char::from_u32),
+            other => other.strip_prefix('#').and_then(|n| {
+                let code = if let Some(hex) = n.strip_prefix('x').or_else(|| n.strip_prefix('X')) {
+                    u32::from_str_radix(hex, 16).ok()
+                } else {
+                    n.parse::<u32>().ok()
+                };
+                code.and_then(char::from_u32)
+            }),
         };
         match replacement {
             Some(c) => out.push(c),
@@ -395,13 +402,47 @@ fn decode_entities(text: &str) -> String {
 }
 
 fn result_json(meta: Value, body: &str) -> String {
-    let bytes = body.len();
-    let truncated = bytes > MAX_BODY_BYTES;
     let mut out = meta;
-    out["bytes"] = json!(bytes);
-    out["truncated"] = json!(truncated);
-    out["body"] = json!(truncate_bytes(body, MAX_BODY_BYTES));
-    serde_json::to_string(&out).unwrap_or_else(|_| "{\"ok\":false}".to_string())
+    out["bytes"] = json!(body.len());
+    out["truncated"] = json!(false);
+    out["body"] = json!("");
+    let overhead = out.to_string().len();
+    let encoded_bytes: usize = body.chars().map(json_char_bytes).sum();
+    if overhead.saturating_add(encoded_bytes) <= MAX_BODY_BYTES {
+        out["body"] = json!(body);
+    } else {
+        // `true` takes one byte less than `false`. Count escaped bytes, not raw text:
+        // a newline costs two on the wire and a control character can cost six.
+        let budget = MAX_BODY_BYTES
+            .saturating_sub(overhead)
+            .saturating_add(1)
+            .saturating_sub(TRUNCATED_MARK.chars().map(json_char_bytes).sum::<usize>());
+        let mut used = 0;
+        let mut end = 0;
+        for (index, ch) in body.char_indices() {
+            let cost = json_char_bytes(ch);
+            if used + cost > budget {
+                break;
+            }
+            used += cost;
+            end = index + ch.len_utf8();
+        }
+        let mut prefix = String::with_capacity(end + TRUNCATED_MARK.len());
+        prefix.push_str(&body[..end]);
+        prefix.push_str(TRUNCATED_MARK);
+        out["body"] = json!(prefix);
+        out["truncated"] = json!(true);
+    }
+    out.to_string()
+}
+
+/// The bytes serde_json emits inside a JSON string, without its enclosing quotes.
+fn json_char_bytes(ch: char) -> usize {
+    match ch {
+        '"' | '\\' | '\u{0008}' | '\u{000c}' | '\n' | '\r' | '\t' => 2,
+        '\u{0000}'..='\u{001f}' => 6,
+        _ => ch.len_utf8(),
+    }
 }
 
 /// Non-2xx arrives as `Err` from the transport, already shaped by
@@ -551,7 +592,7 @@ mod tests {
     }
 
     #[test]
-    fn the_response_body_is_truncated_to_2kb_with_a_marker() {
+    fn the_response_body_is_bounded_with_a_marker() {
         let big = "x".repeat(MAX_BODY_BYTES + 500);
         let mut f = Fake::ok(&big);
         let v = run(&mut f, "net_get", json!({"url": "http://host/big"})).unwrap();
@@ -561,8 +602,8 @@ mod tests {
         assert!(body.len() <= MAX_BODY_BYTES + TRUNCATED_MARK.len(), "{}", body.len());
         assert!(body.ends_with(TRUNCATED_MARK), "the cut must be visible");
 
-        // Exactly at the limit is not truncated.
-        let mut f = Fake::ok(&"y".repeat(MAX_BODY_BYTES));
+        // A body with room for its metadata is not truncated.
+        let mut f = Fake::ok(&"y".repeat(MAX_BODY_BYTES - 1024));
         let v = run(&mut f, "net_get", json!({"url": "http://host/edge"})).unwrap();
         assert_eq!(v["truncated"], false);
         assert!(!v["body"].as_str().unwrap().ends_with(TRUNCATED_MARK));
@@ -645,6 +686,36 @@ mod tests {
         assert!(!looks_like_html("[1,2,3]"));
         assert!(!looks_like_html("hello"));
         assert!(looks_like_html("<!doctype html><html></html>"));
+    }
+
+    #[test]
+    fn unicode_html_and_entities_never_split_a_character() {
+        let html = format!("<html><body>{}</body></html>", "한글日本語".repeat(80));
+        assert!(looks_like_html(&html));
+        let page = html_to_text(&html);
+        assert_eq!(page.text, "한글日本語".repeat(80));
+        assert_eq!(decode_entities("&a한글日本語;"), "&a한글日本語;");
+        assert_eq!(decode_entities("&#x65E5;&#X672C;&#54620;"), "日本한");
+    }
+
+    #[test]
+    fn the_complete_network_result_fits_the_agent_budget() {
+        for body in
+            ["x".repeat(MAX_BODY_BYTES), "\n\"\\".repeat(MAX_BODY_BYTES / 3), "한".repeat(MAX_BODY_BYTES / 3)]
+        {
+            let mut f = Fake::ok(&body);
+            let text = call(&mut f, "net_get", &json!({"url": "http://host/edge"})).unwrap().unwrap();
+            assert!(text.len() <= crate::agent::MAX_TOOL_RESULT_BYTES, "{} bytes", text.len());
+            let v: Value = serde_json::from_str(&text).unwrap();
+            assert_eq!(v["bytes"], body.len());
+            let returned = v["body"].as_str().unwrap();
+            if v["truncated"] == true {
+                assert!(returned.ends_with(TRUNCATED_MARK));
+                assert!(body.starts_with(returned.strip_suffix(TRUNCATED_MARK).unwrap()));
+            } else {
+                assert_eq!(returned, body);
+            }
+        }
     }
 
     #[test]

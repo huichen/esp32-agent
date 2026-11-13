@@ -158,6 +158,8 @@ impl Family {
                 ))
             }
         };
+        ctx.ensure_enabled(self.name)?;
+        ctx.ensure_enabled(&sub.spec.name)?;
         (sub.handler)(ctx, &inner)
     }
 }

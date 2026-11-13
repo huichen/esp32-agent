@@ -134,6 +134,24 @@ impl Device for NamedDevice {
     }
 }
 
+/// Generic, family and direct driver calls all share the instance's public switch
+/// and any manifest confirmation/range/rate-limit policy for that action.
+pub(crate) fn invoke(ctx: &mut ToolCtx<'_>, id: &str, tool: &str, args: &Value) -> Result<Value> {
+    let (public, raw) = ctx.devices.resolve_tool(id, tool)?;
+    invoke_named(ctx, id, &public, &raw, args)
+}
+
+fn invoke_named(ctx: &mut ToolCtx<'_>, id: &str, public: &str, raw: &str, args: &Value) -> Result<Value> {
+    ctx.ensure_enabled(public)?;
+    if let Some(policy) =
+        ctx.manifest.driver_tool(id, public).or_else(|| ctx.manifest.driver_tool(id, raw)).cloned()
+    {
+        ctx.ensure_enabled(&policy.name)?;
+        return crate::manifest::run_tool(&policy, ctx, args);
+    }
+    ctx.devices.call(id, raw, args, ctx.hw)
+}
+
 impl std::fmt::Debug for Devices {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Devices").field("count", &self.items.len()).finish()
@@ -262,10 +280,9 @@ impl Devices {
                     def.spec.title = name.clone();
                 }
                 let id = device_id.clone();
+                let public_name = def.spec.name.clone();
                 let handler: ToolHandler = Box::new(move |ctx: &mut ToolCtx, args: &Value| {
-                    let ToolCtx { hw, devices, .. } = ctx;
-                    let name = tool_name.clone();
-                    devices.call(&id, &name, args, &mut **hw)
+                    invoke_named(ctx, &id, &public_name, &tool_name, args)
                 });
                 def.handler = handler;
                 def.spec.device_tool = true;
@@ -285,6 +302,25 @@ impl Devices {
             }
         }
         out
+    }
+
+    /// Resolve a published (possibly suffixed) name or a legacy raw driver alias.
+    /// The instance's published name is also the name its permission switch controls.
+    pub fn resolve_tool(&self, id: &str, tool: &str) -> Result<(String, String)> {
+        let idx = self
+            .find_index(id)
+            .ok_or_else(|| McpError::not_found(format!("no device `{id}` on this board")))?;
+        let names = self.unique_tool_names();
+        let defs = self.items[idx].tools();
+        let slot = defs
+            .iter()
+            .enumerate()
+            .find(|(slot, _)| names.get(&(idx, *slot)).is_some_and(|name| name == tool))
+            .or_else(|| defs.iter().enumerate().find(|(_, def)| def.spec.name == tool))
+            .ok_or_else(|| McpError::not_found(format!("device `{id}` has no tool `{tool}`")))?
+            .0;
+        let raw = defs[slot].spec.name.clone();
+        Ok((names.get(&(idx, slot)).cloned().unwrap_or_else(|| raw.clone()), raw))
     }
 
     pub fn call(&mut self, id: &str, tool: &str, args: &Value, hw: &mut dyn Hardware) -> Result<Value> {

@@ -77,6 +77,38 @@ pub fn ranged_i64(args: &Value, name: &str, default: i64, min: i64, max: i64) ->
     Ok(v)
 }
 
+/// Optional integer for raw hardware arguments. Absence keeps a driver default;
+/// an explicit null, fractional number, boolean or malformed string is an error.
+/// Other handlers retain the intentionally lenient helpers above.
+pub fn optional_ranged_i64(args: &Value, name: &str, min: i64, max: i64) -> Result<Option<i64>> {
+    let Some(raw) = args.get(name) else { return Ok(None) };
+    let value = raw
+        .as_i64()
+        .or_else(|| raw.as_str().and_then(|s| s.trim().parse::<i64>().ok()))
+        .ok_or_else(|| McpError::invalid_params(format!("`{name}` must be an integer")))?;
+    if value < min || value > max {
+        return Err(McpError::invalid_params(format!("`{name}` must be within {min}..={max}, got {value}")));
+    }
+    Ok(Some(value))
+}
+
+/// Optional JSON integer for size/count fields whose advertised type is numeric.
+pub fn optional_ranged_u64(args: &Value, name: &str, min: u64, max: u64) -> Result<Option<u64>> {
+    let Some(raw) = args.get(name) else { return Ok(None) };
+    let value = raw
+        .as_u64()
+        .ok_or_else(|| McpError::invalid_params(format!("`{name}` must be an unsigned JSON integer")))?;
+    if value < min || value > max {
+        return Err(McpError::invalid_params(format!("`{name}` must be within {min}..={max}, got {value}")));
+    }
+    Ok(Some(value))
+}
+
+pub fn required_ranged_i64(args: &Value, name: &str, min: i64, max: i64) -> Result<i64> {
+    optional_ranged_i64(args, name, min, max)?
+        .ok_or_else(|| McpError::invalid_params(format!("`{name}` (integer) is required")))
+}
+
 pub fn opt_u8(args: &Value, name: &str) -> Option<u8> {
     opt_i64(args, name).and_then(|v| u8::try_from(v).ok())
 }
@@ -137,6 +169,32 @@ mod tests {
     fn range_errors_name_the_field() {
         let e = ranged_i64(&json!({ "pin": 99 }), "pin", 0, 0, 48).unwrap_err();
         assert!(e.message.contains("pin"));
+    }
+
+    #[test]
+    fn strict_integers_distinguish_absence_from_invalid_input() {
+        assert_eq!(optional_ranged_i64(&json!({}), "pin", 0, 48).unwrap(), None);
+        assert!(required_ranged_i64(&json!({}), "pin", 0, 48).unwrap_err().message.contains("pin"));
+        for raw in [
+            json!(null),
+            json!(true),
+            json!({}),
+            json!([]),
+            json!(1.5),
+            json!(1.0),
+            json!("1.5"),
+            json!("NaN"),
+            json!("bad"),
+            json!(-1),
+            json!(49),
+            json!(u64::MAX),
+        ] {
+            let error = optional_ranged_i64(&json!({"pin":raw}), "pin", 0, 48).unwrap_err();
+            assert_eq!(error.code, crate::error::code::INVALID_PARAMS);
+            assert!(error.message.contains("pin"));
+        }
+        assert_eq!(required_ranged_i64(&json!({"pin":" 42 "}), "pin", 0, 48).unwrap(), 42);
+        assert_eq!(required_ranged_i64(&json!({"pin":0}), "pin", 0, 48).unwrap(), 0);
     }
 
     #[test]

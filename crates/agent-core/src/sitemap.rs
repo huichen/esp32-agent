@@ -16,16 +16,19 @@ use serde_json::{json, Value};
 pub enum Auth {
     /// No credentials, on any configuration.
     Open,
-    /// The portal PIN when `auth.portal_pin` is set (`X-Portal-Pin` header or `?pin=`),
-    /// otherwise open. Every mutation on this board is in this class.
+    /// A portal credential when `auth.portal_pin` is set, otherwise open.
+    /// This also protects reads of private conversation/configuration data.
     Pin,
+    /// Dedicated MCP bearer token, or the portal credential when none is configured.
+    Mcp,
 }
 
 impl Auth {
     fn as_str(self) -> &'static str {
         match self {
             Auth::Open => "none",
-            Auth::Pin => "portal pin, when one is configured",
+            Auth::Pin => "portal credential, when auth.portal_pin is configured",
+            Auth::Mcp => "auth.mcp_token bearer when configured; otherwise the portal credential",
         }
     }
 }
@@ -142,12 +145,18 @@ pub const ROUTES: &[Route] = &[
         "",
         "{drivers}",
     ),
+    r(
+        "POST", "/api/tools", "tools", Auth::Pin,
+        "Change tool visibility/disabled switches and listing mode; switches are enforced on execution",
+        "{disabled?: [name], mode?: auto|all|generic}",
+        "{tools, visible, total, mode}",
+    ),
     // --- configuration -------------------------------------------------------------
     r(
         "GET",
         "/api/config",
         "config",
-        Auth::Open,
+        Auth::Pin,
         "Current configuration; secrets appear as __set__, never in the clear",
         "",
         "the config object",
@@ -216,14 +225,14 @@ pub const ROUTES: &[Route] = &[
         "agent",
         Auth::Pin,
         "Queue a user message for the on-board agent; the run happens on its own thread",
-        "{text}",
-        "202 and the queued count",
+        "{text, attachments?: [{name, mime, data_b64}]}",
+        "202 and the queued count; attachment admission is atomic with the message",
     ),
     r(
         "GET",
         "/api/agent/history",
         "agent",
-        Auth::Open,
+        Auth::Pin,
         "Transcript entries, optionally only those after a sequence number",
         "?after=<n>",
         "{messages, usage}",
@@ -260,7 +269,7 @@ pub const ROUTES: &[Route] = &[
         "GET",
         "/api/agent/events",
         "agent",
-        Auth::Open,
+        Auth::Pin,
         "The run journal (polling), optionally after a sequence number",
         "?after=<seq>",
         "{events}",
@@ -269,7 +278,7 @@ pub const ROUTES: &[Route] = &[
         "GET",
         "/api/agent/stream",
         "agent",
-        Auth::Open,
+        Auth::Pin,
         "The same journal as server-sent events: replay, then follow",
         "?after=<seq>",
         "text/event-stream; 503 and Retry-After: 5 when two are open",
@@ -278,10 +287,31 @@ pub const ROUTES: &[Route] = &[
         "GET",
         "/api/agent/prompt",
         "agent",
-        Auth::Open,
+        Auth::Pin,
         "The system prompt as the model receives it: memory index and the compressed view of earlier turns included",
         "",
         "{system, bytes, archive_lines, history}",
+    ),
+    r(
+        "GET", "/api/attachment/<name>", "agent", Auth::Pin,
+        "Download an attachment from the last accepted message; URL-encode its name",
+        "", "the original decoded bytes and MIME type, or 404",
+    ),
+    // --- workspace -----------------------------------------------------------------
+    r(
+        "GET", "/api/files", "files", Auth::Pin,
+        "List one workspace directory", "?path=<directory>",
+        "{ok, path, count, entries, total_bytes, total_max, file_max}",
+    ),
+    r(
+        "GET", "/api/files/tree", "files", Auth::Pin,
+        "List the workspace as a directory tree and flat entries", "",
+        "{ok, count, entries, total_bytes, total_max, file_max}",
+    ),
+    r(
+        "GET", "/api/files/read", "files", Auth::Pin,
+        "Read one UTF-8 workspace file", "?path=<file>",
+        "{ok, path, text, size_bytes}, or {ok: false, error}",
     ),
     // --- audio ---------------------------------------------------------------------
     r(
@@ -322,12 +352,22 @@ pub const ROUTES: &[Route] = &[
         "{tasks, rules}",
         "the stored schedule",
     ),
+    r(
+        "POST", "/api/sched/run", "sched", Auth::Pin,
+        "Run a scheduled task now without moving its timer", "{id}",
+        "the queued prompt or script result, or 404 for an unknown id",
+    ),
+    r(
+        "GET", "/api/script/<id>", "script", Auth::Pin,
+        "Poll the id returned by an asynchronous script submission", "",
+        "{id, state, ok, result, output, steps, ms, error}, or 404",
+    ),
     // --- diagnostics and recovery --------------------------------------------------
     r(
         "GET",
         "/api/logs",
         "logs",
-        Auth::Open,
+        Auth::Pin,
         "The ring log, newest last, bounded by log.ring",
         "?n=<count>&since=<seq>",
         "{lines}",
@@ -361,9 +401,12 @@ pub const ROUTES: &[Route] = &[
         "",
         "{ok}",
     ),
-    r("POST", "/mcp", "mcp", Auth::Open,
+    r("POST", "/mcp", "mcp", Auth::Mcp,
       "The MCP transport itself: initialize, tools/list, tools/call, resources/*. The path is `mcp.path`, so read it from the dynamic section before you connect",
       "a JSON-RPC 2.0 message", "a JSON-RPC response, or text/event-stream when mcp.sse is on"),
+    r("DELETE", "/mcp", "mcp", Auth::Mcp,
+      "Close the session in Mcp-Session-Id; the same service and credential gate as POST",
+      "", "204 with no body"),
     // --- the console ---------------------------------------------------------------
     r(
         "GET",
@@ -393,7 +436,7 @@ pub const ROUTES: &[Route] = &[
         "text/css",
     ),
     r(
-        "GET",
+        "POST",
         "/selftest/chat/completions",
         "agent",
         Auth::Open,
@@ -401,18 +444,23 @@ pub const ROUTES: &[Route] = &[
         "an OpenAI chat request",
         "a canned completion",
     ),
+    r("GET", "/selftest/ping", "agent", Auth::Open,
+      "Lock-free local HTTP target for the scripted network turn", "",
+      "{ok, service, purpose}"),
 ];
 
 /// The MCP transport, described the way a client needs it.
-pub fn mcp_json(path: &str, tools: usize, auth_required: bool) -> Value {
+pub fn mcp_json(path: &str, tools: usize, dedicated_token: bool, portal_pin: bool) -> Value {
     json!({
         "path": path,
-        "transport": "streamable-http, POST only",
+        "transport": "streamable-http, POST for JSON-RPC; DELETE to close a session; no standalone GET stream",
         "protocol_versions": ["2025-06-18", "2025-03-26"],
-        "auth": if auth_required {
-            "Authorization: Bearer <mcp.token> is required"
+        "auth": if dedicated_token {
+            "Authorization: Bearer <auth.mcp_token> is required"
+        } else if portal_pin {
+            "portal credential required: a bearer token from POST /api/auth or the portal PIN"
         } else {
-            "open; set mcp.token to require a bearer token"
+            "open; set auth.mcp_token or auth.portal_pin to require credentials"
         },
         "session": {
             "header": "Mcp-Session-Id",
@@ -424,6 +472,9 @@ pub fn mcp_json(path: &str, tools: usize, auth_required: bool) -> Value {
             "initialize",
             "notifications/initialized",
             "ping",
+            "prompts/list",
+            "logging/setLevel",
+            "completion/complete",
             "tools/list",
             "tools/call",
             "resources/list",
@@ -440,9 +491,9 @@ pub fn mcp_json(path: &str, tools: usize, auth_required: bool) -> Value {
                            "params": {"protocolVersion": "2025-06-18", "capabilities": {},
                                       "clientInfo": {"name": "your-agent", "version": "0"}}},
             "call": {"jsonrpc": "2.0", "id": 2, "method": "tools/call",
-                     "params": {"name": "board_status", "arguments": {}}},
+                     "params": {"name": "board", "arguments": {"command": "status"}}},
         },
-        "not_mcp": "the fs_* and net_* tools are on this endpoint too; the on-board model sees them as well",
+        "shared_tools": "read, write, edit, shell, script and image_read are served here too; the on-board model uses the same tools and disabled switches",
     })
 }
 
@@ -469,21 +520,39 @@ pub fn document(dynamic: Value) -> Value {
         "read_this_first": [
             "GET /api/status for the state, GET /api/tools for what you can call",
             "Every tool call is POST /mcp with tools/call; there is no REST tool endpoint",
-            "Mutations need the portal PIN when one is configured, so ask the operator before you try one",
+            "Portal writes and private reads need a portal credential when a PIN is set; MCP uses its dedicated bearer token, or falls back to that portal credential",
             "A manifest edit is live immediately: there is no apply-and-reboot step",
         ],
         "conventions": {
-            "content_type": "application/json; requests without a body still need Content-Length: 0 or a JSON body",
+            "content_type": "JSON endpoints use application/json; send Content-Length or chunked framing for a body. Media routes accept their documented binary MIME types",
             "errors": {"shape": {"error": "<human sentence>"}, "codes": "HTTP status carries the class; 4xx is your request, 5xx is the board"},
             "ids": "JSON-RPC ids in the MCP surface; sequence numbers in the polling endpoints",
-            "encoding": "UTF-8 everywhere; binary payloads are base64 in a string field",
+            "encoding": "UTF-8 JSON; attachments/tool binary fields use base64. Downloads and media streams carry raw binary bytes",
+            "portal_auth": "X-Portal-Pin, ?pin=, or Authorization: Bearer <PIN|minted token>. Minted ?token= is read-only (GET/HEAD), for EventSource/downloads; a raw PIN is not a URL token",
+            "persistence": "A successful write usually means RAM update plus bounded queue admission, not flash acknowledgement. Check /api/status.store.pending, failed and last_failure; pending zero alone is not success",
             "limits": {
-                "tool_result_bytes": 8192,
-                "reply_bytes": 8192,
-                "http_connections": 6,
-                "event_streams": 2,
-                "manifest_tools": 48,
-                "sequence_steps": 8,
+                "tool_result_bytes": crate::agent::MAX_TOOL_RESULT_BYTES,
+                "reply_bytes": crate::agent::MAX_REPLY_BYTES,
+                "user_bytes": crate::agent::MAX_USER_BYTES,
+                "history_bytes": crate::agent::MAX_HISTORY_BYTES,
+                "history_messages": crate::agent::MAX_HISTORY_MESSAGES,
+                "saved_transcript_bytes": crate::agent::MAX_SAVED_BYTES,
+                "workspace_file_bytes": crate::app::WORKSPACE_FILE_MAX,
+                "workspace_text_bytes": crate::app::WORKSPACE_TOTAL_MAX,
+                "workspace_files": crate::app::WORKSPACE_FILES_MAX,
+                "workspace_path_bytes": crate::app::WORKSPACE_PATH_MAX,
+                "workspace_names_bytes": crate::app::WORKSPACE_NAMES_MAX,
+                "attachment_bytes": crate::app::MAX_ATTACHMENT_BYTES,
+                "attachments": crate::app::MAX_ATTACHMENTS,
+                "http_body_bytes": crate::http::MAX_BODY_BYTES,
+                "outbound_http_body_bytes": crate::http_client::MAX_BODY_BYTES,
+                "http_connections": crate::http::MAX_CONNECTIONS,
+                "event_streams": crate::http::MAX_EVENT_STREAMS,
+                "manifest_tools": crate::manifest::MAX_TOOLS,
+                "sequence_steps": crate::manifest::MAX_STEPS,
+                "sequence_wait_ms": crate::manifest::MAX_TOTAL_DELAY_MS,
+                "audio_stream_bytes": crate::app::AUDIO_STREAM_MAX_BYTES,
+                "av_stream_bytes": crate::app::AV_MAX_BODY_BYTES,
                 "model_steps": "unlimited by default; POST /api/agent/config max_steps sets a cap (0 = off, 200 max)",
             },
         },
@@ -532,5 +601,25 @@ mod tests {
         assert_eq!(listed.len(), ROUTES.len());
         assert_eq!(doc["counts"]["endpoints"], ROUTES.len());
         assert_eq!(doc["dynamic"]["base_url"], "http://board");
+        assert_eq!(doc["conventions"]["limits"]["tool_result_bytes"], crate::agent::MAX_TOOL_RESULT_BYTES);
+        assert_eq!(doc["conventions"]["limits"]["reply_bytes"], crate::agent::MAX_REPLY_BYTES);
+        for (method, path) in [
+            ("POST", "/api/tools"),
+            ("GET", "/api/files"),
+            ("GET", "/api/files/tree"),
+            ("GET", "/api/files/read"),
+            ("POST", "/api/sched/run"),
+            ("POST", "/selftest/chat/completions"),
+            ("DELETE", "/mcp"),
+            ("GET", "/api/script/<id>"),
+            ("GET", "/api/attachment/<name>"),
+        ] {
+            assert!(
+                listed.iter().any(|route| route["method"] == method && route["path"] == path),
+                "implemented route omitted from discovery: {method} {path}"
+            );
+        }
+        assert!(mcp_json("/mcp", 1, false, true)["auth"].as_str().unwrap().contains("portal credential"));
+        assert!(mcp_json("/mcp", 1, true, true)["auth"].as_str().unwrap().contains("auth.mcp_token"));
     }
 }

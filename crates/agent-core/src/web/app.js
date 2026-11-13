@@ -26,6 +26,7 @@ const S = {
   busy: false,
   panel: "status",
   afterUnlock: null,
+  unlockPromise: null,
 };
 
 // ---------------------------------------------------------------- transport
@@ -52,11 +53,15 @@ async function api(path, opts = {}) {
 }
 
 function unlock() {
-  return new Promise((resolve) => {
+  // Startup reads can be refused together. All of them wait for one login; a
+  // second 401 must not strand the first request by replacing its resolver.
+  if (S.unlockPromise) return S.unlockPromise;
+  S.unlockPromise = new Promise((resolve) => {
     S.afterUnlock = resolve;
     $("#login").hidden = false;
     setTimeout(() => $("#login-pin").focus(), 60);
   });
+  return S.unlockPromise;
 }
 
 async function doLogin() {
@@ -80,6 +85,7 @@ async function doLogin() {
     $("#login-pin").value = "";
     const wait = S.afterUnlock;
     S.afterUnlock = null;
+    S.unlockPromise = null;
     if (wait) wait(true);
     else location.reload();
   } catch (e) {
@@ -100,13 +106,29 @@ function toast(text) {
 const escapeHtml = (s) =>
   s.replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 
+/** Only passive links are clickable. HTML escaping alone does not neutralize
+ * javascript: or browser-normalized control characters inside a URL. */
+function markdownLink(label, escapedTarget) {
+  const decoder = document.createElement("textarea");
+  decoder.innerHTML = escapedTarget;
+  const target = decoder.value.trim();
+  if (!target || /[\u0000-\u0020\u007f]/.test(target)) return label;
+  try {
+    const url = new URL(target, location.href);
+    if (!["http:", "https:", "mailto:"].includes(url.protocol)) return label;
+  } catch {
+    return label;
+  }
+  return '<a href="' + escapeHtml(target) + '" target="_blank" rel="noopener noreferrer">' + label + "</a>";
+}
+
 /** Inline spans, applied to text that has already been HTML-escaped. */
 function inline(text) {
   return text
     .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
     .replace(/(^|[^*])\*([^*\n]+)\*/g, "$1<em>$2</em>")
     .replace(/`([^`]+)`/g, "<code>$1</code>")
-    .replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
+    .replace(/\[([^\]]+)\]\(([^)]+)\)/g, (_, label, target) => markdownLink(label, target));
 }
 
 /** One table row's cells. `\|` is a pipe in the text, not a separator. */
@@ -172,7 +194,7 @@ function tableFrom(lines, at) {
   return { html, next: i };
 }
 
-/** A small Markdown subset: what a model actually emits on a 2 KB budget. */
+/** A small Markdown subset for model replies, with raw HTML kept as text. */
 function markdown(text) {
   const blocks = [];
   let src = escapeHtml(text || "").replace(/```([\s\S]*?)```/g, (_, code) => {
@@ -732,7 +754,10 @@ const EVENT_KINDS = [
 
 function connectStream() {
   if (S.stream) return;
-  const es = new EventSource("/api/agent/stream?after=" + S.lastEvent);
+  // EventSource cannot set request headers. The server accepts only a minted,
+  // expiring portal token here (never a raw PIN), and only for reads.
+  const es = new EventSource("/api/agent/stream?after=" + S.lastEvent +
+    (S.token ? "&token=" + encodeURIComponent(S.token) : ""));
   S.stream = es;
   for (const kind of EVENT_KINDS) {
     es.addEventListener(kind, (ev) => {
@@ -941,13 +966,11 @@ async function schedOp(id, op) {
 
 /** The workspace as one tree: directories fold, a file opens below.
  *
- * It used to be a directory-at-a-time list with breadcrumbs, which cost a request per level
- * for a workspace that is at most 8 KB. One `/api/files/tree` answers the whole thing, and
- * the hierarchy is the one the paths already carry.
+ * One `/api/files/tree` returns metadata, not all file contents. File-count/path budgets
+ * bound the tree, and its hierarchy is the one the canonical paths already carry.
  *
- * Read-only on purpose. Every write goes through the agent or the `write` tool, where the
- * 8 KB budget and the one-blob-in-NVS storage are enforced; a portal editor that writes
- * would need the same checks a second time and would be the place they drift apart. */
+ * Read-only on purpose. Writes go through the agent/file tools, where shared workspace
+ * admission and incremental publication are enforced, rather than a second editor path. */
 async function loadTree() {
   try {
     const d = await api("/api/files/tree");
@@ -1205,7 +1228,7 @@ $("#attach").onclick = () => $("#attach-input").click();
     };
     const key = $("#agent-key").value.trim();
     if (key) body.api_key = key;
-    try { await api("/api/agent/config", { method: "POST", body }); $("#agent-key").value = ""; toast("saved"); loadStatus(); }
+    try { await api("/api/agent/config", { method: "POST", body }); $("#agent-key").value = ""; toast("applied; save queued"); loadStatus(); }
     catch (e) { toast(e.message); }
   };
 
@@ -1253,7 +1276,7 @@ $("#attach").onclick = () => $("#attach-input").click();
         method: "POST",
         body: { ssid: $("#wifi-ssid").value.trim(), password: $("#wifi-password").value },
       });
-      $("#wifi-result").textContent = "saved; the board is joining";
+      $("#wifi-result").textContent = "credentials queued; the board is joining";
       setTimeout(loadStatus, 4000);
     } catch (e) { $("#wifi-result").textContent = e.message; }
   };
@@ -1274,7 +1297,7 @@ $("#attach").onclick = () => $("#attach-input").click();
       $("#auth-pin").value = "";
       // A new PIN invalidates the token the page is holding.
       if (pin) { S.token = ""; localStorage.removeItem("esp32-agent.token"); }
-      toast("saved");
+      toast("applied; save queued");
     } catch (e) { toast(e.message); }
   };
 

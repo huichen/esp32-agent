@@ -11,10 +11,11 @@ extra model call, and nothing that needs a host.
 
 ```text
 /MEMORY.md              the index: one line per memory, each pointing at a file
-/memory/<topic>.md      the memory itself, at most 2 KB (the workspace file limit)
+/memory/<topic>.md      the memory itself, at most 256 KiB (the workspace file limit)
 ```
 
-The **index** is what reaches the system prompt, every run, capped at 24 lines / 2 KB:
+The **index** reaches the system prompt every run, capped at 24 pointer lines / 2 KiB,
+including the truncation marker:
 
 ```text
 ## Memory (/MEMORY.md)
@@ -24,9 +25,10 @@ The **index** is what reaches the system prompt, every run, capped at 24 lines /
 ```
 
 The **bodies** stay on the workspace and are opened with `fs_read` when a topic is
-relevant. That split is the whole design: a prompt that carries every memory crowds out the
-tool descriptions, and on a board with a few dozen kB of internal RAM the prompt is the
-expensive part.
+relevant. A prompt that carries every memory crowds out tool descriptions and costs
+request heap and provider tokens. The full workspace is still in RAM, with a 4 MiB
+aggregate text limit and separate metadata limits; a flash filesystem does not add heap.
+See [storage](storage.md).
 
 Lines that are not pointers are dropped — a heading, a paragraph, a bullet with no path.
 A model that writes prose instead of an index therefore loses the budget, not the
@@ -53,13 +55,16 @@ then one line appended to the index:
 ```
 
 `GET /api/agent/prompt` shows exactly what the model will be told, memory included, so this
-is checkable without a model in the loop.
+is checkable without a model in the loop. Memory-file tools report `queued: true` /
+`saved: false`: the RAM edit was admitted, not confirmed on storage. Later publication
+receipts control saved-hash bookkeeping; neither is a power-loss measurement.
 
 ## 2. Compression without a summary
 
 When the transcript passes 80% of `agent.context_tokens`, or either hard cap (1,024
-messages, 2 MB), the oldest exchanges are **not** handed to a model to summarise. They
-are replaced by one deterministic line per message, derived from the messages themselves:
+messages, 2 MiB of payload), the oldest exchanges are **not** handed to a model to summarise. They
+are represented by deterministic excerpts derived from earlier messages, not a generated
+summary:
 
 ```text
 ## Earlier in this conversation (compressed)
@@ -74,10 +79,15 @@ are replaced by one deterministic line per message, derived from the messages th
 | No model call | Compression must never fail, cost tokens, or depend on the network. |
 | Cannot invent facts | The lines are the transcript's own text, truncated — not an interpretation. |
 | Reproducible | The same history compresses the same way. |
-| Bounded | One line per message, 40 lines maximum; older lines fall off the front. |
+| Bounded | At most 40 archive lines, with bounded excerpts; older lines fall off the front. |
 
-The last four exchanges survive verbatim (`COMPACT_KEEP_TURNS`), which is what keeps a task
-on the rails: what was just asked, and what the last tools returned.
+Recent exchanges are selected by `keep_recent_tokens`: at most a quarter of the 80% token
+trigger, further limited by the output reserve. At least one newest exchange is kept.
+Four verbatim exchanges are not an invariant of the current token-based selection, and
+hard byte/message trimming can remove more. Payload accounting includes text, reasoning,
+serialized arguments, attachment payloads/metadata, IDs and source; an oversized newest
+message can remain as an explicit exception. The 2 MiB ceiling is not a measured peak-heap
+guarantee.
 
 The index is rendered into the system prompt under *Earlier in this conversation*, with one
 instruction that matters: a tool call listed there has already been made.
@@ -91,9 +101,11 @@ instruction that matters: a tool call listed there has already been made.
 | `0` | Drop the whole conversation — a fresh start |
 | `1..n` | Keep the last `n` question-and-answer exchanges, drop everything older |
 
-The response is `{ok, removed, kept}`, and the compressed index is cleared with it: an index
-of what is no longer there is worse than none. `POST /api/agent/reset` is the same thing
-with `keep: 0` and is kept for older clients.
+The response includes `{ok, removed, kept}`; `removed` and `kept` count messages, while
+`keep` selects exchanges. The compressed index is cleared too. `POST /api/agent/reset`
+clears the conversation like `keep: 0` (its response uses `reset: true`). Both request a
+stored-transcript update/removal, but the response is not flash acknowledgement; a later
+queued-write failure can leave the older persisted history. See [storage](storage.md).
 
 External agents use this between tasks; the on-board agent cannot call it (it would be
 editing the conversation it is in the middle of).
@@ -102,12 +114,16 @@ editing the conversation it is in the middle of).
 
 | Budget | Value |
 |---|---|
-| Memory index in the prompt | ≤ 2 KB, ≤ 24 lines |
-| Compressed index in the prompt | ≤ 40 lines, ~90 chars each |
-| Transcript kept verbatim | the last 4 exchanges, within 80% of `context_tokens` and the 2 MB / 1,024-message caps |
+| Memory index in the prompt | ≤ 2 KiB including truncation marker, ≤ 24 pointer lines |
+| Compressed index in the prompt | ≤ 40 lines of bounded excerpts; separate from the history byte budget |
+| Transcript kept verbatim | recent exchanges selected by the token budget, subject to the 2 MiB / 1,024-message backstops and newest-message exception |
+| Saved transcript | ≤ 512 KiB of JSONL including header, newest complete exchanges/call-result pairs; no attachment payloads |
 | Model calls added | none |
 
 ## Verifying it without a model
+
+When configured, add the MCP bearer token to `/mcp` requests and the portal credential
+to the REST prompt/forget requests; they are separate credentials ([security](security.md)).
 
 ```bash
 # write a memory through the normal file tools

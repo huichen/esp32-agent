@@ -28,13 +28,10 @@ use std::sync::Arc;
 pub fn start(app: Shared, log: Arc<LogBuf>) {
     // A named thread, because `ps` reads the FreeRTOS name and this one answers `provision`
     // on the console. Internal RAM: provisioning stores credentials in NVS.
-    let spawned = crate::threads::spawn(
-        b"provision\0",
-        6 * 1024,
-        crate::threads::INTERNAL,
-        None,
-        move || read_console(app, log),
-    );
+    let spawned =
+        crate::threads::spawn(b"provision\0", 6 * 1024, crate::threads::INTERNAL, None, move || {
+            read_console(app, log)
+        });
     if spawned.is_err() {
         log::error!("could not start the console provisioning thread");
     }
@@ -71,12 +68,7 @@ fn read_console(app: Shared, log: Arc<LogBuf>) {
         }
         if n <= 0 && uart {
             n = unsafe {
-                sys::uart_read_bytes(
-                    0,
-                    buf.as_mut_ptr() as *mut core::ffi::c_void,
-                    buf.len() as u32,
-                    5,
-                )
+                sys::uart_read_bytes(0, buf.as_mut_ptr() as *mut core::ffi::c_void, buf.len() as u32, 5)
             };
         }
         if n <= 0 {

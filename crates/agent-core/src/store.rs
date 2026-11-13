@@ -56,6 +56,20 @@ pub const ERR_KEY_TOO_LONG_NAME: &str = "ESP_ERR_NVS_KEY_TOO_LONG";
 /// count of the rest is kept in [`StoreQueue::refused_other`].
 pub const REFUSED_KEYS_MAX: usize = 16;
 
+/// Queue admission budgets, including key strings and a per-operation bookkeeping charge.
+/// Two workspaces' worth of names permit replacing 1,024 paths before old values are removed;
+/// the byte budget covers 4 MiB of file text, a 512 KiB transcript and escaped index/metadata.
+/// These are queue ceilings, not promises of available heap or backend capacity.
+pub const PENDING_KEYS_MAX: usize = 2 * crate::app::WORKSPACE_FILES_MAX + 256;
+pub const PENDING_BYTES_MAX: usize = 6 * 1024 * 1024;
+const PENDING_ENTRY_BYTES: usize = 128;
+
+/// Queue-local errors are deliberately negative, not ESP-IDF error numbers.
+pub const ERR_QUEUE_FULL: i32 = -1;
+pub const ERR_QUEUE_ALLOC: i32 = -2;
+pub const ERR_DEPENDENCY: i32 = -3;
+const PENDING_PUBLICATION_BYTES: usize = 256;
+
 /// How one blob is spread over values, and how to tell it from one written before it was
 /// chunked.
 #[derive(Debug, Clone, Copy)]
@@ -170,13 +184,23 @@ pub fn write_blob(
         Some(bytes) => (bytes.max(1), bytes),
         None => (plan.chunk_bytes, plan.capacity()),
     };
-    let chunks = split(blob, chunk_bytes);
+    if chunk_bytes == 0 {
+        return Err("the storage plan asks for zero-byte chunks; nothing was written".into());
+    }
     if blob.len() > capacity {
         return Err(format!(
             "it is {} bytes and the store keeps at most {} bytes, so it needs {} values; nothing was written",
             blob.len(),
             capacity,
-            chunks.len()
+            blob.len().div_ceil(chunk_bytes)
+        ));
+    }
+    let chunks = split(blob, chunk_bytes);
+    if chunks.len() > plan.chunks_max || chunks.iter().any(|chunk| chunk.len() > chunk_bytes) {
+        return Err(format!(
+            "UTF-8 boundaries need {} values and the storage plan keeps at most {}; nothing was written",
+            chunks.len(),
+            plan.chunks_max
         ));
     }
     if chunk_bytes > VALUE_MAX && max_value.is_none() {
@@ -233,6 +257,12 @@ pub fn read_blob(store: &dyn KvStore, base: &str, plan: Plan) -> BlobState {
     let (Ok(count), Ok(total)) = (count.parse::<usize>(), total.parse::<usize>()) else {
         return BlobState::Corrupt(format!("the `{base}` header is not numbers: `{}`", clip(&header)));
     };
+    let capacity = store.whole_value_bytes().unwrap_or_else(|| plan.capacity());
+    if total > capacity {
+        return BlobState::Corrupt(format!(
+            "the `{base}` header describes {total} bytes and the store keeps at most {capacity}"
+        ));
+    }
     if count > plan.chunks_max {
         return BlobState::Corrupt(format!(
             "the `{base}` header describes {count} values and the store keeps at most {}",
@@ -253,6 +283,9 @@ pub fn read_blob(store: &dyn KvStore, base: &str, plan: Plan) -> BlobState {
     };
     let mut expected = Vec::with_capacity(count);
     for field in checksums.split(',') {
+        if expected.len() == count {
+            return BlobState::Corrupt(format!("the `{base}` header lists too many checksums"));
+        }
         match u64::from_str_radix(field, 16) {
             Ok(value) => expected.push(value),
             Err(_) => {
@@ -266,7 +299,10 @@ pub fn read_blob(store: &dyn KvStore, base: &str, plan: Plan) -> BlobState {
             expected.len()
         ));
     }
-    let mut blob = String::with_capacity(total);
+    let mut blob = String::new();
+    if blob.try_reserve_exact(total).is_err() {
+        return BlobState::Corrupt(format!("the `{base}` header requests more memory than is available"));
+    }
     for (index, want) in expected.iter().enumerate() {
         let key = chunk_key(base, index + 1);
         let Some(chunk) = store.get(&key) else {
@@ -280,6 +316,9 @@ pub fn read_blob(store: &dyn KvStore, base: &str, plan: Plan) -> BlobState {
             return BlobState::Corrupt(format!(
                 "`{key}` does not match the checksum in `{base}` (a write torn by a power cut, or a chunk from another write, looks exactly like this)"
             ));
+        }
+        if chunk.len() > total.saturating_sub(blob.len()) {
+            return BlobState::Corrupt(format!("`{base}` chunks exceed the declared {total} bytes"));
         }
         blob.push_str(&chunk);
     }
@@ -374,6 +413,38 @@ pub trait KvStore: Send {
         }
     }
 
+    /// Publish an index only after every supplied value succeeds, then remove obsolete keys.
+    /// A queued implementation admits the complete request atomically and returns a receipt
+    /// whose outcome is filled by the writer. `Some` alone does not establish durability.
+    /// The synchronous default preserves dependency order, not an all-values transaction.
+    fn publish(
+        &mut self,
+        index_key: &str,
+        index: &str,
+        writes: &[(&str, &str)],
+        cleanup: &[&str],
+    ) -> Option<PublicationReceipt> {
+        for (key, value) in writes {
+            if !self.set(key, value) {
+                return None;
+            }
+        }
+        if !self.set(index_key, index) {
+            return None;
+        }
+        let mut cleanup_failed = Vec::new();
+        for key in cleanup {
+            if !self.remove(key) && self.last_error().is_some() {
+                cleanup_failed.push((*key).to_string());
+            }
+        }
+        let receipt = PublicationReceipt::new(index_key);
+        receipt.with_state(|state| {
+            state.outcome = Some(PublicationOutcome::Finished { published: true, cleanup_failed });
+        });
+        Some(receipt)
+    }
+
     /// A reader over the stored value, when the backend can offer one without building it.
     ///
     /// A file can be read as it is; NVS has to assemble its values first, so it answers `None`
@@ -388,8 +459,8 @@ pub trait KvStore: Send {
     ///
     /// The primitive a streaming read is built on: the caller asks for the next few kilobytes
     /// instead of the whole value. The default materialises the value through [`KvStore::get`],
-    /// which is right for a backend whose values are small (NVS caps one at ~4 KB, the
-    /// simulator has no cap and no 4 MB workspace either). A file backend seeks.
+    /// which is suitable only for small values (NVS caps one at ~4 KB). Map and filesystem
+    /// backends override it to avoid a full-value copy for each small pull.
     fn read_at(&self, key: &str, offset: usize, buf: &mut [u8]) -> Option<usize> {
         let text = self.get(key)?;
         let bytes = text.as_bytes();
@@ -453,11 +524,10 @@ pub struct Refusal {
 /// **Where each number comes from**, because a reader has to be able to tell a measured figure
 /// from a derived one:
 ///
-/// * `Bytes.total` and `Bytes.used` are what the backend reports: on SPIFFS,
-///   `esp_spiffs_info()`, which is `SPIFFS_info()`. Its `total` is not the partition size - it is
-///   `(blocks - 2) * (pages_per_block - lookup_pages) + 1` data pages times the data page size,
-///   i.e. the 12 517 376-byte partition minus two spare blocks and the object-lookup pages. On
-///   this board that is 45 811 * 251 = 11 498 561, which is what `/api/status` shows.
+/// * `Bytes.total` and `Bytes.used` are what the filesystem backend reports. The firmware
+///   uses `esp_littlefs_info()`: configured block count * block size for total and
+///   `lfs_fs_size()` * block size for used. The former SPIFFS data-page capacity formula
+///   does not describe LittleFS; see `docs/storage.md` for the dependency evidence.
 /// * `Bytes.free` and `Entries.free_bytes` are **computed here** as `total - used`. No backend
 ///   reports a "free" number; saying so is the point of this note.
 /// * `Entries.used/free/total` are `nvs_get_stats()`'s `nvs_stats_t`, counted in 32-byte entries.
@@ -513,8 +583,154 @@ impl StoreSpace {
     }
 }
 
-/// One queued operation: `Some` is a write, `None` is a removal.
-type Pending = Vec<(String, Option<String>)>;
+/// A generation-specific acknowledgement, never inferred from a key's presence in a report.
+/// Replacing a not-yet-drained publication supersedes its receipt, not a newer generation's.
+#[derive(Clone, Debug)]
+pub struct PublicationReceipt(Arc<Publication>);
+
+#[derive(Debug)]
+struct Publication {
+    index_key: String,
+    state: Mutex<PublicationState>,
+}
+
+#[derive(Debug, Default)]
+struct PublicationState {
+    dependency_failed: bool,
+    index_processed: bool,
+    published: bool,
+    cleanup_failed: Vec<String>,
+    outcome: Option<PublicationOutcome>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PublicationOutcome {
+    /// The entire older request was replaced before any of its operations ran.
+    Superseded,
+    Finished {
+        published: bool,
+        cleanup_failed: Vec<String>,
+    },
+}
+
+impl PublicationReceipt {
+    fn new(index_key: &str) -> Self {
+        Self::from_key(index_key.to_string())
+    }
+
+    fn from_key(index_key: String) -> Self {
+        Self(Arc::new(Publication { index_key, state: Mutex::default() }))
+    }
+
+    fn with_state<R>(&self, f: impl FnOnce(&mut PublicationState) -> R) -> R {
+        match self.0.state.lock() {
+            Ok(mut state) => f(&mut state),
+            Err(poisoned) => f(&mut poisoned.into_inner()),
+        }
+    }
+
+    pub fn outcome(&self) -> Option<PublicationOutcome> {
+        self.with_state(|state| state.outcome.clone())
+    }
+
+    fn cost(&self) -> usize {
+        PENDING_PUBLICATION_BYTES.saturating_add(self.0.index_key.capacity())
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PublicationPhase {
+    Value,
+    Index,
+    Cleanup,
+}
+
+/// Shared value buffers let a replacement publication reuse unchanged pending text.
+/// `get` still returns an owned string; range reads never clone the shared value.
+struct QueuedOp {
+    key: String,
+    value: Option<Arc<String>>,
+    publication: Option<PublicationReceipt>,
+    phase: PublicationPhase,
+}
+
+impl QueuedOp {
+    fn cost(&self) -> usize {
+        PENDING_ENTRY_BYTES
+            .saturating_add(self.key.capacity())
+            .saturating_add(self.value.as_ref().map_or(0, |value| value.capacity()))
+    }
+
+    fn belongs_to(&self, index_key: &str) -> bool {
+        self.publication.as_ref().is_some_and(|receipt| receipt.0.index_key == index_key)
+    }
+}
+
+#[derive(Default)]
+struct Pending {
+    ops: Vec<QueuedOp>,
+    // Retained even if a normal write supersedes a group's index operation: that group
+    // still needs a failed acknowledgement, rather than a receipt left pending forever.
+    publications: Vec<PublicationReceipt>,
+}
+
+impl Pending {
+    fn find(&self, key: &str) -> Option<&QueuedOp> {
+        self.ops.iter().rev().find(|op| op.key == key)
+    }
+
+    fn len(&self) -> usize {
+        self.ops.len() + self.publications.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.ops.is_empty() && self.publications.is_empty()
+    }
+
+    fn bytes(&self) -> usize {
+        self.ops
+            .iter()
+            .map(QueuedOp::cost)
+            .sum::<usize>()
+            .saturating_add(self.publications.iter().map(PublicationReceipt::cost).sum::<usize>())
+    }
+
+    fn remove_key(&mut self, key: &str) {
+        self.ops.retain(|op| {
+            if op.key != key {
+                return true;
+            }
+            if op.phase != PublicationPhase::Cleanup {
+                if let Some(receipt) = &op.publication {
+                    receipt.with_state(|state| state.dependency_failed = true);
+                }
+            }
+            false
+        });
+    }
+}
+
+fn dependency_error() -> StoreError {
+    StoreError { code: ERR_DEPENDENCY, name: "STORE_DEPENDENCY: index not published because a required write failed or was superseded; cleanup skipped".into() }
+}
+
+fn request_cost(key: &str, value: Option<&str>) -> usize {
+    PENDING_ENTRY_BYTES.saturating_add(key.len()).saturating_add(value.map_or(0, str::len))
+}
+
+fn copy_string(text: &str) -> std::result::Result<String, ()> {
+    let mut copy = String::new();
+    copy.try_reserve_exact(text.len()).map_err(|_| ())?;
+    copy.push_str(text);
+    Ok(copy)
+}
+
+fn copy_range(bytes: &[u8], offset: usize, out: &mut [u8]) -> usize {
+    let available = bytes.get(offset..).unwrap_or_default();
+    let count = available.len().min(out.len());
+    out[..count].copy_from_slice(&available[..count]);
+    count
+}
 
 /// What one [`StoreQueue::flush`] did.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -525,7 +741,8 @@ pub struct FlushReport {
     /// will not take on the next tick either, and a queue that retried forever would fill
     /// the log and hide the one line that says what is wrong.
     pub failed: usize,
-    /// The keys involved, in the order they were applied.
+    /// The keys attempted (including dependency refusals), in execution order. Skipped
+    /// cleanup is not attempted. Unreasonably long invalid names are clipped for diagnostics.
     pub keys: Vec<String>,
     /// One entry per refusal, in the order they happened: the key, the operation and the
     /// backend's own reason. `failed` is the count of these; this is what makes the count
@@ -575,6 +792,8 @@ struct StoreStats {
     /// Refusals whose key did not fit [`REFUSED_KEYS_MAX`]; counted, not enumerated.
     refused_other: u32,
     space: Option<StoreSpace>,
+    /// The most recent operation's error, separate from the historical last refusal.
+    last_error: Option<StoreError>,
 }
 
 impl StoreStats {
@@ -585,6 +804,7 @@ impl StoreStats {
             refused_keys: BTreeMap::new(),
             refused_other: 0,
             space,
+            last_error: None,
         }
     }
 
@@ -593,8 +813,9 @@ impl StoreStats {
     }
 
     fn note(&mut self, refusal: Refusal) {
+        self.last_error = Some(StoreError { code: refusal.code, name: refusal.name.clone() });
         if let Some(count) = self.refused_keys.get_mut(&refusal.key) {
-            *count += 1;
+            *count = count.saturating_add(1);
         } else if self.refused_keys.len() < REFUSED_KEYS_MAX {
             self.refused_keys.insert(refusal.key.clone(), 1);
         } else {
@@ -622,26 +843,302 @@ impl StoreQueue {
         let space = inner.space();
         Self {
             inner: Arc::new(Mutex::new(inner)),
-            pending: Arc::new(Mutex::new(Vec::new())),
+            pending: Arc::new(Mutex::new(Pending::default())),
             written: Arc::new(AtomicU32::new(0)),
             failed: Arc::new(AtomicU32::new(0)),
             stats: Arc::new(Mutex::new(StoreStats::new(space))),
         }
     }
 
-    /// Note a write (`Some`) or a removal (`None`). A key queued twice keeps the position
-    /// of the first time and the value of the last, so a task that rewrites the same blob
-    /// every tick costs one operation, not one per tick.
-    fn enqueue(&self, key: &str, value: Option<String>) -> bool {
+    /// Note a write (`Some`) or a removal (`None`). A key queued twice keeps the
+    /// position and value of its latest request. Coalescing still costs one operation,
+    /// but a blob header rewritten after a newly added chunk must move behind it.
+    fn enqueue(&self, key: &str, value: Option<&str>) -> bool {
         let mut pending = match self.pending.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         };
-        match pending.iter_mut().find(|(queued, _)| queued == key) {
-            Some(entry) => entry.1 = value,
-            None => pending.push((key.to_string(), value)),
+        let (had_previous, replaced) = pending.find(key).map_or((false, 0), |op| (true, op.cost()));
+        let keys = pending.len() + usize::from(!had_previous);
+        let before = pending.bytes();
+        let bytes = before.saturating_sub(replaced).saturating_add(request_cost(key, value));
+        if keys > PENDING_KEYS_MAX || bytes > PENDING_BYTES_MAX {
+            self.refuse(
+                key,
+                if value.is_some() { StoreOp::Set } else { StoreOp::Remove },
+                StoreError {
+                    code: ERR_QUEUE_FULL,
+                    name: format!(
+                        "STORE_QUEUE_FULL: request needs {keys} keys / {bytes} charged bytes; limits are {PENDING_KEYS_MAX} / {PENDING_BYTES_MAX}; previous queue unchanged"
+                    ),
+                },
+            );
+            return false;
         }
+        // No large value copy or vector growth happens until admission has passed. Allocate
+        // fallibly before replacing anything, so even an allocation refusal keeps the old value.
+        let allocated = (|| {
+            let entry = QueuedOp {
+                key: copy_string(key)?,
+                value: value.map(|value| Self::copy_or_reuse(&pending, key, value)).transpose()?,
+                publication: None,
+                phase: PublicationPhase::Value,
+            };
+            if !had_previous {
+                pending.ops.try_reserve(1).map_err(|_| ())?;
+            }
+            Ok::<_, ()>(entry)
+        })();
+        let Ok(entry) = allocated else {
+            self.refuse(
+                key,
+                if value.is_some() { StoreOp::Set } else { StoreOp::Remove },
+                StoreError {
+                    code: ERR_QUEUE_ALLOC,
+                    name: "STORE_QUEUE_ALLOC: previous queue unchanged".into(),
+                },
+            );
+            return false;
+        };
+        pending.remove_key(key);
+        pending.ops.push(entry);
+        self.clear_error();
         true
+    }
+
+    fn copy_or_reuse(pending: &Pending, key: &str, text: &str) -> std::result::Result<Arc<String>, ()> {
+        if let Some(value) = pending.find(key).and_then(|op| op.value.as_ref()) {
+            if value.as_str() == text {
+                return Ok(value.clone());
+            }
+        }
+        copy_string(text).map(Arc::new)
+    }
+
+    /// Replace a complete publication, rather than admitting some of its files and then
+    /// refusing the index. Values from its previous pending generation may be shared.
+    fn enqueue_publication(
+        &self,
+        index_key: &str,
+        index: &str,
+        writes: &[(&str, &str)],
+        cleanup: &[&str],
+    ) -> Option<PublicationReceipt> {
+        let mut pending = match self.pending.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let requested = writes.len().saturating_add(cleanup.len()).saturating_add(2);
+        if requested > PENDING_KEYS_MAX {
+            self.refuse(index_key, StoreOp::Set, StoreError {
+                code: ERR_QUEUE_FULL,
+                name: format!("STORE_QUEUE_FULL: publication needs {requested} key/metadata slots; limit is {PENDING_KEYS_MAX}; previous queue unchanged"),
+            });
+            return None;
+        }
+        // Validate disjoint operations without allocating a second unbounded key map.
+        let duplicate = writes.iter().enumerate().any(|(at, (key, _))| {
+            *key == index_key
+                || writes[..at].iter().any(|(earlier, _)| earlier == key)
+                || cleanup.contains(key)
+        }) || cleanup
+            .iter()
+            .enumerate()
+            .any(|(at, key)| *key == index_key || cleanup[..at].contains(key));
+        if duplicate {
+            self.refuse(
+                index_key,
+                StoreOp::Set,
+                StoreError {
+                    code: ERR_DEPENDENCY,
+                    name: "STORE_DEPENDENCY: publication keys must be disjoint; previous queue unchanged"
+                        .into(),
+                },
+            );
+            return None;
+        }
+        let includes = |key: &str| {
+            key == index_key || writes.iter().any(|(write, _)| *write == key) || cleanup.contains(&key)
+        };
+        let keep = |op: &&QueuedOp| !op.belongs_to(index_key) && !includes(&op.key);
+        let kept_ops = pending.ops.iter().filter(keep).count();
+        let kept_publications =
+            pending.publications.iter().filter(|receipt| receipt.0.index_key != index_key).count();
+        let keys = kept_ops.saturating_add(kept_publications).saturating_add(requested);
+        let bytes = pending
+            .ops
+            .iter()
+            .filter(keep)
+            .map(QueuedOp::cost)
+            .sum::<usize>()
+            .saturating_add(
+                pending
+                    .publications
+                    .iter()
+                    .filter(|receipt| receipt.0.index_key != index_key)
+                    .map(PublicationReceipt::cost)
+                    .sum::<usize>(),
+            )
+            .saturating_add(PENDING_PUBLICATION_BYTES)
+            .saturating_add(index_key.len())
+            .saturating_add(request_cost(index_key, Some(index)))
+            .saturating_add(
+                writes
+                    .iter()
+                    .fold(0usize, |n, (key, value)| n.saturating_add(request_cost(key, Some(value)))),
+            )
+            .saturating_add(cleanup.iter().fold(0usize, |n, key| n.saturating_add(request_cost(key, None))));
+        if keys > PENDING_KEYS_MAX || bytes > PENDING_BYTES_MAX {
+            self.refuse(index_key, StoreOp::Set, StoreError {
+                code: ERR_QUEUE_FULL,
+                name: format!("STORE_QUEUE_FULL: publication needs {keys} keys / {bytes} charged bytes; limits are {PENDING_KEYS_MAX} / {PENDING_BYTES_MAX}; previous queue unchanged"),
+            });
+            return None;
+        }
+        let allocated = (|| {
+            let receipt = PublicationReceipt::from_key(copy_string(index_key)?);
+            let mut ops = Vec::new();
+            ops.try_reserve_exact(requested - 1).map_err(|_| ())?;
+            for (key, text) in writes {
+                ops.push(QueuedOp {
+                    key: copy_string(key)?,
+                    value: Some(Self::copy_or_reuse(&pending, key, text)?),
+                    publication: Some(receipt.clone()),
+                    phase: PublicationPhase::Value,
+                });
+            }
+            ops.push(QueuedOp {
+                key: copy_string(index_key)?,
+                value: Some(Self::copy_or_reuse(&pending, index_key, index)?),
+                publication: Some(receipt.clone()),
+                phase: PublicationPhase::Index,
+            });
+            for key in cleanup {
+                ops.push(QueuedOp {
+                    key: copy_string(key)?,
+                    value: None,
+                    publication: Some(receipt.clone()),
+                    phase: PublicationPhase::Cleanup,
+                });
+            }
+            let extra_ops = kept_ops.saturating_add(ops.len()).saturating_sub(pending.ops.len());
+            pending.ops.try_reserve(extra_ops).map_err(|_| ())?;
+            let extra_groups = kept_publications.saturating_add(1).saturating_sub(pending.publications.len());
+            pending.publications.try_reserve(extra_groups).map_err(|_| ())?;
+            Ok::<_, ()>((receipt, ops))
+        })();
+        let Ok((receipt, ops)) = allocated else {
+            self.refuse(
+                index_key,
+                StoreOp::Set,
+                StoreError {
+                    code: ERR_QUEUE_ALLOC,
+                    name: "STORE_QUEUE_ALLOC: previous queue unchanged".into(),
+                },
+            );
+            return None;
+        };
+        pending.ops.retain(|op| !op.belongs_to(index_key));
+        pending.publications.retain(|old| {
+            if old.0.index_key != index_key {
+                return true;
+            }
+            old.with_state(|state| state.outcome = Some(PublicationOutcome::Superseded));
+            false
+        });
+        for op in &ops {
+            pending.remove_key(&op.key);
+        }
+        pending.ops.extend(ops);
+        pending.publications.push(receipt.clone());
+        self.clear_error();
+        Some(receipt)
+    }
+
+    fn clear_error(&self) {
+        match self.stats.lock() {
+            Ok(mut stats) => stats.last_error = None,
+            Err(poisoned) => poisoned.into_inner().last_error = None,
+        }
+    }
+
+    fn refuse(&self, key: &str, op: StoreOp, error: StoreError) {
+        let mut stats = match self.stats.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        // An untrusted, enormous key must not bypass the admission bound via diagnostics.
+        let diagnostic_key: String = key.chars().take(128).collect();
+        let refusal =
+            Refusal { key: diagnostic_key, op, code: error.code, name: error.name, at_ms: stats.now_ms() };
+        self.failed.fetch_add(1, Ordering::Relaxed);
+        stats.note(refusal);
+    }
+
+    /// Copy only the requested range of a pending value. Do not call `get` for each pull:
+    /// that would duplicate a 256 KiB file to answer an 8 KiB read.
+    fn read_at(&self, key: &str, offset: usize, out: &mut [u8]) -> Option<usize> {
+        let pending = match self.pending.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if let Some(op) = pending.find(key) {
+            return op.value.as_ref().map(|text| copy_range(text.as_bytes(), offset, out));
+        }
+        drop(pending);
+        self.with_inner(|inner| inner.read_at(key, offset, out))
+    }
+
+    /// A successful synchronous stream supersedes an older request for this key; a refused
+    /// stream leaves that request alone. Lock in the same order as `flush` for both cases.
+    fn set_stream(
+        &self,
+        key: &str,
+        fill: &mut dyn FnMut(&mut dyn std::io::Write) -> std::io::Result<()>,
+    ) -> bool {
+        let mut pending = match self.pending.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if key.len() > KEY_MAX {
+            self.refuse(
+                key,
+                StoreOp::Set,
+                StoreError { code: ERR_KEY_TOO_LONG, name: ERR_KEY_TOO_LONG_NAME.into() },
+            );
+            return false;
+        }
+        let mut inner = match self.inner.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let mut fill_error = None;
+        let ok = inner.set_stream(key, &mut |out| {
+            let result = fill(out);
+            if let Err(error) = &result {
+                fill_error =
+                    Some(StoreError { code: error.raw_os_error().unwrap_or(0), name: error.to_string() });
+            }
+            result
+        });
+        if ok {
+            pending.remove_key(key);
+            self.written.fetch_add(1, Ordering::Relaxed);
+            self.clear_error();
+        } else {
+            self.refuse(
+                key,
+                StoreOp::Set,
+                fill_error
+                    .or_else(|| inner.last_error())
+                    .unwrap_or_else(|| StoreError { code: 0, name: "refused".into() }),
+            );
+        }
+        match self.stats.lock() {
+            Ok(mut stats) => stats.space = inner.space(),
+            Err(poisoned) => poisoned.into_inner().space = inner.space(),
+        }
+        ok
     }
 
     /// The value `key` will have once the queue is drained: the queued one if there is
@@ -651,8 +1148,8 @@ impl StoreQueue {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         };
-        if let Some((_, queued)) = pending.iter().rev().find(|(queued, _)| queued == key) {
-            return queued.clone();
+        if let Some(op) = pending.find(key) {
+            return op.value.as_ref().map(|text| text.as_str().to_string());
         }
         drop(pending);
         match self.inner.lock() {
@@ -685,64 +1182,109 @@ impl StoreQueue {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         };
-        for (key, value) in pending.drain(..) {
-            let op = match &value {
-                Some(_) => StoreOp::Set,
-                None => StoreOp::Remove,
-            };
-            let refusal = if key.len() > KEY_MAX {
-                // A name the board cannot hold. Reported here, with the code the board
-                // would return, so it costs a log line instead of a flash round trip that
-                // ends in `false` with no reason.
-                Some(Refusal {
-                    key: key.clone(),
-                    op,
-                    code: ERR_KEY_TOO_LONG,
-                    name: ERR_KEY_TOO_LONG_NAME.to_string(),
-                    at_ms: stats.now_ms(),
-                })
-            } else {
-                let ok = match &value {
-                    Some(text) => inner.set(&key, text),
-                    // "It was not there" is not a failure: a removal that removes nothing is
-                    // what a second boot asks for. A removal the *backend* failed is, and
-                    // that is the difference `last_error` makes.
-                    None => {
-                        let removed = inner.remove(&key);
-                        removed || inner.last_error().is_none()
-                    }
-                };
-                if ok {
-                    None
-                } else {
-                    let why = inner.last_error();
-                    Some(Refusal {
-                        key: key.clone(),
-                        op,
-                        code: why.as_ref().map(|e| e.code).unwrap_or(0),
-                        name: why.map(|e| e.name).unwrap_or_else(|| "refused".to_string()),
-                        at_ms: stats.now_ms(),
-                    })
+        for queued in pending.ops.drain(..) {
+            let mut blocked = None;
+            if let Some(receipt) = &queued.publication {
+                let (dependency_failed, published) =
+                    receipt.with_state(|state| (state.dependency_failed, state.published));
+                if queued.phase == PublicationPhase::Cleanup && !published {
+                    continue; // No index publication: preserve previous files and legacy data.
                 }
-            };
-            match refusal {
-                Some(refusal) => {
-                    report.failed += 1;
-                    self.failed.fetch_add(1, Ordering::Relaxed);
-                    report.failures.push(refusal.clone());
-                    stats.note(refusal);
-                }
-                None => {
-                    report.written += 1;
-                    self.written.fetch_add(1, Ordering::Relaxed);
+                if queued.phase == PublicationPhase::Index && dependency_failed {
+                    blocked = Some(dependency_error());
                 }
             }
-            report.keys.push(key);
+            let ok = self.apply_queued(&queued, blocked, inner.as_mut(), &mut stats, &mut report);
+            if let Some(receipt) = &queued.publication {
+                receipt.with_state(|state| match queued.phase {
+                    PublicationPhase::Value => state.dependency_failed |= !ok,
+                    PublicationPhase::Index => {
+                        state.index_processed = true;
+                        state.published = ok;
+                    }
+                    PublicationPhase::Cleanup if !ok => state.cleanup_failed.push(queued.key.clone()),
+                    PublicationPhase::Cleanup => {}
+                });
+            }
         }
-        // Re-read once per drain, not per operation: `nvs_get_stats` walks the pages, and
-        // the number is only interesting for what the drain just did to it.
+        for receipt in pending.publications.drain(..) {
+            if !receipt.with_state(|state| state.index_processed) {
+                // A normal write/stream superseded this group's index. A receipt must still
+                // finish as failed; it cannot falsely acknowledge that newer operation.
+                let refused = QueuedOp {
+                    key: receipt.0.index_key.clone(),
+                    value: Some(Arc::new(String::new())),
+                    publication: None,
+                    phase: PublicationPhase::Index,
+                };
+                self.apply_queued(
+                    &refused,
+                    Some(dependency_error()),
+                    inner.as_mut(),
+                    &mut stats,
+                    &mut report,
+                );
+            }
+            receipt.with_state(|state| {
+                state.outcome = Some(PublicationOutcome::Finished {
+                    published: state.published,
+                    cleanup_failed: std::mem::take(&mut state.cleanup_failed),
+                });
+            });
+        }
+        // Re-read once per drain, not per operation: `nvs_get_stats` walks the pages.
         stats.space = inner.space();
         report
+    }
+
+    fn apply_queued(
+        &self,
+        queued: &QueuedOp,
+        blocked: Option<StoreError>,
+        inner: &mut dyn KvStore,
+        stats: &mut StoreStats,
+        report: &mut FlushReport,
+    ) -> bool {
+        let op = if queued.value.is_some() { StoreOp::Set } else { StoreOp::Remove };
+        let error = if let Some(error) = blocked {
+            Some(error)
+        } else if queued.key.len() > KEY_MAX {
+            Some(StoreError { code: ERR_KEY_TOO_LONG, name: ERR_KEY_TOO_LONG_NAME.into() })
+        } else {
+            let ok = match &queued.value {
+                Some(text) => inner.set(&queued.key, text),
+                None => {
+                    let removed = inner.remove(&queued.key);
+                    removed || inner.last_error().is_none()
+                }
+            };
+            if ok {
+                None
+            } else {
+                Some(inner.last_error().unwrap_or_else(|| StoreError { code: 0, name: "refused".into() }))
+            }
+        };
+        let ok = error.is_none();
+        let diagnostic_key: String = queued.key.chars().take(128).collect();
+        if let Some(error) = error {
+            let refusal = Refusal {
+                key: diagnostic_key.clone(),
+                op,
+                code: error.code,
+                name: error.name,
+                at_ms: stats.now_ms(),
+            };
+            report.failed += 1;
+            self.failed.fetch_add(1, Ordering::Relaxed);
+            report.failures.push(refusal.clone());
+            stats.note(refusal);
+        } else {
+            report.written += 1;
+            self.written.fetch_add(1, Ordering::Relaxed);
+            stats.last_error = None;
+        }
+        report.keys.push(diagnostic_key);
+        ok
     }
 
     /// What the backend takes as one value, asked through the queue: the App decides how to
@@ -755,11 +1297,9 @@ impl StoreQueue {
         }
     }
 
-    /// Run `f` against the backend with the queue's lock held.
-    ///
-    /// Used by a caller that can write flash itself (its stack is in internal RAM) and wants
-    /// to stream a value instead of building it as one `String` first. Taking the same lock
-    /// the writer takes is what keeps the two from overlapping.
+    /// Run `f` under the backend mutex. This is raw backend access, not a publication or
+    /// reconciliation of pending values. Read/space helpers use it; writing callers should
+    /// use `QueuedStore::set_stream` so older pending operations cannot overwrite the result.
     pub fn with_inner<R>(&self, f: impl FnOnce(&mut dyn KvStore) -> R) -> R {
         match self.inner.lock() {
             Ok(mut store) => f(store.as_mut()),
@@ -767,11 +1307,28 @@ impl StoreQueue {
         }
     }
 
-    /// How many writes are queued and waiting for the writer.
+    /// How many operations await the writer. An invalidated publication with no remaining
+    /// operations still counts once: its failed acknowledgement is pending too.
     pub fn pending(&self) -> usize {
+        let pending = match self.pending.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        pending.ops.len().max(usize::from(!pending.publications.is_empty()))
+    }
+
+    /// Charged pending bytes: values, names and per-operation metadata, not backend usage.
+    pub fn pending_bytes(&self) -> usize {
         match self.pending.lock() {
-            Ok(guard) => guard.len(),
-            Err(poisoned) => poisoned.into_inner().len(),
+            Ok(guard) => guard.bytes(),
+            Err(poisoned) => poisoned.into_inner().bytes(),
+        }
+    }
+
+    fn last_error(&self) -> Option<StoreError> {
+        match self.stats.lock() {
+            Ok(stats) => stats.last_error.clone(),
+            Err(poisoned) => poisoned.into_inner().last_error.clone(),
         }
     }
 
@@ -834,11 +1391,11 @@ impl StoreQueue {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         };
-        for (key, value) in pending.iter() {
-            match value {
-                Some(_) if !out.contains(key) => out.push(key.clone()),
+        for op in &pending.ops {
+            match &op.value {
+                Some(_) if !out.contains(&op.key) => out.push(op.key.clone()),
                 Some(_) => {}
-                None => out.retain(|stored| stored != key),
+                None => out.retain(|stored| stored != &op.key),
             }
         }
         out
@@ -859,17 +1416,15 @@ impl QueuedStore {
         Self { queue }
     }
 
-    /// Run `f` against the backend with the queue's lock held.
-    ///
-    /// The reader below pulls through this, one chunk at a time: a value never has to exist as
-    /// one `String` on the way in *or* on the way out.
+    /// Raw backend access under its mutex, with the same pending-write caveat as
+    /// `StoreQueue::with_inner`. Normal readers use `read_at` to include queued changes.
     pub fn with_inner<R>(&self, f: impl FnOnce(&mut dyn KvStore) -> R) -> R {
         self.queue.with_inner(f)
     }
 
     /// A reader over a stored value, pulling `chunk` bytes at a time through the queue.
     pub fn reader<'a>(&'a self, key: &str, chunk: usize) -> QueueReader<'a> {
-        QueueReader { store: self, key: key.to_string(), offset: 0, buf: vec![0; chunk], len: chunk }
+        QueueReader { store: self, key: key.to_string(), offset: 0, chunk: chunk.max(1) }
     }
 }
 
@@ -878,11 +1433,11 @@ impl KvStore for QueuedStore {
         self.queue.read(key)
     }
 
-    /// Always true: the write is accepted into the queue. Whether NVS takes it is known
-    /// only after the writer runs, and is reported by [`StoreQueue::failed`] and the log
-    /// line the writer emits — not by this return value.
+    /// `true` means queue admission, not durability. A queue-budget/allocation refusal
+    /// returns `false` without replacing an earlier request. Backend validation (including
+    /// NVS's key-length rule) still happens when the writer drains the request.
     fn set(&mut self, key: &str, value: &str) -> bool {
-        self.queue.enqueue(key, Some(value.to_string()))
+        self.queue.enqueue(key, Some(value))
     }
 
     /// Streamed *through the queue's lock*, on this thread.
@@ -896,24 +1451,43 @@ impl KvStore for QueuedStore {
         key: &str,
         fill: &mut dyn FnMut(&mut dyn std::io::Write) -> std::io::Result<()>,
     ) -> bool {
-        self.queue.with_inner(|inner| inner.set_stream(key, fill))
+        self.queue.set_stream(key, fill)
     }
+    fn publish(
+        &mut self,
+        index_key: &str,
+        index: &str,
+        writes: &[(&str, &str)],
+        cleanup: &[&str],
+    ) -> Option<PublicationReceipt> {
+        self.queue.enqueue_publication(index_key, index, writes, cleanup)
+    }
+
     /// Whether the key exists *now*: a queued value counts, a queued removal does not.
+    /// A refused removal leaves the queue untouched; `last_error` distinguishes that from absence.
     fn remove(&mut self, key: &str) -> bool {
-        let had = self.queue.read(key).is_some();
-        self.queue.enqueue(key, None);
-        had
+        let had = self.queue.read_at(key, 0, &mut []).is_some();
+        self.queue.enqueue(key, None) && had
+    }
+
+    fn last_error(&self) -> Option<StoreError> {
+        self.queue.last_error()
+    }
+
+    fn read_at(&self, key: &str, offset: usize, out: &mut [u8]) -> Option<usize> {
+        self.queue.read_at(key, offset, out)
     }
 
     fn keys(&self) -> Vec<String> {
         self.queue.keys()
     }
 
-    /// Reads are streamed too: the reader pulls chunks through the queue, so loading a
-    /// workspace does not need it as one `String` first. 64 KB per pull, because each one is a
-    /// file open and a seek.
+    /// Pending writes/removals participate in streaming reads too. A zero-byte probe
+    /// distinguishes absence from an empty value without copying queued text. Pulls use
+    /// the consumer's buffer directly, capped at 8 KiB; there is no extra 64 KiB allocation.
     fn reader(&self, key: &str) -> Option<Box<dyn std::io::Read + '_>> {
-        Some(Box::new(QueuedStore::reader(self, key, 64 * 1024)))
+        self.queue.read_at(key, 0, &mut [])?;
+        Some(Box::new(QueuedStore::reader(self, key, 8 * 1024)))
     }
 
     /// Forwarded, not defaulted: the App asks this before it decides whether a blob is one
@@ -941,8 +1515,7 @@ pub struct QueueReader<'a> {
     store: &'a QueuedStore,
     key: String,
     offset: usize,
-    buf: Vec<u8>,
-    len: usize,
+    chunk: usize,
 }
 
 impl std::fmt::Debug for QueueReader<'_> {
@@ -956,15 +1529,69 @@ impl std::io::Read for QueueReader<'_> {
         if out.is_empty() {
             return Ok(0);
         }
-        let want = self.len.min(out.len());
+        let want = self.chunk.min(out.len());
         let got = self
             .store
-            .with_inner(|inner| inner.read_at(&self.key, self.offset, &mut self.buf[..want]))
+            .queue
+            .read_at(&self.key, self.offset, &mut out[..want])
             .ok_or_else(|| std::io::Error::other("the stored value cannot be read"))?;
         self.offset += got;
-        out[..got].copy_from_slice(&self.buf[..got]);
         Ok(got)
     }
+}
+
+/// A retained file handle for sequential reads. A mutation must invalidate it
+/// before rename or unlink: ESP LittleFS refuses those operations on open paths.
+#[derive(Debug, Default)]
+pub struct FileReadCache(std::cell::RefCell<Option<(PathBuf, std::fs::File)>>);
+
+impl FileReadCache {
+    pub fn invalidate(&self, path: &std::path::Path) {
+        let mut slot = self.0.borrow_mut();
+        if matches!(&*slot, Some((open, _)) if open == path) {
+            *slot = None;
+        }
+    }
+
+    pub fn read_at(&self, path: &std::path::Path, offset: usize, buf: &mut [u8]) -> std::io::Result<usize> {
+        use std::io::{Read, Seek, SeekFrom};
+        let mut slot = self.0.borrow_mut();
+        if !matches!(&*slot, Some((open, _)) if open == path) {
+            *slot = None;
+            *slot = Some((path.to_path_buf(), std::fs::File::open(path)?));
+        }
+        let (_, file) = slot.as_mut().expect("the file was just opened");
+        file.seek(SeekFrom::Start(offset as u64))?;
+        file.read(buf)
+    }
+}
+
+/// Recover the backup made by older filesystem stores. An existing published
+/// value always wins; only a genuinely missing value may be restored. Metadata
+/// errors are not treated as absence, and failed cleanup preserves the backup.
+pub fn recover_file_backup(path: &std::path::Path, backup: &std::path::Path) -> std::io::Result<bool> {
+    match path.metadata() {
+        Ok(_) => {
+            std::fs::remove_file(backup)?;
+            Ok(false)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::rename(backup, path)?;
+            Ok(true)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// File-backed keys are single, short names, never paths or recovery suffixes.
+pub fn is_file_store_key(key: &str) -> bool {
+    !key.is_empty()
+        && key.len() <= KEY_MAX
+        && key != "."
+        && key != ".."
+        && !key.ends_with(".tmp")
+        && !key.ends_with(".old")
+        && key.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
 }
 
 /// In-memory store: used by tests and by a simulator run started without a
@@ -983,6 +1610,11 @@ impl MemoryStore {
 impl KvStore for MemoryStore {
     fn get(&self, key: &str) -> Option<String> {
         self.map.lock().ok()?.get(key).cloned()
+    }
+
+    fn read_at(&self, key: &str, offset: usize, out: &mut [u8]) -> Option<usize> {
+        let map = self.map.lock().ok()?;
+        Some(copy_range(map.get(key)?.as_bytes(), offset, out))
     }
 
     fn set(&mut self, key: &str, value: &str) -> bool {
@@ -1016,6 +1648,7 @@ impl KvStore for MemoryStore {
 pub struct FileStore {
     path: PathBuf,
     map: BTreeMap<String, String>,
+    last_error: Option<StoreError>,
 }
 
 impl FileStore {
@@ -1025,20 +1658,35 @@ impl FileStore {
             .ok()
             .and_then(|s| serde_json::from_str::<BTreeMap<String, String>>(&s).ok())
             .unwrap_or_default();
-        Self { path, map }
+        Self { path, map, last_error: None }
     }
 
-    fn flush(&self) -> bool {
-        let s = serde_json::to_string_pretty(&self.map).unwrap_or_else(|_| "{}".into());
-        if let Some(dir) = self.path.parent() {
-            let _ = std::fs::create_dir_all(dir);
+    fn flush(&self) -> std::io::Result<()> {
+        use std::io::Write;
+        if let Some(dir) = self.path.parent().filter(|dir| !dir.as_os_str().is_empty()) {
+            std::fs::create_dir_all(dir)?;
         }
-        // Write-then-rename keeps a power cut from leaving half a file.
+        // Stream the JSON rather than making a second copy of every stored value.
+        // Sync the complete temporary file before replacing the published one.
         let tmp = self.path.with_extension("json.tmp");
-        match std::fs::write(&tmp, s) {
-            Ok(()) => std::fs::rename(&tmp, &self.path).is_ok(),
-            Err(_) => false,
+        let saved = (|| {
+            let file = std::fs::File::create(&tmp)?;
+            let mut writer = std::io::BufWriter::new(file);
+            serde_json::to_writer_pretty(&mut writer, &self.map)?;
+            writer.flush()?;
+            writer.get_ref().sync_all()?;
+            drop(writer);
+            std::fs::rename(&tmp, &self.path)
+        })();
+        if saved.is_err() {
+            let _ = std::fs::remove_file(tmp);
         }
+        saved
+    }
+
+    fn note_error(&mut self, error: std::io::Error) {
+        self.last_error =
+            Some(StoreError { code: error.raw_os_error().unwrap_or(0), name: error.to_string() });
     }
 }
 
@@ -1047,19 +1695,49 @@ impl KvStore for FileStore {
         self.map.get(key).cloned()
     }
 
+    fn read_at(&self, key: &str, offset: usize, out: &mut [u8]) -> Option<usize> {
+        Some(copy_range(self.map.get(key)?.as_bytes(), offset, out))
+    }
+
     fn set(&mut self, key: &str, value: &str) -> bool {
-        self.map.insert(key.to_string(), value.to_string());
-        self.flush()
+        self.last_error = None;
+        let previous = self.map.insert(key.to_string(), value.to_string());
+        match self.flush() {
+            Ok(()) => true,
+            Err(error) => {
+                match previous {
+                    Some(text) => {
+                        self.map.insert(key.to_string(), text);
+                    }
+                    None => {
+                        self.map.remove(key);
+                    }
+                }
+                self.note_error(error);
+                false
+            }
+        }
     }
 
     fn remove(&mut self, key: &str) -> bool {
-        let had = self.map.remove(key).is_some();
-        self.flush();
-        had
+        self.last_error = None;
+        let Some(previous) = self.map.remove(key) else { return false };
+        match self.flush() {
+            Ok(()) => true,
+            Err(error) => {
+                self.map.insert(key.to_string(), previous);
+                self.note_error(error);
+                false
+            }
+        }
     }
 
     fn keys(&self) -> Vec<String> {
         self.map.keys().cloned().collect()
+    }
+
+    fn last_error(&self) -> Option<StoreError> {
+        self.last_error.clone()
     }
 }
 
@@ -1180,6 +1858,53 @@ mod tests {
     }
 
     #[test]
+    fn a_file_read_cache_is_invalidated_before_replace_or_remove() {
+        let dir = std::env::temp_dir().join(format!("store-cache-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("ws");
+        let tmp = dir.join("ws.tmp");
+        std::fs::write(&path, b"old").unwrap();
+        let cache = FileReadCache::default();
+        let mut buf = [0u8; 3];
+        assert_eq!(cache.read_at(&path, 0, &mut buf).unwrap(), 3);
+        assert_eq!(&buf, b"old");
+        cache.invalidate(&path);
+        std::fs::write(&tmp, b"new").unwrap();
+        std::fs::rename(&tmp, &path).unwrap();
+        assert_eq!(cache.read_at(&path, 0, &mut buf).unwrap(), 3);
+        assert_eq!(&buf, b"new");
+        cache.invalidate(&path);
+        std::fs::remove_file(&path).unwrap();
+        assert!(cache.read_at(&path, 0, &mut buf).is_err());
+        for key in crate::keys::all() {
+            assert!(is_file_store_key(&key), "{key}");
+        }
+        for bad in ["", ".", "..", "../ws", "ws/../x", "C:ws", "ws.tmp", "ws.old", "x\0y"] {
+            assert!(!is_file_store_key(bad), "{bad:?}");
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn recovery_never_overwrites_a_published_value_with_its_backup() {
+        let dir = std::env::temp_dir().join(format!("store-recovery-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("ws");
+        let old = dir.join("ws.old");
+        std::fs::write(&path, b"new").unwrap();
+        std::fs::write(&old, b"old").unwrap();
+        assert!(!recover_file_backup(&path, &old).unwrap());
+        assert_eq!(std::fs::read(&path).unwrap(), b"new");
+        assert!(!old.exists());
+        std::fs::remove_file(&path).unwrap();
+        std::fs::write(&old, b"old").unwrap();
+        assert!(recover_file_backup(&path, &old).unwrap());
+        assert_eq!(std::fs::read(&path).unwrap(), b"old");
+        assert!(!old.exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn file_store_survives_reopen() {
         let dir = std::env::temp_dir().join(format!("mcp-store-test-{}", std::process::id()));
         let path = dir.join("kv.json");
@@ -1187,9 +1912,19 @@ mod tests {
             let mut s = FileStore::open(&path);
             assert!(s.set("config", "{\"a\":1}"));
         }
-        let s = FileStore::open(&path);
+        let mut s = FileStore::open(&path);
         assert_eq!(s.get("config").as_deref(), Some("{\"a\":1}"));
-        let _ = std::fs::remove_dir_all(&dir);
+        // A deterministic I/O failure: the parent stops being a directory. A failed
+        // save must not become visible in RAM, nor be reported as a successful removal.
+        std::fs::remove_dir_all(&dir).unwrap();
+        std::fs::write(&dir, b"not a directory").unwrap();
+        assert!(!s.set("config", "new"));
+        assert_eq!(s.get("config").as_deref(), Some("{\"a\":1}"));
+        assert!(s.last_error().is_some());
+        assert!(!s.remove("config"));
+        assert_eq!(s.get("config").as_deref(), Some("{\"a\":1}"));
+        assert!(s.last_error().is_some());
+        std::fs::remove_file(&dir).unwrap();
     }
 
     #[test]
@@ -1280,6 +2015,12 @@ mod tests {
             BlobState::Corrupt(why) => assert!(why.contains("at most 5"), "{why}"),
             other => panic!("got {other:?}"),
         }
+        // Header sizes are untrusted. Refuse them before allocating: usize::MAX
+        // otherwise panics with capacity overflow on the host and can abort the board.
+        store.map.insert("ws".into(), format!("ws1 1 {} 0000000000000000", usize::MAX));
+        let result = std::panic::catch_unwind(|| read_blob(&store, "ws", PLAN));
+        assert!(matches!(result, Ok(BlobState::Corrupt(_))), "untrusted size must not panic");
+
         // A header that claims bytes it does not carry is refused as a whole.
         store.map.insert("ws".into(), "ws1 0 4000 ".into());
         match read_blob(&store, "ws", PLAN) {
@@ -1321,6 +2062,12 @@ mod tests {
         let mut store = LimitedStore::default();
         write_blob(&mut store, "ws", &blob, PLAN).expect("fits");
         assert_eq!(read_blob(&store, "ws", PLAN), BlobState::Stored(blob));
+        // UTF-8 slack can require more chunks than raw byte division predicts.
+        // Refuse before touching the old blob when those chunks do not fit the plan.
+        let wide = "界".repeat(PLAN.capacity() / 3);
+        let before = store.map.clone();
+        assert!(write_blob(&mut store, "ws", &wide, PLAN).is_err());
+        assert_eq!(store.map, before);
         // An empty blob is one header with no chunks, and reads back as empty.
         write_blob(&mut store, "ws", "", PLAN).expect("fits");
         assert_eq!(read_blob(&store, "ws", PLAN), BlobState::Stored(String::new()));
@@ -1363,6 +2110,251 @@ mod tests {
     }
 
     #[test]
+    fn a_streamed_write_supersedes_the_pending_write_or_removal() {
+        let inner = Shared::default();
+        let queue = StoreQueue::new(Box::new(inner.clone()));
+        let mut store = QueuedStore::new(queue.clone());
+        assert!(store.set("ws", "queued old"));
+        assert!(store.set("other", "unrelated"));
+        assert!(store.set_stream("ws", &mut |out| out.write_all(b"streamed new")));
+        assert_eq!(store.get("ws").as_deref(), Some("streamed new"));
+        assert_eq!(queue.flush().keys, vec!["other".to_string()]);
+        assert_eq!(inner.get("ws").as_deref(), Some("streamed new"));
+
+        assert!(store.remove("ws"));
+        assert!(store.set_stream("ws", &mut |out| out.write_all(b"newer")));
+        assert!(queue.flush().is_empty(), "an old removal cannot erase a newer stream");
+        assert_eq!(inner.get("ws").as_deref(), Some("newer"));
+    }
+
+    #[test]
+    fn a_queue_reader_reads_pending_bytes_instead_of_the_backend() {
+        use std::io::Read as _;
+        let inner = Shared::default();
+        inner.clone().set("ws", "old on storage");
+        let queue = StoreQueue::new(Box::new(inner));
+        let mut store = QueuedStore::new(queue.clone());
+        let latest = "界é".repeat(8192);
+        assert!(store.set("ws", &latest));
+        let mut text = String::new();
+        KvStore::reader(&store, "ws").unwrap().read_to_string(&mut text).unwrap();
+        assert!(text == latest, "reader and get must agree before a flush");
+        let mut bytes = [0u8; 7];
+        assert_eq!(store.read_at("ws", 3, &mut bytes), Some(7));
+        assert_eq!(&bytes, &latest.as_bytes()[3..10]);
+        assert_eq!(store.read_at("ws", usize::MAX, &mut bytes), Some(0));
+        assert!(store.remove("ws"));
+        assert!(KvStore::reader(&store, "ws").is_none(), "queued removal is absence");
+        assert_eq!(store.read_at("ws", 0, &mut bytes), None);
+        queue.flush();
+    }
+
+    #[test]
+    fn a_queue_reader_distinguishes_an_absent_key_from_an_empty_value() {
+        use std::io::Read as _;
+        let inner = Shared::default();
+        inner.clone().set("empty", "");
+        let store = QueuedStore::new(StoreQueue::new(Box::new(inner)));
+        assert!(KvStore::reader(&store, "missing").is_none());
+        let mut text = String::new();
+        KvStore::reader(&store, "empty").unwrap().read_to_string(&mut text).unwrap();
+        assert_eq!(text, "");
+    }
+
+    #[test]
+    fn a_failed_stream_keeps_the_queued_value_and_reports_the_refusal() {
+        let inner = Shared::default();
+        let queue = StoreQueue::new(Box::new(inner.clone()));
+        let mut store = QueuedStore::new(queue.clone());
+        assert!(store.set("ws", "still wanted"));
+        assert!(!store.set_stream("ws", &mut |_| Err(std::io::Error::other("fill refused"))));
+        assert_eq!(store.get("ws").as_deref(), Some("still wanted"));
+        assert_eq!(queue.failed(), 1, "synchronous streaming failures must not disappear");
+        assert_eq!(queue.last_failure().unwrap().key, "ws");
+        assert_eq!(queue.last_failure().unwrap().name, "fill refused");
+        assert_eq!(queue.flush().written, 1);
+        assert_eq!(inner.get("ws").as_deref(), Some("still wanted"));
+        assert!(queue.flush().is_empty(), "no infinite retry");
+    }
+
+    #[test]
+    fn queue_byte_admission_keeps_the_previous_value_when_growth_is_refused() {
+        let queue = StoreQueue::new(Box::new(MemoryStore::new()));
+        let mut store = QueuedStore::new(queue.clone());
+        assert!(store.set("keep", "old"));
+        let remaining = PENDING_BYTES_MAX - queue.pending_bytes() - request_cost("bulk", None);
+        assert!(store.set("bulk", &"x".repeat(remaining)));
+        let before = queue.pending_bytes();
+        assert!(before <= PENDING_BYTES_MAX);
+        assert!(!store.set("keep", "new and larger"));
+        assert_eq!(queue.pending_bytes(), before);
+        assert_eq!(queue.pending(), 2);
+        assert_eq!(store.get("keep").as_deref(), Some("old"));
+        assert_eq!(store.last_error().unwrap().code, ERR_QUEUE_FULL);
+        assert!(queue.last_failure().unwrap().name.contains("previous queue unchanged"));
+        assert!(!store.set("extra", ""));
+        assert_eq!(queue.pending(), 2);
+        // Replacements/removals that reduce the charge still fit at the ceiling.
+        assert!(store.remove("bulk"));
+        assert!(store.set("extra", "now fits"));
+        assert!(store.last_error().is_none());
+        assert_eq!(queue.flush().failed, 0);
+        assert!(queue.flush().is_empty());
+    }
+
+    #[test]
+    fn queue_key_admission_refuses_new_keys_without_discarding_old_requests() {
+        let queue = StoreQueue::new(Box::new(MemoryStore::new()));
+        let mut store = QueuedStore::new(queue.clone());
+        for index in 0..PENDING_KEYS_MAX {
+            assert!(store.set(&format!("k{index}"), ""));
+        }
+        let before = queue.pending_bytes();
+        assert!(!store.set("one_more", ""));
+        assert_eq!(queue.pending(), PENDING_KEYS_MAX);
+        assert_eq!(queue.pending_bytes(), before);
+        assert_eq!(queue.failed(), 1);
+        assert_eq!(queue.last_failure().unwrap().code, ERR_QUEUE_FULL);
+        assert_eq!(store.get("k0").as_deref(), Some(""));
+        assert!(store.set("k0", "replacement"), "existing keys do not consume a new slot");
+        assert_eq!(queue.pending(), PENDING_KEYS_MAX);
+        assert_eq!(queue.flush().failed, 0);
+        assert_eq!(store.get("k0").as_deref(), Some("replacement"));
+    }
+
+    #[test]
+    fn queue_admission_covers_full_shipped_text_and_index_metadata_budgets() {
+        let queue = StoreQueue::new(Box::new(MemoryStore::new()));
+        let mut store = QueuedStore::new(queue.clone());
+        let file = "x".repeat(crate::app::WORKSPACE_TOTAL_MAX / crate::app::WORKSPACE_FILES_MAX);
+        for index in 0..crate::app::WORKSPACE_FILES_MAX {
+            assert!(store.set(&format!("ws.{index:012x}"), &file));
+            assert!(store.set(&format!("old{index}"), ""));
+            assert!(store.remove(&format!("old{index}")));
+        }
+        // JSON may escape each filename byte to six bytes, plus quotes, key, colon and comma.
+        let index_max = 2 + 6 * crate::app::WORKSPACE_NAMES_MAX + 22 * crate::app::WORKSPACE_FILES_MAX;
+        assert!(store.set(crate::keys::WORKSPACE_INDEX, &"i".repeat(index_max)));
+        assert!(store.set(crate::keys::TRANSCRIPT, &"t".repeat(crate::agent::MAX_SAVED_BYTES)));
+        for key in [crate::keys::CONFIG, crate::keys::MANIFEST, crate::keys::AGENT, crate::keys::SCHED] {
+            assert!(store.set(key, &"m".repeat(VALUE_MAX)));
+        }
+        assert!(queue.pending_bytes() <= PENDING_BYTES_MAX);
+        assert!(queue.pending() <= PENDING_KEYS_MAX);
+        assert_eq!(queue.flush().failed, 0);
+    }
+
+    #[test]
+    fn publication_dependencies_guard_the_index_and_cleanup() {
+        let queue = StoreQueue::new(Box::new(RefusingStore {
+            map: [
+                ("index".into(), "previous".into()),
+                ("obsolete".into(), "keep".into()),
+                ("ws".into(), "legacy".into()),
+            ]
+            .into(),
+            refuse: Some(("b".into(), 42, "test refusal")),
+            ..Default::default()
+        }));
+        let mut store = QueuedStore::new(queue.clone());
+        let receipt = store
+            .publish("index", "next", &[("a", "accepted"), ("b", "refused")], &["obsolete", "ws"])
+            .unwrap();
+        assert!(receipt.outcome().is_none(), "admission is not publication");
+        let report = queue.flush();
+        assert_eq!(report.keys, vec!["a", "b", "index"]);
+        assert_eq!(report.written, 1);
+        assert_eq!(report.failed, 2);
+        assert_eq!(report.failures[1].code, ERR_DEPENDENCY);
+        assert_eq!(store.get("index").as_deref(), Some("previous"));
+        assert_eq!(store.get("obsolete").as_deref(), Some("keep"));
+        assert_eq!(store.get("ws").as_deref(), Some("legacy"));
+        assert_eq!(store.get("a").as_deref(), Some("accepted"), "not an all-values transaction");
+        assert_eq!(
+            receipt.outcome(),
+            Some(PublicationOutcome::Finished { published: false, cleanup_failed: Vec::new() })
+        );
+        assert!(queue.flush().is_empty(), "no automatic retry");
+    }
+
+    #[test]
+    fn publication_replacement_shares_pending_text_and_supersedes_only_its_receipt() {
+        let queue = StoreQueue::new(Box::new(MemoryStore::new()));
+        let mut store = QueuedStore::new(queue.clone());
+        let text = "x".repeat(crate::app::WORKSPACE_FILE_MAX);
+        let first = store.publish("index", "first", &[("a", &text)], &[]).unwrap();
+        let first_buffer = queue.pending.lock().unwrap().find("a").unwrap().value.as_ref().unwrap().clone();
+        let second = store.publish("index", "second", &[("a", &text), ("b", "new")], &[]).unwrap();
+        let second_buffer = queue.pending.lock().unwrap().find("a").unwrap().value.as_ref().unwrap().clone();
+        assert!(Arc::ptr_eq(&first_buffer, &second_buffer), "unchanged pending file is not copied again");
+        assert_eq!(first.outcome(), Some(PublicationOutcome::Superseded));
+        assert!(second.outcome().is_none());
+        assert_eq!(queue.pending.lock().unwrap().publications.len(), 1);
+        assert_eq!(queue.flush().keys, vec!["a", "b", "index"]);
+        assert_eq!(first.outcome(), Some(PublicationOutcome::Superseded));
+        assert_eq!(
+            second.outcome(),
+            Some(PublicationOutcome::Finished { published: true, cleanup_failed: Vec::new() })
+        );
+    }
+
+    #[test]
+    fn a_refused_publication_admission_keeps_the_complete_previous_generation() {
+        let queue = StoreQueue::new(Box::new(MemoryStore::new()));
+        let mut store = QueuedStore::new(queue.clone());
+        let receipt = store.publish("index", "old", &[("a", "old")], &["legacy"]).unwrap();
+        let remaining = PENDING_BYTES_MAX - queue.pending_bytes() - request_cost("budget", None);
+        assert!(store.set("budget", &"x".repeat(remaining)));
+        let (before_keys, before_bytes) = (queue.pending(), queue.pending_bytes());
+        assert!(store.publish("index", "new", &[("a", "larger"), ("b", "new")], &["legacy"]).is_none());
+        assert_eq!(queue.pending(), before_keys);
+        assert_eq!(queue.pending_bytes(), before_bytes);
+        assert!(receipt.outcome().is_none(), "failed replacement did not supersede the old receipt");
+        assert_eq!(store.get("a").as_deref(), Some("old"));
+        assert_eq!(store.get("index").as_deref(), Some("old"));
+        assert!(store.get("b").is_none());
+        assert_eq!(store.last_error().unwrap().code, ERR_QUEUE_FULL);
+        assert!(store.remove("budget"));
+        assert_eq!(queue.flush().failed, 0);
+        assert_eq!(
+            receipt.outcome(),
+            Some(PublicationOutcome::Finished { published: true, cleanup_failed: Vec::new() })
+        );
+        // Duplicate/overlapping dependencies are rejected before any queue mutation too.
+        assert!(store.publish("index", "bad", &[("a", "first"), ("a", "second")], &[]).is_none());
+        assert!(store.publish("index", "bad", &[("a", "first")], &["a"]).is_none());
+        assert_eq!(queue.pending(), 0);
+    }
+
+    #[test]
+    fn a_superseded_publication_dependency_cannot_acknowledge_a_newer_write() {
+        for (index, streamed) in [(false, false), (false, true), (true, false), (true, true)] {
+            let inner = Shared::default();
+            inner.clone().set("index", "previous");
+            inner.clone().set("obsolete", "keep");
+            let queue = StoreQueue::new(Box::new(inner.clone()));
+            let mut store = QueuedStore::new(queue.clone());
+            let receipt =
+                store.publish("index", "older publication", &[("a", "older value")], &["obsolete"]).unwrap();
+            let key = if index { "index" } else { "a" };
+            if streamed {
+                assert!(store.set_stream(key, &mut |out| out.write_all(b"newer")));
+            } else {
+                assert!(store.set(key, "newer"));
+            }
+            let report = queue.flush();
+            assert_eq!(report.failed, 1, "{index} {streamed}: {report:?}");
+            assert_eq!(report.failures[0].code, ERR_DEPENDENCY);
+            assert_eq!(inner.get(key).as_deref(), Some("newer"));
+            assert_eq!(inner.get("obsolete").as_deref(), Some("keep"));
+            assert_eq!(
+                receipt.outcome(),
+                Some(PublicationOutcome::Finished { published: false, cleanup_failed: Vec::new() })
+            );
+        }
+    }
+
+    #[test]
     fn a_queued_removal_reads_as_absent_and_then_clears_the_value() {
         let inner = Shared::default();
         let mut seed = inner.clone();
@@ -1386,6 +2378,9 @@ mod tests {
         let inner = Shared::default();
         let queue = StoreQueue::new(Box::new(inner.clone()));
         let mut store = QueuedStore::new(queue.clone());
+        write_blob(&mut store, "ws", "first", PLAN).expect("fits");
+        // Growing a blob before the drain adds a new chunk. A header that kept its
+        // first position would now publish before that new chunk, not after it.
         write_blob(&mut store, "ws", &"x".repeat(2 * CHUNK_BYTES), PLAN).expect("fits");
         let report = queue.flush();
         assert_eq!(report.keys, vec!["ws.1".to_string(), "ws.2".to_string(), "ws".to_string()]);
@@ -1404,7 +2399,7 @@ mod tests {
         let report = queue.flush();
         assert_eq!(report.written, 2);
         assert_eq!(inner.get("sched").as_deref(), Some("second"));
-        assert_eq!(report.keys, vec!["sched".to_string(), "other".to_string()], "first position kept");
+        assert_eq!(report.keys, vec!["other".to_string(), "sched".to_string()], "latest request order kept");
     }
 
     #[test]

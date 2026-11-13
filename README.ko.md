@@ -14,7 +14,7 @@ JSON으로 새 센서를 선언할 수 있습니다.
 
 | 기능 | 상세 |
 |---|---|
-| 보드의 모델 | 루프, 도구, 메모리, 대화 기록은 펌웨어에 있으며, 모델은 OpenAI 호환 또는 Anthropic 엔드포인트라면 무엇이든 사용할 수 있습니다. [모델](docs/model.md) |
+| 보드의 에이전트 | 루프, 도구, 메모리, 대화 기록은 펌웨어에 있으며, 모델은 OpenAI 호환 또는 Anthropic 엔드포인트라면 무엇이든 사용할 수 있습니다. [모델](docs/model.md) |
 | 매니페스트 기반 도구 | `manifest` (`command: apply`)가 JSON 매니페스트를 검증하고 도구로 컴파일하여 같은 턴 안에 활성화합니다. [매니페스트](docs/manifest.md) |
 | 자동 장치 탐색 | 부팅할 때 I2C, 1-Wire, 선언된 핀을 탐색하며, 응답하는 대상에만 도구가 생깁니다. [기능 목록](docs/capabilities.md) |
 | 도구 집합 하나, 호출자 둘 | MCP 엔드포인트와 보드의 에이전트는 하나의 설명에서 나온 같은 도구를 봅니다. [HTTP 및 MCP API](docs/http-api.md) |
@@ -23,14 +23,21 @@ JSON으로 새 센서를 선언할 수 있습니다.
 | 셸과 스크립트 | NuttX의 명명 방식을 따른 명령 57개를 갖춘 `shell`과, 도구 호출을 반복하는 인터프리터가 있습니다. [셸](docs/shell.md) · [스크립트](docs/scripting.md) |
 | 장기 메모리 | 상시 지침, `/AGENTS.md`, `/MEMORY.md` 인덱스, 스킬을 매 턴 프롬프트에 조합합니다. [컨텍스트 계층](docs/context.md) |
 | 내장 스킬 | 펌웨어에 포함된 절차는 표준 `---` 헤더로 작성된 `create-skill` 하나이며, 이 절차가 나머지를 가르칩니다. 스킬이 무엇이고 어떻게 작성하는지 설명합니다. 첫 부팅 때 `/skills`에 설치되며, 편집한 내용은 그대로 유지됩니다. [스킬](docs/agent-skills.md) |
-| 보드 자체가 서버 | 보드가 HTTPS를 제공하고 인증서를 직접 생성하며, 호출자 셋이 PIN 하나를 공유합니다. [보안](docs/security.md) |
+| 보드 자체가 서버 | 보드가 HTTPS를 제공하고 인증서를 직접 생성하며, 콘솔 PIN과 별도의 MCP 토큰을 사용합니다. [보안](docs/security.md) |
 | 하드웨어 없이 테스트 | 시뮬레이터가 가상 보드에서 동일한 `agent-core`를 실행합니다. [시뮬레이터](docs/simulator.md) |
 
 ## 플래시 및 연결
 
+소스에서 빌드하세요. 미리 빌드한 릴리스 이미지는 배포되지 않습니다. 기본 대상은 16 MiB 플래시와
+8 MiB 옥탈 PSRAM을 갖춘 ESP32-S3 N16R8입니다. [플래시](docs/flashing.md)의 절차로 툴체인을
+설치한 뒤 다음을 실행하세요.
+
 ```bash
-espflash write-bin --chip esp32s3 --flash-size 16mb 0x0 esp32-agent-vX.Y.Z.bin
+bash scripts/build-firmware.sh --flash --port /dev/ttyACM0
 ```
+
+Windows에서는 `powershell -File scripts/build-firmware.ps1 -Flash -Port COM3`를 사용합니다.
+스크립트는 빌드 후 플래시하며, 파티션 테이블과 `factory` 앱 파티션을 명시적으로 전달합니다.
 
 보드에는 WiFi 자격 증명이 없으므로 `esp32-agent-setup`이라는 이름의 액세스 포인트를 시작합니다.
 여기에 연결하고 `http://192.168.4.1/`을 열어 네트워크 이름과 비밀번호를 입력한 뒤 저장합니다.
@@ -51,7 +58,7 @@ URL을 가져올 수 있는 에이전트라면 다른 것은 필요하지 않습
 ## 모델 설정
 
 `http://<board>/`를 열고 **Agent**를 선택한 뒤 엔드포인트, 모델 id, 키를 입력하고 저장합니다.
-키는 쓰기 전용입니다. NVS에 저장되고, 읽으면 `__set__`으로 반환됩니다. 같은 패널에서
+키는 쓰기 전용입니다. NVS에 저장되고, 읽으면 키 대신 `api_key_set`이 반환됩니다. 같은 패널에서
 `protocol`(`chat`, `responses`, `anthropic` 중 하나), `reasoning`, `context_tokens`,
 `max_output_tokens`도 설정할 수 있습니다.
 
@@ -69,15 +76,16 @@ URL을 가져올 수 있는 에이전트라면 다른 것은 필요하지 않습
 ## 안전 참고 사항
 
 - **자격 증명은 보드에 남습니다.** WiFi 자격 증명은 `provision`을 통해 NVS에 저장되며, 이미지에
-  들어가지 않습니다. `api_key`는 쓰기 전용이고 읽으면 `__set__`으로 반환됩니다.
-- **보드가 책상을 떠나기 전에 PIN을 설정하세요.** `auth.portal_pin`은 모든 쓰기 작업과, 대화 기록,
-  프롬프트, 설정, 로그를 노출하는 읽기 작업을 보호합니다.
+  들어가지 않습니다. `api_key`는 쓰기 전용이고 읽으면 `api_key_set`만 반환됩니다.
+- **보드가 책상을 떠나기 전에 두 자격 증명을 모두 설정하세요.** `auth.portal_pin`은 REST 쓰기와
+  설정, 일정, 대화 기록, 프롬프트, 작업 공간, 첨부 파일, 로그, 실행 저널, 스크립트 결과 읽기를 보호합니다.
+  MCP는 `auth.mcp_token`을 사용하며, 설정되지 않으면 콘솔 자격 증명으로 대체합니다.
 - **인증서를 대조하세요.** 보드의 TLS 인증서는 자체 서명이며, 지문은 `GET /api/tls`에서 확인할 수
   있습니다. 포트 80은 기본적으로 열려 있으므로 인증서가 잘못되어도 잃는 것은 URL 하나이지 보드에
   대한 접근 자체가 아닙니다. `mcp.plain_http: false`로 포트를 닫으면, 다시 접근할 수 있는 수단은
   USB 케이블이 됩니다.
 - **`shell`, `script`, 매니페스트 도구는 핀 상태를 바꿉니다.** 그것이 바로 이 보드의 목적입니다.
-  PIN은 에이전트가 제 일을 하는 것과 지나가던 사람이 같은 일을 하는 것을 구분합니다.
+  각 인터페이스의 자격 증명을 설정하여 허가된 호출자와 지나가던 사람을 구분하세요.
 
 [보안](docs/security.md) 문서에 의도적으로 보호하지 않는 대상이 명시되어 있습니다.
 
@@ -85,14 +93,16 @@ URL을 가져올 수 있는 에이전트라면 다른 것은 필요하지 않습
 
 | 부분 | 상태 |
 |---|---|
-| `agent-core` | 단위 테스트 763개와 통합 테스트 5개 통과. `scripts/smoke.ps1`도 엔드투엔드로 통과 |
+| `agent-core` | 단위 테스트 831개와 통합 테스트 5개 통과. `scripts/smoke.ps1`도 엔드투엔드로 통과 |
 | 시뮬레이터 | 콘솔, MCP, 에이전트 루프가 엔드투엔드로 동작 |
-| 펌웨어 | ESP32-S3-DevKitC-1 N16R8(IDF v5.5.2)에 플래시됨: 도구 42개, OLED 128×32, I²S 마이크와 앰프, WS2812, TLS 콘솔, HTTPS를 통한 모델 턴 |
-| 미구현 | OTA, SD 카드, DHT11/22, 카메라. `ROADMAP.md` 참고 |
+| 펌웨어 | 과거 작업대 펌웨어가 ESP32-S3-DevKitC-1 N16R8(IDF v5.5.2)에서 동작: 도구 42개, OLED 128×32, I²S 마이크와 앰프, WS2812, TLS 콘솔, HTTPS를 통한 모델 턴. 감사 변경 사항은 보드에서 미검증 |
+| 미구현 / 미검증 | OTA와 펌웨어 DVP 카메라 캡처는 미구현입니다. SD 원시 섹터 및 DHT11/22 드라이버는 호스트 테스트가 있지만 보드에서 검증되지 않았습니다. `ROADMAP.md` 참고 |
 
-작업대에서의 측정값: 도구 네 개를 사용하는 턴은 13.7 s, TLS를 통한 콘솔은 0.55 s입니다.
-I²C 스캔은 8회 실행에서 안정적입니다. TLS 페이지를 읽은 뒤 내부 SRAM의 여유 공간은
-5–6 kB로, 여기서 가장 빠듯한 제약입니다.
+과거 작업대 측정값: 도구 네 개를 사용하는 턴은 13.7 s, TLS를 통한 콘솔은 0.55 s였습니다.
+I²C 스캔은 8회 실행에서 안정적이었습니다. TLS 페이지를 읽은 뒤 내부 SRAM 여유 공간이
+5–6 kB였던 초기 측정값은 할당자 수정(`10b16dd`) 이전의 값이며 현재 제한이 아닙니다.
+이후의 풀별 측정값과 출처는 [문제 해결](docs/troubleshooting.md#how-much-memory-the-board-has)에 있습니다.
+감사 펌웨어는 플래시하거나 보드에서 테스트하지 않았습니다.
 
 ## 문서
 
@@ -100,7 +110,7 @@ I²C 스캔은 8회 실행에서 안정적입니다. TLS 페이지를 읽은 뒤
 [HTTP 및 MCP](docs/http-api.md) · [장치 추가](docs/adding-a-device.md) · [플래시](docs/flashing.md) ·
 [문제 해결](docs/troubleshooting.md) · [에이전트 루프](docs/agent-loop.md) · [스트림](docs/agent-stream.md) ·
 [스킬](docs/agent-skills.md) · [메모리](docs/agent-memory.md) · [스크립트](docs/scripting.md) ·
-[모델](docs/model.md) · [웹 콘솔](docs/web-console.md) · [스케줄링](docs/scheduling.md) · [셸](docs/shell.md) · [컨텍스트 계층](docs/context.md) · [보안](docs/security.md) · [시뮬레이터](docs/simulator.md) · [오디오](docs/audio.md)
+[모델](docs/model.md) · [웹 콘솔](docs/web-console.md) · [스케줄링](docs/scheduling.md) · [셸](docs/shell.md) · [컨텍스트 계층](docs/context.md) · [보안](docs/security.md) · [시뮬레이터](docs/simulator.md) · [오디오](docs/audio.md) · [감사 보고서](docs/audit-2026-11.md)
 
 ## 기여
 

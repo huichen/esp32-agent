@@ -43,8 +43,9 @@ function Need($cmd, $hint) {
 }
 
 Need 'cargo' 'install Rust: https://rustup.rs'
+Need 'rustup' 'install Rust: https://rustup.rs'
 $toolchains = (rustup toolchain list) -join "`n"
-if ($toolchains -notmatch 'esp') {
+if ($LASTEXITCODE -ne 0 -or $toolchains -notmatch '(?m)^esp(?:\s|$)') {
   throw 'missing the esp toolchain — run: cargo install espup; espup install'
 }
 if (-not (Get-Command 'ldproxy' -ErrorAction SilentlyContinue)) {
@@ -109,31 +110,36 @@ try {
   if ($wrapped -match 'sccache') {
     Write-Warning "cargo is configured with rustc-wrapper = $wrapped; esp-idf-sys fails on Windows with 'os error 206' because its command line is too long. Move the [build] rustc-wrapper line out of the cargo config for this build."
   }
-  if (-not $env:CARGO_TARGET_DIR) {
-    $env:CARGO_TARGET_DIR = if ($TargetDir) { $TargetDir } else { Join-Path $repo 'target' }
+  if ($TargetDir) {
+    $env:CARGO_TARGET_DIR = $TargetDir
+  } elseif (-not $env:CARGO_TARGET_DIR) {
+    $env:CARGO_TARGET_DIR = Join-Path $repo 'target'
   }
   $outProbe = "$env:CARGO_TARGET_DIR\$Target\release\build\esp-idf-sys-0000000000000000\out"
   if ($outProbe.Length -gt 84) {
     Write-Warning "the output path is $($outProbe.Length) characters; esp-idf-sys refuses more than 88 on Windows - pass -TargetDir with a shorter path"
   }
 
-  $profileArg = if ($Release) { '--release' } else { '' }
-  Write-Host "cargo +esp build $profileArg --target $Target (MCU=$Mcpu, target-dir=$env:CARGO_TARGET_DIR)" -ForegroundColor Cyan
-  cargo +esp build $profileArg --target $Target
+  $buildArgs = @('+esp', 'build', '--target', $Target)
+  if ($Release) { $buildArgs += '--release' }
+  Write-Host "cargo $($buildArgs -join ' ') (MCU=$Mcpu, target-dir=$env:CARGO_TARGET_DIR)" -ForegroundColor Cyan
+  & cargo @buildArgs
   if ($LASTEXITCODE -ne 0) { throw 'firmware build failed' }
 
   if ($Flash) {
     Need 'espflash' 'cargo install espflash'
-    $bin = Join-Path $env:CARGO_TARGET_DIR "$Target\release\esp32-agent"
-    if (-not (Test-Path $bin)) { $bin = Join-Path $env:CARGO_TARGET_DIR "$Target\debug\esp32-agent" }
-    $args = @('flash', '--monitor', $bin)
-    # §4: the partition table is passed to the flasher explicitly. Left out, espflash writes
-    # the stock single-app table and the image enumerates partitions that are not there.
+    $profileName = if ($Release) { 'release' } else { 'debug' }
+    $bin = Join-Path $env:CARGO_TARGET_DIR "$Target\$profileName\esp32-agent"
+    if (-not (Test-Path $bin -PathType Leaf)) { throw "built firmware not found: $bin" }
+    $flashArgs = @('flash', '--monitor', $bin)
+    # Never let the flasher substitute its stock layout or select a stale app slot.
     $table = Join-Path $fw 'partitions.csv'
-    if (Test-Path $table) { $args += @('--partition-table', $table) }
-    if ($Port) { $args += @('--port', $Port) }
-    Write-Host "espflash $($args -join ' ')" -ForegroundColor Cyan
-    & espflash @args
+    if (-not (Test-Path $table -PathType Leaf)) { throw "partition table not found: $table" }
+    $flashArgs += @('--partition-table', $table, '--target-app-partition', 'factory')
+    if ($Port) { $flashArgs += @('--port', $Port) }
+    Write-Host "espflash $($flashArgs -join ' ')" -ForegroundColor Cyan
+    & espflash @flashArgs
+    if ($LASTEXITCODE -ne 0) { throw 'firmware flash failed' }
   }
 } finally {
   Pop-Location

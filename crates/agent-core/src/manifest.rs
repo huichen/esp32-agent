@@ -74,7 +74,7 @@ impl Num {
 
     pub fn resolve_u32(&self, args: &Value) -> Result<u32> {
         let v = self.resolve(args)?;
-        if v < 0.0 || v > u32::MAX as f64 {
+        if !v.is_finite() || v < 0.0 || v > u32::MAX as f64 {
             return Err(McpError::invalid_params("value out of range"));
         }
         Ok(v.round() as u32)
@@ -451,8 +451,9 @@ impl Manifest {
             }
             Exec::Toggle { pin, times, gap_ms } => {
                 self.check_pin(pin, &format!("{path}/pin"), issues);
+                let before_limits = issues.len();
                 if let Num::Lit(t) = times {
-                    if *t < 1.0 || *t > 20.0 {
+                    if !t.is_finite() || *t < 1.0 || *t > 20.0 {
                         issues.push(Issue::new(
                             &format!("{path}/times"),
                             "times must be 1..=20",
@@ -461,13 +462,21 @@ impl Manifest {
                     }
                 }
                 if let Num::Lit(ms) = gap_ms {
-                    if *ms < 10.0 || *ms > 1000.0 {
+                    if !ms.is_finite() || *ms < 10.0 || *ms > 1000.0 {
                         issues.push(Issue::new(
                             &format!("{path}/gap_ms"),
                             "gap_ms must be 10..=1000",
                             "Human-visible blink rates live there.",
                         ));
                     }
+                }
+                let total = exec.static_delay_ms();
+                if issues.len() == before_limits && total > u64::from(MAX_TOTAL_DELAY_MS) {
+                    issues.push(Issue::new(
+                        path,
+                        format!("total delay {total} ms exceeds {MAX_TOTAL_DELAY_MS} ms"),
+                        "Reduce times or gap_ms; both the high and low waits count.",
+                    ));
                 }
             }
             Exec::Pwm { pin, freq_hz, duty_pct } => {
@@ -547,7 +556,7 @@ impl Manifest {
             }
             Exec::Delay { ms } => {
                 if let Num::Lit(m) = ms {
-                    if *m < 0.0 || *m as u32 > MAX_TOTAL_DELAY_MS {
+                    if !m.is_finite() || *m < 0.0 || *m > f64::from(MAX_TOTAL_DELAY_MS) {
                         issues.push(Issue::new(
                             &format!("{path}/ms"),
                             format!("ms must be 0..={MAX_TOTAL_DELAY_MS}"),
@@ -592,12 +601,11 @@ impl Manifest {
                         "Batching more than that makes one tool call too slow.",
                     ));
                 }
-                let mut total = 0u32;
                 for (i, step) in steps.iter().enumerate() {
-                    total += step.ms;
                     self.validate_exec(&step.exec, &format!("{path}/steps/{i}/exec"), ctx, device, issues);
                 }
-                if total > MAX_TOTAL_DELAY_MS {
+                let total = exec.static_delay_ms();
+                if total > u64::from(MAX_TOTAL_DELAY_MS) {
                     issues.push(Issue::new(
                         &format!("{path}/steps"),
                         format!("total delay {total} ms exceeds {MAX_TOTAL_DELAY_MS} ms"),
@@ -738,6 +746,35 @@ impl Manifest {
 }
 
 impl Exec {
+    /// One accumulated wait cost, using the same toggle coercion as execution.
+    /// Wider, saturating arithmetic also handles invalid old/stored manifests.
+    fn delay_ms(&self, resolve: &impl Fn(&Num) -> Result<u32>) -> Result<u64> {
+        match self {
+            Exec::Delay { ms } => Ok(u64::from(resolve(ms)?)),
+            Exec::Toggle { times, gap_ms, .. } => {
+                let times = resolve(times)?.clamp(1, 20);
+                let gap = resolve(gap_ms)?.clamp(10, 1000);
+                Ok(2 * u64::from(times) * u64::from(gap))
+            }
+            Exec::Sequence { steps } => steps.iter().try_fold(0u64, |total, step| {
+                Ok(total.saturating_add(u64::from(step.ms)).saturating_add(step.exec.delay_ms(resolve)?))
+            }),
+            _ => Ok(0),
+        }
+    }
+
+    /// A lower bound for apply-time validation. Argument-dependent waits remain
+    /// legal here and are resolved together against the ceiling at call time.
+    fn static_delay_ms(&self) -> u64 {
+        self.delay_ms(&|n| {
+            Ok(match n {
+                Num::Lit(v) => v.round().clamp(0.0, f64::from(u32::MAX)) as u32,
+                Num::Param { .. } => 0,
+            })
+        })
+        .unwrap_or(u64::MAX)
+    }
+
     fn is_mutating(&self) -> bool {
         !matches!(self, Exec::GpioRead { .. } | Exec::Adc { .. } | Exec::I2cRead { .. } | Exec::Delay { .. })
     }
@@ -947,8 +984,53 @@ fn safety_refused(
     .with_data(json!({ "tool": tool, "param": param, "value": value }))
 }
 
+/// Check the complete operation tree before any hardware effect or rate accounting.
+/// A disabled late step must not leave an earlier actuator energized.
+fn preflight_enabled(exec: &Exec, ctx: &ToolCtx<'_>) -> Result<()> {
+    let names: &[&str] = match exec {
+        Exec::GpioWrite { .. } => &["gpio_mode", "gpio_write"],
+        Exec::GpioRead { .. } => &["gpio_mode", "gpio_read"],
+        Exec::Toggle { .. } => &["gpio_mode", "gpio_write", "delay"],
+        Exec::Adc { .. } => &["adc_read"],
+        Exec::I2cRead { .. } => &["i2c_read"],
+        Exec::I2cWrite { .. } => &["i2c_write"],
+        Exec::Delay { .. } => &["delay"],
+        Exec::Rgb { .. } => &["rgb", "indicators"],
+        Exec::Pwm { .. } => &["pwm"],
+        Exec::Driver { driver, action } => {
+            let (public, _) = ctx.devices.resolve_tool(driver, action)?;
+            ctx.ensure_enabled(&public)?;
+            &[]
+        }
+        Exec::Sequence { steps } => {
+            for step in steps {
+                if step.ms != 0 {
+                    ctx.ensure_enabled("delay")?;
+                }
+                preflight_enabled(&step.exec, ctx)?;
+            }
+            &[]
+        }
+    };
+    for name in names {
+        ctx.ensure_enabled(name)?;
+    }
+    Ok(())
+}
+
 pub(crate) fn run_tool(t: &ManifestTool, ctx: &mut ToolCtx, args: &Value) -> Result<Value> {
+    ctx.ensure_enabled(&t.name)?;
     check_args(t, args)?;
+    preflight_enabled(&t.exec, ctx)?;
+    // Resolve every wait before any hardware access. Refusing halfway through a
+    // pump sequence could leave it energized without reaching its release step.
+    let delay = t.exec.delay_ms(&|n| n.resolve_u32(args))?;
+    if delay > u64::from(MAX_TOTAL_DELAY_MS) {
+        return Err(McpError::invalid_params(format!(
+            "total delay {delay} ms exceeds {MAX_TOTAL_DELAY_MS} ms"
+        ))
+        .with_data(json!({ "total_delay_ms": delay, "max_delay_ms": MAX_TOTAL_DELAY_MS })));
+    }
     // Rate limit, so a looping model cannot hammer a relay or a display.
     if let Some(limit) = t.safety.max_calls_per_min {
         let key = format!("manifest:{}", t.name);
@@ -1036,14 +1118,15 @@ fn run_exec(exec: &Exec, ctx: &mut ToolCtx, args: &Value) -> Result<Value> {
             Ok(json!({ "pin": pin, "color": c }))
         }
         Exec::Delay { ms } => {
-            let ms = ms.resolve_u32(args)?.min(MAX_TOTAL_DELAY_MS);
+            let ms = ms.resolve_u32(args)?;
             ctx.hw.delay_us(ms * 1000);
             Ok(json!({ "slept_ms": ms }))
         }
         Exec::Driver { driver, action } => {
             // The device id equals the driver id unless the manifest renamed it.
             let id = driver.clone();
-            let value = ctx.devices.call(&id, action, args, &mut *ctx.hw)?;
+            let (_, raw) = ctx.devices.resolve_tool(&id, action)?;
+            let value = ctx.devices.call(&id, &raw, args, &mut *ctx.hw)?;
             Ok(value)
         }
         Exec::Sequence { steps } => {
@@ -1053,7 +1136,7 @@ fn run_exec(exec: &Exec, ctx: &mut ToolCtx, args: &Value) -> Result<Value> {
                 results.push(run_exec(&step.exec, ctx, args)?);
                 n += 1;
                 if step.ms > 0 {
-                    ctx.hw.delay_us(step.ms.min(MAX_TOTAL_DELAY_MS) * 1000);
+                    ctx.hw.delay_us(step.ms * 1000);
                 }
             }
             let mut out = steps_note(n);
@@ -1079,6 +1162,9 @@ fn bytes_from_value(v: &Value) -> Result<Vec<u8>> {
             let cleaned = s.replace([' ', ',', ':'], "");
             if cleaned.len() % 2 != 0 {
                 return Err(McpError::invalid_params("hex strings need an even number of digits"));
+            }
+            if !cleaned.bytes().all(|b| b.is_ascii_hexdigit()) {
+                return Err(McpError::invalid_params("invalid hex digit in data"));
             }
             let mut out = Vec::with_capacity(cleaned.len() / 2);
             for i in (0..cleaned.len()).step_by(2) {
@@ -1108,6 +1194,72 @@ mod tests {
             known_device_ids: vec!["bme280".into()],
             taken: vec!["board_status".into(), "manifest_apply".into(), "bme280_read".into()],
         }
+    }
+
+    #[derive(Default)]
+    struct RecordedHardware {
+        calls: Vec<&'static str>,
+        waited_us: u64,
+        level: Option<bool>,
+    }
+
+    impl crate::hardware::Hardware for RecordedHardware {
+        fn board_info(&mut self) -> crate::hardware::BoardInfo {
+            crate::hardware::BoardInfo::default()
+        }
+        fn gpio_config(&mut self, _pin: i32, _mode: PinMode) -> Result<()> {
+            self.calls.push("gpio_config");
+            Ok(())
+        }
+        fn gpio_write(&mut self, _pin: i32, high: bool) -> Result<()> {
+            self.calls.push("gpio_write");
+            self.level = Some(high);
+            Ok(())
+        }
+        fn delay_us(&mut self, us: u32) {
+            self.calls.push("delay_us");
+            self.waited_us += u64::from(us);
+        }
+    }
+
+    fn run_recorded(t: &ManifestTool, args: &Value) -> (Result<Value>, RecordedHardware) {
+        run_recorded_with_config(t, args, crate::config::Config::default())
+    }
+
+    fn run_recorded_with_config(
+        t: &ManifestTool,
+        args: &Value,
+        mut cfg: crate::config::Config,
+    ) -> (Result<Value>, RecordedHardware) {
+        let mut hw = RecordedHardware::default();
+        let mut devices = crate::device::Devices::new();
+        let mut runtime = crate::state::Runtime::new(0, "test", "test");
+        let log = crate::logbuf::LogBuf::new(8);
+        let caps = CapSet::new();
+        let probe = crate::state::ProbeReport::default();
+        let mut manifest = Manifest::default();
+        let mut tasks = Vec::new();
+        let mut rules = Vec::new();
+        let result = run_tool(
+            t,
+            &mut ToolCtx {
+                hw: &mut hw,
+                devices: &mut devices,
+                cfg: &mut cfg,
+                runtime: &mut runtime,
+                log: &log,
+                caps: &caps,
+                profile: crate::boards::find("generic").unwrap(),
+                probe: &probe,
+                manifest: &mut manifest,
+                taken: &[],
+                tasks: &mut tasks,
+                rules: &mut rules,
+                families: &std::collections::BTreeMap::new(),
+            },
+            args,
+        );
+        (result, hw)
     }
 
     fn sample() -> Manifest {
@@ -1185,6 +1337,49 @@ mod tests {
         let issues = m.validate(&ctx());
         assert!(issues.iter().any(|i| i.message.contains("at most")));
         assert!(issues.iter().any(|i| i.message.contains("total delay")));
+
+        // Primitive waits, both halves of a toggle, nested waits and step waits
+        // share one ceiling, rather than each getting another five seconds.
+        for exec in [
+            json!({ "type": "sequence", "steps": [
+                { "exec": { "type": "delay", "ms": 4000 } },
+                { "exec": { "type": "delay", "ms": 4000 } }
+            ] }),
+            json!({ "type": "sequence", "steps": [
+                { "ms": 2000, "exec": { "type": "sequence", "steps": [
+                    { "exec": { "type": "delay", "ms": 2000 } },
+                    { "exec": { "type": "delay", "ms": 2000 } }
+                ] } }
+            ] }),
+            json!({ "type": "sequence", "steps": [
+                { "ms": 1001, "exec": { "type": "toggle", "pin": 2, "times": 2, "gap_ms": 1000 } }
+            ] }),
+            json!({ "type": "toggle", "pin": 2, "times": 3, "gap_ms": 1000 }),
+        ] {
+            let m = Manifest::from_json_str(&tool(exec.clone()).to_string()).unwrap();
+            let issues = m.validate(&ctx());
+            assert!(issues.iter().any(|i| i.message.contains("total delay")), "accepted {exec}: {issues:?}");
+        }
+        let at_limit = tool(json!({ "type": "sequence", "steps": [
+            { "ms": 500, "exec": { "type": "toggle", "pin": 2, "times": 2, "gap_ms": 1000 } },
+            { "exec": { "type": "sequence", "steps": [
+                { "exec": { "type": "delay", "ms": 500 } }
+            ] } }
+        ] }));
+        assert!(issue_paths(at_limit).is_empty(), "exactly 5000 ms remains valid");
+
+        // Both fields fit u32 individually. Their sum must be an issue, not a
+        // debug panic or a wrapping zero that is accepted in a release build.
+        let overflow = tool(json!({ "type": "sequence", "steps": [
+            { "ms": u32::MAX, "exec": { "type": "delay", "ms": 0 } },
+            { "ms": 1, "exec": { "type": "delay", "ms": 0 } }
+        ] }));
+        let m = Manifest::from_json_str(&overflow.to_string()).unwrap();
+        let issues = m.validate(&ctx());
+        assert!(issues.iter().any(|i| i.message.contains("4294967296")), "{issues:?}");
+        let (result, hw) = run_recorded(&m.tools[0], &json!({}));
+        assert_eq!(result.unwrap_err().code, code::INVALID_PARAMS);
+        assert!(hw.calls.is_empty(), "old/stored oversized step waits are refused before execution too");
     }
 
     #[test]
@@ -1195,6 +1390,80 @@ mod tests {
         assert_eq!(e.code, code::INVALID_PARAMS);
         assert!(check_args(&t, &json!({ "brightness": 3.5 })).is_err(), "integer params reject fractions");
         assert!(check_args(&t, &json!({ "brightness": 10 })).is_ok());
+
+        let blocked = Manifest::from_json_str(
+            &tool(json!({"type": "sequence", "steps": [
+                {"exec": {"type": "gpio_write", "pin": 12, "level": 1}},
+                {"exec": {"type": "sequence", "steps": [{"exec": {"type": "gpio_read", "pin": 0}}]}}
+            ]}))
+            .to_string(),
+        )
+        .unwrap();
+        let mut cfg = crate::config::Config::default();
+        cfg.mcp.disabled_tools = vec!["gpio_read".into()];
+        let (result, hw) = run_recorded_with_config(&blocked.tools[0], &json!({}), cfg);
+        assert_eq!(result.unwrap_err().code, code::FORBIDDEN);
+        assert!(
+            hw.calls.is_empty(),
+            "a disabled nested step must be rejected before energizing the first pin"
+        );
+
+        let m = Manifest::from_json_str(
+            &json!({ "tools": [{
+            "name": "timed", "params": [{ "name": "ms", "type": "number", "required": true }],
+            "exec": { "type": "sequence", "steps": [
+                { "ms": 250, "exec": { "type": "gpio_write", "pin": 12, "level": 1 } },
+                { "ms": 250, "exec": { "type": "sequence", "steps": [
+                    { "exec": { "type": "delay", "ms": { "param": "ms" } } },
+                    { "exec": { "type": "delay", "ms": { "param": "ms" } } }
+                ] } },
+                { "exec": { "type": "gpio_write", "pin": 12, "level": 0 } }
+            ] }
+        }] })
+            .to_string(),
+        )
+        .unwrap();
+        assert!(m.validate(&ctx()).is_empty(), "a parameterized sequence is not statically refused");
+        for ms in [json!(2251), json!(4000), json!(6000), json!(-1), json!("NaN")] {
+            let (result, hw) = run_recorded(&m.tools[0], &json!({ "ms": ms }));
+            let err = result.expect_err("all waits are resolved before any GPIO write");
+            assert_eq!(err.code, code::INVALID_PARAMS, "{ms}: {err:?}");
+            assert!(hw.calls.is_empty(), "refused {ms} only after touching hardware: {:?}", hw.calls);
+        }
+        let (result, hw) = run_recorded(&m.tools[0], &json!({ "ms": 2250 }));
+        assert!(result.is_ok(), "exactly 5000 ms: {result:?}");
+        assert_eq!(hw.waited_us, 5_000_000);
+        assert_eq!(hw.level, Some(false), "the sequence reaches its release step");
+
+        let pump = Manifest::from_json_str(&json!({ "tools": [{
+            "name": "bench_pump", "params": [{ "name": "ms", "type": "integer", "min": 10, "max": 5000, "required": true }],
+            "safety": { "confirm": true },
+            "exec": { "type": "sequence", "steps": [
+                { "exec": { "type": "gpio_write", "pin": 12, "level": 1 } },
+                { "exec": { "type": "delay", "ms": { "param": "ms" } } },
+                { "exec": { "type": "gpio_write", "pin": 12, "level": 0 } }
+            ] }
+        }] }).to_string()).unwrap();
+        assert!(pump.validate(&ctx()).is_empty());
+        let (result, hw) = run_recorded(&pump.tools[0], &json!({ "ms": 5000, "confirm": true }));
+        assert!(result.is_ok(), "the legitimate pump sequence is preserved: {result:?}");
+        assert_eq!(hw.waited_us, 5_000_000);
+        assert_eq!(hw.level, Some(false));
+
+        let toggle = Manifest::from_json_str(
+            &tool(json!({ "type": "sequence", "steps": [
+            { "exec": { "type": "gpio_write", "pin": 12, "level": 1 } },
+            { "exec": { "type": "toggle", "pin": 12, "times": { "param": "n" }, "gap_ms": 1000 } }
+        ] }))
+            .to_string(),
+        )
+        .unwrap();
+        let (result, hw) = run_recorded(&toggle.tools[0], &json!({ "n": 3 }));
+        assert_eq!(result.unwrap_err().code, code::INVALID_PARAMS);
+        assert!(hw.calls.is_empty(), "both halves of a parameterized toggle count before mutation");
+        let (result, hw) = run_recorded(&toggle.tools[0], &json!({}));
+        assert_eq!(result.unwrap_err().code, code::INVALID_PARAMS);
+        assert!(hw.calls.is_empty(), "a missing later wait argument is checkable before mutation");
     }
 
     #[test]
@@ -1591,6 +1860,12 @@ mod tests {
         assert_eq!(err.code, code::INVALID_PARAMS);
         let err = resolve_bytes(&json!("1g"), &json!({})).unwrap_err();
         assert!(err.message.contains("hex"), "{}", err.message);
+        // Even byte length does not mean byte-pair boundaries are UTF-8 boundaries.
+        for text in ["a界", "é01", "界a"] {
+            let err = resolve_bytes(&json!({ "param": "bytes" }), &json!({ "bytes": text })).unwrap_err();
+            assert_eq!(err.code, code::INVALID_PARAMS);
+            assert!(err.message.contains("hex"), "{}", err.message);
+        }
         let err = resolve_bytes(&json!({ "param": "bytes" }), &json!({})).unwrap_err();
         assert!(err.message.contains("bytes"), "{}", err.message);
     }

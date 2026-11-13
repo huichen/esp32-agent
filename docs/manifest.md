@@ -113,6 +113,24 @@ Any value field may be a literal or `{"param": "name"}` to read a call argument.
 `sequence` is the entry point for composing basics: pulse a relay, blink then read a light
 sensor, sweep a servo and take a reading.
 
+One tool call has a **5000 ms cumulative explicit-wait budget**. It includes every
+`delay`, both the high and low waits of each `toggle`, and every step's `ms`, including
+nested sequences. Apply-time validation rejects a known total above that ceiling;
+large step fields cannot overflow the accounting. Parameterized waits remain legal,
+including a pump-on / `delay {"param":"ms"}` / pump-off sequence. At call time all wait
+arguments are resolved and summed **before any hardware access**. Missing, non-finite
+or invalid unsigned wait arguments and over-budget totals return `-32602`; `delay` is
+no longer silently shortened or refused after energizing a relay. Toggle arguments
+retain their existing coercion to 1–20 repetitions and 10–1000 ms gaps, and those coerced
+high/low waits count toward the total. An over-budget error includes
+`total_delay_ms` and `max_delay_ms` in its data. This bounds manifest waits, not the wall
+clock time of driver calls or hardware I/O, which have their own limits.
+
+An `i2c_write` data parameter may contain a hex string, e.g. `"01:02 ff"`. Spaces,
+commas and colons are ignored; the remaining characters must be ASCII hex digits in
+complete byte pairs. Invalid text, including non-ASCII characters, returns an argument
+error before any I2C write.
+
 ## 5. safety (enforced on the board)
 
 ```json
@@ -124,7 +142,16 @@ sensor, sweep a servo and take a reading.
   to catch a hallucinating model.
 - `max_calls_per_min`: sliding-window rate limit, so a model in a loop cannot use a relay
   as a drum.
-- `confirm: true`: the call must carry `"confirm": true`.
+- `confirm: true`: the call must carry `"confirm": true`. A direct driver call, a family
+  command and `device_invoke` share the manifest policy for the same device/action;
+  choosing another entry point does not skip confirmation, ranges or rate limiting.
+- `mcp.disabled_tools` applies at execution time, not just to `tools/list`. Manifest
+  driver actions resolve the device's published name (including `_2` suffixes) before
+  checking that switch and its family. Legacy raw names remain accepted by
+  `device_invoke`, but cannot evade a disabled instance. GPIO/I2C/ADC primitives and
+  explicit waits check their underlying command switches too. Every nested sequence
+  is preflighted before hardware access or rate accounting, so a disabled late step
+  cannot leave an earlier actuator energized.
 
 Error codes: an out-of-range argument is `-32602`; a safety range, a missing confirmation
 or rate limiting is `-32005` (forbidden), with the range in the message.

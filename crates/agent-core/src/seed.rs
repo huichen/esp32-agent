@@ -46,9 +46,8 @@ pub fn defaults_for(_profile: &str) -> &'static [(&'static str, &'static str)] {
 /// no revision counter: an owner who edits `pinout` into something that fits their bench
 /// has made their version the real one, and a firmware upgrade must not argue with that.
 ///
-/// Running out of room is not an error. The workspace is 8 KB, and three skills with a
-/// memory beside them can exceed it; what did not fit is missing from the count, and the
-/// log line in `App::seed_default_skills` is where that shows up.
+/// Seeding is best effort under the workspace's file/text/path budgets. What did not fit
+/// is missing from the count, and `App::seed_default_skills` logs the admission outcome.
 pub fn seed(ws: &mut AppWorkspace, profile: &str) -> usize {
     let mut written = 0;
     for (name, text) in defaults_for(profile) {

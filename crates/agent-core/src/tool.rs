@@ -41,6 +41,55 @@ pub struct ToolCtx<'a> {
     /// app writes NVS after the call returns — the same path `POST /api/sched` uses.
     pub tasks: &'a mut Vec<crate::sched::ScheduledTask>,
     pub rules: &'a mut Vec<crate::sched::SensorRule>,
+    /// Public action names and the families that own them, including suffixed instances.
+    pub families: &'a BTreeMap<String, String>,
+}
+
+impl ToolCtx<'_> {
+    pub fn ensure_enabled(&self, name: &str) -> Result<()> {
+        ensure_tool_enabled_in(self.cfg, self.families, name)
+    }
+}
+
+/// Enforce a public action's switch and the switch of the family containing it.
+pub fn ensure_tool_enabled_in(cfg: &Config, families: &BTreeMap<String, String>, name: &str) -> Result<()> {
+    ensure_tool_enabled(cfg, name)?;
+    if let Some(family) = families.get(name).and_then(|reached| reached.split_whitespace().next()) {
+        ensure_tool_enabled(cfg, family)?;
+    }
+    Ok(())
+}
+
+/// The explicit disable that applies to a name, including supported legacy aliases.
+/// Listing profiles and generic/family folding are not execution permissions.
+pub fn disabled_tool<'a>(cfg: &'a Config, name: &str) -> Option<&'a str> {
+    let command = name.strip_prefix("shell_").unwrap_or(name);
+    let aliases: &[&str] = match command {
+        "read" | "fs_read" => &["read", "fs_read"],
+        "write" | "fs_write" => &["write", "fs_write"],
+        "edit" | "fs_edit" => &["edit", "fs_edit"],
+        "nslookup" | "net_dns" => &["nslookup", "net_dns"],
+        "nc" | "net_tcp" => &["nc", "net_tcp"],
+        "net_get" => &["net_get", "curl"],
+        "net_post" => &["net_post", "curl"],
+        _ => &[],
+    };
+    cfg.mcp
+        .disabled_tools
+        .iter()
+        .find(|disabled| {
+            disabled.as_str() == name || disabled.as_str() == command || aliases.contains(&disabled.as_str())
+        })
+        .map(String::as_str)
+}
+
+pub fn ensure_tool_enabled(cfg: &Config, name: &str) -> Result<()> {
+    match disabled_tool(cfg, name) {
+        Some(disabled) => Err(crate::error::McpError::forbidden(format!(
+            "tool `{name}` is disabled by `{disabled}` in `mcp.disabled_tools`"
+        ))),
+        None => Ok(()),
+    }
 }
 
 pub type ToolHandler = Box<dyn for<'a> Fn(&mut ToolCtx<'a>, &Value) -> Result<Value> + Send + Sync>;
