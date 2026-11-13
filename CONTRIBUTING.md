@@ -14,14 +14,15 @@ For: GPIO switches, PWM, ADC, reading one I2C register, composed actions.
    I2C sensor at a known address:
 
    ```json
-   {"tools":[{"name":"soil.moisture","description":"Read the raw soil moisture value",
+   {"tools":[{"name":"soil_moisture","description":"Read the raw soil moisture value",
      "params":[],"exec":{"type":"i2c_read","addr":72,"reg":0,"length":2},
      "safety":{"max_calls_per_min":30}}]}
    ```
 
-2. Once it works, put it in `examples/manifests/<device>.json` and record in a header
-   comment: the chip part number, the address, the wiring, the datasheet page, and how
-   the raw value converts to a physical quantity (a model needs that last part).
+2. Once it works, put it in `examples/manifests/<device>.json` and record in a companion
+   Markdown file: the chip part number, address, wiring, datasheet page, and how the raw
+   value converts to a physical quantity (a model needs that last part). Manifests are
+   strict JSON: do not put header comments in the JSON.
 3. Add a row to the table in `docs/capabilities.md` with status `manifest`.
 
 ### Path B: a driver (needs timing, calibration or a state machine)
@@ -67,10 +68,17 @@ compensation itself.
 
 ```bash
 cargo test -p esp32-agent-core
+cargo build -p esp32-agent-sim
 powershell -File scripts/smoke.ps1        # or: bash scripts/smoke.sh
 cargo clippy -p esp32-agent-core -p esp32-agent-sim -- -D warnings
 cargo fmt --all --check
 ```
+
+README changes include all seven translations in the same commit and also run
+`python scripts/check-readmes.py --self-test`. For firmware changes, run the matching
+`build-firmware` wrapper in [flashing](docs/flashing.md); if it cannot be built here,
+state "firmware not built/verified" and the remaining board checks in the commit/handoff.
+Host tests do not verify ESP-IDF compilation or physical hardware.
 
 ## Code of conduct
 
