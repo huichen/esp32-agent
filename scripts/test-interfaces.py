@@ -1556,6 +1556,11 @@ def storage(rec, sim, fake):
     sim.state.write_bytes(encode({"ws.index": "not valid JSON"}))
     sim.start()
     rec.equal("corrupt-index-survives", sim.request("GET", "/api/files/tree").status, 200)
+    # The save-failure fixture must start with a readable workspace. A corrupt index
+    # would reject the edit before it reaches persistence and mask false save acknowledgements.
+    sim.stop()
+    sim.state.write_bytes(encode({}))
+    sim.start()
     sim.drain()
     # A directory at the destination makes rename fail on Windows and Unix without ACL tricks.
     sim.state.unlink()
@@ -1564,7 +1569,7 @@ def storage(rec, sim, fake):
     rec.check("failed-save-not-acknowledged-as-durable", saved.get("saved") is not True, short(saved))
     rec.equal("config-response-distinguishes-admission", saved.get("queued"), True)
     result = sim.call("write", {"path": "/cannot-save.txt", "text": "must not claim durable"})
-    rec.check("failed-workspace-save-not-acknowledged-as-durable", result.get("isError") is True or content(result).get("ok") is not True, short(result))
+    rec.check("failed-workspace-save-not-acknowledged-as-durable", result.get("isError") is True or content(result).get("saved") is False and content(result).get("queued") is True, short(result))
     status = wait_for(lambda: sim.get("/api/status")["store"], lambda s: s["pending"] == 0 and s["failed"] > 0)
     rec.check("persistence-failure-observable", status["last_failure"] is not None and bool(status["refused_keys"]), short(status))
     rec.note("Private malformed workspace index, path/file budgets at load and deterministic destination-rename failure are tested. Real NVS/flash full/power-loss atomicity requires its own hardware evidence.")

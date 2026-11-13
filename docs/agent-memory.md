@@ -55,8 +55,9 @@ then one line appended to the index:
 ```
 
 `GET /api/agent/prompt` shows exactly what the model will be told, memory included, so this
-is checkable without a model in the loop. Memory-file writes use the workspace publication
-receipt, not just queue admission; that does not establish power-loss durability.
+is checkable without a model in the loop. Memory-file tools report `queued: true` /
+`saved: false`: the RAM edit was admitted, not confirmed on storage. Later publication
+receipts control saved-hash bookkeeping; neither is a power-loss measurement.
 
 ## 2. Compression without a summary
 

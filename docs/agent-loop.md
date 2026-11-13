@@ -98,8 +98,9 @@ may be requested and billed again.
 **Acknowledgement matters.** The firmware queues ordinary configuration/transcript
 writes. A successful `set` or `queued: true` configuration response means admission, not
 that flash has finished. A later writer refusal can leave RAM newer than the persisted
-value; inspect `store.pending`, `failed` and `last_failure`. Workspace writes instead
-wait for a publication receipt, as described below. Per-file replacement uses a synced
+value; inspect `store.pending`, `failed` and `last_failure`. File-tool replies also report
+`queued: true` / `saved: false`; completed publication receipts govern later saved-hash
+acknowledgements, not a blocking tool response. Per-file replacement uses a synced
 temporary file and rename, but the host-tested ordering/recovery code is not a board
 power-cut measurement. The detailed backend guarantees and mount policy are in
 [storage](storage.md).
@@ -118,8 +119,9 @@ power-cut measurement. The detailed backend guarantees and mount policy are in
 | Restore | validate the complete index/document and contents before adoption; preserve refused data and block mutations |
 
 A save submits changed file values and the index instead of rewriting all workspace text.
-Workspace writes wait for the required values/index publication receipt: queue admission
-alone is not enough for a successful tool response. Legacy document/chunk formats remain
+A successful file-tool response confirms the RAM edit and queue admission, with
+`queued: true` / `saved: false`; it does not wait for the required values/index publication
+receipt. Only a completed receipt advances the workspace's saved hashes. Legacy document/chunk formats remain
 readable. This is not an all-files transaction or a power-cut guarantee; see
 [storage](storage.md) for failed-publication and recovery boundaries.
 
