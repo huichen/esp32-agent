@@ -7,9 +7,10 @@ effect: `tools/list` changes immediately, without a reboot or a reflash.
 The five manifest operations are one tool with five commands — `get`, `describe`,
 `validate`, `apply`, `reset` — called as `{"command": "apply", "arguments": {...}}`.
 `{"command": "help"}` lists them with their arguments in about a kilobyte, which is what
-lets the board send one declaration instead of five. The old names (`manifest_apply` and
-the rest) still answer, so a stored script keeps working; they are no longer listed, and
-`/api/tools` says which command each one became.
+lets the board send one declaration instead of five. The name is `manifest` and nothing
+else: one capability has one name, so the five old ones (`manifest_apply` and the rest) are
+gone rather than hidden, and a stored script that used them gets `no tool` and a pointer to
+the family.
 
 ## 0. Manifest or driver?
 
@@ -81,12 +82,13 @@ Limits: `tools ≤ 48`, `sequence.steps ≤ 8`, cumulative `delay ≤ 5000 ms` p
   choice: `function.name` is validated against `^[a-zA-Z0-9_-]+$`, and every request
   carries the whole tool list — one name outside it fails **every** call, including the
   `manifest` call (`command: apply`) that would repair the manifest.
-- `name` must not be one the board already provides: the built-in tools
-  (`board_status`, `manifest_apply`, `i2c_read`, …) and the driver tools of the detected
-  hardware (`bme280_read`, `led_set`, …). Reusing one is refused with
-  `` `manifest_apply` is already a tool the board provides `` — a manifest tool that took
-  `manifest_apply` would leave the board unable to fix its own manifest. The `manifest_`
-  prefix itself is not reserved: `manifest_helper` is fine, `manifest_apply` is not.
+- `name` must not be one the board already provides: the built-in tools (`board`, `bus`,
+  `manifest`, `display`, `read`, `shell`, …) and the driver tools of the detected hardware
+  (`bme280_read`, `sensor_read_2`, …). Reusing one is refused with
+  `` `board` is already a tool the board provides `` — a manifest tool that took `manifest`
+  would leave the board unable to fix its own manifest. The `manifest_`, `board_` and
+  `bus_` prefixes are not reserved by themselves: `manifest_helper` is fine, `manifest` is
+  not.
 - `description` is the only natural language the model sees; state **units and side
   effects**.
 - `params`: `{name, type: integer|number|string|boolean, required, min, max, unit, enum, default, description}`.

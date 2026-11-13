@@ -42,7 +42,7 @@ display, the order of reads that avoids a bus fault.
 4. `ls /skills` again and confirm it appears.
 
 ```text
-write {"path":"/skills/blink/SKILL.md","text":"---\nname: blink\ndescription: blink the LED three times\n---\n# blink\n1. gpio_write {pin:48, level:1}\n2. delay {ms:200}\n3. gpio_write {pin:48, level:0}\n4. repeat 1-3 three times\n"}
+write {"path":"/skills/blink/SKILL.md","text":"---\nname: blink\ndescription: blink the LED three times\n---\n# blink\n1. bus {command: \"gpio_write\", arguments: {pin:48, level:1}}\n2. board {command: \"delay\", arguments: {ms:200}}\n3. bus {command: \"gpio_write\", arguments: {pin:48, level:0}}\n4. repeat 1-3 three times\n"}
 ```
 
 ## House rules

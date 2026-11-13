@@ -764,19 +764,14 @@ impl App {
         self.caps = caps;
 
         let mut tools = ToolRegistry::new();
-        // A name in `DROPPED_ALIASES` is not registered: the family below carries its own
-        // copy of the handler, and `help`/`dispatch` reach the command without a second name.
-        for def in board_tools::always_tools().into_iter().chain(board_tools::manifest_tools()) {
-            if !Self::DROPPED_ALIASES.contains(&def.spec.name.as_str()) {
-                tools.register(def);
-            }
-        }
-        tools.register(board_tools::board_family());
-        tools.register(board_tools::bus_family());
-        // A family is one tool with several commands; the members are still registered under
-        // their old names, so a stored script keeps calling the same handler. Remembering
-        // which is which is what lets the listing say "reachable as `board status`" instead
-        // of dropping nine names without a word.
+        // One capability, one name. A command a family owns is not registered on its own:
+        // the family carries its own copy of every handler, so `display {command: "oled_text"}`
+        // runs the same code the standalone name used to. The second spelling would be a second
+        // thing to document, to disable and to keep in step, which is what the family replaced.
+        //
+        // `family_members` still maps every command name to the family that owns it, because
+        // `disabled_tools` names a command: disabling `oled_text` keeps disabling the OLED
+        // through `display` as well.
         let mut members: std::collections::BTreeMap<String, String> = Default::default();
         for (family, names) in [
             ("manifest", board_tools::manifest_members()),
@@ -789,14 +784,12 @@ impl App {
                 members.insert(name, format!("{family} {command}"));
             }
         }
-        self.family_members = members;
-        tools.register_all(self.devices.tool_defs());
-        tools.register_all(board_tools::media::tools(&self.devices));
+
         // Device tools that belong together answer to one family name: six `oled_*` become
         // `display`, four audio tools become `audio`, and the LED and the buttons become
-        // `indicators`. The grouping is the board's own vocabulary — a kind of device it
-        // detected — so a driver that is not in this list keeps its individual tools
-        // instead of being guessed at by name.
+        // `indicators`. The grouping is the board's own vocabulary, a kind of device it
+        // detected, so a driver that is not in this list keeps its individual tools instead of
+        // being guessed at by name.
         let mut groups: std::collections::BTreeMap<&'static str, Vec<String>> = Default::default();
         for info in self.devices.infos() {
             let Some((_, family)) = Self::DEVICE_FAMILIES.iter().find(|(kind, _)| *kind == info.kind) else {
@@ -804,10 +797,8 @@ impl App {
             };
             groups.entry(family).or_default().extend(info.tools.iter().cloned());
         }
+        let mut families: Vec<(&'static str, Vec<ToolDef>)> = Vec::new();
         for (family, declared) in groups {
-            // A second pass, because a family owns its commands while the old names stay in
-            // the registry: `oled_text` still answers, and `display oled_text` is the same
-            // handler behind one declaration.
             let subs: Vec<ToolDef> = self
                 .devices
                 .tool_defs()
@@ -820,12 +811,30 @@ impl App {
                 // One tool is not a family: the declaration would cost more than the tool.
                 continue;
             }
-            let summary = format!("{family}: {} commands", subs.len());
-            for name in subs.iter().map(|d| d.spec.name.clone()).collect::<Vec<String>>() {
-                self.family_members.insert(name.clone(), format!("{family} {name}"));
+            for name in subs.iter().map(|d| d.spec.name.clone()) {
+                members.insert(name.clone(), format!("{family} {name}"));
             }
+            families.push((family, subs));
+        }
+
+        let owned: std::collections::BTreeSet<String> = members.keys().cloned().collect();
+        for def in board_tools::always_tools().into_iter().chain(board_tools::manifest_tools()) {
+            if !owned.contains(&def.spec.name) {
+                tools.register(def);
+            }
+        }
+        tools.register(board_tools::board_family());
+        tools.register(board_tools::bus_family());
+        for def in self.devices.tool_defs().into_iter().chain(board_tools::media::tools(&self.devices)) {
+            if !owned.contains(&def.spec.name) {
+                tools.register(def);
+            }
+        }
+        for (family, subs) in families {
+            let summary = format!("{family}: {} commands", subs.len());
             tools.register(Family::new(family, summary, subs).into_tool().device_tool());
         }
+        self.family_members = members;
         // A manifest may not take a name the board already uses (validation refuses it),
         // but a manifest stored by an older build — or one applied before the hardware
         // was plugged in — can still arrive here. The board's own tool wins, and the
@@ -923,67 +932,10 @@ impl App {
     /// that is not a rule buried inside one handler.
     const NEVER_OFFERED: &'static [&'static str] = &[];
 
-    /// Aliases that are gone, not hidden.
-    ///
-    /// A family owns these commands and carries its own copy of every handler, so dropping the
-    /// standalone name costs no ability: `board {command: "config_get"}` is the same code the
-    /// name used to run. They are listed here because nothing in this repository named them
-    /// (`git grep` over the code, the tests, `scripts/`, `tools/`, `examples/`, `skills/`, the
-    /// seven translations and `docs/`), which is the bar for removing a published name rather
-    /// than leaving it as a compatibility alias.
-    ///
-    /// Adding a name here is the whole change: `rebuild` skips it and the family keeps it.
-    const DROPPED_ALIASES: &'static [&'static str] =
-        &["board_config_get", "manifest_get", "manifest_validate"];
     pub const ALIASES_ACCEPTED_BUT_NOT_ADVERTISED: &'static [&'static str] = &[
-        // the board family's members
-        "board_status",
-        "config_set",
-        "chip_temp",
-        "logs_tail",
-        "delay",
-        "inventory",
-        // the bus family's
-        "i2c_scan",
-        "i2c_read",
-        "i2c_write",
-        "i2c_identify",
-        "gpio_mode",
-        "gpio_read",
-        "gpio_write",
-        "adc_read",
-        // the manifest family's
-        "manifest_describe",
-        "manifest_apply",
-        "manifest_reset",
-        // the device families'
-        "oled_text",
-        "oled_read",
-        "oled_clear",
-        "oled_rect",
-        "oled_bitmap",
-        "oled_contrast",
-        "led_set",
-        "led_blink",
-        "buttons_read",
-        "button_wait",
-        "mic_level",
-        "mic_record",
-        "speaker_tone",
-        "speaker_play",
         // what `read` and `shell` absorbed
-        "fs_read",
-        "fs_write",
-        "fs_edit",
-        "fs_ls",
-        "fs_grep",
-        "fs_rm",
-        "fs_cp",
-        "fs_mv",
-        "net_get",
-        "net_post",
-        "net_dns",
-        "net_tcp",
+        "fs_read", "fs_write", "fs_edit", "fs_ls", "fs_grep", "fs_rm", "fs_cp", "fs_mv", "net_get",
+        "net_post", "net_dns", "net_tcp",
     ];
 
     /// Device tools that belong together, by the kind of device the board detected.
@@ -1028,11 +980,9 @@ impl App {
         if self.ensure_enabled(name).is_err() {
             return Some("switched off in `mcp.disabled_tools`".to_string());
         }
-        // A family took this name over. The handler still answers, so the sentence says
-        // where to find it rather than pretending the ability is gone.
-        if let Some(reached) = self.family_members.get(name) {
-            return Some(format!("reachable as `{reached}`"));
-        }
+        // A command a family owns is not a tool, so it never reaches this point: the registry
+        // lookup above returns `None` first. The map is kept for `disabled_tools`, where the
+        // command name is still what a person writes.
         if Self::NEVER_OFFERED.contains(&name) {
             return Some("a person's action, not a caller's".to_string());
         }
@@ -1507,8 +1457,9 @@ impl App {
              Detected hardware: {devs}.\n\
              {n} tool(s) available: {tool_list}.\n\
              Tools whose hardware is missing are not listed, so anything you can see is usable.\n\
-             This board is self-configuring: use `inventory` / `i2c_identify` to find what is wired, \
-             `manifest_describe` for the device+tools schema, and `manifest_apply` to add hardware and tools. \
+             This board is self-configuring: `board` and `bus` take a `command` argument, and \
+             `inventory`, `i2c_identify`, `describe` and `apply` are commands of `board`, `bus` \
+             and `manifest`. A manifest change adds hardware and tools. \
              A manifest change takes effect immediately - no reboot and no reflash - so you can iterate: \
              apply, call the new tool, and fix the manifest if the result is wrong.\n\
              Endpoint: {url}.{setup_note}",
@@ -7751,7 +7702,7 @@ impl crate::http::BodySink for AvSink {
                     // addressed, and a second copy of that would drift.
                     let mut state = app_lock(&shared);
                     match state
-                        .call_tool("oled_bitmap", &json!({ "data_b64": b64, "width": 128, "height": height }))
+                        .call_tool("display", &json!({"command": "oled_bitmap", "arguments": { "data_b64": b64, "width": 128, "height": height }}))
                     {
                         Ok(_) => {
                             *frames += 1;
@@ -8330,8 +8281,8 @@ mod tests {
 
         app.rules.push(SensorRule {
             id: "r1".to_string(),
-            tool: "board_status".to_string(),
-            path: "board_name".to_string(),
+            tool: "bme280_read".to_string(),
+            path: "temperature_c".to_string(),
             prompt: "sensor".to_string(),
             ..Default::default()
         });
@@ -8365,8 +8316,8 @@ mod tests {
             app.agent_reply(Ok(llm::ModelReply {
                 tool_calls: vec![llm::ToolCall {
                     id: "old-call".into(),
-                    name: "board_status".into(),
-                    arguments: json!({})
+                    name: "board".into(),
+                    arguments: json!({ "command": "status" })
                 }],
                 ..Default::default()
             })),
@@ -8553,7 +8504,7 @@ mod tests {
         }
         for turn in 0..3u64 {
             let mut model = Scripted::new(vec![
-                Scripted::tool_call(&format!("c{turn}"), "board_status", "{}"),
+                Scripted::tool_call(&format!("c{turn}"), "board", r#"{"command": "status"}"#),
                 Scripted::answer(&format!("turn {turn} done")),
             ]);
             shared.lock().unwrap().agent.push_user(&format!("question {turn}"), "http", turn);
@@ -8766,8 +8717,8 @@ mod tests {
             let reply = llm::ModelReply {
                 tool_calls: vec![llm::ToolCall {
                     id: "c1".into(),
-                    name: "board_status".into(),
-                    arguments: json!({}),
+                    name: "board".into(),
+                    arguments: json!({ "command": "status" }),
                 }],
                 ..Default::default()
             };
@@ -8827,7 +8778,10 @@ mod tests {
             .iter()
             .find(|m| m["role"] == "tool" && m["tool_call_id"] == "c1")
             .unwrap_or_else(|| panic!("its result is missing: {request}"));
-        assert!(call["tool_calls"][0]["function"]["arguments"].as_str().unwrap_or_default().contains("{}"));
+        assert!(call["tool_calls"][0]["function"]["arguments"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("\"command\":\"status\""));
         assert!(
             result["content"].as_str().unwrap_or_default().contains("board_name"),
             "the board reading is carried: {result}"
@@ -9266,7 +9220,7 @@ mod tests {
             app.hw.i2s_setup(None, Some(pins)).expect("amplifier");
         }
         // The virtual bench has an SSD1306, so `oled_bitmap` is a real tool here.
-        assert!(shared.lock().unwrap().tools.get("oled_bitmap").is_some(), "no OLED on the test bench");
+        assert!(shared.lock().unwrap().tools.get("display").is_some(), "no OLED on the test bench");
 
         let routes = make_routes(Arc::clone(&shared));
         let router = routes.body.as_ref().expect("a body router");
@@ -9596,7 +9550,7 @@ mod tests {
         let mut app = test_app();
         app.hw = Box::new(NoRawAccess);
         let refused = |app: &mut App, name: &str, args: Value| {
-            let error = app.call_tool(name, &args).unwrap_err();
+            let error = app.call_tool("bus", &json!({ "command": name, "arguments": args })).unwrap_err();
             assert_eq!(error.code, code::INVALID_PARAMS, "{name} {args}: {}", error.message);
         };
         for name in ["gpio_read", "gpio_write", "gpio_mode", "adc_read"] {
@@ -9653,15 +9607,26 @@ mod tests {
         // bus, one-byte read length and command-only register default.
         app.hw = Box::new(VirtualBoard::new());
         app.cfg.bus.i2c[0].bus = 2;
-        assert_eq!(app.call_tool("gpio_write", &json!({"pin":"12","level":"1"})).unwrap()["pin"], 12);
-        let read = app.call_tool("i2c_read", &json!({"addr":"118"})).unwrap();
+        assert_eq!(
+            app.call_tool("bus", &json!({"command": "gpio_write", "arguments": {"pin":"12","level":"1"}}))
+                .unwrap()["pin"],
+            12
+        );
+        let read =
+            app.call_tool("bus", &json!({"command": "i2c_read", "arguments": {"addr":"118"}})).unwrap();
         assert_eq!(read["bus"], 2);
         assert_eq!(read["bytes"].as_array().unwrap().len(), 1);
         assert_eq!(read["reg"], Value::Null);
-        let read =
-            app.call_tool("i2c_read", &json!({"addr":"118","reg":"208","length":1,"bus":"0"})).unwrap();
+        let read = app
+            .call_tool(
+                "bus",
+                &json!({"command": "i2c_read", "arguments": {"addr":"118","reg":"208","length":1,"bus":"0"}}),
+            )
+            .unwrap();
         assert_eq!(read["bytes"][0], 0x60);
-        assert!(app.call_tool("i2c_write", &json!({"addr":"60","data":[0,255]})).is_ok());
+        assert!(app
+            .call_tool("bus", &json!({"command": "i2c_write", "arguments": {"addr":"60","data":[0,255]}}))
+            .is_ok());
     }
 
     #[test]
@@ -9789,7 +9754,8 @@ mod tests {
             "devices": candidate["adopt"]["devices"].clone(),
             "tools": [],
         });
-        app.call_tool("manifest_apply", &json!({"manifest": manifest})).expect("adopting a candidate works");
+        app.call_tool("manifest", &json!({"command": "apply", "arguments": {"manifest": manifest}}))
+            .expect("adopting a candidate works");
         assert!(app.devices.len() >= 1, "the adopted device is live");
     }
 
@@ -10601,7 +10567,7 @@ mod tests {
         let mut app = test_app();
         app.cfg.agent.tool_timeout_s = 30;
         app.tool_deadline = Some(std::time::Instant::now() - Duration::from_millis(1));
-        let err = app.call_tool("board_status", &json!({})).unwrap_err();
+        let err = app.call_tool("board", &json!({"command": "status", "arguments": {}})).unwrap_err();
         assert_eq!(err.code, code::TIMEOUT, "{}", err.message);
         // The message names the time the call had, not the zero that is left of it, and it
         // says where the fix is: a nested call is one step of somebody else's budget.
@@ -10611,7 +10577,7 @@ mod tests {
         assert!(data["suggestion"].as_str().unwrap_or("").contains("tool_timeout_s"), "{data}");
         // A top-level call leaves no deadline behind, so the next one starts fresh.
         app.tool_deadline = None;
-        assert!(app.call_tool("board_status", &json!({})).is_ok());
+        assert!(app.call_tool("board", &json!({"command": "status", "arguments": {}})).is_ok());
         assert!(app.tool_deadline.is_none(), "the deadline outlived its call");
     }
 
@@ -10671,12 +10637,12 @@ mod tests {
         let mut app = test_app();
         app.tool_deadline = Some(std::time::Instant::now() + std::time::Duration::from_secs(30));
         app.cancel_requested = true;
-        let err = app.call_tool("board_status", &json!({})).unwrap_err();
+        let err = app.call_tool("board", &json!({ "command": "status" })).unwrap_err();
         assert!(err.message.contains("interrupted"), "{}", err.message);
         assert_eq!(err.data.as_ref().unwrap()["interrupted"], json!(true));
         // The cancelled call installs no deadline of its own: the next turn starts clean.
         app.cancel_requested = false;
-        assert!(app.call_tool("board_status", &json!({})).is_ok());
+        assert!(app.call_tool("board", &json!({ "command": "status" })).is_ok());
     }
 
     #[test]
@@ -11155,8 +11121,8 @@ mod tests {
         {
             let mut app = shared.lock().unwrap();
             app.agent.events.push_back(journal_event(1, "message_start", ""));
-            app.agent.events.push_back(journal_event(2, "tool_use", "board_status"));
-            app.agent.events.push_back(journal_event(3, "tool_result", "board_status"));
+            app.agent.events.push_back(journal_event(2, "tool_use", "board"));
+            app.agent.events.push_back(journal_event(3, "tool_result", "board"));
         }
         let resp = shared.lock().unwrap().agent_stream_from(
             1,
@@ -11272,10 +11238,10 @@ mod tests {
         assert!(!head.contains("Content-Length"), "a bounded stream announces no length: {head}");
 
         // The agent emits mid-stream; the client is already reading and must see it.
-        shared.lock().unwrap().agent.events.push_back(journal_event(1, "tool_use", "board_status"));
+        shared.lock().unwrap().agent.events.push_back(journal_event(1, "tool_use", "board"));
         let body = read_until(&mut first, "id: 1");
         assert!(body.contains("event: tool_use"), "got: {body}");
-        assert!(body.contains("\"name\":\"board_status\""), "got: {body}");
+        assert!(body.contains("\"name\":\"board\""), "got: {body}");
 
         // Two live streams are allowed, the third is refused on the spot.
         let mut second = std::net::TcpStream::connect(addr).unwrap();
@@ -11763,7 +11729,8 @@ mod tests {
             .unwrap_err();
         assert!(err.contains("transport"), "got {err}");
         // The board's own tools return their text, not a protocol envelope.
-        let text = ToolHost::call_tool(&mut app, "board_status", &json!({})).unwrap();
+        let text =
+            ToolHost::call_tool(&mut app, "board", &json!({"command": "status", "arguments": {}})).unwrap();
         assert!(text.contains("board_name"), "got {}", &text[..text.len().min(200)]);
         assert!(!text.contains("\"content\""), "the MCP envelope leaked into the prompt: {text}");
     }
@@ -11793,7 +11760,7 @@ mod tests {
             self.calls += 1;
             if self.calls == 1 {
                 Ok(json!({"choices":[{"message":{"role":"assistant","content":null,"tool_calls":[
-                    {"id":"call_1","type":"function","function":{"name":"board_status","arguments":"{}"}}
+                    {"id":"call_1","type":"function","function":{"name":"board","arguments":"{\"command\":\"status\"}"}}
                 ]}}]})
                 .to_string())
             } else {
@@ -13486,46 +13453,53 @@ mod tests {
     }
 
     /// A tool with arguments that were never named cannot be written down.
-    /// A dropped alias is gone from every list, and the family command it used to be is not.
+    /// Every command has exactly one name, and it is the one inside its family.
     ///
-    /// This is the check `DROPPED_ALIASES` needs to be safe to grow: the name leaves the
-    /// registry, the hidden list and the compatibility column, while the ability it named
-    /// stays reachable through its family. The mapping comes from `family_members`, so a name
-    /// added to the list without a family behind it fails here instead of silently vanishing.
+    /// The mapping comes from `family_members`, so a driver that joins a family is covered
+    /// without this test being edited, and a name that is both registered on its own and owned
+    /// by a family fails here.
     #[test]
-    fn a_dropped_alias_is_reachable_only_through_its_family() {
-        assert!(!App::DROPPED_ALIASES.is_empty(), "nothing to check");
+    fn a_family_command_has_exactly_one_name() {
         let mut app = test_app();
-        for alias in App::DROPPED_ALIASES {
-            let reach = app
-                .family_members
-                .get(*alias)
-                .cloned()
-                .unwrap_or_else(|| panic!("`{alias}` dropped, but no family owns it"));
-            let (family, command) = reach.split_once(' ').expect("a family and a command word");
+        assert!(
+            app.family_members.len() >= 20,
+            "the families did not form: {} commands",
+            app.family_members.len()
+        );
+        let commands: Vec<(String, String)> =
+            app.family_members.iter().map(|(name, reach)| (name.clone(), reach.clone())).collect();
+        for (command, reach) in commands {
+            let (family, word) = reach.split_once(' ').expect("a family and a command word");
             let family = family.to_string();
-            let command = command.to_string();
+            let word = word.to_string();
 
-            assert!(app.tools.get(alias).is_none(), "`{alias}` is still a registered tool");
-            assert!(app.why_hidden(alias).is_none(), "`{alias}` is still reported as hidden");
-            assert!(
-                !App::ALIASES_ACCEPTED_BUT_NOT_ADVERTISED.contains(alias),
-                "`{alias}` is still in the compatibility column"
-            );
-            assert!(!tool_names(&mut app).contains(&alias.to_string()), "`{alias}` is still offered");
-            let err = app.call_tool(alias, &json!({})).unwrap_err();
-            assert_eq!(err.code, code::NOT_FOUND, "`{alias}` still answers: {err:?}");
+            assert!(app.tools.get(&command).is_none(), "`{command}` is a second name for `{reach}`");
+            assert!(app.why_hidden(&command).is_none(), "`{command}` is reported as hidden");
+            assert!(!tool_names(&mut app).contains(&command), "`{command}` is still offered");
+            let err = app.call_tool(&command, &json!({})).unwrap_err();
+            assert_eq!(err.code, code::NOT_FOUND, "`{command}` still answers: {err:?}");
 
-            // The ability itself has to survive: the command answers, and an unknown one does not.
-            match app.call_tool(&family, &json!({ "command": command, "arguments": {} })) {
-                Ok(value) => assert!(value.is_object(), "{family} {command}: {value}"),
+            // The one name works, with the arguments its own schema documents.
+            let waits = app
+                .tools
+                .get(&word)
+                .map(|def| def.spec.input_schema["properties"].get("timeout_ms").is_some())
+                .unwrap_or(false);
+            let args = if waits {
+                json!({ "command": word, "arguments": { "timeout_ms": 10 } })
+            } else {
+                json!({ "command": word, "arguments": {} })
+            };
+            match app.call_tool(&family, &args) {
+                Ok(value) => assert!(value.is_object(), "{family} {word}: {value}"),
                 Err(e) => assert!(
                     !e.message.contains("no command"),
-                    "`{alias}` was dropped and `{family}` lost `{command}` too: {e:?}"
+                    "`{command}` was dropped and `{family}` lost `{word}` too: {e:?}"
                 ),
             }
         }
     }
+
     /// The published list and the code are the same set, in the reference a person reads.
     ///
     /// `a_family_declares_helps_and_dispatches_the_same_commands` pins schema, `help` and
@@ -13768,8 +13742,10 @@ mod tests {
         }
         assert!(!tool_names(&mut app).contains(&"write".into()), "the alias should not be offered");
         app.cfg.mcp.disabled_tools = vec!["board".into(), "display".into()];
-        assert!(app.call_tool("board_status", &json!({})).is_err());
-        assert!(app.call_tool("oled_text", &json!({"text": "no"})).is_err());
+        assert!(app.call_tool("board", &json!({"command": "status", "arguments": {}})).is_err());
+        assert!(app
+            .call_tool("display", &json!({"command": "oled_text", "arguments": {"text": "no"}}))
+            .is_err());
         assert!(app
             .call_tool(
                 "device_invoke",
@@ -13787,7 +13763,7 @@ mod tests {
         let calls = board.hw_calls.clone();
         let mut app =
             App::new(Box::new(board), Box::new(MemoryStore::new()), LogBuf::new(32), FwMeta::default());
-        let applied = app.call_tool("manifest_apply", &json!({"manifest": {"tools": [
+        let applied = app.call_tool("manifest", &json!({"command": "apply", "arguments": {"manifest": {"tools": [
             {"name": "wrapped_read", "exec": {"type": "driver", "driver": "bme280", "action": "bme280_read"}},
             {"name": "nested_read", "safety": {"max_calls_per_min": 1}, "exec": {"type": "sequence", "steps": [
                 {"exec": {"type": "gpio_write", "pin": 12, "level": 1}},
@@ -13797,7 +13773,7 @@ mod tests {
                 {"exec": {"type": "gpio_write", "pin": 12, "level": 1}},
                 {"ms": 1, "exec": {"type": "gpio_write", "pin": 12, "level": 0}}
             ]}}
-        ]}})).unwrap();
+        ]}}})).unwrap();
         assert_eq!(applied["applied"], true, "{applied}");
         for (disabled, tool) in [
             ("bme280_read", "wrapped_read"),
@@ -13941,7 +13917,7 @@ mod tests {
             .unwrap();
         let text = v["result"]["instructions"].as_str().unwrap();
         assert!(text.contains("BME280"), "instructions: {text}");
-        assert!(text.contains("manifest_apply"));
+        assert!(text.contains("manifest"));
         assert_eq!(v["result"]["protocolVersion"], protocol::PROTOCOL_VERSION);
     }
 
@@ -13972,8 +13948,8 @@ mod tests {
         assert!(!app.is_visible("pin_led"));
         let v = app
             .call_tool(
-                "manifest_apply",
-                &json!({
+                "manifest",
+                &json!({"command": "apply", "arguments": {
                     "manifest": {
                         "tools": [{
                             "name": "pin_led",
@@ -13982,7 +13958,7 @@ mod tests {
                             "exec": { "type": "gpio_write", "pin": 48, "level": { "param": "on" } }
                         }]
                     }
-                }),
+                }}),
             )
             .unwrap();
         assert_eq!(v["applied"], true);
@@ -14004,8 +13980,8 @@ mod tests {
         let mut app = test_app();
         let v = app
             .call_tool(
-                "manifest_apply",
-                &json!({ "manifest": { "tools": [
+                "manifest",
+                &json!({"command": "apply", "arguments": { "manifest": { "tools": [
                     { "name": "read_pin", "params": [], "exec": { "type": "gpio_read", "pin": 3 } },
                     { "name": "blink_pin", "params": [],
                       "exec": { "type": "toggle", "pin": 4, "times": 2, "gap_ms": 10 } },
@@ -14022,7 +13998,7 @@ mod tests {
                         { "exec": { "type": "gpio_read", "pin": 6 } }] } },
                     { "name": "servo_pin", "params": [{ "name": "d", "type": "number", "required": true }],
                       "exec": { "type": "pwm", "pin": 8, "freq_hz": 50, "duty_pct": { "param": "d" } } }
-                ] } }),
+                ] } }}),
             )
             .unwrap();
         assert_eq!(v["applied"], true, "{v}");
@@ -14076,11 +14052,11 @@ mod tests {
         let mut app = test_app();
         let v = app
             .call_tool(
-                "manifest_apply",
-                &json!({ "manifest": { "tools": [{
+                "manifest",
+                &json!({"command": "apply", "arguments": { "manifest": { "tools": [{
                     "name": "wide_pwm", "params": [{ "name": "d", "type": "number", "required": true }],
                     "exec": { "type": "pwm", "pin": 8, "freq_hz": 50, "duty_pct": { "param": "d" } }
-                }] } }),
+                }] } }}),
             )
             .unwrap();
         assert_eq!(v["applied"], true, "{v}");
@@ -14095,15 +14071,22 @@ mod tests {
     #[test]
     fn a_drivers_own_tools_are_reachable_by_the_name_the_model_sees() {
         let mut app = test_app();
-        let out = app.call_tool("oled_text", &json!({ "text": "OK", "line": 1 })).unwrap();
-        assert_eq!(out["chars"], 2, "{out}");
-        let out = app.call_tool("oled_read", &json!({})).unwrap();
-        assert!(out["text"].as_str().unwrap_or("").contains("OK"), "{out}");
-        app.call_tool("oled_rect", &json!({ "x": 0, "y": 0, "w": 4, "h": 4 })).unwrap();
-        app.call_tool("oled_bitmap", &json!({ "data_b64": crate::util::b64_encode(&vec![0u8; 1024]) }))
+        let out = app
+            .call_tool("display", &json!({"command": "oled_text", "arguments": { "text": "OK", "line": 1 }}))
             .unwrap();
-        app.call_tool("oled_contrast", &json!({ "value": 0x80 })).unwrap();
-        app.call_tool("oled_clear", &json!({})).unwrap();
+        assert_eq!(out["chars"], 2, "{out}");
+        let out = app.call_tool("display", &json!({"command": "oled_read", "arguments": {}})).unwrap();
+        assert!(out["text"].as_str().unwrap_or("").contains("OK"), "{out}");
+        app.call_tool(
+            "display",
+            &json!({"command": "oled_rect", "arguments": { "x": 0, "y": 0, "w": 4, "h": 4 }}),
+        )
+        .unwrap();
+        app.call_tool("display", &json!({"command": "oled_bitmap", "arguments": { "data_b64": crate::util::b64_encode(&vec![0u8; 1024]) }}))
+            .unwrap();
+        app.call_tool("display", &json!({"command": "oled_contrast", "arguments": { "value": 0x80 }}))
+            .unwrap();
+        app.call_tool("display", &json!({"command": "oled_clear", "arguments": {}})).unwrap();
     }
 
     /// A manifest tool with a rate limit is the only thing standing between a looping model
@@ -14113,11 +14096,11 @@ mod tests {
         let mut app = test_app();
         let v = app
             .call_tool(
-                "manifest_apply",
-                &json!({ "manifest": { "tools": [{
+                "manifest",
+                &json!({"command": "apply", "arguments": { "manifest": { "tools": [{
                     "name": "once_a_minute", "params": [], "safety": { "max_calls_per_min": 1 },
                     "exec": { "type": "gpio_write", "pin": 5, "level": 1 }
-                }] } }),
+                }] } }}),
             )
             .unwrap();
         assert_eq!(v["applied"], true, "{v}");
@@ -14131,10 +14114,7 @@ mod tests {
     fn an_invalid_manifest_is_rejected_with_paths_and_changes_nothing() {
         let mut app = test_app();
         let v = app
-            .call_tool(
-                "manifest_apply",
-                &json!({ "manifest": { "tools": [{ "name": "bad name", "exec": { "type": "gpio_write", "pin": 99, "level": 1 } }] } }),
-            )
+            .call_tool("manifest", &json!({"command": "apply", "arguments": { "manifest": { "tools": [{ "name": "bad name", "exec": { "type": "gpio_write", "pin": 99, "level": 1 } }] } }}))
             .unwrap();
         assert_eq!(v["applied"], false);
         let issues = v["issues"].as_array().unwrap();
@@ -14183,8 +14163,12 @@ mod tests {
 
         let mut app = test_app();
         for section in ["overview", "schema", "exec", "examples", "drivers"] {
-            let text = ToolHost::call_tool(&mut app, "manifest_describe", &json!({ "section": section }))
-                .unwrap_or_else(|e| panic!("section {section} failed: {e}"));
+            let text = ToolHost::call_tool(
+                &mut app,
+                "manifest",
+                &json!({"command": "describe", "arguments": { "section": section }}),
+            )
+            .unwrap_or_else(|e| panic!("section {section} failed: {e}"));
             assert!(
                 text.len() <= MAX_TOOL_RESULT_BYTES,
                 "section {section} is {} bytes, over the {MAX_TOOL_RESULT_BYTES} the model sees",
@@ -14195,8 +14179,8 @@ mod tests {
         for name in ["relay_with_safety", "servo_angle", "sensor_driver", "led_then_read_back"] {
             let text = ToolHost::call_tool(
                 &mut app,
-                "manifest_describe",
-                &json!({ "section": "examples", "example": name }),
+                "manifest",
+                &json!({"command": "describe", "arguments": { "section": "examples", "example": name }}),
             )
             .unwrap();
             assert!(text.len() <= MAX_TOOL_RESULT_BYTES, "example {name} is {} bytes", text.len());
@@ -14204,15 +14188,21 @@ mod tests {
         }
 
         // The overview is the entry point: it names the sections and the examples.
-        let overview = ToolHost::call_tool(&mut app, "manifest_describe", &json!({})).unwrap();
+        let overview =
+            ToolHost::call_tool(&mut app, "manifest", &json!({"command": "describe", "arguments": {}}))
+                .unwrap();
         for needle in ["exec", "schema", "relay_with_safety", "max_tools"] {
             assert!(overview.contains(needle), "the overview does not mention {needle}: {overview}");
         }
 
         // The driver catalogue is paged for the same reason: fourteen entries in one
         // result would be cut, so each one is asked for by name.
-        let listed =
-            ToolHost::call_tool(&mut app, "manifest_describe", &json!({ "section": "drivers" })).unwrap();
+        let listed = ToolHost::call_tool(
+            &mut app,
+            "manifest",
+            &json!({"command": "describe", "arguments": { "section": "drivers" }}),
+        )
+        .unwrap();
         let listed: Value = serde_json::from_str(&listed).unwrap();
         let kinds: Vec<String> = listed["drivers"]
             .as_array()
@@ -14225,16 +14215,20 @@ mod tests {
         for kind in kinds {
             let text = ToolHost::call_tool(
                 &mut app,
-                "manifest_describe",
-                &json!({ "section": "drivers", "driver": kind }),
+                "manifest",
+                &json!({"command": "describe", "arguments": { "section": "drivers", "driver": kind }}),
             )
             .unwrap();
             assert!(text.len() <= MAX_TOOL_RESULT_BYTES, "driver {kind} is {} bytes", text.len());
             assert!(!text.contains("truncated"), "driver {kind} was cut");
         }
         // A section name that does not exist is refused with the list, not guessed at.
-        let err =
-            ToolHost::call_tool(&mut app, "manifest_describe", &json!({ "section": "nope" })).unwrap_err();
+        let err = ToolHost::call_tool(
+            &mut app,
+            "manifest",
+            &json!({"command": "describe", "arguments": { "section": "nope" }}),
+        )
+        .unwrap_err();
         assert!(err.contains("overview"), "{err}");
     }
 
@@ -14249,11 +14243,11 @@ mod tests {
     fn every_tool_reaches_the_model_in_one_shape_and_a_predictable_order() {
         let mut app = test_app();
         app.call_tool(
-            "manifest_apply",
-            &json!({ "manifest": { "tools": [{
+            "manifest",
+            &json!({"command": "apply", "arguments": { "manifest": { "tools": [{
                 "name": "aaa_manifest", "params": [],
                 "exec": { "type": "gpio_read", "pin": 3 }
-            }] } }),
+            }] } }}),
         )
         .expect("manifest applied");
 
@@ -14318,7 +14312,11 @@ mod tests {
         if declared.is_empty() {
             return; // a board with no addressable devices has nothing to duplicate
         }
-        app.call_tool("manifest_apply", &json!({ "manifest": { "devices": declared } })).expect("applied");
+        app.call_tool(
+            "manifest",
+            &json!({"command": "apply", "arguments": { "manifest": { "devices": declared } }}),
+        )
+        .expect("applied");
         assert_eq!(app.devices.infos().len(), before, "a device declared twice became two devices");
     }
 
@@ -14636,8 +14634,8 @@ mod tests {
         }] } });
         let mut a = test_app();
         let mut b = test_app();
-        a.call_tool("manifest_apply", &manifest).expect("apply a");
-        b.call_tool("manifest_apply", &manifest).expect("apply b");
+        a.call_tool("manifest", &json!({"command": "apply", "arguments": manifest})).expect("apply a");
+        b.call_tool("manifest", &json!({"command": "apply", "arguments": manifest})).expect("apply b");
 
         let bytes = |app: &App| serde_json::to_string(&ToolHost::tool_specs(app)).expect("serialise");
         let first = bytes(&a);
@@ -14858,7 +14856,7 @@ mod tests {
         assert!(app.is_visible("device_invoke"));
 
         let v =
-            app.call_tool("config_set", &json!({ "patch": { "mcp": { "tools_mode": "generic" } } })).unwrap();
+            app.call_tool("board", &json!({"command": "config_set", "arguments": { "patch": { "mcp": { "tools_mode": "generic" } } }})).unwrap();
         assert!(v["touched"].as_array().unwrap().iter().any(|t| t == "mcp.tools_mode"), "{v}");
 
         for folded in ["bme280_read", "sht3x_read", "power_read", "oled_text"] {
@@ -14883,7 +14881,7 @@ mod tests {
     fn an_unknown_tools_mode_is_refused() {
         let mut app = test_app();
         let err = app
-            .call_tool("config_set", &json!({ "patch": { "mcp": { "tools_mode": "generik" } } }))
+            .call_tool("board", &json!({"command": "config_set", "arguments": { "patch": { "mcp": { "tools_mode": "generik" } } }}))
             .unwrap_err();
         assert!(err.message.contains("auto, generic or all"), "{err:?}");
         assert_eq!(app.cfg.mcp.tools_mode, "auto", "the value changed anyway");
@@ -14913,7 +14911,11 @@ mod tests {
         assert!(app.is_visible("indicators"), "the profile's LED and buttons are there by default");
 
         // Through the config path a person or the agent would use.
-        app.call_tool("config_set", &json!({ "patch": { "auto_peripherals": false } })).unwrap();
+        app.call_tool(
+            "board",
+            &json!({"command": "config_set", "arguments": { "patch": { "auto_peripherals": false } }}),
+        )
+        .unwrap();
         for gone in ["led_set", "led_blink", "buttons_read", "button_wait"] {
             assert!(!app.is_visible(gone), "{gone} survived a minimal start");
         }
@@ -14923,18 +14925,20 @@ mod tests {
         // Declaring them in the manifest brings the tools back — the whole point.
         let v = app
             .call_tool(
-                "manifest_apply",
-                &json!({ "manifest": { "devices": [
+                "manifest",
+                &json!({"command": "apply", "arguments": { "manifest": { "devices": [
                     { "id": "rgb", "kind": "led", "driver": "led", "pins": { "out": 48 },
                       "options": { "kind": "ws2812" } },
                     { "id": "boot", "kind": "buttons", "driver": "buttons", "pins": { "boot": 0 } }
-                ] } }),
+                ] } }}),
             )
             .unwrap();
         assert_eq!(v["applied"], true, "{v}");
         assert!(app.is_visible("indicators"), "the declared LED did not appear");
         assert!(app.is_visible("indicators"), "the declared button did not appear");
-        let out = app.call_tool("led_set", &json!({ "color": "#010203" })).unwrap();
+        let out = app
+            .call_tool("indicators", &json!({"command": "led_set", "arguments": { "color": "#010203" }}))
+            .unwrap();
         assert_eq!(out["color"], json!("#010203"), "{out}");
     }
 
@@ -14959,15 +14963,18 @@ mod tests {
 
         // The capabilities ride on the devices, so a board that cannot bring I2S up never
         // claims them (that was the bench bug this replaces).
-        let inv = app.call_tool("inventory", &json!({})).unwrap();
+        let inv = app.call_tool("board", &json!({"command": "inventory", "arguments": {}})).unwrap();
         let caps: Vec<String> =
             inv["capabilities"].as_array().unwrap().iter().map(|c| c.as_str().unwrap().to_string()).collect();
         assert!(caps.contains(&"mic".to_string()) && caps.contains(&"speaker".to_string()), "{caps:?}");
 
-        let level = app.call_tool("mic_level", &json!({ "ms": 50 })).unwrap();
+        let level =
+            app.call_tool("audio", &json!({"command": "mic_level", "arguments": { "ms": 50 }})).unwrap();
         assert!(level["dbfs"].is_number(), "the level meter read nothing: {level}");
 
-        let rec = app.call_tool("mic_record", &json!({ "samples": 64 })).unwrap();
+        let rec = app
+            .call_tool("audio", &json!({"command": "mic_record", "arguments": { "samples": 64 }}))
+            .unwrap();
         assert_eq!(rec["samples"], json!(64), "{rec}");
         // The board records WAV: the result says so, and the payload is header + samples.
         assert_eq!(rec["format"], json!("wav"), "a recording states its format: {rec}");
@@ -14981,7 +14988,12 @@ mod tests {
             crate::agent::MAX_TOOL_RESULT_BYTES
         );
 
-        let tone = app.call_tool("speaker_tone", &json!({ "freq_hz": 440, "ms": 50 })).unwrap();
+        let tone = app
+            .call_tool(
+                "audio",
+                &json!({"command": "speaker_tone", "arguments": { "freq_hz": 440, "ms": 50 }}),
+            )
+            .unwrap();
         assert_eq!(tone["ok"], json!(true), "{tone}");
         assert!(tone["samples"].as_u64().unwrap() >= 400, "{tone}");
     }
@@ -14996,11 +15008,11 @@ mod tests {
 
         let v = app
             .call_tool(
-                "manifest_apply",
-                &json!({ "manifest": { "devices": [
+                "manifest",
+                &json!({"command": "apply", "arguments": { "manifest": { "devices": [
                     { "id": "lamp", "kind": "led", "driver": "led", "pins": { "out": 18 },
                       "options": { "kind": "ws2812", "count": "8" } }
-                ] } }),
+                ] } }}),
             )
             .unwrap();
         assert_eq!(v["applied"], true, "{v}");
@@ -15030,7 +15042,9 @@ mod tests {
         assert!(tools.contains(&"led_set_2".to_string()), "{tools:?}");
 
         // ... and the second one is answered by the strip, not refused as unknown.
-        let out = app.call_tool("led_set_2", &json!({ "color": "#102030" })).unwrap();
+        let out = app
+            .call_tool("indicators", &json!({"command": "led_set_2", "arguments": { "color": "#102030" }}))
+            .unwrap();
         assert_eq!(out["ok"], json!(true), "{out}");
         for tool in ["led_set_2", "led_set"] {
             let out = app
@@ -15056,7 +15070,8 @@ mod tests {
             assert!(err.message.contains("disabled"), "{tool}: {err}");
         }
         assert!(
-            app.call_tool("led_set", &json!({"color": "#102030"})).is_ok(),
+            app.call_tool("indicators", &json!({"command": "led_set", "arguments": {"color": "#102030"}}))
+                .is_ok(),
             "disabling the second strip does not disable the first"
         );
     }
@@ -15066,24 +15081,26 @@ mod tests {
         let mut app = test_app();
         let v = app
             .call_tool(
-                "manifest_apply",
-                &json!({ "manifest": { "tools": [{
-                    "name": "manifest_apply", "params": [],
+                "manifest",
+                &json!({"command": "apply", "arguments": { "manifest": { "tools": [{
+                    "name": "board", "params": [],
                     "exec": { "type": "delay", "ms": 1 }
-                }] } }),
+                }] } }}),
             )
             .unwrap();
-        assert_eq!(v["applied"], false, "a manifest tool took `manifest_apply`: {v}");
+        assert_eq!(v["applied"], false, "a manifest tool took `board`: {v}");
         let issue = v["issues"]
             .as_array()
             .unwrap()
             .iter()
             .find(|i| i["path"] == "/tools/0/name")
             .expect("an issue on the name");
-        assert!(issue["message"].as_str().unwrap().contains("manifest_apply"), "{issue}");
+        assert!(issue["message"].as_str().unwrap().contains("board"), "{issue}");
         assert!(issue["hint"].as_str().unwrap().contains("my_"), "the hint must offer a rename: {issue}");
         // The board kept its own tool.
-        let v = app.call_tool("manifest_apply", &json!({ "manifest": { "tools": [] } })).unwrap();
+        let v = app
+            .call_tool("manifest", &json!({"command": "apply", "arguments": { "manifest": { "tools": [] } }}))
+            .unwrap();
         assert_eq!(v["applied"], true, "{v}");
     }
 
@@ -15093,22 +15110,22 @@ mod tests {
         let mut app = test_app();
         let v = app
             .call_tool(
-                "manifest_apply",
-                &json!({ "manifest": { "tools": [{
+                "manifest",
+                &json!({"command": "apply", "arguments": { "manifest": { "tools": [{
                     "name": "bme280_read", "params": [],
                     "exec": { "type": "delay", "ms": 1 }
-                }] } }),
+                }] } }}),
             )
             .unwrap();
         assert_eq!(v["applied"], false, "a manifest tool took a driver tool: {v}");
 
         let v = app
             .call_tool(
-                "manifest_apply",
-                &json!({ "manifest": { "tools": [{
+                "manifest",
+                &json!({"command": "apply", "arguments": { "manifest": { "tools": [{
                     "name": "manifest_helper", "params": [],
                     "exec": { "type": "delay", "ms": 1 }
-                }] } }),
+                }] } }}),
             )
             .unwrap();
         assert_eq!(v["applied"], true, "a free name with the prefix must be allowed: {v}");
@@ -15121,14 +15138,16 @@ mod tests {
     fn a_stale_manifest_cannot_take_a_board_tool_either() {
         let mut app = test_app();
         app.manifest = crate::manifest::Manifest::from_json_str(
-            r#"{"tools":[{"name":"manifest_apply","params":[],"exec":{"type":"delay","ms":1}}]}"#,
+            r#"{"tools":[{"name":"board","params":[],"exec":{"type":"delay","ms":1}}]}"#,
         )
         .expect("a manifest");
         app.rebuild();
         // The board's own `manifest` tool wins over the manifest entry of the same name, and
         // the five old command names stay reachable through it.
         assert!(app.is_visible("manifest"), "the built-in disappeared on rebuild");
-        let v = app.call_tool("manifest_apply", &json!({ "manifest": { "tools": [] } })).unwrap();
+        let v = app
+            .call_tool("manifest", &json!({"command": "apply", "arguments": { "manifest": { "tools": [] } }}))
+            .unwrap();
         assert_eq!(v["applied"], true, "the built-in no longer applies: {v}");
     }
 
@@ -15140,7 +15159,7 @@ mod tests {
     #[test]
     fn a_dotted_tool_name_is_refused_by_name_and_charset() {
         let mut app = test_app();
-        let v = app.call_tool("manifest_apply", &dotted_pump()).unwrap();
+        let v = app.call_tool("manifest", &json!({"command": "apply", "arguments": dotted_pump()})).unwrap();
         assert_eq!(v["applied"], false, "`pump.pulse` must not be applied: {v}");
         let issues = v["issues"].as_array().expect("issues");
         let issue = issues
@@ -15162,7 +15181,8 @@ mod tests {
     #[test]
     fn a_refused_manifest_poisons_nothing() {
         let mut app = test_app();
-        let refused = app.call_tool("manifest_apply", &dotted_pump()).unwrap();
+        let refused =
+            app.call_tool("manifest", &json!({"command": "apply", "arguments": dotted_pump()})).unwrap();
         assert_eq!(refused["applied"], false);
 
         // tools/list still answers, and the board's own tools are still in it.
@@ -15171,7 +15191,10 @@ mod tests {
         assert!(listed.iter().any(|t| t["name"] == "board"), "tools/list lost the built-ins");
 
         // A normal call still reaches the hardware.
-        assert!(app.call_tool("board_status", &json!({})).is_ok(), "the board stopped answering");
+        assert!(
+            app.call_tool("board", &json!({"command": "status", "arguments": {}})).is_ok(),
+            "the board stopped answering"
+        );
 
         // And a model round still happens. The recorded request is the wire payload
         // the endpoint would have refused.
@@ -15198,16 +15221,17 @@ mod tests {
     #[test]
     fn every_tool_name_on_the_wire_is_one_an_openai_endpoint_accepts() {
         let mut app = test_app();
-        let refused = app.call_tool("manifest_apply", &dotted_pump()).unwrap();
+        let refused =
+            app.call_tool("manifest", &json!({"command": "apply", "arguments": dotted_pump()})).unwrap();
         assert_eq!(refused["applied"], false);
         let applied = app
             .call_tool(
-                "manifest_apply",
-                &json!({ "manifest": { "tools": [{
+                "manifest",
+                &json!({"command": "apply", "arguments": { "manifest": { "tools": [{
                     "name": "pump_pulse",
                     "params": [{ "name": "ms", "type": "integer", "required": true }],
                     "exec": { "type": "gpio_write", "pin": 12, "level": 1 }
-                }] } }),
+                }] } }}),
             )
             .unwrap();
         assert_eq!(applied["applied"], true);
@@ -15268,13 +15292,13 @@ mod tests {
     fn safety_limits_are_enforced_on_the_board() {
         let mut app = test_app();
         app.call_tool(
-            "manifest_apply",
-            &json!({ "manifest": { "tools": [{
+            "manifest",
+            &json!({"command": "apply", "arguments": { "manifest": { "tools": [{
                 "name": "servo_set",
                 "params": [{ "name": "deg", "type": "number", "required": true, "min": 0, "max": 180 }],
                 "exec": { "type": "pwm", "pin": 7, "freq_hz": 50, "duty_pct": { "param": "deg" } },
                 "safety": { "min": 5, "max": 175 }
-            }] } }),
+            }] } }}),
         )
         .unwrap();
         // Schema range would allow 180; the safety range does not.
@@ -15288,13 +15312,13 @@ mod tests {
     fn confirm_flag_is_required_for_dangerous_tools() {
         let mut app = test_app();
         app.call_tool(
-            "manifest_apply",
-            &json!({ "manifest": { "tools": [{
+            "manifest",
+            &json!({"command": "apply", "arguments": { "manifest": { "tools": [{
                 "name": "relay_pulse",
                 "params": [],
                 "exec": { "type": "gpio_write", "pin": 5, "level": 1 },
                 "safety": { "confirm": true }
-            }] } }),
+            }] } }}),
         )
         .unwrap();
         let err = app.call_tool("relay_pulse", &json!({})).unwrap_err();
@@ -15311,10 +15335,10 @@ mod tests {
         ));
         let mut app = App::new(hw, store, log.clone(), FwMeta::default());
         app.call_tool(
-            "manifest_apply",
-            &json!({ "manifest": { "tools": [{
+            "manifest",
+            &json!({"command": "apply", "arguments": { "manifest": { "tools": [{
                 "name": "p_keep", "params": [],
-                "exec": { "type": "gpio_read", "pin": 3 } }] } }),
+                "exec": { "type": "gpio_read", "pin": 3 } }] } }}),
         )
         .unwrap();
         assert_eq!(app.runtime.manifest_rev, 2, "one for boot, one for the save");
@@ -15422,14 +15446,14 @@ mod tests {
         app.cfg.mcp.tools_mode = "all".into();
         let applied = app
             .call_tool(
-                "manifest_apply",
-                &json!({ "manifest": { "tools": [{
+                "manifest",
+                &json!({"command": "apply", "arguments": { "manifest": { "tools": [{
                     "name": "climate_read",
                     "description": "blocking read, needs an explicit confirmation",
                     "params": [],
                     "exec": { "type": "driver", "driver": "bme280", "action": "bme280_read" },
                     "safety": { "confirm": true }
-                }] } }),
+                }] } }}),
             )
             .unwrap();
         assert_eq!(applied["applied"], true, "apply rejected: {applied}");
@@ -15465,12 +15489,12 @@ mod tests {
         let mut app = App::new(Box::new(board), Box::new(MemoryStore::new()), log, FwMeta::default());
         app.cfg.mcp.tools_mode = "all".into();
         app.call_tool(
-            "manifest_apply",
-            &json!({ "manifest": { "tools": [{
+            "manifest",
+            &json!({"command": "apply", "arguments": { "manifest": { "tools": [{
                 "name": "climate_window",
                 "params": [{ "name": "ms", "type": "integer", "min": 10, "max": 5000, "required": true }],
                 "exec": { "type": "driver", "driver": "bme280", "action": "bme280_read" }
-            }] } }),
+            }] } }}),
         )
         .unwrap();
         let before = calls.load(std::sync::atomic::Ordering::SeqCst);
@@ -15492,24 +15516,24 @@ mod tests {
     fn a_manifest_tool_for_an_absent_device_is_not_listed() {
         let mut app = test_app();
         app.call_tool(
-            "manifest_apply",
-            &json!({ "manifest": { "tools": [{
+            "manifest",
+            &json!({"command": "apply", "arguments": { "manifest": { "tools": [{
                 "name": "imu_read",
                 "params": [],
                 "exec": { "type": "driver", "driver": "mpu6050", "action": "mpu6050_read" }
-            }] } }),
+            }] } }}),
         )
         .unwrap();
         assert!(!app.is_visible("imu_read"), "no IMU on this board");
         assert!(!tool_names(&mut app).contains(&"imu_read".to_string()));
         // A tool for a device that *is* present stays listed.
         app.call_tool(
-            "manifest_apply",
-            &json!({ "mode": "merge", "manifest": { "tools": [{
+            "manifest",
+            &json!({"command": "apply", "arguments": { "mode": "merge", "manifest": { "tools": [{
                 "name": "climate_read",
                 "params": [],
                 "exec": { "type": "driver", "driver": "bme280", "action": "bme280_read" }
-            }] } }),
+            }] } }}),
         )
         .unwrap();
         assert!(tool_names(&mut app).contains(&"climate_read".to_string()));
@@ -15541,9 +15565,11 @@ mod tests {
     #[test]
     fn i2c_identify_reports_candidates_for_a_known_address() {
         let mut app = test_app();
-        let v = app.call_tool("i2c_identify", &json!({ "addr": 0x76 })).unwrap();
+        let v =
+            app.call_tool("bus", &json!({"command": "i2c_identify", "arguments": { "addr": 0x76 }})).unwrap();
         assert!(v["candidates"].as_array().unwrap().iter().any(|c| c["driver"] == "bme280"));
-        let v = app.call_tool("i2c_identify", &json!({ "addr": 0x3C })).unwrap();
+        let v =
+            app.call_tool("bus", &json!({"command": "i2c_identify", "arguments": { "addr": 0x3C }})).unwrap();
         assert!(v["candidates"].as_array().unwrap().iter().any(|c| c["driver"] == "ssd1306"));
     }
 
@@ -15552,19 +15578,31 @@ mod tests {
         // One section per call: the whole reference does not fit a tool result, so it is
         // split rather than truncated (the model used to receive 2 KB of an 8 KB answer).
         let mut app = test_app();
-        let schema = app.call_tool("manifest_describe", &json!({ "section": "schema" })).unwrap();
+        let schema = app
+            .call_tool("manifest", &json!({"command": "describe", "arguments": { "section": "schema" }}))
+            .unwrap();
         assert!(schema["manifest_schema"]["properties"]["tools"].is_object());
-        let exec = app.call_tool("manifest_describe", &json!({ "section": "exec" })).unwrap();
+        let exec = app
+            .call_tool("manifest", &json!({"command": "describe", "arguments": { "section": "exec" }}))
+            .unwrap();
         assert!(exec["primitives"].as_array().unwrap().len() >= 8);
-        let examples = app.call_tool("manifest_describe", &json!({ "section": "examples" })).unwrap();
+        let examples = app
+            .call_tool("manifest", &json!({"command": "describe", "arguments": { "section": "examples" }}))
+            .unwrap();
         assert!(examples["names"].as_array().unwrap().iter().any(|n| n == "relay_with_safety"));
-        let drivers = app.call_tool("manifest_describe", &json!({ "section": "drivers" })).unwrap();
+        let drivers = app
+            .call_tool("manifest", &json!({"command": "describe", "arguments": { "section": "drivers" }}))
+            .unwrap();
         assert!(drivers["drivers"].as_array().unwrap().iter().any(|d| d["kind"] == "bme280"));
-        let one =
-            app.call_tool("manifest_describe", &json!({ "section": "drivers", "driver": "bme280" })).unwrap();
+        let one = app
+            .call_tool(
+                "manifest",
+                &json!({"command": "describe", "arguments": { "section": "drivers", "driver": "bme280" }}),
+            )
+            .unwrap();
         assert_eq!(one["driver"]["kind"], "bme280");
         // The overview is what a first call gets, and it points at the rest.
-        let overview = app.call_tool("manifest_describe", &json!({})).unwrap();
+        let overview = app.call_tool("manifest", &json!({"command": "describe", "arguments": {}})).unwrap();
         assert_eq!(overview["section"], "overview");
         assert!(overview["shape"]["tools"].is_array());
     }
@@ -15575,12 +15613,9 @@ mod tests {
         // The virtual board has the BME280 at 0x76; remove nothing, but declare an
         // OLED at 0x3D which is *not* on the bus: instantiation must fail softly.
         let v = app
-            .call_tool(
-                "manifest_apply",
-                &json!({ "manifest": { "devices": [
+            .call_tool("manifest", &json!({"command": "apply", "arguments": { "manifest": { "devices": [
                     { "id": "board", "kind": "display", "driver": "ssd1306", "bus": 0, "address": 61, "enabled": true }
-                ], "tools": [] } }),
-            )
+                ], "tools": [] } }}))
             .unwrap();
         assert_eq!(v["applied"], true);
         assert!(app.devices.infos().iter().any(|d| d.id == "ssd1306" || d.id == "ssd1306_2"));
@@ -15614,7 +15649,7 @@ mod tests {
         app.workspace
             .write("/MEMORY.md", "- [pins](/memory/pins.md) — GPIO18 is the strip\n")
             .expect("write");
-        app.agent.archive.push("called: board_status({})".into());
+        app.agent.archive.push("called: board status({})".into());
         let resp = app.route(&get("/api/agent/prompt"));
         assert_eq!(resp.status, 200);
         let body: Value = serde_json::from_slice(&resp.body).expect("json");

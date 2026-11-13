@@ -5,7 +5,7 @@
 # The POSIX counterpart of scripts/smoke.ps1: same build, same simulator
 # invocation, same HTTP calls, same checks. Starts esp32-agent-sim on a free
 # port, waits for /api/status, then walks the flow a model would:
-# tools/list -> manifest_apply -> tools/list -> tool call -> an out-of-range
+# tools/list -> manifest apply -> tools/list -> tool call -> an out-of-range
 # call that must be refused. Exits non-zero if any step fails.
 #
 #   bash scripts/smoke.sh
@@ -99,7 +99,7 @@ manifest='{"mode":"merge","manifest":{"tools":[
    "exec":{"type":"rgb","pin":48,"color":{"param":"color"}}}
 ]}}'
 
-applied=$(rpc '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"manifest_apply","arguments":'"$manifest"'}}')
+applied=$(rpc '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"manifest","arguments":{"command":"apply","arguments":'"$manifest"'}}}')
 echo "apply -> $(sed -n 's/.*"applied":\([a-z]*\).*/\1/p' <<<"$applied")"
 check 'manifest applied without a restart' grep -q '"applied":true' <<<"$applied"
 
@@ -117,10 +117,10 @@ check 'out-of-range argument is refused on the board' bash -c 'grep -q "\"isErro
 missing=$(rpc '{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"lcd_text","arguments":{"text":"hi"}}}')
 check 'a tool for absent hardware is not callable' grep -q '"isError":true' <<<"$missing"
 
-schema=$(rpc '{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"manifest_describe","arguments":{"section":"schema"}}}')
-exec=$(rpc '{"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"manifest_describe","arguments":{"section":"exec"}}}')
+schema=$(rpc '{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"manifest","arguments":{"command":"describe","arguments":{"section":"schema"}}}}')
+exec=$(rpc '{"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"manifest","arguments":{"command":"describe","arguments":{"section":"exec"}}}}')
 primitives=$(python3 -c 'import json,sys; d=json.load(sys.stdin); print(len(d["result"]["structuredContent"].get("primitives") or []))' <<<"$exec")
-check 'manifest_describe hands the model a schema and the exec types' bash -c \
+check 'manifest describe hands the model a schema and the exec types' bash -c \
   'grep -q "\"manifest_schema\"" <<<"$1" && grep -q "\"tools\"" <<<"$1" && [ "$2" -ge 8 ]' _ "$schema" "${primitives:-0}"
 
 # The count, not a session list: `/api/status` already carries it.

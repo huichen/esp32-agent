@@ -203,7 +203,7 @@ obsolete SRAM-based conclusions.
 - Keep `volume` modest: it is a percentage of full scale, and 90 against a 3 W amplifier at
   desk distance is genuinely loud.
 
-## The microphone and the speaker vanish after `manifest_apply`
+## The microphone and the speaker vanish after a manifest apply
 
 - Every apply rebuilds the device list, so `Hardware::i2s_setup` runs again on channels that
   are already open. `i2s_new_channel` refuses a port in use, and one failure there drops both

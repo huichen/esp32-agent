@@ -1213,7 +1213,7 @@ def agent(rec, sim, fake):
 
     sim.post("/api/agent/reset", {})
     url = fake.fixture("/mixed-errors", [model_reply(text="", calls=[("ok", "board", {"command": "status"}),
-        ("bad", "board_status", "{bad"), ("unknown", "not_a_tool", {}), ("unnamed", "", {})]), model_reply()], dialect="chat")
+        ("bad", "board", "{bad"), ("unknown", "not_a_tool", {}), ("unnamed", "", {})]), model_reply()], dialect="chat")
     sim.post("/api/agent/config", {"base_url": url})
     hist, _ = run_turn(sim, "valid and invalid calls in the same model reply")
     results = {m["tool_call_id"]: m for m in hist["messages"] if m["role"] == "tool"}
@@ -1377,7 +1377,7 @@ def transport(rec, sim, fake):
     for protocol, raw_args in [("chat", "{bad"), ("responses", "{bad"), ("anthropic", []), ("chat", "[]")]:
         case = protocol + ("-array-args" if raw_args == "[]" or raw_args == [] else "-bad-args")
         sim.post("/api/agent/reset", {})
-        url = fake.fixture("/" + case, [model_reply(protocol, text="", calls=[("bad-call", "board_status", raw_args)]), model_reply(protocol)], dialect=protocol)
+        url = fake.fixture("/" + case, [model_reply(protocol, text="", calls=[("bad-call", "board", raw_args)]), model_reply(protocol)], dialect=protocol)
         sim.post("/api/agent/config", {"base_url": url, "protocol": protocol})
         hist, _ = run_turn(sim, case)
         results = [m for m in hist["messages"] if m["role"] == "tool"]

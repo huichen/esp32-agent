@@ -431,8 +431,8 @@ mod tests {
     fn every_board_tool_description_names_its_schema_arguments() {
         let mut app = test_board();
         app.call_tool(
-            "manifest_apply",
-            &json!({"manifest": {"tools": [{
+            "manifest",
+            &json!({"command": "apply", "arguments": {"manifest": {"tools": [{
                 "name": "bench_wait",
                 "description": "Wait for a declared duration",
                 "params": [
@@ -441,11 +441,11 @@ mod tests {
                 ],
                 "exec": {"type": "delay", "ms": {"param": "ms"}},
                 "safety": {"confirm": true}
-            }]}}),
+            }]}}}),
         )
         .expect("manifest tool is compiled live");
         app.caps.insert("camera"); // Include the app-owned image tool without a real camera.
-        for name in ["led_set", "oled_text", "bench_wait"] {
+        for name in ["indicators", "display", "bench_wait"] {
             assert!(app.tools.get(name).is_some(), "{name} is absent from the board registry");
         }
         for def in app.tools.iter() {
