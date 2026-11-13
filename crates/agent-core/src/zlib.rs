@@ -1,9 +1,8 @@
-//! Deflate/inflate, small enough for a board with a few kB of heap.
+//! A compact DEFLATE decoder with bounded output.
 //!
-//! Only the **decoder** is here: `unzip` on a real archive is useless without it (every
-//! zip tool deflates by default), while a compressor would need a match finder and a
-//! window that cost more than the 8 kB workspace is worth. `zip` therefore writes *stored*
-//! entries — valid archives that any unzip reads — and says so in the tool result.
+//! Only the **decoder** is implemented. `unzip` needs it for ordinary compressed archives;
+//! the ZIP writer emits *stored* entries without a compressor. This is an implementation
+//! choice, not a claim that a compressor cannot fit in the board's PSRAM.
 //!
 //! The decode follows the reference (`puff.c`): canonical Huffman codes held as counts and
 //! offsets, decoded a bit at a time, which is slower than a table and needs a fraction of

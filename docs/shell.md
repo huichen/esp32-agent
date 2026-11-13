@@ -1,8 +1,9 @@
 # `shell`: one command line
 
-A shell, not a bag of tools with an `op` field. One call, one line, parsed like a shell:
+A shell, not a bag of tools with an `op` field. One call, one line, parsed like a shell.
+Each line below is a separate argument object for the `shell` tool:
 
-```json
+```jsonl
 {"command": "ls /notes"}
 {"command": "grep GPIO /"}
 {"command": "curl https://example.com/"}
@@ -13,7 +14,7 @@ Words, quotes and `--flags` are understood. `read`, `write` and `edit` stay sepa
 because they are the three most common operations and a wrapper would only add a layer.
 
 The declaration says what this is and how a line is written; the **index of 57 commands is
-not in it**. `{"command": "shell", "arguments": {"help": true}}` returns the whole index with
+not in it**. Calling `shell` with `{"help": true}` returns the whole index with
 a usage line per command, and `help <command>` returns one. Keeping the index in the
 declaration cost about 2 KB on every step of every run, to describe a tool whose entire
 interface is a single string.
@@ -39,16 +40,20 @@ Names follow NuttX's shell where one exists, so anyone who has used it can guess
 
 One line may carry a pipeline, and what a stage prints is what the next one reads:
 
-```json
+```jsonl
 {"command": "ls / | grep txt"}
 {"command": "cat /log.txt | grep error | wc -l"}
 {"command": "echo done >> /log.txt"}
 ```
 
-`< file` feeds a stage from a file, `> file` writes a stage's output truncating it first, and
-`>> file` appends. All three write into the same 8 KB workspace as everything else, so a
-redirect that would not fit is refused with the number of bytes it needed and **nothing is
-written**.
+`< file` reads a stage's input from a file; `> file` replaces a file with the stage's output,
+and `>> file` appends. Writes share the 256 KiB per-file, 4 MiB aggregate text and
+path/file-count workspace budgets. A refused edit/admission restores that command's RAM
+edit; it does not undo an earlier successful command in a `;` sequence. Accepted writes
+report `queued: true` / `saved: false`, not completed storage publication.
+
+Pipeline stdout has a separate 8 KiB policy, not the agent's 64 KiB tool-text ceiling.
+See [storage](storage.md) for acknowledgement and rollback boundaries.
 
 **The stages** are the commands that read or write lines. `jq cat grep sort uniq tr cut
 head tail wc strings od xd hexdump base64enc base64dec sha256sum md5sum crc32 tee` read
@@ -157,18 +162,22 @@ Two of these report what the build cannot do instead of making something up:
 
 ## The workspace behind them
 
-One writable area, 8 KB of text, persisted. A file holds 2048 bytes and the whole workspace
-8192; what is *stored* is a JSON blob spread over five NVS values (17 500 bytes), because
-one value cannot exceed about 4000 bytes and a workspace with a few files in it is already
-past that. `write` creates parent paths; `edit` refuses when `find` matches zero or several
-times, so an ambiguous edit cannot rewrite the wrong place; `rm` and `mv` need `confirm`.
-`zip` writes stored entries and returns the archive as base64
-because a tool result is capped at 2 KB — `unzip` reads stored and deflated entries and checks
-each CRC. `du` totals it file by file; there are no directories to total separately.
+One RAM workspace, backed by an index and one LittleFS value per file on firmware;
+configuration/secrets remain in NVS. Text is limited to 256 KiB per file and 4 MiB in total,
+with at most 1,024 files and additional canonical-path/metadata limits. The old five-value
+`ws1` JSON format is readable for migration, not the active capacity policy.
 
-`sleep <s>` and `usleep <ms>` really wait, and the wait is capped at 10 s: one loop serves
-the MCP endpoint, the portal and the agent, so an uncapped sleep would look like a hung
-device. `crc32` reuses the checksum the zip writer already has, so there is one of them.
+`write` creates parent paths; `edit` refuses zero or multiple matches; `rm` and `mv` need
+`confirm`. `du` totals file text, not the heap or the physical filesystem's metadata.
+`zip` writes stored ZIP32 entries and returns base64. Its current inline archive cap is
+1,400 bytes **before** base64, including ZIP headers/names; admission is checked before
+copying workspace payloads. `unzip` supports stored/deflated entries and checks CRCs,
+with independent 3,072-byte payload/name budgets and 128 entries. These compact archive
+policies are not the 64 KiB tool-result ceiling or evidence that PSRAM cannot hold more.
+
+`sleep <s>` and `usleep <ms>` really wait, capped at 10 s. Tool calls hold the shared App
+lock, so the wait delays other callers needing that lock. `crc32` reuses the ZIP checksum.
+The full persistence and parser contracts are in [storage](storage.md).
 
 ## When a command is wrong
 
@@ -191,8 +200,9 @@ on either.
 
 `curl <url>` is a GET; `-d <body>` makes it a POST; `-f raw` keeps the document as it arrived
 instead of reducing HTML to text. The reduction is worth knowing about: tags are stripped,
-block elements become newlines, common entities decoded, so a 2 KB result carries the article
-and not the navigation. `wget -o <path>` saves the body to the workspace instead.
+block elements become newlines and common entities are decoded. The complete network tool
+result fits the current 64 KiB envelope, including JSON escaping and metadata; truncation
+stays on UTF-8 boundaries and is marked. `wget -o <path>` saves the body to the workspace instead.
 
 `ifconfig` reports the *configured* gateway and DNS rather than the lease, which is what
 answers "did my override take effect". `ping` sends real ICMP through ESP-IDF's ping session.
