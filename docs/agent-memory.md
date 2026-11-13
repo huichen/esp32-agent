@@ -103,9 +103,11 @@ instruction that matters: a tool call listed there has already been made.
 
 The response includes `{ok, removed, kept}`; `removed` and `kept` count messages, while
 `keep` selects exchanges. The compressed index is cleared too. `POST /api/agent/reset`
-clears the conversation like `keep: 0` (its response uses `reset: true`). Both request a
-stored-transcript update/removal, but the response is not flash acknowledgement; a later
-queued-write failure can leave the older persisted history. See [storage](storage.md).
+clears the conversation like `keep: 0` (its response uses `reset: true`). Both discard the
+pending question in RAM and request removal of its stored queue copy, even when keeping
+some older exchanges. Both request a stored-transcript update/removal, but the response
+is not flash acknowledgement; a later queued-write failure can leave the older persisted
+history. See [storage](storage.md).
 
 External agents use this between tasks; the on-board agent cannot call it (it would be
 editing the conversation it is in the middle of).

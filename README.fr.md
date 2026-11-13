@@ -96,7 +96,7 @@ pour chaque carte qu'il peut joindre. Sans aucune clé, `base_url` sur
 
 | Partie | État |
 |---|---|
-| `agent-core` | 842 tests unitaires et 5 tests d’intégration passent ; `scripts/smoke.ps1` passe de bout en bout |
+| `agent-core` | 853 tests unitaires et 5 tests d’intégration passent ; `scripts/smoke.ps1` passe de bout en bout |
 | Simulateur | console, MCP et la boucle d’agent fonctionnent de bout en bout |
 | Firmware | firmware du banc flashé sur un ESP32-S3-DevKitC-1 N16R8 (IDF v5.5.2) le 2026-11-13 : 42 outils, OLED 128×32, micro et ampli I²S, WS2812, console TLS, tours de modèle en HTTPS ; ce que ce flash n’a pas vérifié est listé dans `ROADMAP.md` |
 | Non implémenté / non vérifié | La capture DVP du firmware n’est pas implémentée. Les pilotes SD par secteurs bruts et DHT11/22 ont des tests sur hôte, pas de vérification sur carte. Voir `ROADMAP.md` |

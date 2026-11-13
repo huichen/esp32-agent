@@ -69,6 +69,10 @@ pub const TRANSCRIPT_CHUNKS_MAX: usize = 8;
 /// `agent.run_in_flight` was 19 bytes and therefore never stored; the marker existed only
 /// in the RAM of the run that wrote it. Like the transcript, it needs no migration.
 pub const NVS_KEY_RUN_IN_FLIGHT: &str = crate::keys::RUN_IN_FLIGHT;
+/// The depth-1 queue between boots: JSON `{text, source, at_ms}`, without attachments.
+/// Kept beside the transcript on the filesystem, since one question can exceed NVS's
+/// single-value limit. Removed only after the question is consumed (or explicitly forgotten).
+pub const NVS_KEY_PENDING_MESSAGE: &str = crate::keys::PENDING_MESSAGE;
 /// The source a resumed turn carries, so a reply can be told apart from one the user just
 /// asked for.
 pub const RESUME_SOURCE: &str = "resume";
@@ -2512,13 +2516,100 @@ impl App {
         ok
     }
 
+    /// Queue through the App, so every trigger keeps the same truncated/coalesced message
+    /// in RAM and in the store queue. Queue admission is not a flash acknowledgement.
+    fn queue_user(&mut self, text: &str, source: &str, at_ms: u64) -> bool {
+        if !self.agent.push_user(text, source, at_ms) {
+            return false;
+        }
+        self.persist_pending_message();
+        true
+    }
+
+    fn persist_pending_message(&mut self) -> bool {
+        if !self.cfg.agent.persist_transcript {
+            return false;
+        }
+        let Some(pending) = self.agent.pending.as_ref() else {
+            return false;
+        };
+        let saved = json!({
+            "text": pending.text,
+            "source": pending.source,
+            "at_ms": pending.at_ms,
+        })
+        .to_string();
+        let ok = self.store.set(NVS_KEY_PENDING_MESSAGE, &saved);
+        if !ok {
+            self.log.warn("agent", "could not queue the pending user message for saving; a reboot loses it");
+        }
+        ok
+    }
+
+    fn clear_pending_message(&mut self) {
+        // Do not enqueue an absent-key removal when persistence is off. An existing copy
+        // is still removed regardless of the setting, so a forget cannot resurrect it.
+        if self.store.get(NVS_KEY_PENDING_MESSAGE).is_some() && !self.store.remove(NVS_KEY_PENDING_MESSAGE) {
+            self.log.warn("agent", "could not queue removal of the stored pending user message");
+        }
+    }
+
+    fn load_pending_message(&mut self) {
+        let Some(saved) = self.store.get(NVS_KEY_PENDING_MESSAGE) else {
+            return;
+        };
+        if !self.cfg.agent.persist_transcript {
+            self.clear_pending_message();
+            return;
+        }
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct QueuedUser {
+            text: String,
+            source: String,
+            at_ms: u64,
+        }
+        let parsed =
+            serde_json::from_str::<QueuedUser>(&saved).ok().filter(|message| !message.text.trim().is_empty());
+        let Some(parsed) = parsed else {
+            self.clear_pending_message();
+            self.log.warn(
+                "agent",
+                "the stored pending user message does not check out (torn or foreign JSON); ignored and removed",
+            );
+            return;
+        };
+        let pending = crate::agent::Message::user(&parsed.text, &parsed.source, parsed.at_ms);
+        // The transcript's final exchange wins over a stale queue copy. Text alone is
+        // not an identity: a person can ask the same question again. Compare source and
+        // enqueue time too, and compare the transcript's 4 KiB text projection because
+        // that copy is shorter than a queued question may be. This is snapshot de-dup,
+        // not a globally unique turn id or an exactly-once execution guarantee.
+        let in_transcript =
+            self.agent.history.iter().rfind(|m| m.role == crate::agent::Role::User).is_some_and(|last| {
+                last.source == pending.source
+                    && last.at_ms == pending.at_ms
+                    && last.text == llm::truncate_bytes(&pending.text, crate::agent::MAX_SAVED_TEXT_BYTES)
+            });
+        if in_transcript {
+            self.clear_pending_message();
+            self.log.info("agent", "dropped a stored pending message already present in the transcript");
+            return;
+        }
+        self.agent.pending = Some(pending);
+        self.log.info("agent", "restored a queued user message from flash");
+    }
+
     /// Restore the transcript from flash and finish a turn a power cut interrupted.
     ///
-    /// Two independent pieces of evidence are read here, in this order:
+    /// Three independent pieces of evidence are read here, in this order:
     ///
     /// * the transcript, which holds everything up to the last completed step. A blob that
     ///   does not check out - torn by a power failure, written by a newer build, or just not
     ///   JSON - is logged and skipped, never a panic and never half-adopted;
+    /// * the queued question, which has not started yet. The final transcript exchange
+    ///   takes precedence over an identical stale queue copy; otherwise the queued question
+    ///   wins over replaying an older interrupted turn in this depth-1 queue;
     /// * the in-flight marker, whose presence means a turn was running when the board lost
     ///   power. The question it was answering is queued again with the source
     ///   [`RESUME_SOURCE`], so the turn continues from the last completed step: a tool call
@@ -2550,6 +2641,7 @@ impl App {
                 }
             }
         }
+        self.load_pending_message();
         // The marker is consumed whatever the setting says: leaving one behind would resume
         // a turn from weeks ago the day persistence is switched back on.
         let Some(marker) = self.store.get(NVS_KEY_RUN_IN_FLIGHT).filter(|text| !text.is_empty()) else {
@@ -2559,6 +2651,16 @@ impl App {
         let source = parsed.get("source").and_then(|v| v.as_str()).unwrap_or("unknown").to_string();
         let started = parsed.get("started_ms").and_then(|v| v.as_u64()).unwrap_or(0);
         self.store.remove(NVS_KEY_RUN_IN_FLIGHT);
+        if self.agent.pending.is_some() {
+            self.log.warn(
+                "agent",
+                format!(
+                    "a turn from `{}` (started {started} ms after boot) was interrupted by a reboot; keeping the newer queued question instead of replaying the older turn",
+                    clip(&source, 40)
+                ),
+            );
+            return;
+        }
         match self.agent.last_user().map(|text| text.to_string()) {
             Some(text) => {
                 let extra = if self.agent.ends_on_a_tool_result() {
@@ -2573,7 +2675,7 @@ impl App {
                         clip(&source, 40)
                     ),
                 );
-                self.agent.push_user(&text, RESUME_SOURCE, now_ms());
+                self.queue_user(&text, RESUME_SOURCE, now_ms());
             }
             None => self.log.warn(
                 "agent",
@@ -2646,9 +2748,13 @@ impl App {
             agent.set_budget(context_tokens, max_output_tokens);
             agent.begin(host, now_ms, max_steps)
         });
-        // The queued question is in the transcript now. Saving here is what lets the next
-        // boot resume this turn instead of the one before it.
-        self.persist_transcript();
+        // The queued question is in the transcript now. Queue its save before removing
+        // the pending copy, and only after begin actually consumed the message. A reboot
+        // between those writes can leave both copies; load_pending_message de-duplicates them.
+        if step.is_some() {
+            self.persist_transcript();
+            self.clear_pending_message();
+        }
         step
     }
 
@@ -2710,7 +2816,7 @@ impl App {
                 self.log.info("script", format!("{source} ran a script: {}", job.id));
                 fired.push(source);
             } else if !prompt.trim().is_empty() {
-                self.agent.push_user(&prompt, &source, at_ms);
+                self.queue_user(&prompt, &source, at_ms);
                 self.log.info("agent", format!("queued {source}"));
                 fired.push(source);
             }
@@ -2747,7 +2853,7 @@ impl App {
             self.rules[i].last_fire_ms = at_ms;
             dirty = true;
             if !prompt.trim().is_empty() {
-                self.agent.push_user(&prompt, &source, at_ms);
+                self.queue_user(&prompt, &source, at_ms);
                 self.log.info("agent", format!("queued {source}"));
                 fired.push(source);
             }
@@ -3122,7 +3228,7 @@ impl App {
             );
         }
         self.agent.vision = self.llm.vision;
-        if !self.agent.push_user(&text, "http", now_ms()) {
+        if !self.queue_user(&text, "http", now_ms()) {
             return Response::json_status(400, &json!({ "error": "`text` is required" }));
         }
         // A text-only message intentionally replaces the list with an empty one.
@@ -3417,7 +3523,7 @@ impl App {
             out["kind"] = json!("script");
             out["job"] = json!(job.id);
         } else if !prompt.trim().is_empty() {
-            self.agent.push_user(&prompt, &source, at_ms);
+            self.queue_user(&prompt, &source, at_ms);
             self.log.info("sched", format!("{source} queued on demand"));
             out["kind"] = json!("prompt");
             out["queued"] = json!(true);
@@ -3630,39 +3736,35 @@ impl App {
             return Ok(String::new());
         }
         let cfg = self.llm.clone();
-        self.active_attachments = self.agent.pending.as_ref().map(|pending| pending.attachments.clone());
-        // The source of the queued message, which the journal and the transcript record.
-        let source = self.agent.pending.as_ref().map(|p| p.source.clone()).unwrap_or_default();
-        // This runner takes the whole turn in one call (`run_pending`), so its transcript
-        // write comes at the end and the marker can only say "a turn was running". A power
-        // cut here resumes the last question that reached flash, which is the previous one;
-        // the driver path (`agent_begin`) writes the question before the first model call,
-        // and that is the path the firmware and the simulator use.
-        self.mark_run_in_flight(&source);
-        // The agent lives in `self` and needs `self` as its tool host, so it is
-        // moved out for the duration of the run and put back afterwards.
-        let mut agent = std::mem::replace(&mut self.agent, Agent::new());
-        let mut transport = self.model_transport.take();
-        let (out, ran) = match transport.as_mut() {
-            Some(t) => (agent.run_pending(self, t.as_mut(), &cfg, now_ms), true),
+        let out = match self.model_transport.take() {
+            Some(mut transport) => {
+                self.agent.vision = cfg.vision;
+                // Use the same consumption boundary as the platform driver: begin moves
+                // the question into history and clears its stored queue copy before the
+                // first model call, not after the entire synchronous turn has finished.
+                let mut step = self.agent_begin().expect("the queued message was checked above");
+                let out = loop {
+                    match step {
+                        AgentStep::Ask { messages, tools } => {
+                            let reply = llm::chat(transport.as_mut(), &cfg, &messages, &tools);
+                            step = self.agent_reply(reply);
+                        }
+                        AgentStep::Done(result) => break result,
+                    }
+                };
+                self.model_transport = Some(transport);
+                out
+            }
             None => {
                 let why = "no HTTP transport is attached for the model call, so the model cannot be reached"
                     .to_string();
-                agent.last_error = why.clone();
-                (Err(why), false)
+                self.agent.last_error = why.clone();
+                // No run started: keep (and re-persist) the queued question for a later
+                // attempt rather than writing an in-flight marker for the previous turn.
+                self.persist_pending_message();
+                Err(why)
             }
         };
-        self.model_transport = transport;
-        self.agent = agent;
-        self.active_attachments = None;
-        self.run_active = false;
-        // Only a turn that actually ran ends here: a missing transport leaves the
-        // message queued for a later attempt and keeps the run-in-flight marker, so the
-        // next boot resumes it instead of forgetting it.
-        if ran {
-            self.clear_run_in_flight();
-        }
-        self.persist_transcript();
         match &out {
             Ok(text) if !text.is_empty() => self.log.info("agent", format!("run done: {}", clip(text, 120))),
             Ok(_) => self.log.info("agent", "run done with no text"),
@@ -4122,6 +4224,7 @@ impl App {
                     return r;
                 }
                 let (removed, kept) = self.agent.forget(0);
+                self.clear_pending_message();
                 self.attachments.clear();
                 self.active_attachments = None;
                 self.persist_transcript();
@@ -4140,6 +4243,7 @@ impl App {
                 let body: Value = serde_json::from_str(&req.body_str()).unwrap_or(Value::Null);
                 let keep = body.get("keep").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
                 let (removed, kept) = self.agent.forget(keep);
+                self.clear_pending_message();
                 if keep == 0 {
                     self.attachments.clear();
                     self.active_attachments = None;
@@ -8010,13 +8114,13 @@ mod tests {
 
     // ------------------------------------------------- a store that outlives the App
 
-    /// A store two `App`s can share, so "reload" means "a new `App` over the same keys",
+    /// A MemoryStore two `App`s can share, so "reload" means "a new `App` over the same keys",
     /// which is what a reboot looks like from the inside. The transcript feature is
     /// exactly the property that a new `App` and an old one disagree about, and a store
     /// per `App` could not express it.
     #[derive(Clone, Debug, Default)]
     struct SharedStore(
-        Arc<Mutex<std::collections::BTreeMap<String, String>>>,
+        Arc<Mutex<MemoryStore>>,
         // Writes that actually reached this store, as opposed to being queued for it.
         Arc<std::sync::atomic::AtomicU32>,
     );
@@ -8036,13 +8140,17 @@ mod tests {
 
         /// Every key currently stored, in order: the transcript spans several of them.
         fn all(&self) -> Vec<String> {
-            self.0.lock().map(|m| m.keys().cloned().collect()).unwrap_or_default()
+            self.0.lock().map(|m| m.keys()).unwrap_or_default()
         }
     }
 
     impl KvStore for SharedStore {
         fn get(&self, key: &str) -> Option<String> {
-            self.0.lock().ok()?.get(key).cloned()
+            self.0.lock().ok()?.get(key)
+        }
+
+        fn read_at(&self, key: &str, offset: usize, out: &mut [u8]) -> Option<usize> {
+            self.0.lock().ok()?.read_at(key, offset, out)
         }
 
         /// The board's store is a file on a filesystem now, so a blob is one value. The
@@ -8055,9 +8163,8 @@ mod tests {
         fn set(&mut self, key: &str, value: &str) -> bool {
             match self.0.lock() {
                 Ok(mut m) => {
-                    m.insert(key.to_string(), value.to_string());
                     self.1.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    true
+                    m.set(key, value)
                 }
                 Err(_) => false,
             }
@@ -8067,7 +8174,7 @@ mod tests {
             match self.0.lock() {
                 Ok(mut m) => {
                     self.1.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    m.remove(key).is_some()
+                    m.remove(key)
                 }
                 Err(_) => false,
             }
@@ -8161,6 +8268,485 @@ mod tests {
         );
         assert_eq!(NVS_KEY_TRANSCRIPT, "transcript");
         assert_eq!(NVS_KEY_RUN_IN_FLIGHT, "run_in_flight");
+        assert_eq!(NVS_KEY_PENDING_MESSAGE, "transcript.q");
+    }
+
+    #[test]
+    fn a_queued_message_is_saved_before_a_run_and_cleared_on_begin() {
+        let store = SharedStore::new();
+        let mut app = app_with(&store);
+        drain_store(&mut app);
+        let writes_before = store.writes();
+        assert_eq!(app.route(&post("/api/agent/message", r#"{"text":"   "}"#)).status, 400);
+        assert!(app.store.get(NVS_KEY_PENDING_MESSAGE).is_none());
+        assert_eq!(
+            app.route(&post("/api/agent/message", r#"{"text":"  answer after the reboot  "}"#)).status,
+            202
+        );
+        let pending = app.agent.pending.clone().expect("queued in RAM");
+        let saved = app.store.get(NVS_KEY_PENDING_MESSAGE).expect("queued for the writer");
+        let value: Value = serde_json::from_str(&saved).unwrap();
+        assert_eq!(value, json!({ "text": pending.text, "source": "http", "at_ms": pending.at_ms }));
+        assert_eq!(pending.text, "answer after the reboot");
+        assert_eq!(store.writes(), writes_before, "enqueue must not write the backend itself");
+        assert!(store.get(NVS_KEY_PENDING_MESSAGE).is_none(), "admission is not durability");
+        drain_store(&mut app);
+        assert_eq!(store.get(NVS_KEY_PENDING_MESSAGE).as_deref(), Some(saved.as_str()));
+        let writes_before_begin = store.writes();
+
+        assert!(matches!(app.agent_begin(), Some(AgentStep::Ask { .. })));
+        assert!(app.agent.pending.is_none(), "begin consumed the question");
+        assert!(
+            app.store.get(NVS_KEY_PENDING_MESSAGE).is_none(),
+            "the consumed copy is removed from the queue"
+        );
+        assert_eq!(app.agent.history.last().map(|m| m.text.as_str()), Some(pending.text.as_str()));
+        assert_eq!(store.writes(), writes_before_begin, "begin must not write under the App lock");
+        assert!(store.get(NVS_KEY_PENDING_MESSAGE).is_some(), "only the writer removes the stored copy");
+        drain_store(&mut app);
+        assert!(store.get(NVS_KEY_PENDING_MESSAGE).is_none());
+        assert!(store.get(NVS_KEY_TRANSCRIPT).is_some(), "the question moved into the transcript");
+    }
+
+    #[test]
+    fn a_queued_message_survives_a_reboot_and_is_answered_once() {
+        struct PendingClearedModel {
+            store: store::QueuedStore,
+            scripted: Scripted,
+        }
+        impl ChatTransport for PendingClearedModel {
+            fn post_json(
+                &mut self,
+                url: &str,
+                headers: &[(&str, &str)],
+                body: &str,
+            ) -> std::result::Result<String, String> {
+                assert!(
+                    self.store.get(NVS_KEY_PENDING_MESSAGE).is_none(),
+                    "the stored queue copy must be cleared before the first model call"
+                );
+                self.scripted.post_json(url, headers, body)
+            }
+        }
+
+        // Both consumers must have the same boundary, including the synchronous runner.
+        for synchronous in [false, true] {
+            let store = SharedStore::new();
+            let mut before = app_with(&store);
+            assert_eq!(
+                before.route(&post("/api/agent/message", r#"{"text":"please answer me"}"#)).status,
+                202
+            );
+            let queued = before.agent.pending.clone().unwrap();
+            drain_store(&mut before);
+            drop(before);
+
+            let (app, log) = app_with_log(&store);
+            let restored = app.agent.pending.as_ref().expect("the queued question survived the reboot");
+            assert_eq!(restored.text, queued.text);
+            assert_eq!(restored.source, queued.source);
+            assert_eq!(restored.at_ms, queued.at_ms);
+            assert_eq!(
+                log.tail(80, 0)
+                    .iter()
+                    .filter(|l| l.level == "info" && l.message == "restored a queued user message from flash")
+                    .count(),
+                1
+            );
+            let mut model = PendingClearedModel {
+                store: store::QueuedStore::new(app.store_queue()),
+                scripted: Scripted::new(vec![Scripted::answer("answered after reboot")]),
+            };
+            let seen = model.scripted.seen.clone();
+            let shared = Arc::new(Mutex::new(app));
+            point_at_the_stub(&mut shared.lock().unwrap());
+            if synchronous {
+                let mut app = shared.lock().unwrap();
+                app.attach_model_transport(Box::new(model));
+                assert_eq!(app.agent_run_once(), Ok("answered after reboot".to_string()));
+                assert_eq!(app.agent_run_once(), Ok(String::new()), "an idle tick must not run it twice");
+            } else {
+                assert_eq!(drive_agent(&shared, &mut model), Some(Ok("answered after reboot".to_string())));
+                assert!(drive_agent(&shared, &mut model).is_none(), "an idle tick must not run it twice");
+            }
+            let requests = seen.lock().unwrap();
+            assert_eq!(requests.len(), 1, "one queued question means one model call, not zero or two");
+            let request: Value = serde_json::from_str(&requests[0]).unwrap();
+            let users: Vec<&Value> =
+                request["messages"].as_array().unwrap().iter().filter(|m| m["role"] == "user").collect();
+            assert_eq!(users.len(), 1);
+            assert_eq!(users[0]["content"], json!(queued.text));
+            drop(requests);
+            {
+                let mut app = shared.lock().unwrap();
+                assert_eq!(app.agent.runs, 1);
+                assert_eq!(app.agent.history.len(), 2);
+                drain_store(&mut app);
+            }
+            assert!(store.get(NVS_KEY_PENDING_MESSAGE).is_none());
+            drop(shared);
+            let after = app_with(&store);
+            assert!(after.agent.pending.is_none(), "a finished answer must not come back as queued");
+            assert_eq!(after.agent.history.last().map(|m| m.text.as_str()), Some("answered after reboot"));
+        }
+    }
+
+    #[test]
+    fn a_corrupt_stored_pending_message_is_removed_logged_and_does_not_break_boot() {
+        for bad in [
+            "not json",
+            "",
+            "[]",
+            "null",
+            r#"{"text":"torn","source":"http","at_ms":3"#,
+            r#"{"text":"missing time","source":"http"}"#,
+            r#"{"text":7,"source":"http","at_ms":3}"#,
+            r#"{"text":"bad source","source":7,"at_ms":3}"#,
+            r#"{"text":"bad time","source":"http","at_ms":-1}"#,
+            r#"{"text":"bad time","source":"http","at_ms":1.5}"#,
+            r#"{"text":"foreign","source":"http","at_ms":3,"version":99}"#,
+            r#"{"text":"  ","source":"http","at_ms":3}"#,
+        ] {
+            let store = SharedStore::new();
+            assert!(store.clone().set(NVS_KEY_PENDING_MESSAGE, bad));
+            let (mut app, log) = app_with_log(&store);
+            assert!(app.agent.pending.is_none(), "`{bad}` became a queued question");
+            assert!(app.store.get(NVS_KEY_PENDING_MESSAGE).is_none(), "the bad value was not removed");
+            assert_eq!(
+                log.tail(80, 0)
+                    .iter()
+                    .filter(|l| l.level == "warn"
+                        && l.message.contains("stored pending user message does not check out"))
+                    .count(),
+                1,
+                "`{bad}` must produce one warning"
+            );
+            assert_eq!(app.route(&get("/healthz")).status, 200, "boot leaves a usable app");
+            drain_store(&mut app);
+            assert!(store.get(NVS_KEY_PENDING_MESSAGE).is_none(), "the writer must remove the bad value too");
+            assert_eq!(app.route(&post("/api/agent/message", r#"{"text":"still usable"}"#)).status, 202);
+            point_at_the_stub(&mut app);
+            let model = Scripted::new(vec![Scripted::answer("yes")]);
+            let seen = model.seen.clone();
+            app.attach_model_transport(Box::new(model));
+            assert_eq!(app.agent_run_once(), Ok("yes".to_string()));
+            assert_eq!(seen.lock().unwrap().len(), 1);
+        }
+    }
+
+    #[test]
+    fn turning_persistence_off_keeps_queued_messages_out_of_flash() {
+        let store = SharedStore::new();
+        let mut app = app_with(&store);
+        drain_store(&mut app);
+        let writes_before = store.writes();
+        app.cfg.agent.persist_transcript = false;
+        assert_eq!(app.route(&post("/api/agent/message", r#"{"text":"RAM only"}"#)).status, 202);
+        assert!(app.agent.pending.is_some(), "the question still runs in RAM");
+        assert!(!app.persist_pending_message());
+        assert!(app.store.get(NVS_KEY_PENDING_MESSAGE).is_none());
+        assert_eq!(app.store_queue().pending(), 0, "disabled persistence admits no pending-message write");
+        drain_store(&mut app);
+        assert_eq!(store.writes(), writes_before, "disabled persistence writes nothing");
+        assert!(store.get(NVS_KEY_PENDING_MESSAGE).is_none());
+
+        // A copy left by an earlier configuration is not revived when retention is off.
+        let store = SharedStore::new();
+        let mut writer = store.clone();
+        assert!(writer.set(crate::config::NVS_KEY_CONFIG, r#"{"agent":{"persist_transcript":false}}"#));
+        assert!(writer
+            .set(NVS_KEY_PENDING_MESSAGE, r#"{"text":"old retained question","source":"http","at_ms":7}"#));
+        let (mut app, log) = app_with_log(&store);
+        assert!(!app.cfg.agent.persist_transcript);
+        assert!(app.agent.pending.is_none());
+        assert!(app.store.get(NVS_KEY_PENDING_MESSAGE).is_none());
+        assert!(!log.tail(80, 0).iter().any(|l| l.message == "restored a queued user message from flash"));
+        drain_store(&mut app);
+        assert!(store.get(NVS_KEY_PENDING_MESSAGE).is_none(), "do not leave a question to resurrect later");
+    }
+
+    #[test]
+    fn an_oversized_pending_question_is_saved_and_restored_with_the_user_byte_cap() {
+        let store = SharedStore::new();
+        let mut app = app_with(&store);
+        let text = "界".repeat(crate::agent::MAX_USER_BYTES);
+        assert!(text.len() > crate::agent::MAX_USER_BYTES, "UTF-8 bytes, not characters");
+        let expected = llm::truncate_bytes(&text, crate::agent::MAX_USER_BYTES);
+        app.tasks.push(ScheduledTask {
+            id: "large".to_string(),
+            prompt: text.clone(),
+            every_s: 1,
+            ..Default::default()
+        });
+        assert_eq!(app.sched_tick(1_000, 0), vec!["schedule:large"]);
+        let queued = app.store.get(NVS_KEY_PENDING_MESSAGE).unwrap();
+        let value: Value = serde_json::from_str(&queued).unwrap();
+        let saved_text = value["text"].as_str().unwrap();
+        assert_eq!(saved_text, expected);
+        assert_eq!(saved_text.len(), app.agent.pending.as_ref().unwrap().text.len());
+        assert!(saved_text.len() < text.len());
+        // truncate_bytes appends its marker outside the payload cap; preserve that existing
+        // contract instead of changing what the model sees just to save the queue.
+        assert!(saved_text.len() <= crate::agent::MAX_USER_BYTES + llm::TRUNCATED_MARK.len());
+        assert!(saved_text.ends_with(llm::TRUNCATED_MARK));
+        assert!(queued.len() > store::VALUE_MAX, "this key must route to the filesystem, not NVS");
+        drain_store(&mut app);
+        drop(app);
+        let app = app_with(&store);
+        assert_eq!(app.agent.pending.as_ref().unwrap().text, expected);
+        drop(app);
+
+        // Defensive restoration also clamps a complete but oversized JSON value from elsewhere.
+        assert!(store.clone().set(
+            NVS_KEY_PENDING_MESSAGE,
+            &json!({
+                "text": text, "source": "http", "at_ms": 17
+            })
+            .to_string()
+        ));
+        let app = app_with(&store);
+        let pending = app.agent.pending.as_ref().unwrap();
+        assert_eq!(pending.text, expected);
+        assert!(pending.text.len() <= crate::agent::MAX_USER_BYTES + llm::TRUNCATED_MARK.len());
+        assert_eq!(pending.source, "http");
+        assert_eq!(pending.at_ms, 17);
+    }
+
+    #[test]
+    fn every_trigger_saves_the_coalesced_pending_question() {
+        let store = SharedStore::new();
+        let mut app = app_with(&store);
+        app.tasks.push(ScheduledTask {
+            id: "t1".to_string(),
+            prompt: "scheduled".to_string(),
+            every_s: 1,
+            ..Default::default()
+        });
+        assert_eq!(app.sched_tick(1_000, 0), vec!["schedule:t1"]);
+        drain_store(&mut app);
+        let saved: Value = serde_json::from_str(&store.get(NVS_KEY_PENDING_MESSAGE).unwrap()).unwrap();
+        assert_eq!(saved, json!({ "text": "scheduled", "source": "schedule:t1", "at_ms": 1_000 }));
+
+        assert_eq!(app.route(&post("/api/agent/message", r#"{"text":"portal"}"#)).status, 202);
+        drain_store(&mut app);
+        let saved: Value = serde_json::from_str(&store.get(NVS_KEY_PENDING_MESSAGE).unwrap()).unwrap();
+        assert_eq!(saved["text"], "portal");
+        assert_eq!(saved["source"], "schedule:t1,http");
+        assert_eq!(saved["at_ms"], app.agent.pending.as_ref().unwrap().at_ms);
+
+        app.rules.push(SensorRule {
+            id: "r1".to_string(),
+            tool: "board_status".to_string(),
+            path: "board_name".to_string(),
+            prompt: "sensor".to_string(),
+            ..Default::default()
+        });
+        assert_eq!(app.sched_tick(1_001, 0), vec!["sensor:r1"]);
+        drain_store(&mut app);
+        let saved: Value = serde_json::from_str(&store.get(NVS_KEY_PENDING_MESSAGE).unwrap()).unwrap();
+        assert_eq!(
+            saved,
+            json!({ "text": "sensor", "source": "schedule:t1,http,sensor:r1", "at_ms": 1_001 })
+        );
+
+        let run = app.route(&post("/api/sched/run", r#"{"id":"t1"}"#));
+        assert_eq!(run.status, 200);
+        assert_eq!(body_json(&run)["queued"], true);
+        drain_store(&mut app);
+        let saved: Value = serde_json::from_str(&store.get(NVS_KEY_PENDING_MESSAGE).unwrap()).unwrap();
+        let pending = app.agent.pending.as_ref().unwrap();
+        assert_eq!(saved, json!({ "text": pending.text, "source": pending.source, "at_ms": pending.at_ms }));
+        assert_eq!(pending.text, "scheduled", "newest text wins");
+        assert_eq!(pending.source, "schedule:t1,http,sensor:r1", "repeated sources are not duplicated");
+    }
+
+    #[test]
+    fn a_newer_queued_question_survives_reboot_while_an_older_turn_was_in_flight() {
+        let store = SharedStore::new();
+        let mut app = app_with(&store);
+        point_at_the_stub(&mut app);
+        assert_eq!(app.route(&post("/api/agent/message", r#"{"text":"older question"}"#)).status, 202);
+        assert!(matches!(app.agent_begin(), Some(AgentStep::Ask { .. })));
+        assert!(matches!(
+            app.agent_reply(Ok(llm::ModelReply {
+                tool_calls: vec![llm::ToolCall {
+                    id: "old-call".into(),
+                    name: "board_status".into(),
+                    arguments: json!({})
+                }],
+                ..Default::default()
+            })),
+            AgentStep::Ask { .. }
+        ));
+        assert_eq!(app.route(&post("/api/agent/message", r#"{"text":"newer question"}"#)).status, 202);
+        let queued = app.agent.pending.clone().unwrap();
+        drain_store(&mut app);
+        assert!(store.get(NVS_KEY_RUN_IN_FLIGHT).is_some());
+        drop(app);
+
+        let (mut app, log) = app_with_log(&store);
+        assert_eq!(app.agent.pending.as_ref().unwrap().text, queued.text);
+        assert_eq!(app.agent.pending.as_ref().unwrap().source, "http");
+        assert_eq!(app.agent.pending.as_ref().unwrap().at_ms, queued.at_ms);
+        assert!(app.agent.ends_on_a_tool_result(), "the older turn's context is still available");
+        assert!(log
+            .tail(80, 0)
+            .iter()
+            .any(|l| l.level == "warn" && l.message.contains("keeping the newer queued question")));
+        drain_store(&mut app);
+        assert!(store.get(NVS_KEY_RUN_IN_FLIGHT).is_none());
+        assert!(store.get(NVS_KEY_PENDING_MESSAGE).is_some(), "restoring is not consuming");
+        drop(app);
+
+        // Even another reboot before the run starts keeps the queued question.
+        let mut app = app_with(&store);
+        point_at_the_stub(&mut app);
+        let model = Scripted::new(vec![Scripted::answer("newer question answered")]);
+        let seen = model.seen.clone();
+        app.attach_model_transport(Box::new(model));
+        assert_eq!(app.agent_run_once(), Ok("newer question answered".to_string()));
+        assert_eq!(app.agent_run_once(), Ok(String::new()));
+        let requests = seen.lock().unwrap();
+        assert_eq!(requests.len(), 1, "do not replay the older turn in a second run");
+        let request: Value = serde_json::from_str(&requests[0]).unwrap();
+        assert_eq!(request["messages"].as_array().unwrap().last().unwrap()["content"], "newer question");
+        assert_eq!(app.agent.history.iter().filter(|m| m.role == crate::agent::Role::User).count(), 2);
+        drain_store(&mut app);
+        assert!(store.get(NVS_KEY_PENDING_MESSAGE).is_none());
+    }
+
+    #[test]
+    fn the_final_transcript_exchange_wins_over_the_same_stored_queue_copy() {
+        for text in ["same question".to_string(), "界".repeat(crate::agent::MAX_SAVED_TEXT_BYTES)] {
+            for (source, at_ms, duplicate) in
+                [("http", 77, true), ("http", 78, false), ("sensor:r1", 77, false)]
+            {
+                let store = SharedStore::new();
+                let mut writer = app_with(&store);
+                writer.agent.history.push(crate::agent::Message::user(&text, "http", 77));
+                writer.agent.history.push(crate::agent::Message::assistant(
+                    "already answered",
+                    Vec::new(),
+                    78,
+                ));
+                assert!(writer.persist_transcript());
+                assert!(writer.queue_user(&text, source, at_ms));
+                drain_store(&mut writer);
+                drop(writer);
+
+                let mut app = app_with(&store);
+                point_at_the_stub(&mut app);
+                let model = Scripted::new(vec![Scripted::answer("asked again deliberately")]);
+                let seen = model.seen.clone();
+                app.attach_model_transport(Box::new(model));
+                if duplicate {
+                    assert!(app.agent.pending.is_none(), "the transcript already contains this turn");
+                    assert!(app.store.get(NVS_KEY_PENDING_MESSAGE).is_none());
+                    assert_eq!(app.agent_run_once(), Ok(String::new()));
+                    assert_eq!(
+                        seen.lock().unwrap().len(),
+                        0,
+                        "do not bill for the same completed turn again"
+                    );
+                    assert_eq!(app.agent.history.len(), 2);
+                } else {
+                    let pending =
+                        app.agent.pending.as_ref().expect("same text with new metadata is a new turn");
+                    assert_eq!(pending.source, source);
+                    assert_eq!(pending.at_ms, at_ms);
+                    assert_eq!(app.agent_run_once(), Ok("asked again deliberately".to_string()));
+                    assert_eq!(seen.lock().unwrap().len(), 1);
+                }
+                drain_store(&mut app);
+                assert!(store.get(NVS_KEY_PENDING_MESSAGE).is_none());
+            }
+        }
+
+        // A stale queue copy of an interrupted question is discarded too: only the existing
+        // in-flight recovery queues it, with its resume source, for one model call.
+        let store = SharedStore::new();
+        let mut writer = app_with(&store);
+        writer.agent.history.push(crate::agent::Message::user("interrupted", "http", 77));
+        assert!(writer.persist_transcript());
+        assert!(writer.queue_user("interrupted", "http", 77));
+        assert!(writer.mark_run_in_flight("http"));
+        drain_store(&mut writer);
+        drop(writer);
+        let mut app = app_with(&store);
+        assert_eq!(app.agent.pending.as_ref().unwrap().source, RESUME_SOURCE);
+        point_at_the_stub(&mut app);
+        let model = Scripted::new(vec![Scripted::answer("resumed once")]);
+        let seen = model.seen.clone();
+        app.attach_model_transport(Box::new(model));
+        assert_eq!(app.agent_run_once(), Ok("resumed once".to_string()));
+        assert_eq!(app.agent_run_once(), Ok(String::new()));
+        assert_eq!(seen.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn an_unstarted_turn_keeps_its_saved_question_when_the_transport_is_missing() {
+        let store = SharedStore::new();
+        let mut app = app_with(&store);
+        app.agent.history.push(crate::agent::Message::user("previous question", "http", 1));
+        app.agent.history.push(crate::agent::Message::assistant("previous answer", Vec::new(), 2));
+        assert!(app.persist_transcript());
+        assert_eq!(app.route(&post("/api/agent/message", r#"{"text":"not started yet"}"#)).status, 202);
+        drain_store(&mut app);
+        assert!(app.agent_run_once().unwrap_err().contains("transport"));
+        assert_eq!(app.agent.pending.as_ref().unwrap().text, "not started yet");
+        assert!(app.store.get(NVS_KEY_PENDING_MESSAGE).is_some());
+        assert!(
+            app.store.get(NVS_KEY_RUN_IN_FLIGHT).is_none(),
+            "no turn started, so do not resume the old one"
+        );
+        drain_store(&mut app);
+        drop(app);
+        let mut app = app_with(&store);
+        assert_eq!(app.agent.pending.as_ref().unwrap().text, "not started yet");
+        point_at_the_stub(&mut app);
+        let model = Scripted::new(vec![Scripted::answer("transport is here now")]);
+        let seen = model.seen.clone();
+        app.attach_model_transport(Box::new(model));
+        assert_eq!(app.agent_run_once(), Ok("transport is here now".to_string()));
+        assert_eq!(seen.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn forgetting_also_removes_a_question_that_has_not_started() {
+        for (path, body) in
+            [("/api/agent/reset", "{}"), ("/api/agent/forget", "{}"), ("/api/agent/forget", r#"{"keep":1}"#)]
+        {
+            for persistence in [true, false] {
+                let store = SharedStore::new();
+                let mut app = app_with(&store);
+                app.agent.history.push(crate::agent::Message::user("past", "http", 1));
+                app.agent.history.push(crate::agent::Message::assistant("answered", Vec::new(), 2));
+                assert!(app.persist_transcript());
+                assert_eq!(
+                    app.route(&post("/api/agent/message", r#"{"text":"never start this"}"#)).status,
+                    202
+                );
+                drain_store(&mut app);
+                assert!(store.get(NVS_KEY_PENDING_MESSAGE).is_some());
+                app.cfg.agent.persist_transcript = persistence;
+                let writes_before = store.writes();
+                assert_eq!(app.route(&post(path, body)).status, 200);
+                assert!(app.agent.pending.is_none());
+                assert!(app.store.get(NVS_KEY_PENDING_MESSAGE).is_none());
+                assert_eq!(
+                    store.writes(),
+                    writes_before,
+                    "forget requests removal without writing under the App lock"
+                );
+                drain_store(&mut app);
+                assert!(store.get(NVS_KEY_PENDING_MESSAGE).is_none());
+                drop(app);
+                assert!(
+                    app_with(&store).agent.pending.is_none(),
+                    "a forgotten pending question must not return"
+                );
+            }
+        }
     }
 
     #[test]
@@ -8407,6 +8993,7 @@ mod tests {
         // removal is queued like every other write, so the writer is what makes it stick.
         drain_store(&mut app);
         assert!(store.get(NVS_KEY_RUN_IN_FLIGHT).is_none(), "the marker outlived the boot that read it");
+        assert!(store.get(NVS_KEY_PENDING_MESSAGE).is_some(), "the resumed question is persisted too");
         let queued = app.agent.pending.clone().expect("the interrupted turn is queued again");
         assert_eq!(queued.source, RESUME_SOURCE);
         assert_eq!(queued.text, "turn the pump on for two seconds");
@@ -8420,6 +9007,15 @@ mod tests {
         // The results that landed are still there, and no answer was invented for them.
         assert_eq!(app.agent.history.iter().filter(|m| m.role == crate::agent::Role::Tool).count(), 1);
         assert!(app.agent.ends_on_a_tool_result());
+
+        // Consuming the marker must not make a second reboot lose this not-yet-started resume.
+        drop(app);
+        let mut app = app_with(&store);
+        point_at_the_stub(&mut app);
+        let restored = app.agent.pending.as_ref().expect("the resumed question survived another reboot");
+        assert_eq!(restored.text, queued.text);
+        assert_eq!(restored.source, queued.source);
+        assert_eq!(restored.at_ms, queued.at_ms);
 
         // The turn continues: one model call, which already carries the call and its result.
         let shared = Arc::new(Mutex::new(app));
@@ -8631,14 +9227,14 @@ mod tests {
         // cannot fire it twice while the writer has not caught up.
         let queued = app.store.get(NVS_KEY_SCHED).expect("the tick queued the schedule");
         assert!(queued.contains("\"t1\""), "{queued}");
-        assert_eq!(app.store_queue().pending(), 1, "one key, however many ticks queued it");
+        assert_eq!(app.store_queue().pending(), 2, "the schedule and its pending question, once per key");
 
         // The writer is what makes it durable, and it is the only thing that does.
         let report = app.flush_store("test-writer");
-        assert_eq!(report.written, 1);
+        assert_eq!(report.written, 2);
         assert_eq!(report.failed, 0);
-        assert_eq!(report.keys, vec![NVS_KEY_SCHED.to_string()]);
-        assert_eq!(store.writes(), writes_before + 1);
+        assert_eq!(report.keys, vec![NVS_KEY_PENDING_MESSAGE.to_string(), NVS_KEY_SCHED.to_string()]);
+        assert_eq!(store.writes(), writes_before + 2);
         assert!(store.get(NVS_KEY_SCHED).expect("stored").contains("\"t1\""));
         assert_eq!(app.store_queue().pending(), 0);
         // And the next tick is not due: only true because the write was applied.
@@ -11684,6 +12280,10 @@ mod tests {
         assert_eq!(app.agent.last_error, err);
         // Nothing is lost: the message can still run once a transport is attached.
         assert!(app.agent.pending.is_some());
+        assert!(
+            app.store.get(NVS_KEY_PENDING_MESSAGE).is_some(),
+            "an unstarted retry re-persists the question"
+        );
         // With nothing queued a run is a no-op, not an error.
         app.agent.reset();
         assert_eq!(app.agent_run_once(), Ok(String::new()));
@@ -11719,13 +12319,15 @@ mod tests {
     }
 
     fn workspace_snapshot(store: &SharedStore) -> std::collections::BTreeMap<String, String> {
-        store
-            .0
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|(key, _)| *key == "ws" || key.starts_with("ws."))
-            .map(|(key, value)| (key.clone(), value.clone()))
+        let memory = store.0.lock().unwrap();
+        memory
+            .keys()
+            .into_iter()
+            .filter(|key| key == "ws" || key.starts_with("ws."))
+            .map(|key| {
+                let value = memory.get(&key).expect("a listed key is present under the store lock");
+                (key, value)
+            })
             .collect()
     }
 
@@ -11778,14 +12380,8 @@ mod tests {
             if offset >= until {
                 return None;
             }
-            let values = self.inner.0.lock().unwrap();
-            let bytes = values.get(key)?.as_bytes();
-            if offset >= bytes.len() {
-                return Some(0);
-            }
-            let count = out.len().min(bytes.len() - offset).min(until - offset);
-            out[..count].copy_from_slice(&bytes[offset..offset + count]);
-            Some(count)
+            let count = out.len().min(until - offset);
+            self.inner.read_at(key, offset, &mut out[..count])
         }
     }
 
