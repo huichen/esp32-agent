@@ -1000,7 +1000,7 @@ def scripts(rec, sim, fake):
     for case, command in [("six-stages", "echo x | cat | cat | cat | cat | cat"),
                           ("command-substitution", "echo $(id)"), ("shell-traversal", "echo x > /../escape")]:
         refusal(rec, sim, case, "shell", {"command": command})
-    rec.note("Runaway wall-time/5-million-step and 30-second sleep budgets are unit-tested, not spent again live; sync, background, lint, stdout, bounded job history and dispatch are exercised here.")
+    rec.note("Runaway wall-time/5-million-step limits and the per-call tool budget (including a sleep longer than what is left) are unit-tested, not spent again live; sync, background, lint, stdout, bounded job history and dispatch are exercised here.")
 
 
 def sched(rec, sim, fake):
