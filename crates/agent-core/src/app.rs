@@ -1840,6 +1840,7 @@ impl App {
         // `tool(…)`, a family command, a shell stage) keeps the outer one. Ten tools inside
         // one script are one call as far as the portal is concerned.
         let outer = self.tool_deadline;
+        let nested = outer.is_some();
         if outer.is_none() {
             self.tool_deadline = self.configured_tool_deadline();
         }
@@ -1850,10 +1851,22 @@ impl App {
         // already been written off as timed out, and starting hardware work now would be
         // doing it for nobody.
         let result = match (self.remaining_tool_ms(), budget) {
-            (Some(0), Some(budget)) => Err(McpError::timeout(format!(
-                "`{name}` did not start: the {budget} ms tool budget for this call was already gone"
-            ))
-            .with_data(json!({ "tool": name, "timeout_ms": budget }))),
+            (Some(0), Some(budget)) => {
+                // Quote the budget the call was given, not the zero that is left of it: the
+                // number a reader needs is how much time the whole call had.
+                let seconds = u64::from(self.cfg.agent.tool_timeout_s).max(1);
+                let message = if nested {
+                    format!("`{name}` did not run: the tool call it belongs to has used its whole {seconds} s budget, so nothing is left for another step")
+                } else {
+                    format!("`{name}` did not run: its {seconds} s tool budget was already gone")
+                };
+                Err(McpError::timeout(message).with_data(json!({
+                    "tool": name,
+                    "timeout_ms": budget,
+                    "nested": nested,
+                    "suggestion": "do less in one call (a 180-frame animation is 700+ draws) or raise agent.tool_timeout_s, up to 300 s. Long media needs a background job, which the board does not have yet: see ROADMAP",
+                })))
+            }
             _ => self.call_tool_inner(name, args),
         };
         let elapsed = started.elapsed().as_millis() as u64;
@@ -10851,10 +10864,16 @@ mod tests {
     #[test]
     fn a_call_that_starts_after_its_deadline_is_refused_as_a_timeout() {
         let mut app = test_app();
+        app.cfg.agent.tool_timeout_s = 30;
         app.tool_deadline = Some(std::time::Instant::now() - Duration::from_millis(1));
         let err = app.call_tool("board_status", &json!({})).unwrap_err();
         assert_eq!(err.code, code::TIMEOUT, "{}", err.message);
-        assert!(err.message.contains("already gone"), "{}", err.message);
+        // The message names the time the call had, not the zero that is left of it, and it
+        // says where the fix is: a nested call is one step of somebody else's budget.
+        assert!(err.message.contains("used its whole 30 s budget"), "{}", err.message);
+        let data = err.data.clone().unwrap_or(Value::Null);
+        assert_eq!(data["nested"], json!(true), "{data}");
+        assert!(data["suggestion"].as_str().unwrap_or("").contains("tool_timeout_s"), "{data}");
         // A top-level call leaves no deadline behind, so the next one starts fresh.
         app.tool_deadline = None;
         assert!(app.call_tool("board_status", &json!({})).is_ok());
