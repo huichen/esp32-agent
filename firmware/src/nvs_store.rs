@@ -109,6 +109,9 @@ impl KvStore for NvsStore {
             used_entries: stats.used_entries,
             free_entries: stats.free_entries,
             total_entries: stats.total_entries,
+            // NVS thinks in entries; the byte budget is the filesystem's answer.
+            total_bytes: None,
+            used_bytes: None,
         })
     }
 }

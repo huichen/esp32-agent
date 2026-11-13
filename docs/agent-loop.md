@@ -25,13 +25,14 @@ works towards an objective on its own between turns.
   "skip verification" switch. Inbound traffic — the portal and `/mcp` — is a separate
   listener; port 80 stays open by default and 443 serves the same routes with the
   board's own certificate. See [security](security.md).
-- **Bounded everything.** History ring (≤ 256 messages / ≤ 512 KB), one user message ≤ 4 KB,
-  reasoning ≤ 4 KB, tool result ≤ 2 KB (cut with `…(truncated)`), model reply ≤ 8 KB,
+- **Bounded everything.** History ring (at most 256 messages / 512 KB), one user message
+  32 KB, reasoning 4 KB, tool result 64 KB (cut with `...(truncated)`), model reply 32 KB,
   `agent.max_steps` model calls per turn (`0` = no limit, capped at 200 when set),
-  `agent.tick_ms` clamped to 200–5000 (default 1000).
-- **No new ESP-IDF components.** The file workspace is an in-RAM map persisted in NVS over
-  several values, files ≤ 2 KB, whole workspace ≤ 8 KB of text. See §4 for the layout and
-  what a reboot can and cannot lose.
+  `agent.tick_ms` clamped to 200-5000 (default 1000).
+- **Storage is a filesystem.** The transcript and the file workspace are files on the 12 MB
+  `storage` partition (SPIFFS); NVS keeps the configuration and the secrets, and nothing
+  that grows. A workspace file may be 256 KB and the whole workspace 4 MB. See section 4
+  for the layout and what a reboot can and cannot lose.
 
 ## 2. The order of the tool list is part of the contract
 
@@ -67,11 +68,11 @@ hard-coding an endpoint has to be a deliberate act with a failing test to justif
 Two mechanisms, one storage: `agent.persist_transcript` (default on) and the
 `run_in_flight` marker.
 
-The transcript is written as JSON Lines behind a header under `transcript`,
-`transcript.1`, … Each chunk is 3500 bytes with an FNV-1a checksum in its header,
-because ESP-IDF refuses a string value above about 4000 bytes and the firmware's NVS
-adapter reads through a fixed 4096-byte buffer. A single 16 KB key would pass every host
-test and persist nothing on the board.
+The transcript is one JSON Lines file, `/storage/kv/transcript` on the `storage`
+partition, behind a header line carrying the format version, the number of dropped
+messages and a checksum over the body. It used to be five to eight NVS values of 3 500
+bytes, chunked because ESP-IDF refuses a string value above about 4 000 bytes; the
+filesystem has no such ceiling, so it is one value and the ceiling is `MAX_SAVED_BYTES`.
 
 A key name is a limit too: NVS keeps 15 bytes (`NVS_KEY_NAME_MAX_SIZE` is 16 with the
 terminator) and refuses a longer one with `ESP_ERR_NVS_KEY_TOO_LONG`, storing nothing.
@@ -89,9 +90,9 @@ reads the old names either: a key that never existed cannot hold a conversation,
 fallback for it would only hide the next such mistake. A simulator's state file is the one
 place an old name could exist — that is a developer's scratch state, not the board's.
 
-The stored copy is lossy on purpose: text over 300 bytes, reasoning over 200 and tool
-arguments over 256 are cut with the truncation marker, images are not stored at all, and
-only the newest messages that fit 16 KB are kept (`dropped: N` in the header, repeated in
+The stored copy is lossy on purpose: text over 4 KB, reasoning over 1 KB and tool
+arguments over 4 KB are cut with the truncation marker, images are not stored at all,
+and only the newest messages that fit 512 KB are kept (`dropped: N` in the header,
 the prompt as "Recovered after a reboot"). A blob with a bad checksum, an unknown version,
 an edited body or an orphan tool result at the tail is discarded whole and logged, so a
 torn write loses the transcript rather than half-adopting it.
@@ -119,35 +120,29 @@ The layout is the transcript's, with one difference that matters when something 
 
 | | |
 |---|---|
-| routing | `ws` holds the header, `ws.1` … `ws.5` the chunks |
-| header | `ws1 <chunks> <bytes> <crc>,<crc>,…` — count, total length, and one FNV-1a checksum per chunk |
-| per value | 3500 bytes of blob, under the ~4000-byte ceiling ESP-IDF enforces |
-| per file | 2048 bytes of text (`tools::fs::MAX_FILE_BYTES`, unchanged) |
-| whole workspace | 8192 bytes of text (`WORKSPACE_TOTAL_MAX`, unchanged), 17 500 bytes of stored JSON |
-| write order | chunks first, header last |
-| read | every chunk is checked against the header; one that is missing, torn or from another write drops the whole workspace, logged with the value that disagreed |
-| migration | a plain JSON value under `ws` is the old format: read, then written back chunked on the same boot |
+| where | `/storage/kv/ws` on the `storage` partition; NVS is not involved |
+| per file | 256 KB of text (`WORKSPACE_FILE_MAX`) |
+| whole workspace | 4 MB of text (`WORKSPACE_TOTAL_MAX`) |
+| write order | one value, written whole: a filesystem has no chunks to order |
+| read | the stored text is parsed; a torn file is dropped whole and logged |
+| the old layout | `ws` + `ws.1`..`ws.5` in NVS, still read: a plain value under `ws` is migrated on the same boot |
 
-The count in the header is what makes a stale tail harmless — a workspace that shrinks
-leaves older chunks behind, and they are never read. The per-chunk checksums are what make
-a torn write visible *and nameable*: `ws.2 does not match the checksum in ws` is something a
-person can act on, where "the workspace is empty" is not.
+Chunking still exists in `store::write_blob` and is still tested: it is what a backend
+without `whole_value_bytes` gets, and its header (a count, the total length and one
+checksum per chunk) is what makes a torn write *nameable*. The board's backend answers
+`Some(..)` because a file has no 4 KB ceiling, so the workspace and the transcript are one
+value each and the filesystem's own bookkeeping is the only copy.
 
-What it costs, stated rather than implied: a power cut inside a save loses the workspace
-instead of the previous version of it. The chunks are overwritten in place, so by the time
-the header could have been left alone the older copy is already gone. Keeping two live
-copies does not fit — the NVS partition is 24 KB and also holds the config, the manifest and
-the transcript — so the narrow guarantee is the one that ships. Everything else is as
-before: what was saved before the cut comes back, nothing is half-adopted, and the boot log
-names the value that failed.
-
-The other half of the fix is at the tool. `write`, `edit`, `rm`, `cp`, `mv`, the `>` and
-`>>` redirect, `tee`, `touch`, `base64 -o` and `wget` all go through one helper that stores
-the workspace and, when that fails, **rolls the change back** and answers with the reason:
+What that costs is stated rather than implied: `std::fs::write` replaces a file, so a power
+cut inside a save can lose the workspace instead of the previous version of it. SPIFFS
+writes through its own pages and its own garbage collector, which narrows the window but
+does not close it. What does not change is the guarantee the tools make: `write`, `edit`,
+`rm`, `cp`, `mv`, a `>>` redirect, `tee`, `touch`, `base64 -o` and `wget` all go through
+one save and, when it fails, **roll the change back** and answer with the numbers.
 
 ```text
-the file workspace was not saved: it is 18001 bytes, one stored value holds at most 3500 bytes
-and the store keeps 5 of them (17500 bytes in total), so it needs 6 values; nothing was written.
+the file workspace was not saved: it is 4194305 bytes and the store keeps at most
+4194304 bytes, so it needs 2 values; nothing was written
 The change was dropped, so `read` shows the file as it was before this call
 ```
 
