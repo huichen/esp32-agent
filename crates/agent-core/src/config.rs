@@ -124,6 +124,13 @@ pub struct WifiCfg {
     pub dns2: String,
     /// Start a setup access point when the station fails to connect.
     pub ap_fallback: bool,
+    /// Keep that access point up beside the station *after* the board has joined.
+    ///
+    /// Off by default: the AP exists to get the board onto a network, and a second radio
+    /// network that nobody needs is one more thing advertising itself in the room. Once the
+    /// station has an address the portal reports it and the AP is closed; the station stays.
+    #[serde(default)]
+    pub keep_ap: bool,
     pub ap_ssid: String,
     pub ap_password: String,
     /// Seconds without a connection before the setup AP comes up.
@@ -336,6 +343,7 @@ impl Default for WifiCfg {
             dns: String::new(),
             dns2: String::new(),
             ap_fallback: true,
+            keep_ap: false,
             ap_ssid: "esp32-agent-setup".into(),
             ap_password: String::new(),
             ap_after_s: 30,
@@ -490,6 +498,10 @@ impl Config {
             if let Some(b) = w.get("ap_fallback").and_then(|v| v.as_bool()) {
                 self.wifi.ap_fallback = b;
                 touched.push("wifi.ap_fallback".into());
+            }
+            if let Some(b) = w.get("keep_ap").and_then(|v| v.as_bool()) {
+                self.wifi.keep_ap = b;
+                touched.push("wifi.keep_ap".into());
             }
             for key in ["ip", "netmask", "gateway", "dns", "dns2", "ap_ssid"] {
                 if let Some(s) = w.get(key).and_then(|v| v.as_str()) {
@@ -767,6 +779,14 @@ mod tests {
         assert_eq!(c.mcp.port, DEFAULT_PORT);
         assert_eq!(c.mcp.path, DEFAULT_PATH);
         assert_eq!(c.board, "auto");
+        // A board joins a network and stops advertising its own: `keep_ap` has to be asked
+        // for, and the setup AP is only an on-ramp.
+        assert!(!c.wifi.keep_ap, "the setup AP must not stay up by default");
+        let mut patched = Config::default();
+        patched.apply_patch(&json!({ "wifi": { "keep_ap": true } })).unwrap();
+        assert!(patched.wifi.keep_ap);
+        let back = Config::from_json_str(&patched.to_json_string()).expect("round trip");
+        assert!(back.wifi.keep_ap, "the switch survives a reboot");
     }
 
     fn synthetic_secret(n: u8) -> String {
