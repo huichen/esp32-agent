@@ -80,6 +80,19 @@ mod tests {
             | 0xFF00..=0xFFEF)
     }
 
+    /// The page decides how large an attachment may be before it is sent, and the board
+    /// enforces the same number in Rust. Two copies of a limit is how the page came to send
+    /// 26 328 bytes into a 24 576-byte refusal.
+    #[test]
+    fn the_portal_attachment_limit_is_the_boards_limit() {
+        let kilobytes = crate::app::MAX_ATTACHMENT_BYTES / 1024;
+        let needle = format!("const ATTACH_BYTES_MAX = {kilobytes} * 1024;");
+        assert!(
+            APP_JS.contains(&needle),
+            "app.js must carry `{needle}`, or the page and MAX_ATTACHMENT_BYTES disagree"
+        );
+    }
+
     /// Clearing is available in the conversation itself, in English, with an accessible
     /// status for cancellation and refusal feedback. It is not a settings reset.
     #[test]

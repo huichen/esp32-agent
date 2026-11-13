@@ -40,6 +40,11 @@ pub const WORKSPACE: &str = "ws";
 pub const TRANSCRIPT: &str = "transcript";
 /// Written before a run starts, removed when it ends.
 pub const RUN_IN_FLIGHT: &str = "run_in_flight";
+/// One queued user turn, kept until it enters the transcript.
+///
+/// Under `transcript.` so the firmware's `SplitStore` routes it to the filesystem:
+/// a 32 KiB question (plus JSON escaping) cannot fit one NVS string value.
+pub const PENDING_MESSAGE: &str = "transcript.q";
 
 /// The one place a chunked key is assembled from a base and a chunk number.
 ///
@@ -97,7 +102,7 @@ pub fn transcript(index: usize) -> String {
     }
 }
 
-/// Every key name the assembly in this module can produce: the seven base names plus both
+/// Every key name the assembly in this module can produce: the base names plus both
 /// chunked shapes for indices 0 through 99.
 ///
 /// The index range is deliberately wider than today's plans (`TRANSCRIPT_CHUNKS_MAX` is 8,
@@ -106,11 +111,20 @@ pub fn transcript(index: usize) -> String {
 /// Nothing at runtime calls this; the assertion in `mod tests` and the plan-coverage test
 /// in `app.rs` do.
 pub fn all() -> Vec<String> {
-    let mut keys: Vec<String> =
-        [CONFIG, MANIFEST, AGENT, SCHED, WORKSPACE, WORKSPACE_INDEX, TRANSCRIPT, RUN_IN_FLIGHT]
-            .iter()
-            .map(|key| key.to_string())
-            .collect();
+    let mut keys: Vec<String> = [
+        CONFIG,
+        MANIFEST,
+        AGENT,
+        SCHED,
+        WORKSPACE,
+        WORKSPACE_INDEX,
+        TRANSCRIPT,
+        RUN_IN_FLIGHT,
+        PENDING_MESSAGE,
+    ]
+    .iter()
+    .map(|key| key.to_string())
+    .collect();
     for index in 0..=99usize {
         keys.push(workspace_chunk(index));
         keys.push(transcript(index));
@@ -144,6 +158,20 @@ mod tests {
                 key == "ws" || key.starts_with("ws."),
                 "`{key}` does not start with `ws.`, so the firmware would send it to NVS"
             );
+            assert!(key.len() <= KEY_MAX, "`{key}` is {} bytes", key.len());
+        }
+    }
+
+    /// Conversation text can exceed one NVS value, including a not-yet-started question.
+    /// Keep every such key under the firmware's existing filesystem routing prefix.
+    #[test]
+    fn every_conversation_key_is_routed_to_the_filesystem() {
+        for key in [transcript(0), transcript(99), PENDING_MESSAGE.to_string()] {
+            assert!(
+                key == "transcript" || key.starts_with("transcript."),
+                "`{key}` would send conversation text to NVS instead of the filesystem"
+            );
+            assert!(all().contains(&key), "`{key}` is missing from keys::all()");
             assert!(key.len() <= KEY_MAX, "`{key}` is {} bytes", key.len());
         }
     }
