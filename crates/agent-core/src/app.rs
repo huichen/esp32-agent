@@ -88,10 +88,14 @@ pub const WORKSPACE_TOTAL_MAX: usize = 4 * 1024 * 1024;
 pub const WORKSPACE_PLAN: store::Plan =
     store::Plan { tag: "ws1", chunk_bytes: store::CHUNK_BYTES, chunks_max: 5 };
 
-/// The longest `sleep` / `usleep` waits this board will actually wait.
+/// The longest `sleep` / `usleep` waits when no tool budget is configured.
 ///
-/// Tool calls hold the shared App lock, so a sleeping command delays other callers
-/// needing that lock. The cap is an execution policy, independent of heap capacity.
+/// The real bound is `agent.tool_timeout_s` (30 s by default): a wait asks how much of the
+/// call is left instead of using this number, so one setting governs every command that
+/// waits. This cap comes back only when that deadline is switched off with `0`, because
+/// nothing else would bound a bare `sleep 1e9`. Tool calls hold the shared App lock, so a
+/// sleeping command delays other callers needing that lock; the bound is an execution
+/// policy, independent of heap capacity.
 pub const MAX_SHELL_SLEEP_MS: u64 = 10_000;
 
 /// How much of a pipeline's last stage reaches the answer.
@@ -350,6 +354,15 @@ pub struct App {
     /// Values potentially left by a refused publication/cleanup, retained for a later
     /// successful index publication. Bounded with the queue's key budget before admission.
     workspace_stale_keys: std::collections::BTreeSet<String>,
+    /// When the tool call now running must stop, from `agent.tool_timeout_s`.
+    ///
+    /// Nested calls inherit the outer deadline instead of starting a new one: a script that
+    /// calls ten tools is one call as far as the portal is concerned, and ten fresh budgets
+    /// would be ten ways to hold the board.
+    tool_deadline: Option<std::time::Instant>,
+    /// Whether a model turn is in flight, so clearing the transcript can refuse instead of
+    /// deleting the question whose answer is about to arrive.
+    run_active: bool,
 }
 
 /// Whether the thread that runs the agent loop is up.
@@ -499,6 +512,8 @@ impl App {
             workspace_pending: None,
             workspace_admissions: 0,
             workspace_stale_keys: Default::default(),
+            tool_deadline: None,
+            run_active: false,
         };
         app.log.info(
             "boot",
@@ -1617,9 +1632,12 @@ impl App {
         // global scope as `args` (a map) and `argv` (its values, in order), which is what
         // makes one script usable for several pins.
         let args = script_arguments(args.get("args"));
+        // The script runs inside this tool call, so it gets what is left of that call's
+        // budget rather than a fresh one of its own.
+        let budget = self.remaining_tool_ms();
         let mut host = Host { app: self };
         let started = now_ms();
-        match crate::script::run_with(&source, &mut host, &args) {
+        match crate::script::run_with_budget(&source, &mut host, &args, budget) {
             Ok(outcome) => {
                 self.log.info(
                     "script",
@@ -1635,6 +1653,7 @@ impl App {
                     "result": outcome.result,
                     "output": outcome.output,
                     "steps": outcome.steps,
+                    "budget_ms": budget,
                 }))
             }
             Err(e) => Err(McpError::invalid_params(format!("script failed: {e}"))),
@@ -1813,8 +1832,31 @@ impl App {
     }
 
     pub fn call_tool(&mut self, name: &str, args: &Value) -> Result<Value> {
+        // A top-level call installs the configured deadline; a nested one (a script's
+        // `tool(…)`, a family command, a shell stage) keeps the outer one. Ten tools inside
+        // one script are one call as far as the portal is concerned.
+        let outer = self.tool_deadline;
+        if outer.is_none() {
+            self.tool_deadline = self.configured_tool_deadline();
+        }
+        let budget = self.remaining_tool_ms();
+        let started = std::time::Instant::now();
         let before = self.workspace_admissions;
-        let result = self.call_tool_inner(name, args);
+        // A call that starts after the budget is gone never reaches a driver: its caller has
+        // already been written off as timed out, and starting hardware work now would be
+        // doing it for nobody.
+        let result = match (self.remaining_tool_ms(), budget) {
+            (Some(0), Some(budget)) => Err(McpError::timeout(format!(
+                "`{name}` did not start: the {budget} ms tool budget for this call was already gone"
+            ))
+            .with_data(json!({ "tool": name, "timeout_ms": budget }))),
+            _ => self.call_tool_inner(name, args),
+        };
+        let elapsed = started.elapsed().as_millis() as u64;
+        let result = self.note_tool_overrun(name, result, budget, elapsed);
+        // The outer deadline comes back whatever the result was, or a refused call would
+        // leave the next one with a budget that has already been spent.
+        self.tool_deadline = outer;
         if self.workspace_admissions == before {
             return result;
         }
@@ -1831,6 +1873,76 @@ impl App {
                 Err(error)
             }
         }
+    }
+
+    /// The deadline a top-level tool call installs, from `agent.tool_timeout_s`.
+    fn configured_tool_deadline(&self) -> Option<std::time::Instant> {
+        let seconds = self.cfg.agent.tool_timeout_s;
+        (seconds > 0).then(|| std::time::Instant::now() + std::time::Duration::from_secs(u64::from(seconds)))
+    }
+
+    /// Milliseconds left of the tool call now running; `None` when the deadline is off.
+    ///
+    /// This is the number every waiting command asks for: `shell sleep`, `script sleep`
+    /// and the HTTP client use what is left instead of a fixed cap of their own, which is
+    /// what makes one configured timeout enough.
+    pub fn remaining_tool_ms(&self) -> Option<u64> {
+        let deadline = self.tool_deadline?;
+        let now = std::time::Instant::now();
+        Some(if deadline <= now { 0 } else { (deadline - now).as_millis().min(u128::from(u64::MAX)) as u64 })
+    }
+
+    /// A refusal for a route that would delete the question a running turn is answering.
+    ///
+    /// The turn happens with the app lock released while the model thinks, so a clear that
+    /// arrives in that window is not blocked by anything: without this check it would empty
+    /// the transcript, and the reply would then be appended to a thread that no longer holds
+    /// its question. Waiting is the honest answer, and 409 says "try again".
+    fn refuse_while_running(&self, action: &str) -> Option<Response> {
+        self.run_active.then(|| {
+            Response::error_json(
+                409,
+                &format!(
+                    "a model turn is running, so you cannot {action}: its question would be gone 
+                     and its answer would arrive in a thread that no longer has it. Wait for the 
+                     turn to finish (GET /api/agent/history stops growing) and try again"
+                ),
+            )
+        })
+    }
+
+    /// Say so when a call finished after its budget, without pretending it did nothing.
+    ///
+    /// The work already happened (a write landed, a tone played), so this is not an error a
+    /// caller can retry blindly: it is a result that carries the overrun, and the log gets a
+    /// line a person can find.
+    fn note_tool_overrun(
+        &mut self,
+        name: &str,
+        result: Result<Value>,
+        budget: Option<u64>,
+        elapsed_ms: u64,
+    ) -> Result<Value> {
+        let (Ok(value), Some(budget)) = (&result, budget) else { return result };
+        if elapsed_ms <= budget {
+            return result;
+        }
+        self.log.warn("tool", format!("{name} finished after {elapsed_ms} ms, past its {budget} ms budget"));
+        let note = json!({
+            "timeout_ms": budget,
+            "elapsed_ms": elapsed_ms,
+            "note": "the call ran past `agent.tool_timeout_s`; its effects happened, and a retry is a second effect",
+        });
+        let mut value = value.clone();
+        match value.as_object_mut() {
+            Some(object) => {
+                object.insert("deadline_exceeded".into(), note);
+            }
+            None => {
+                value = json!({ "result": value, "deadline_exceeded": note });
+            }
+        }
+        Ok(value)
     }
 
     fn call_tool_inner(&mut self, name: &str, args: &Value) -> Result<Value> {
@@ -2528,6 +2640,8 @@ impl App {
         // did not finish, and a marker written afterwards would only describe turns that
         // already survived.
         self.mark_run_in_flight(&source);
+        self.run_active = true;
+        self.run_active = true;
         let step = self.with_agent(move |agent, host| {
             agent.set_budget(context_tokens, max_output_tokens);
             agent.begin(host, now_ms, max_steps)
@@ -2544,6 +2658,7 @@ impl App {
         let step = self.with_agent(move |agent, host| agent.apply(host, reply, now_ms));
         if matches!(&step, AgentStep::Done(_)) {
             self.active_attachments = None;
+            self.run_active = false;
             // The turn is over, so a reboot from here must not ask it again. Clearing the
             // marker before the final save means the worst case is a lost reply, never a
             // reply the board repeats.
@@ -3540,6 +3655,7 @@ impl App {
         self.model_transport = transport;
         self.agent = agent;
         self.active_attachments = None;
+        self.run_active = false;
         // Only a turn that actually ran ends here: a missing transport leaves the
         // message queued for a later attempt and keeps the run-in-flight marker, so the
         // next boot resumes it instead of forgetting it.
@@ -4002,6 +4118,9 @@ impl App {
                 if let Err(r) = self.require_pin(req) {
                     return r;
                 }
+                if let Some(r) = self.refuse_while_running("clear the conversation") {
+                    return r;
+                }
                 let (removed, kept) = self.agent.forget(0);
                 self.attachments.clear();
                 self.active_attachments = None;
@@ -4013,6 +4132,9 @@ impl App {
             // agents use this to start a new task without losing what is in flight.
             ("POST", "/api/agent/forget") => {
                 if let Err(r) = self.require_pin(req) {
+                    return r;
+                }
+                if let Some(r) = self.refuse_while_running("forget part of the conversation") {
                     return r;
                 }
                 let body: Value = serde_json::from_str(&req.body_str()).unwrap_or(Value::Null);
@@ -4794,6 +4916,13 @@ impl App {
                 return self.serve_self(&method, &path, body);
             }
             let mut transport = self.tool_transport.take();
+            // The HTTP client waits as long as the call has left, not as long as its own
+            // default: one budget, and the client is one of the things that spends it.
+            if let Some(left) = self.remaining_tool_ms() {
+                if let Some(t) = transport.as_mut() {
+                    t.set_timeout(std::time::Duration::from_millis(left.max(1)));
+                }
+            }
             let result = match transport.as_mut() {
                 Some(t) => net_tools::call(t.as_mut(), name, arguments),
                 None => {
@@ -4868,6 +4997,26 @@ impl App {
                 _ => crate::tools::shell::help_text(),
             };
             return Ok(json!({ "help": text }).to_string());
+        }
+        // `time <command>`: the same command, plus how long it took. The prefix is taken
+        // off by the parser, so what runs below is exactly what was typed after it.
+        if pipeline.timed {
+            let mut inner = pipeline.clone();
+            inner.timed = false;
+            let started = std::time::Instant::now();
+            let text = match inner.single() {
+                Some(parsed) => self.run_single(parsed, args)?,
+                None => self.run_pipeline(&inner)?,
+            };
+            let ms = started.elapsed().as_millis() as u64;
+            let answer = serde_json::from_str::<Value>(&text).unwrap_or_else(|_| json!({ "text": text }));
+            return Ok(json!({
+                "command": line.trim(),
+                "ms": ms,
+                "real_s": ms as f64 / 1000.0,
+                "result": answer,
+            })
+            .to_string());
         }
         match pipeline.single() {
             Some(parsed) => self.run_single(parsed, args),
@@ -5945,18 +6094,42 @@ impl App {
         Ok(out.to_string())
     }
 
-    /// `sleep <s>` / `usleep <ms>`: a real wait, capped, because it blocks the one loop.
+    /// `sleep <s>` / `usleep <ms>`: a real wait, bounded by what the call has left.
+    ///
+    /// There is no separate sleep cap any more. `agent.tool_timeout_s` is the one budget a
+    /// call has, so a wait asks how much of it is left instead of using a constant that
+    /// disagrees with it. With the deadline switched off (`tool_timeout_s: 0`) the old
+    /// ten-second cap comes back, because nothing else would bound a bare `sleep 1e9`.
     fn shell_sleep(&mut self, args: &Value) -> std::result::Result<String, String> {
         let ms_unit = args.get("unit").and_then(|v| v.as_str()) == Some("ms");
         let op = if ms_unit { "usleep" } else { "sleep" };
         let raw = args.get("value").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
-        let (wanted, ms) = plan_sleep(ms_unit, &raw).map_err(|e| format!("{op}: {e}"))?;
-        std::thread::sleep(Duration::from_millis(ms));
+        let budget = self.remaining_tool_ms();
+        let cap = budget.unwrap_or(MAX_SHELL_SLEEP_MS);
+        let (wanted, _) = plan_sleep(ms_unit, &raw, cap).map_err(|e| format!("{op}: {e}"))?;
+        let source = if budget.is_some() {
+            "agent.tool_timeout_s"
+        } else {
+            "10 s fallback (agent.tool_timeout_s is 0)"
+        };
+        // Refused, not shortened: a caller that asked for 20 s and waited 3 would draw the
+        // wrong conclusion about whatever it was timing.
+        if wanted > cap {
+            return Err(format!(
+                "{op}: {wanted} ms is more than the {cap} ms left of this tool call ({source}); \
+                 ask for less, split the work, or raise the budget"
+            ));
+        }
+        if wanted > 0 {
+            std::thread::sleep(Duration::from_millis(wanted));
+        }
         Ok(json!({
-            "slept_ms": ms,
+            "slept_ms": wanted,
             "requested_ms": wanted,
-            "clamped": ms < wanted,
-            "note": "one loop serves the endpoint, the portal and the agent: the wait is capped at 10 s so it cannot look like a hang",
+            "budget_ms": cap,
+            "budget": source,
+            "clamped": false,
+            "note": "one loop serves the endpoint, the portal and the agent: a wait is bounded by `agent.tool_timeout_s`",
         })
         .to_string())
     }
@@ -6239,11 +6412,11 @@ fn with_usage(name: &str, error: String) -> String {
     }
 }
 
-/// `sleep`/`usleep`: how long was asked for, and how long this board will wait.
+/// `sleep`/`usleep`: how long was asked for, and how much of `cap_ms` that may use.
 ///
-/// Split out of the handler so the cap can be tested without a test that takes ten
+/// Split out of the handler so the arithmetic can be tested without a test that takes ten
 /// seconds: the waiting is the one thing a test should not do to prove arithmetic.
-fn plan_sleep(ms_unit: bool, raw: &str) -> std::result::Result<(u64, u64), String> {
+fn plan_sleep(ms_unit: bool, raw: &str, cap_ms: u64) -> std::result::Result<(u64, u64), String> {
     let value: f64 = raw.parse().map_err(|_| format!("`{raw}` is not a number"))?;
     if !value.is_finite() {
         return Err(format!("`{raw}` is not a number"));
@@ -6252,7 +6425,7 @@ fn plan_sleep(ms_unit: bool, raw: &str) -> std::result::Result<(u64, u64), Strin
         return Err("a negative wait is not a wait".to_string());
     }
     let wanted = (if ms_unit { value } else { value * 1000.0 }).round() as u64;
-    Ok((wanted, wanted.min(MAX_SHELL_SLEEP_MS)))
+    Ok((wanted, wanted.min(cap_ms)))
 }
 
 /// A number argument, whether the command line handed it over as text or as a number.
@@ -10021,11 +10194,100 @@ mod tests {
         assert_eq!(out["slept_ms"], json!(0));
         assert_eq!(out["clamped"], json!(false));
         // The cap is arithmetic, so it is tested without waiting ten seconds for it.
-        assert_eq!(plan_sleep(false, "100").unwrap(), (100_000, MAX_SHELL_SLEEP_MS));
-        assert!(plan_sleep(false, "5").is_ok());
-        assert!(plan_sleep(true, "-1").is_err());
+        assert_eq!(plan_sleep(false, "100", MAX_SHELL_SLEEP_MS).unwrap(), (100_000, MAX_SHELL_SLEEP_MS));
+        assert_eq!(plan_sleep(false, "5", MAX_SHELL_SLEEP_MS).unwrap(), (5_000, 5_000));
+        assert!(plan_sleep(false, "5", 3_000).is_ok());
+        assert!(plan_sleep(true, "-1", 3_000).is_err());
         let err = ToolHost::call_tool(&mut app, "shell", &json!({"command": "sleep soon"})).unwrap_err();
         assert!(err.contains("usage: sleep <seconds>"), "{err}");
+    }
+
+    #[test]
+    fn time_reports_how_long_a_command_took() {
+        let mut app = test_app();
+        let out = sh(&mut app, "time echo hi");
+        assert_eq!(out["command"], json!("time echo hi"));
+        assert_eq!(out["result"]["text"], json!("hi"), "the command still answers: {out}");
+        assert!(out["ms"].as_u64().is_some(), "{out}");
+        // It measures the whole line, so a pipeline gets one figure rather than one per stage.
+        let piped = sh(&mut app, "time echo a | wc -l");
+        assert_eq!(piped["result"]["pipeline"], json!(["echo", "wc"]), "{piped}");
+        assert_eq!(piped["result"]["stdout"], json!("1"), "{piped}");
+        // A prefix with nothing after it is a wrong line, not a silent no-op.
+        let err = ToolHost::call_tool(&mut app, "shell", &json!({ "command": "time" })).unwrap_err();
+        assert!(err.contains("needs a command"), "{err}");
+        // And `time` is not a command of its own.
+        assert!(crate::tools::shell::route("time").is_none());
+    }
+
+    #[test]
+    fn sleep_waits_against_the_tool_budget_not_a_cap_of_its_own() {
+        let mut app = test_app();
+        // One second for this call: a two-second wait is refused with the number it had.
+        app.cfg.agent.tool_timeout_s = 1;
+        let err = ToolHost::call_tool(&mut app, "shell", &json!({ "command": "sleep 2" })).unwrap_err();
+        assert!(err.contains("more than the"), "{err}");
+        assert!(err.contains("agent.tool_timeout_s"), "{err}");
+        // Switching the deadline off brings back the old ten-second bound, and says which
+        // one was in force instead of leaving the caller to guess.
+        app.cfg.agent.tool_timeout_s = 0;
+        let out = sh(&mut app, "usleep 1");
+        assert_eq!(out["slept_ms"], json!(1), "{out}");
+        assert_eq!(out["budget_ms"], json!(MAX_SHELL_SLEEP_MS));
+        assert!(out["budget"].as_str().unwrap_or("").contains("fallback"));
+    }
+
+    #[test]
+    fn a_script_draws_on_the_budget_of_the_call_that_started_it() {
+        let mut app = test_app();
+        app.cfg.agent.tool_timeout_s = 2;
+        let err = ToolHost::call_tool(&mut app, "script", &json!({ "source": "sleep(3000)" })).unwrap_err();
+        assert!(err.contains("sleep(3000)"), "{err}");
+        assert!(err.contains("budget"), "{err}");
+        let out: Value = serde_json::from_str(
+            &ToolHost::call_tool(&mut app, "script", &json!({ "source": "sleep(1)\n\"ok\"" })).unwrap(),
+        )
+        .expect("script answers JSON");
+        assert_eq!(out["result"], json!("ok"), "{out}");
+        assert!(out["budget_ms"].as_u64().unwrap() <= 2_000, "{out}");
+    }
+
+    #[test]
+    fn a_call_that_starts_after_its_deadline_is_refused_as_a_timeout() {
+        let mut app = test_app();
+        app.tool_deadline = Some(std::time::Instant::now() - Duration::from_millis(1));
+        let err = app.call_tool("board_status", &json!({})).unwrap_err();
+        assert_eq!(err.code, code::TIMEOUT, "{}", err.message);
+        assert!(err.message.contains("already gone"), "{}", err.message);
+        // A top-level call leaves no deadline behind, so the next one starts fresh.
+        app.tool_deadline = None;
+        assert!(app.call_tool("board_status", &json!({})).is_ok());
+        assert!(app.tool_deadline.is_none(), "the deadline outlived its call");
+    }
+
+    #[test]
+    fn a_call_that_overruns_its_budget_reports_it_without_hiding_what_it_did() {
+        let mut app = test_app();
+        let value = app.note_tool_overrun("slow", Ok(json!({ "ok": true })), Some(10), 40).unwrap();
+        assert_eq!(value["ok"], json!(true), "an effect that happened is still reported");
+        assert_eq!(value["deadline_exceeded"]["timeout_ms"], json!(10));
+        assert_eq!(value["deadline_exceeded"]["elapsed_ms"], json!(40));
+        let on_budget = app.note_tool_overrun("quick", Ok(json!({ "ok": true })), Some(40), 40).unwrap();
+        assert!(on_budget.get("deadline_exceeded").is_none(), "{on_budget}");
+    }
+
+    #[test]
+    fn clearing_refuses_while_a_model_turn_is_in_flight() {
+        let mut app = test_app();
+        assert_eq!(app.route(&post("/api/agent/reset", "{}")).status, 200, "nothing is running yet");
+        app.run_active = true;
+        let busy = app.route(&post("/api/agent/reset", "{}"));
+        assert_eq!(busy.status, 409, "a clear would drop the question being answered");
+        let body = body_json(&busy);
+        assert!(body["error"].as_str().unwrap_or("").contains("model turn is running"), "{body}");
+        assert_eq!(app.route(&post("/api/agent/forget", r#"{"keep":1}"#)).status, 409);
+        app.run_active = false;
+        assert_eq!(app.route(&post("/api/agent/reset", "{}")).status, 200);
     }
 
     #[test]
@@ -10034,7 +10296,7 @@ mod tests {
         let out = sh(&mut app, "usleep 1");
         assert_eq!(out["slept_ms"], json!(1), "{out}");
         assert_eq!(out["requested_ms"], json!(1));
-        assert_eq!(plan_sleep(true, "999999").unwrap(), (999_999, MAX_SHELL_SLEEP_MS));
+        assert_eq!(plan_sleep(true, "999999", MAX_SHELL_SLEEP_MS).unwrap(), (999_999, MAX_SHELL_SLEEP_MS));
     }
 
     #[test]

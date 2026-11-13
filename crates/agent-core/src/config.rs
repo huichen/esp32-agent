@@ -48,6 +48,23 @@ pub fn clamp_tick_ms(ms: u32) -> u32 {
     }
 }
 
+/// Default budget for one tool call, in seconds.
+///
+/// A tool runs on the thread that answers the portal, so an unbounded call is an outage
+/// with a plausible excuse. Thirty seconds is longer than the slowest honest call this
+/// board makes (`net_get` to a distant host, a 12 s score) and short enough that a hung
+/// bus or a peer that never closes does not look like a dead board.
+pub const DEFAULT_TOOL_TIMEOUT_S: u32 = 30;
+/// Longest budget a configuration may ask for.
+pub const MAX_TOOL_TIMEOUT_S: u32 = 300;
+
+/// Clamp a configured tool budget. `0` is a deliberate "no deadline" and is kept: a
+/// person debugging a slow peripheral needs the old behaviour, and the platform still
+/// has its own watchdog. Any other value is at most five minutes.
+pub fn clamp_tool_timeout_s(seconds: u32) -> u32 {
+    seconds.min(MAX_TOOL_TIMEOUT_S)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct Config {
@@ -215,6 +232,19 @@ pub struct AgentCfg {
     /// The platform reads it on every tick instead of once at boot, so a portal edit
     /// takes effect on the next tick.
     pub tick_ms: u32,
+    /// Seconds one tool call may spend, as a cooperative deadline.
+    ///
+    /// The board runs tools on the thread that also answers the portal, so this is the
+    /// promise that a stuck bus or a peer that never closes cannot turn a tool call into
+    /// an outage. Tools that wait (`shell sleep`, `script sleep`, the HTTP client) ask
+    /// how much is left instead of using a fixed cap of their own, and a nested call
+    /// (a tool inside a script) inherits the outer budget rather than starting a new one.
+    /// A call that starts after the budget is gone is refused with the JSON-RPC timeout
+    /// code, and one that overruns anyway says so in its result: this cannot cancel work
+    /// already inside a driver.
+    ///
+    /// `0` disables the deadline and restores the old fixed caps.
+    pub tool_timeout_s: u32,
     /// Extra instructions appended to the system prompt, verbatim.
     ///
     /// The static prompt says how to behave on this board; this field is where the owner
@@ -262,7 +292,12 @@ pub const MAX_SYSTEM_PROMPT: usize = 2048;
 
 impl Default for AgentCfg {
     fn default() -> Self {
-        Self { tick_ms: DEFAULT_TICK_MS, system_prompt: String::new(), persist_transcript: true }
+        Self {
+            tick_ms: DEFAULT_TICK_MS,
+            tool_timeout_s: DEFAULT_TOOL_TIMEOUT_S,
+            system_prompt: String::new(),
+            persist_transcript: true,
+        }
     }
 }
 
@@ -634,6 +669,10 @@ impl Config {
                 self.agent.tick_ms = clamp_tick_ms(n.min(u32::MAX as u64) as u32);
                 touched.push("agent.tick_ms".into());
             }
+            if let Some(n) = a.get("tool_timeout_s").and_then(|v| v.as_u64()) {
+                self.agent.tool_timeout_s = clamp_tool_timeout_s(n.min(u32::MAX as u64) as u32);
+                touched.push("agent.tool_timeout_s".into());
+            }
             if let Some(b) = a.get("persist_transcript").and_then(|v| v.as_bool()) {
                 self.agent.persist_transcript = b;
                 touched.push("agent.persist_transcript".into());
@@ -682,6 +721,7 @@ impl Config {
         }
         self.log.ring = self.log.ring.clamp(16, 1024);
         self.agent.tick_ms = clamp_tick_ms(self.agent.tick_ms);
+        self.agent.tool_timeout_s = clamp_tool_timeout_s(self.agent.tool_timeout_s);
         if self.ui.lang != "en" {
             self.ui.lang = "zh".into();
         }
@@ -831,6 +871,22 @@ mod tests {
         assert_eq!(old.mcp.port, 9000);
         // `0` means "not set", not "as fast as possible".
         assert_eq!(clamp_tick_ms(0), DEFAULT_TICK_MS);
+    }
+
+    #[test]
+    fn a_tool_budget_is_clamped_and_zero_means_no_deadline() {
+        let mut c = Config::default();
+        assert_eq!(c.agent.tool_timeout_s, DEFAULT_TOOL_TIMEOUT_S);
+        c.apply_patch(&json!({ "agent": { "tool_timeout_s": 5 } })).unwrap();
+        assert_eq!(c.agent.tool_timeout_s, 5);
+        c.apply_patch(&json!({ "agent": { "tool_timeout_s": 9999 } })).unwrap();
+        assert_eq!(c.agent.tool_timeout_s, MAX_TOOL_TIMEOUT_S, "five minutes is the ceiling");
+        assert_eq!(clamp_tool_timeout_s(0), 0, "0 is a deliberate 'no deadline', not the floor");
+        let stored = Config::from_json_str(r#"{"agent":{"tool_timeout_s":9000}}"#).unwrap();
+        assert_eq!(stored.agent.tool_timeout_s, MAX_TOOL_TIMEOUT_S);
+        // The number reaches the portal read-back, so a person can see what is in force.
+        let public = c.public_json();
+        assert_eq!(public["agent"]["tool_timeout_s"], json!(MAX_TOOL_TIMEOUT_S));
     }
 
     #[test]

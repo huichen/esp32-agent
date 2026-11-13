@@ -35,13 +35,17 @@ fn now_ms() -> u64 {
     crate::app::now_ms()
 }
 
-/// Wall-clock budget for one script.
+/// Wall-clock budget for one script when the caller has none.
 ///
 /// A step count alone is the wrong bound: 50 000 steps is a few hundred milliseconds of
 /// real work, so the old limit stopped honest loops while saying nothing about a script
 /// that spends its steps waiting. Time is what the board can afford — the interpreter runs
 /// on the thread that also answers the portal, so thirty seconds of spinning is thirty seconds
 /// the board is unreachable.
+///
+/// A tool call has its own budget ([`crate::config::DEFAULT_TOOL_TIMEOUT_S`]); when a
+/// script runs inside one, the smaller of the two is the deadline, so a script can never
+/// outlive the tool call that started it.
 pub const MAX_MS: u64 = 30_000;
 /// A backstop for cheap steps: even inside the time budget, this many means something is
 /// spinning. Large enough that no honest program notices it.
@@ -111,6 +115,9 @@ NOTE       the interpreter runs on the thread that called it: the portal's liste
            not finish holds that thread, so the clock — not the step count — is the limit
            that matters
 LIMITS     30 s or 5 000 000 steps, 32 nested blocks, 4 KB strings, 64 log lines
+           sleep(ms) waits against whatever is left of the call's time budget, so a
+           script with `agent.tool_timeout_s` 60 can sleep half a minute and one
+           whose budget is nearly gone is told exactly how much it has left
 "#;
 
 const BUILTINS: &str = r#"# board script — builtins
@@ -123,12 +130,15 @@ Only these, plus `tool`:
   type(x)       "number" | "string" | "bool" | "nil" | "list" | "map"
   log(x, ...)   one line into the run output (64 lines max)
   print/echo    aliases of log
-  sleep(ms)     wait, at most 2 s per call and 5 s per script
+  sleep(ms)     wait against the call's remaining time budget (see below)
   tool(name, args)   call any board tool; args is a map; returns its JSON
 
 `sleep` really waits: the thread is in the scheduler's hands, not spinning,
-but the portal still answers only after the script returns. A script that
-needs to wait longer than 5 s is a scheduled task, not a loop.
+but the portal still answers only after the script returns. How long it may
+wait is not a separate script limit — it is the budget the call itself has
+(`agent.tool_timeout_s`, 30 s by default, and the script's own 30 s wall
+clock). `tool("shell", {command: "sleep 10"})` inside a script draws on the
+same budget rather than starting a second one.
 
 `tool` is the only way out: same permissions as the caller, and
 `tool("script", ...)` is refused.
@@ -1073,38 +1083,35 @@ struct Run<'a> {
     steps: u64,
     depth: usize,
     output: Vec<String>,
-    /// When the script started, so the loop can be stopped by the clock as well as by
-    /// the step count.
-    started_ms: u64,
-    /// How long this script has slept in total. `sleep()` is capped so a script cannot turn
-    /// into an outage: it runs on the thread that also answers the portal.
-    slept_ms: u64,
+    /// The moment this script must stop, in the same milliseconds-since-boot clock.
+    deadline_ms: u64,
+    /// The budget that deadline came from, so a refusal can quote the number rather
+    /// than only the remaining milliseconds.
+    budget_ms: u64,
 }
 
-/// The longest one `sleep(ms)` call will actually wait.
-///
-/// The script runs on the thread that answers the portal — a 5 s tool call already shows up
-/// as a portal that does not respond (measured: 5 103 ms for a `sleep 5` tool). A two second
-/// nap is the most that stays in the same range as a slow tool result.
-pub const SLEEP_MAX_MS: u64 = 2_000;
-/// The most a whole script may sleep, across every call.
-///
-/// Short enough to stay inside the 30 s wall clock with room to work, and short enough that
-/// a script which sleeps in a loop hits the ceiling rather than the portal's patience.
-pub const SLEEP_TOTAL_MS: u64 = 5_000;
-
 /// Run `source`, returning its last expression value.
-/// Run with the arguments a caller passed in.
 ///
-/// `args` lands in the global scope as a map (`args.pin`) and as `argv`, a list of its
-/// values (`argv[0]`), so a script can be written once and called with different pins
-/// without being rewritten. `Value::Null` is the same as no arguments: `args` is then an
-/// empty map and `argv` an empty list, and a script that reads a missing key gets nil
-/// rather than an error — the same rule as any other absent field.
+/// No budget means the script's own [`MAX_MS`]. A caller that is itself inside a tool call
+/// passes what is left of that call, and the script stops when either runs out.
 pub fn run_with(
     source: &str,
     host: &mut dyn ScriptHost,
     args: &serde_json::Value,
+) -> Result<Outcome, String> {
+    run_with_budget(source, host, args, None)
+}
+
+/// As [`run_with`], with the caller's remaining budget in milliseconds.
+///
+/// The deadline is the smaller of that and [`MAX_MS`]: a script started from a tool call
+/// with nine seconds left must not run for thirty, or the call it belongs to has already
+/// been written off as timed out.
+pub fn run_with_budget(
+    source: &str,
+    host: &mut dyn ScriptHost,
+    args: &serde_json::Value,
+    budget_ms: Option<u64>,
 ) -> Result<Outcome, String> {
     if source.len() > MAX_SOURCE {
         return Err(format!("script is larger than {MAX_SOURCE} bytes"));
@@ -1136,6 +1143,8 @@ pub fn run_with(
     globals.insert("args".into(), Val::Map(map));
     globals.insert("argv".into(), Val::List(list));
 
+    let budget = budget_ms.map(|b| b.min(MAX_MS)).unwrap_or(MAX_MS);
+    let started = now_ms();
     let mut runner = Run {
         host,
         scopes: vec![globals],
@@ -1144,8 +1153,8 @@ pub fn run_with(
         steps: 0,
         depth: 0,
         output: Vec::new(),
-        started_ms: now_ms(),
-        slept_ms: 0,
+        deadline_ms: started.saturating_add(budget),
+        budget_ms: budget,
     };
     runner.execute(program)
 }
@@ -1193,10 +1202,10 @@ impl<'a> Run<'a> {
         // thread that also answers the portal, so ten seconds of spinning is ten seconds
         // the board is unreachable. Checked every 1024 steps so the clock read is not the
         // cost of the loop.
-        if self.steps & 0x3ff == 0 && now_ms().saturating_sub(self.started_ms) > MAX_MS {
+        if self.steps & 0x3ff == 0 && now_ms() >= self.deadline_ms {
             return Err(format!(
-                "script stopped after {MAX_MS} ms ({} steps); it runs on the thread that answers the portal, so a longer script makes the board unreachable",
-                self.steps
+                "script stopped after its {} ms budget ({} steps); it runs on the thread that answers the portal, so a longer script makes the board unreachable",
+                self.budget_ms, self.steps
             ));
         }
         Ok(())
@@ -1589,27 +1598,23 @@ impl<'a> Run<'a> {
                     }
                     None => return Err("sleep() needs milliseconds".into()),
                 };
-                let left = SLEEP_TOTAL_MS.saturating_sub(self.slept_ms);
+                // One budget, not three: what is left of the call this script is running
+                // in (its own 30 s clock, or a shorter `agent.tool_timeout_s` inherited
+                // from the tool call) is exactly how long a wait may last. A separate cap
+                // on one sleep and on all sleeps used to stop honest scripts while still
+                // allowing the total run to overrun; the deadline has no such gap.
+                let left = self.deadline_ms.saturating_sub(now_ms());
                 // Said out loud rather than cut silently: a script that asked for 10 s and
                 // waited 2 would look like it worked, and the author would draw the wrong
                 // conclusion about the sensor it was timing.
-                if ms > SLEEP_MAX_MS {
-                    return Err(format!(
-                        "sleep({ms}) is longer than the {SLEEP_MAX_MS} ms one sleep may take"
-                    ));
-                }
                 if ms > left {
                     return Err(format!(
-                        "this script has {left} ms of sleep left of its {SLEEP_TOTAL_MS} ms"
+                        "sleep({ms}) needs more than the {left} ms left of this script's {} ms budget",
+                        self.budget_ms
                     ));
-                }
-                let spent = now_ms().saturating_sub(self.started_ms);
-                if spent + ms > MAX_MS {
-                    return Err(format!("sleep({ms}) would pass the {MAX_MS} ms a script may run"));
                 }
                 if ms > 0 {
                     std::thread::sleep(std::time::Duration::from_millis(ms));
-                    self.slept_ms += ms;
                 }
                 Ok(Val::Nil)
             }
@@ -1685,12 +1690,13 @@ mod tests {
         let err = run("sleep(\"soon\")", &mut NoHost).unwrap_err();
         assert!(err.contains("needs milliseconds"), "{err}");
 
-        // The total budget is a check on the interpreter's own counter, not on the clock:
-        // the runner starts with the counter already spent, which is what a script that
-        // slept in a loop looks like at the end.
+        // The budget is a check on the deadline, not on a counter: a caller that is nearly
+        // out of time passes the leftover milliseconds, which is what a script that has
+        // been sleeping looks like to the tool call it belongs to.
         let toks = lex("sleep(1)").expect("lex");
         let mut parser = Parser { toks, pos: 0 };
         let program = parser.program().expect("parse");
+        let started = now_ms();
         let mut runner = Run {
             host: &mut NoHost,
             scopes: vec![BTreeMap::new()],
@@ -1699,15 +1705,21 @@ mod tests {
             steps: 0,
             depth: 0,
             output: Vec::new(),
-            started_ms: now_ms(),
-            slept_ms: SLEEP_TOTAL_MS,
+            deadline_ms: started,
+            budget_ms: 0,
         };
         let err = runner.execute(program).unwrap_err();
-        assert!(err.contains("sleep left"), "{err}");
+        assert!(err.contains("left of this script's"), "{err}");
 
-        // A nap longer than one call may take is named, not cut short.
-        let err = run("sleep(5000)", &mut NoHost).unwrap_err();
-        assert!(err.contains("longer than the 2000 ms"), "{err}");
+        // A nap longer than the call has left is named with the remaining milliseconds,
+        // never cut short into a silent short wait.
+        let err = run_with_budget("sleep(5000)", &mut NoHost, &Value::Null, Some(2_000)).unwrap_err();
+        assert!(err.contains("left of this script's 2000 ms budget"), "{err}");
+
+        // And a caller with a larger budget may genuinely wait longer than the old 2 s cap.
+        let err = run_with_budget("sleep(6000)", &mut NoHost, &Value::Null, Some(4_000)).unwrap_err();
+        assert!(err.contains("sleep(6000)"), "{err}");
+        assert!(err.contains("4000 ms budget"), "{err}");
     }
 
     /// 50 000 steps stopped honest loops (about 0.2 s of work); the bound is now the clock.

@@ -26,7 +26,7 @@ interface is a single string.
 | Files | `ls rm cp mv grep zip unzip` |
 | Reading and slicing text | `cat echo wc head tail cut sort uniq tr tee touch du strings od jq` |
 | Network | `curl wget nslookup nc ping ifconfig netstat route arp` |
-| Numbers and time | `sleep usleep jot crc32` |
+| Numbers and time | `sleep usleep jot crc32`, and the `time <command>` prefix |
 | Looking at the board | `df free uptime date uname ps hexdump xd hostname whoami id env setenv unsetenv` |
 | Hashing and encoding | `sha256sum md5sum base64enc base64dec` |
 | The registry | `type which help` |
@@ -175,9 +175,34 @@ copying workspace payloads. `unzip` supports stored/deflated entries and checks 
 with independent 3,072-byte payload/name budgets and 128 entries. These compact archive
 policies are not the 64 KiB tool-result ceiling or evidence that PSRAM cannot hold more.
 
-`sleep <s>` and `usleep <ms>` really wait, capped at 10 s. Tool calls hold the shared App
-lock, so the wait delays other callers needing that lock. `crc32` reuses the ZIP checksum.
+`sleep <s>` and `usleep <ms>` really wait. How long they may wait is not their own cap: a
+wait draws on the tool call's remaining budget (`agent.tool_timeout_s`, 30 s by default),
+and a request longer than what is left is refused with both numbers rather than silently
+shortened. With that budget switched off (`0`) the ten-second fallback applies, because
+nothing else would bound a bare `sleep 1e9`. Tool calls hold the shared App lock, so the
+wait delays other callers needing that lock. `crc32` reuses the ZIP checksum.
 The full persistence and parser contracts are in [storage](storage.md).
+
+### `time <command>`
+
+One line, measured: `time echo hi` runs the command exactly as typed after it and returns
+its answer inside a wrapper with the elapsed milliseconds. The prefix measures the whole
+line, so `time cat /log | grep error | wc -l` reports one figure for the pipeline rather
+than one per stage.
+
+```jsonl
+{"command": "time echo hi"}
+{"command": "time ls / | wc -l"}
+```
+
+```json
+{"command": "time echo hi", "ms": 0, "real_s": 0.0, "result": {"text": "hi", "stdout": "hi\n"}}
+```
+
+`time` is a prefix, not a command: it has no handler and cannot be piped into. Running it
+alone is a wrong line ("`time` needs a command after it"), and `time <cmd> -h` still shows
+`cmd`'s usage. The number is wall time on the calling thread, which includes every wait
+the command made — it is a measurement, not a CPU-time claim.
 
 ## When a command is wrong
 
