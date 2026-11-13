@@ -7,8 +7,9 @@ Port **443** serves the same routes over TLS, with a certificate the board gener
 itself on first boot (EC P-256, stored in NVS, fingerprint at `GET /api/tls`). Both ports
 share **one accept thread** and bounded request workers. Parsing, handlers, TLS
 handshakes and stream bodies run on workers, not the listener. Three ordinary workers
-plus one reserved plaintext control worker use at most four 16 KiB stacks on ESP-IDF;
-idle plaintext sockets consume no worker. TLS connections are not kept alive.
+plus one reserved plaintext control worker reserve four 16 KiB stacks on ESP-IDF
+at startup and reuse them; requests do not create pthreads. Idle plaintext sockets
+occupy no worker. TLS connections are not kept alive.
 See [concurrency and lock ownership](concurrency.md) for pool limits and freshness.
 
 `/agent.json` reports the scheme that answered: fetched over https its `base_url` and the

@@ -1,8 +1,8 @@
 //! A small blocking HTTP/1.1 server.
 //!
 //! Written against `std::net` only, because that is what ESP-IDF's std shim
-//! provides (lwIP sockets) and what the host simulator provides. No async, no TLS
-//! — the board is a LAN device and the MCP spec allows plain HTTP for local use.
+//! provides (lwIP sockets) and what the host simulator provides. No async runtime;
+//! TLS handshakes are injected by the platform. Plain HTTP remains available for LAN use.
 //!
 //! What it does implement matters for MCP clients: keep-alive, chunked request
 //! bodies (Node's fetch sends them), `Expect: 100-continue`, HEAD, and a hard
@@ -23,8 +23,8 @@ pub const MAX_BODY_BYTES: usize = 1024 * 1024;
 pub const MAX_CONNECTIONS: usize = 6;
 const IDLE_TIMEOUT: Duration = Duration::from_secs(20);
 
-/// At most four request/handshake/stream stacks, shared by both listeners.
-/// Idle keep-alive sockets hold connection slots but never worker stacks.
+/// Four preallocated request/handshake/stream stacks, shared by both listeners.
+/// Idle keep-alive sockets hold connection slots but never occupy a worker.
 const MAX_REQUEST_WORKERS: usize = 4;
 // Reserve one plaintext control worker; ordinary/TLS/SSE work uses at most three.
 const MAX_NORMAL_WORKERS: usize = MAX_REQUEST_WORKERS - 1;
@@ -952,10 +952,13 @@ impl Server {
         let log_thread = log.clone();
         let budget = WorkerBudget::default();
         let budget_thread = budget.clone();
+        // Allocate request stacks once, before reporting a live listener. Repeated
+        // pthread creation exhausted the real board under sustained request churn.
+        let pool = WorkerPool::new(&budget)?;
         let join = std::thread::Builder::new()
             .name("httpd".into())
             .stack_size(ACCEPT_STACK)
-            .spawn(move || accept_loop(listeners, routes, stop_thread, log_thread, budget_thread))?;
+            .spawn(move || accept_loop(listeners, routes, stop_thread, log_thread, budget_thread, pool))?;
         log.info("http", format!("listening on {scheme}://{local}/"));
         Ok(Self {
             stop,
@@ -1034,15 +1037,61 @@ struct WorkerBudget {
     control_workers: Arc<AtomicUsize>,
     #[cfg(test)]
     fail_spawn: Arc<AtomicBool>,
+    #[cfg(test)]
+    thread_starts: Arc<AtomicUsize>,
 }
 
+type WorkerJob = Box<dyn FnOnce() + Send + 'static>;
+
+struct WorkerPool {
+    budget: WorkerBudget,
+    normal: SyncSender<WorkerJob>,
+    control: SyncSender<WorkerJob>,
+}
+impl WorkerPool {
+    fn new(budget: &WorkerBudget) -> std::io::Result<Self> {
+        let (normal, normal_rx) = sync_channel::<WorkerJob>(MAX_NORMAL_WORKERS);
+        let (control, control_rx) = sync_channel::<WorkerJob>(1);
+        let normal_rx = Arc::new(std::sync::Mutex::new(normal_rx));
+        let control_rx = Arc::new(std::sync::Mutex::new(control_rx));
+        for index in 0..MAX_REQUEST_WORKERS {
+            let rx = if index == MAX_NORMAL_WORKERS { control_rx.clone() } else { normal_rx.clone() };
+            let name = if index == MAX_NORMAL_WORKERS {
+                "http-control".into()
+            } else {
+                format!("http-work-{index}")
+            };
+            std::thread::Builder::new().name(name).stack_size(CONN_STACK).spawn(move || loop {
+                // Release the receiver lock before executing: the other normal
+                // workers must be able to accept their own jobs concurrently.
+                let job = rx.lock().unwrap_or_else(|p| p.into_inner()).recv();
+                let Ok(job) = job else { break };
+                // On unwind-capable hosts a failed handler must not permanently
+                // remove a worker. ESP-IDF panic=abort still resets the board.
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job));
+            })?;
+            #[cfg(test)]
+            budget.thread_starts.fetch_add(1, Ordering::SeqCst);
+        }
+        Ok(Self { budget: budget.clone(), normal, control })
+    }
+    fn submit(&self, control: bool, job: WorkerJob) -> std::io::Result<()> {
+        let tx = if control { &self.control } else { &self.normal };
+        tx.try_send(job).map_err(|_| std::io::Error::other("request worker queue unavailable"))
+    }
+}
 impl WorkerBudget {
-    fn spawn(&self, body: impl FnOnce() + Send + 'static) -> std::io::Result<JoinHandle<()>> {
+    fn submit(
+        &self,
+        pool: &WorkerPool,
+        control: bool,
+        body: impl FnOnce() + Send + 'static,
+    ) -> std::io::Result<()> {
         #[cfg(test)]
         if self.fail_spawn.swap(false, Ordering::SeqCst) {
-            return Err(std::io::Error::other("injected request spawn failure"));
+            return Err(std::io::Error::other("injected request admission failure"));
         }
-        std::thread::Builder::new().name("http-request".into()).stack_size(CONN_STACK).spawn(body)
+        pool.submit(control, Box::new(body))
     }
 }
 struct PendingConnection {
@@ -1059,6 +1108,7 @@ fn accept_loop(
     stop: Arc<AtomicBool>,
     log: Arc<LogBuf>,
     budget: WorkerBudget,
+    pool: WorkerPool,
 ) {
     // One bounded return channel per listener generation; old workers cannot
     // return sockets to a new server after this receiver has been dropped.
@@ -1090,7 +1140,7 @@ fn accept_loop(
                                 &routes,
                                 &log,
                                 &stop,
-                                &budget,
+                                &pool,
                                 &returned,
                             );
                         } else if conn.stream.set_nonblocking(true).is_ok() {
@@ -1118,7 +1168,7 @@ fn accept_loop(
                 Ready::Data(prefix) => {
                     let mut conn = pending.swap_remove(index);
                     conn.prefix = prefix;
-                    if let Some(conn) = dispatch(conn, None, &routes, &log, &stop, &budget, &returned) {
+                    if let Some(conn) = dispatch(conn, None, &routes, &log, &stop, &pool, &returned) {
                         // A bounded pending socket waits for a worker instead of losing
                         // a normal browser burst. Leave capacity for control workers.
                         pending.push(conn);
@@ -1188,9 +1238,10 @@ fn dispatch(
     routes: &Routes,
     log: &Arc<LogBuf>,
     stop: &Arc<AtomicBool>,
-    budget: &WorkerBudget,
+    pool: &WorkerPool,
     returned: &SyncSender<PendingConnection>,
 ) -> Option<PendingConnection> {
+    let budget = &pool.budget;
     let control = handshake.is_none() && is_control_prefix(&conn.prefix);
     let lane = if control {
         Permit::take(&budget.control_workers, 1)
@@ -1207,7 +1258,7 @@ fn dispatch(
     let log_worker = log.clone();
     let stop = stop.clone();
     let returned = returned.clone();
-    let spawned = budget.spawn(move || {
+    let submitted = budget.submit(pool, control, move || {
         let _worker = worker;
         let _lane = lane;
         if stop.load(Ordering::SeqCst) {
@@ -1245,10 +1296,10 @@ fn dispatch(
             }
         }
     });
-    // std drops the closure (socket and both permits) on spawn failure.
+    // Failed queue admission drops the closure (socket and both permits).
     // Unwinding a handler/handshake/stream also drops those RAII guards.
-    if spawned.is_err() {
-        log.error("http", "could not spawn request thread");
+    if submitted.is_err() {
+        log.error("http", "could not admit request to worker pool");
     }
     None
 }
@@ -1569,6 +1620,27 @@ mod tests {
         assert!(start.elapsed() < Duration::from_secs(1));
         assert!(slow.join().unwrap().contains("done"));
         wait_until(|| server.budget.workers.load(Ordering::SeqCst) == 0);
+    }
+
+    #[test]
+    fn request_workers_are_preallocated_and_reused_across_connection_churn() {
+        let handler: Handler = Arc::new(|_| Response::text("reused"));
+        let server = Server::start("127.0.0.1:0", Routes::new(handler), LogBuf::new(16)).unwrap();
+        assert_eq!(server.budget.thread_starts.load(Ordering::SeqCst), MAX_REQUEST_WORKERS);
+        for index in 0..200 {
+            let path = if index % 2 == 0 { "/api/status" } else { "/ordinary" };
+            let response = raw_request(
+                server.local_addr(),
+                &format!("GET {path} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"),
+            );
+            assert!(response.contains("reused"), "request {index} was lost");
+        }
+        wait_until(|| server.budget.workers.load(Ordering::SeqCst) == 0);
+        assert_eq!(
+            server.budget.thread_starts.load(Ordering::SeqCst),
+            MAX_REQUEST_WORKERS,
+            "request churn must not create additional pthread stacks"
+        );
     }
 
     #[test]

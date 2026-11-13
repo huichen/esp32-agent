@@ -19,10 +19,14 @@ Three paths are independent of a tool holding App:
   workers, not on the accept/readiness thread. Otherwise even a lock-independent
   handler would still queue behind an inline MCP tool.
 
-The ESP-IDF request stack is 16 KiB, with at most four request workers: three
-ordinary/TLS/stream workers and one reserved plaintext control worker. The
-existing listener stack remains 16 KiB. Workers are created only for ready
-requests; idle plaintext keep-alive sockets do not consume a worker. Six admitted
+The ESP-IDF request stack is 16 KiB. Four reusable workers are created at server
+startup: three ordinary/TLS/stream workers and one reserved plaintext control
+worker. Their stacks reserve 64 KiB in total, in addition to the existing 16 KiB
+listener stack. Ready requests enter bounded queues; requests do not create or
+destroy pthreads. Idle plaintext keep-alive sockets do not occupy a worker.
+The intermediate per-request-thread design failed real-board sustained churn
+with `pthread: Failed to create task`; it was not accepted. Reserving a slot alone
+was not enough: the control stack must already exist. Six admitted
 connections bound executing, idle and returned sockets together. Ordinary bursts
 wait in this bounded pending set; pending sockets expire after 30 seconds.
 TLS saturation closes the new connection without starting another handshake.

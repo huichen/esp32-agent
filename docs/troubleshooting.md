@@ -106,8 +106,10 @@ whether a certificate exists and why not.
   kilobyte for the memory.
 - `could not spawn tls thread` in the log, `ERR_CONNECTION_RESET` in the browser: a thread
   per TLS connection needs its stack *before* the handshake starts, and a browser opens six
-  sockets for one page. The current server uses bounded 16 KiB workers shared by ordinary
-  requests, handshakes and streams; it does not create an unbounded stack per connection.
+  sockets for one page. The current server preallocates reusable 16 KiB workers shared by
+  ordinary requests, handshakes and streams; it does not create a pthread per request.
+  The intermediate bounded per-request design still hit `pthread: Failed to create task`
+  during sustained board churn, so a concurrency counter alone is not a memory reservation.
 - `agent thread did not start: Not enough space` at boot: the TLS listener was given its own
   thread. It now shares the plaintext accept thread; adding a second one costs the agent,
   which costs the whole board.
@@ -157,8 +159,9 @@ tells them apart:
   serialising every tool descriptor is a heavy handler; request workers use 16 KiB,
   rather than putting handlers or full status construction on a 6 KiB store-writer stack.
 - `could not spawn connection thread` → a task's required capability pool lacks a
-  **contiguous** stack block. Ready requests use a bounded pool of 16 KiB worker stacks;
-  streams reuse those workers. Idle keep-alive sockets do not reserve a stack. Read `memory.largest_internal_kb` in
+  **contiguous** stack block. The current server allocates its four reusable 16 KiB
+  worker stacks at startup, not per ready request; streams reuse them. Idle keep-alive
+  sockets do not occupy a worker (the pool's stack reservation still exists). Read `memory.largest_internal_kb` in
   `/api/status` and the boot `mem:` lines. PSRAM stacks are possible only on execution
   paths safe when the flash cache is off; they are not a universal workaround.
 - Connections reset with no log line at all → the socket pool. Every closed connection sits
