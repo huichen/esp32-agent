@@ -3,7 +3,7 @@
   End-to-end smoke test against the host simulator: portal, tool list, a live
   manifest change, and the board-side range check.
 .DESCRIPTION
-  Starts esp32-agent-sim on a free port, waits for /healthz, then walks the flow a
+  Starts esp32-agent-sim on a free port, waits for /api/status, then walks the flow a
   model would: tools/list -> manifest_apply -> tools/list -> tool call -> an
   out-of-range call that must be refused. Exits non-zero if any step fails.
 #>
@@ -30,8 +30,8 @@ $proc = Start-Process -FilePath $bin -ArgumentList @('--port', $Port, '--host', 
 function Wait-Ready {
   for ($i = 0; $i -lt 100; $i++) {
     try {
-      $r = Invoke-RestMethod -Uri "http://127.0.0.1:$Port/healthz" -TimeoutSec 2
-      if ($r.ok) { return }
+      $r = Invoke-RestMethod -Uri "http://127.0.0.1:$Port/api/status" -TimeoutSec 2
+      if ($null -ne $r.devices.count) { return }
     } catch { Start-Sleep -Milliseconds 120 }
   }
   throw 'simulator did not become ready'
@@ -66,8 +66,8 @@ try {
     $page.Content -match 'esp32-agent' -and $page.Content -match 'manifest'
   }
 
-  Check 'healthz reports the detected devices' {
-    (Invoke-RestMethod "http://127.0.0.1:$Port/healthz" -TimeoutSec 5).devices -ge 3
+  Check 'status reports the detected devices' {
+    (Invoke-RestMethod "http://127.0.0.1:$Port/api/status" -TimeoutSec 5).devices.count -ge 3
   }
 
   $before = Rpc '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'

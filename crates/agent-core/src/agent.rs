@@ -41,8 +41,8 @@ pub const MAX_HISTORY_MESSAGES: usize = 1_024;
 /// ~6.6 MB of PSRAM still free (`docs/troubleshooting.md`); nothing above that has run on
 /// the board. The transcript, request Values and serialized request coexist during a
 /// turn, so this payload ceiling is not proof of peak heap usage. One oversized newest
-/// message is deliberately retained. Watch `spiram.free_kb` in `/api/memory` between
-/// turns rather than trusting the cap.
+/// message is deliberately retained. Watch `spiram.free_kb` in `/api/status`
+/// `memory.pools` between turns rather than trusting the cap.
 ///
 /// Note that 2 MB is above what the default 262 144-token window carries (~209 000 tokens
 /// is ~840 KB of ASCII), so in normal use the token trigger fires first and this is the

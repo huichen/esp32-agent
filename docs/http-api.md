@@ -25,7 +25,10 @@ example), the error shape, and the limits that apply to a caller.
 curl -sS http://<ip>:80/agent.json | jq '.endpoints[] | "\(.method) \(.path) — \(.summary)"'
 ```
 
-`GET /sitemap.json` is an alias. The document uses a static endpoint/settings table plus
+`endpoints` is the surface an external agent should call: those routes have no MCP tool that
+compares. `portal_endpoints` is the console's own half, and each row names the tool that
+does the same job — a model that reads this document is meant to take the tool and leave
+the route to the browser. The document uses a static endpoint/settings table plus
 runtime values such as `base_url`, tool count, credential-set flags and model endpoint.
 A route-existence test calls documented paths on a real `App`; that alone does not prove
 that the map is complete or its auth, formats and budgets are current. The interface
@@ -84,43 +87,39 @@ agent result budget, so their truncation marker remains inside valid JSON.
 
 CORS is on by default (`mcp.cors`), so a browser MCP client can connect directly.
 
-## 2. Web and configuration REST
+## 2. REST for the console, and the tool that replaces each route
+
+What follows exists because the console is a browser: it cannot hold an MCP session, so it
+calls REST. Where a route only repeats a tool, the table says which tool, and
+`/agent.json` keeps those rows out of `endpoints` for exactly that reason. The exceptions
+to "call the tool instead" are the three places a browser does something a model must not
+or cannot: it signs in, it reboots, and it serves its own assets.
 
 | Method | Path | Purpose |
 |---|---|---|
 | GET | `/` | Console (embedded HTML/CSS/JS, no external links) |
-| GET | `/healthz` | `{ok, uptime_s, devices}`; `uptime_s` is seconds on the board's monotonic clock since boot, so it is right before SNTP has ever answered |
-| GET | `/agent.json` | The map for an external agent: every route, the MCP surface, conventions and limits (`/sitemap.json` is an alias) |
-| GET | `/api/status` | Board, memory, WiFi, MCP, device count, counters, `agent.thread` — `running`, `not started`, or `did not start: <why>` — `threads[]`, each task with the stack it has left at its deepest point (`high_water_kb`), and `store`: `{pending, written, failed}` plus `writer`, `last_failure` (`{key, op, err, err_name, at_ms}` or `null`), `refused_keys` (per-key counts), `refused_other` and `space` (`{used_bytes, free_bytes, total_bytes}`, or `{used_entries, free_entries, total_entries, used_bytes, free_bytes, total_bytes}` on NVS) - every number and where it comes from is in [what the store reports](troubleshooting.md#what-the-store-reports) — see [a store write was refused](troubleshooting.md#a-store-write-was-refused) |
-| GET | `/api/memory` | The heap pool by pool: `{available, pools: [{pool, note, total_kb, free_kb, largest_kb, min_free_kb}]}` for internal, DMA and PSRAM (a chip that registers no IRAM heap, like the S3, leaves that row out); `available: false` with a `why` on a platform with one heap |
+| GET | `/agent.json` | The map for an external agent: the routes to call, the MCP surface, conventions and limits |
+| GET | `/api/status` | Board, memory, WiFi, MCP, device count, counters, `agent.thread` — `running`, `not started`, or `did not start: <why>` — `threads[]`, each task with the stack it has left at its deepest point (`high_water_kb`), `memory.pools` (the heap pool by pool: `[{pool, note, total_kb, free_kb, largest_kb, min_free_kb}]`, empty on a platform that cannot split it), and `store`: `{pending, written, failed}` plus `writer`, `last_failure` (`{key, op, err, err_name, at_ms}` or `null`), `refused_keys` (per-key counts), `refused_other` and `space` (`{used_bytes, free_bytes, total_bytes}`, or `{used_entries, free_entries, total_entries, used_bytes, free_bytes, total_bytes}` on NVS) - every number and where it comes from is in [what the store reports](troubleshooting.md#what-the-store-reports) — see [a store write was refused](troubleshooting.md#a-store-write-was-refused) |
 | GET | `/api/tls` | The board's own certificate: `{enabled, port, fingerprint, error}` |
 | GET | `/api/config` | Configuration (secrets shown as `__set__`) |
 | POST | `/api/config` | Partial update (JSON of the same shape) |
 | GET | `/api/devices` | Device table + unidentified addresses + buses |
 | POST | `/api/devices/probe` | Probe again |
 | GET | `/api/tools` | Tool table, including why anything is hidden |
-| POST | `/api/tools` | `{mode: auto|generic|all, disabled: [...]}` |
-| GET | `/api/manifest` | Current manifest + revision |
-| POST | `/api/manifest` | `{manifest, mode?, dry_run?}` |
-| GET | `/api/manifest/schema` | `manifest_schema` + `primitives`, i.e. the `schema` and `exec` sections of `manifest_describe` (an HTTP response is not subject to the agent's 64 KiB tool-result cap) |
+| POST | `/api/tools` | `{mode: auto|generic|all, disabled: [...]}` — no tool changes visibility, so this one stays a route |
 | GET | `/api/wifi/scan` | Scan |
 | POST | `/api/wifi/connect` | `{ssid, password}`, save and reconnect |
 | POST | `/api/wifi/forget` | Clear the credentials |
 | GET | `/api/logs?n=&since=` | Ring log |
 | GET | `/api/files/tree` | The whole workspace in one answer: every directory (derived from the paths) and file with `size_bytes`, plus `total_bytes` / `total_max` / `file_max`. What the portal's Files tab reads |
-| GET | `/api/files?path=<dir>` | One directory of the workspace, directories first (the same rows `ls` returns) |
 | GET | `/api/files/read?path=<file>` | One file as text |
-| GET | `/api/catalog` | Driver catalog |
 | GET | `/api/sessions` | MCP sessions |
 | GET | `/api/clients` | Client configuration, ready to copy |
-| POST | `/api/script` | Run a script: `{source, async?}`; the answer carries `result`/`output`/`steps`, or `{id, poll}` with `async: true` ([scripting](scripting.md)) |
-| GET | `/api/script/<id>` | One script job: `state` (`queued`/`running`/`done`/`failed`), `result`, `output`, `error` |
 | POST | `/audio/pcm` | Play PCM as it arrives: raw PCM16LE mono at 24000 Hz, chunked or with `Content-Length`, at most 30 s, never buffered ([streaming playback](audio.md#6-streaming-playback-post-audiopcm)) |
 | POST | `/av` | Play audio and draw frames from one body: `tag|u16le len|payload` records — `A` audio, `F` a 512-byte 128x32 or 1024-byte 128x64 bitmap, `E` end — in order ([sound with a picture](audio.md#8-sound-with-a-picture-post-av)) |
 | GET | `/api/attachment/<name>` | The file attached to the last message, with its own mime type ([attachments](#5-attachments)) |
 | POST | `/api/auth` | `{pin}`, check the console PIN |
-| POST | `/api/reboot` | Reboot |
-| POST | `/api/factory-reset` | Clear configuration and manifest, then reboot |
+| POST | `/api/reboot` | Reboot. The `reboot` tool exists but is hidden: a person restarts the board, a model does not |
 
 `/assets/app.js` and `/assets/style.css` are served separately from the console HTML.
 All three carry `Cache-Control: no-store` so old assets are not reused with new firmware.
