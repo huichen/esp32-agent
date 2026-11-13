@@ -725,7 +725,9 @@ def tools(rec, sim, fake):
     default_names = sim.names()
     rec.inventory["default"] = {"visible": default_names, "detected_devices": sim.get("/api/devices")}
     refusal(rec, sim, "default-no-mic-record-refusal", "clip_record", {"name": "absent-mic", "ms": 100}, contains="microphone")
-    rec.note("Visibility gap on the default board: clip_record is advertised without a microphone, while clip_play is hidden despite a detected OLED (oled capability versus display guard). A virtual I2S profile below supplies both dependencies for success coverage.")
+    rec.check("default-no-mic-not-advertised", "clip_record" not in default_names)
+    rec.check("default-oled-clip-play-advertised", "clip_play" in default_names)
+    rec.note("Default-board clip recording is hidden without a microphone; detected OLED playback remains offered. A virtual I2S profile below supplies audio dependencies for success coverage.")
     # Local virtual I2S profile makes public clip_record/clip_play executable.
     # This configuration and its persistence are confined to this area's temp dir.
     sim.post("/api/config", {"board": "esp32s3-xiaozhi-bread"})
@@ -1085,7 +1087,11 @@ def sched(rec, sim, fake):
     rec.check("manual-script-inline-job-id", isinstance(run.get("job"), str) and run["job"].startswith("s"), short(run))
     rec.equal("manual-script-side-effect", sim.get("/api/files/read?path=/scheduled.txt")["text"], "42")
     http_case(rec, sim, "manual-job-has-no-poll-route", "GET", "/api/script/" + run["job"], status=404)
-    rec.note("Contract gap: /api/sched/run advertises a script result but returns only {id, job, kind, source}; job has no poll route. Execution is verified by the script's file effect, not invented job state.")
+    rec.equal("manual-script-finished-state", run["state"], "done")
+    rec.equal("manual-script-result", run["result"], 42)
+    rec.equal("manual-script-output", run["output"], ["scheduled"])
+    rec.check("manual-script-steps", run["steps"] > 0)
+    rec.note("Manual scripts execute inline and return their completed result; the retired job poll route remains absent.")
     rec.equal("manual-run-keeps-clock", sim.get("/api/sched")["tasks"][0]["last_run_ms"], clock)
     for case, body in [("unknown-kind", {"kind": "unknown", "op": "add"}),
                        ("no-task-action", {"kind": "task", "op": "add", "task": {"every_s": 1}}),
