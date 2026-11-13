@@ -1,43 +1,54 @@
+---
+name: create-skill
+description: write a new skill for this board when a procedure had to be worked out
+---
 # create-skill
 
-description: write a new skill for this board when a procedure had to be worked out
+A skill is a file on the workspace: `/skills/<name>/SKILL.md`. The prompt carries one line
+per skill (`name: description (path)`); the body is read only when you open it with `read`.
 
-A skill is a file on the board's workspace: `/skills/<name>/SKILL.md`. The prompt carries
-one line per skill (`name: description (path)`); the body is read only when you open it
-with `read`.
+## The header
+
+Every `SKILL.md` starts with the same block, and it is what the index reads:
+
+```text
+---
+name: blink
+description: blink the onboard LED three times
+---
+```
+
+`name` repeats the directory, `description` is the one line the prompt shows; both are
+required. The body is a `#` heading after the closing `---`. Without the header a file is
+still indexed (a `description:` line, then the first prose line), but the header is what
+marks it a skill rather than a note.
 
 ## When to write one
 
 A procedure you would otherwise work out again: the register sequence that wakes a
-display, the order of reads that avoids a bus fault. Write it when the next session will
-need the same steps and will not remember this turn.
+display, the order of reads that avoids a bus fault.
 
 ## When not to
 
-- A fact about this board (a pin, an address, a wiring quirk) is a memory, not a skill:
-  `/memory/<topic>.md` plus one pointer line in `/MEMORY.md`.
-- A one-off, or something a tool already does. Read the tool's description first.
+- A fact about the board (a pin, an address) is a memory: `/memory/<topic>.md` plus a
+  pointer line in `/MEMORY.md`.
+- Something a tool already does. Read its description first.
 
-## How to write it
+## How
 
-1. `ls /skills` through `shell`: the name is the directory, `a-z A-Z 0-9 _ -`, at most 32
-   characters.
-2. `write` the file; parent directories are created for you.
-3. `read` it back: the `description:` line must be there and short, because it is the only
-   part that reaches the prompt.
-4. `ls /skills` again and confirm the name appears.
+1. `shell {"command":"ls /skills"}`: the name is the directory, `a-z A-Z 0-9 _ -`, 32 max.
+2. `write` the file with the header above; parent directories are created.
+3. `read` it back: `name` and `description` must be there and short.
+4. `ls /skills` again and confirm it appears.
 
 ```text
-write {"path":"/skills/blink/SKILL.md","text":"# blink\ndescription: blink the onboard LED three times\n1. gpio_write {pin:48, level:1}\n2. delay {ms:200}\n3. gpio_write {pin:48, level:0}\n4. repeat steps 1-3 three times\n"}
-shell {"command":"ls /skills"}
-read {"path":"/skills/blink/SKILL.md"}
+write {"path":"/skills/blink/SKILL.md","text":"---\nname: blink\ndescription: blink the LED three times\n---\n# blink\n1. gpio_write {pin:48, level:1}\n2. delay {ms:200}\n3. gpio_write {pin:48, level:0}\n4. repeat 1-3 three times\n"}
 ```
 
 ## House rules
 
 - Imperative sentences, one step per line; the reader is an agent.
-- Name every tool the procedure uses and give the exact call in a fenced block.
+- Name every tool the procedure uses, with the exact call in a fenced block.
 - No secrets: no passwords, no tokens, no keys.
 - Under 2 KB. A larger file cannot be written at all.
-- Put supporting material beside the skill (`/skills/blink/pins.md`) and say when to read
-  it.
+- Supporting material goes beside it (`/skills/blink/pins.md`); say when to read it.

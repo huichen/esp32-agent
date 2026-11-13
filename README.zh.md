@@ -21,7 +21,7 @@
 | 无人值守也会动作 | 定时提示，以及读数越过阈值时触发提示的传感器规则。[定时任务](docs/scheduling.md) |
 | 一个 shell 和一门脚本语言 | `shell` 有 57 个按 NuttX 命名的命令，还有一个对工具调用做循环的解释器。[Shell](docs/shell.md) · [脚本](docs/scripting.md) |
 | 它会记住告诉过它的事 | 常驻指令、`/AGENTS.md`、`/MEMORY.md` 索引与技能，每轮组装进提示词。[模型每轮都能看到什么](docs/context.md) |
-| 自带技能 | 固件里带三个流程——写技能、摸清接线、救回一块看起来坏了的板——首次启动就落在 `/skills`；你改过的那份会一直是你的。[技能](docs/agent-skills.md) |
+| 自带技能 | 固件里只带一个流程 `create-skill`，用标准的 `---` 头部书写，而它教的就是剩下的部分：技能是什么、怎么写。首次启动落在 `/skills`，你改过的那份会一直是你的。[技能](docs/agent-skills.md) |
 | 板子自己就是服务器 | 由板子提供 HTTPS，证书由它生成，三类调用方一个 PIN。[认证](docs/security.md) |
 | 无需硬件即可测试 | 模拟器把同一份 `agent-core` 跑在虚拟板上。[模拟器](docs/simulator.md) |
 
@@ -44,7 +44,7 @@ espflash write-bin --chip esp32s3 --flash-size 16mb 0x0 esp32-agent-vX.Y.Z.bin
 请求体、鉴权，MCP 那一块，带类型和默认值的设置表，以及各项上限。能取一个 URL 的 agent
 不需要别的东西。
 
-**一块新板子已经会三件事。** `/skills/create-skill` 讲 agent 怎么写下一个流程，`/skills/pinout` 讲怎么摸清接线并记进 `/MEMORY.md`，`/skills/recover-board` 讲板子看起来坏了时怎么办。它们就是普通的工作区文件，首次启动时哪条路径空就装哪条；恢复出厂会重新装回，`skills.seed_defaults=false` 可以阻止。所以刚刷好的板子，第一句有用的话可以是「把你的接线写下来」。
+**一块新板子已经会自己学。** `/skills/create-skill` 是唯一内置的流程：它讲技能是什么、必须带什么样的 `---` 头部、怎么写下一个会话能找到的技能。其余的东西——你这张桌子的接线、板子看起来死了该怎么办——由 agent 自己写成技能并保留。它是普通的工作区文件，首次启动时装在路径还空着的地方；恢复出厂会把它装回来，`skills.seed_defaults=false` 可以关掉。对一块刚刷好的板子，第一句有用的话可以是「把你的接线写下来」。
 
 ## 给它一个模型
 
@@ -76,7 +76,7 @@ agent 用 `POST /api/agent/config` 写进去——和面板发的是同一个调
 
 | 部分 | 状态 |
 |---|---|
-| `agent-core` | 749 个单元测试与 5 个集成测试通过；`scripts/smoke.ps1` 端到端通过 |
+| `agent-core` | 750 个单元测试与 5 个集成测试通过；`scripts/smoke.ps1` 端到端通过 |
 | 模拟器 | 控制台、MCP 与智能体循环端到端运行 |
 | 固件 | 在 ESP32-S3-DevKitC-1 N16R8（IDF v5.5.2）上烧录：42 个工具、OLED 128×32、I²S 麦克风与功放、WS2812、TLS 控制台、通过 HTTPS 的模型轮次 |
 | 未实现 | OTA、SD 卡、DHT11/22、摄像头。见 `ROADMAP.md` |
