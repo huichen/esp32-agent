@@ -95,9 +95,13 @@ impl KvStore for NvsStore {
     }
 
     /// `nvs_get_stats` for the default partition, which is the one this store was opened
-    /// on (`main.rs` takes `EspDefaultNvsPartition`). Reported in
-    /// `/api/status.store.space`: an entry is 32 bytes and a 4 KB page holds 126 of them,
-    /// so "used_entries" is what says whether a refusal is about room or about the name.
+    /// on (`main.rs` takes `EspDefaultNvsPartition`).
+    ///
+    /// `used`, `free` and `total` are `nvs_stats_t`'s `used_entries`/`free_entries`/
+    /// `total_entries`: an entry is 32 bytes and a 4 KB page holds 126 of them, so
+    /// `free_entries` is what says whether a refusal is about room or about the name. The two
+    /// byte figures are computed in this function from those counts - NVS reports no bytes, and
+    /// `StoreSpace` says which of its numbers come from where.
     fn space(&self) -> Option<StoreSpace> {
         let mut stats = std::mem::MaybeUninit::<sys::nvs_stats_t>::uninit();
         let rc = unsafe { sys::nvs_get_stats(std::ptr::null(), stats.as_mut_ptr()) };

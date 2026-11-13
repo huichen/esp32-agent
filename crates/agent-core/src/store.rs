@@ -449,6 +449,25 @@ pub struct Refusal {
 /// write was refused. `null` and `0` are different answers here: "not applicable" and "nothing
 /// left". So the variant carries whichever unit applies, and the JSON for it carries only the
 /// keys that mean something.
+///
+/// **Where each number comes from**, because a reader has to be able to tell a measured figure
+/// from a derived one:
+///
+/// * `Bytes.total` and `Bytes.used` are what the backend reports: on SPIFFS,
+///   `esp_spiffs_info()`, which is `SPIFFS_info()`. Its `total` is not the partition size - it is
+///   `(blocks - 2) * (pages_per_block - lookup_pages) + 1` data pages times the data page size,
+///   i.e. the 12 517 376-byte partition minus two spare blocks and the object-lookup pages. On
+///   this board that is 45 811 * 251 = 11 498 561, which is what `/api/status` shows.
+/// * `Bytes.free` and `Entries.free_bytes` are **computed here** as `total - used`. No backend
+///   reports a "free" number; saying so is the point of this note.
+/// * `Entries.used/free/total` are `nvs_get_stats()`'s `nvs_stats_t`, counted in 32-byte entries.
+/// * `Entries.used_bytes` and `Entries.total_bytes` are **computed here** as entries * 32; NVS
+///   itself does not report bytes.
+///
+/// What `free` is not: a promise that one allocation of that size will succeed. Measured on this
+/// board, creating a 2.1 MB file failed with `ENOSPC` while `free` read 9.38 MB - SPIFFS needs
+/// somewhere to move live pages while it writes a new file, and reports no figure for that. So a
+/// refusal can arrive while `free` is large, and that is the filesystem, not this arithmetic.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StoreSpace {
     /// A key-value store counted in entries: NVS, 32 bytes each and 126 per 4 KB page, which is
@@ -470,7 +489,9 @@ impl StoreSpace {
     /// The JSON this space becomes in `/api/status.store.space`.
     ///
     /// One place, so "the filesystem reports no entries" is a property of the code and not of
-    /// each caller remembering.
+    /// each caller remembering. The keys that are arithmetic (`free_bytes`, and NVS's byte pair)
+    /// are computed in this function and nowhere else - see [`StoreSpace`] for which backend call
+    /// produces the rest.
     pub fn to_json(self) -> serde_json::Value {
         match self {
             StoreSpace::Entries { used, free, total, used_bytes, total_bytes } => {
@@ -1077,6 +1098,76 @@ mod tests {
         fn keys(&self) -> Vec<String> {
             self.map.keys().cloned().collect()
         }
+    }
+
+    /// A store with a byte budget and a `space()` that reports it, so the last writable byte is
+    /// an event rather than an opinion.
+    struct BudgetStore {
+        map: BTreeMap<String, String>,
+        cap: usize,
+    }
+
+    impl KvStore for BudgetStore {
+        fn get(&self, key: &str) -> Option<String> {
+            self.map.get(key).cloned()
+        }
+
+        fn set(&mut self, key: &str, value: &str) -> bool {
+            let used: usize = self.map.iter().filter(|(k, _)| k.as_str() != key).map(|(_, v)| v.len()).sum();
+            if used + value.len() > self.cap {
+                return false;
+            }
+            self.map.insert(key.to_string(), value.to_string());
+            true
+        }
+
+        fn remove(&mut self, key: &str) -> bool {
+            self.map.remove(key).is_some()
+        }
+
+        fn keys(&self) -> Vec<String> {
+            self.map.keys().cloned().collect()
+        }
+
+        fn space(&self) -> Option<StoreSpace> {
+            let used: usize = self.map.values().map(|v| v.len()).sum();
+            Some(StoreSpace::Bytes { used, total: self.cap })
+        }
+    }
+
+    /// `free_bytes` and a refusal have to be the same event: whatever the state says is left,
+    /// that much still writes, and one byte past it does not.
+    ///
+    /// Geometric on purpose - a number out of the JSON, a `true`/`false` out of `set`, and a
+    /// running total that must reach exactly zero as the last write lands.
+    #[test]
+    fn the_last_byte_is_writable_and_the_next_is_refused() {
+        fn free(s: &BudgetStore) -> usize {
+            let shown = s.space().expect("a budgeted store reports its space").to_json();
+            shown["free_bytes"].as_u64().expect("free_bytes") as usize
+        }
+
+        let mut store = BudgetStore { map: BTreeMap::new(), cap: 8192 };
+        assert_eq!(free(&store), 8192, "an empty store has all of it");
+
+        let mut index = 0;
+        while free(&store) > 0 {
+            let chunk = free(&store).min(1000);
+            let key = format!("k{index}");
+            let before = free(&store);
+            assert!(
+                store.set(&key, &"x".repeat(chunk)),
+                "the state said {before} bytes were free and {chunk} would not fit"
+            );
+            index += 1;
+        }
+        assert_eq!(free(&store), 0, "filling to the byte leaves nothing");
+        assert!(!store.set("one-more", "x"), "a store reporting 0 free accepted a byte");
+
+        let shown = store.space().unwrap().to_json();
+        assert_eq!(shown["total_bytes"], 8192, "{shown}");
+        assert_eq!(shown["used_bytes"], 8192, "{shown}");
+        assert_eq!(shown["free_bytes"], 0, "{shown}");
     }
 
     #[test]
