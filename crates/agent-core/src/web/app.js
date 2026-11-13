@@ -26,6 +26,7 @@ const S = {
   busy: false,
   panel: "status",
   afterUnlock: null,
+  unlockPromise: null,
 };
 
 // ---------------------------------------------------------------- transport
@@ -52,11 +53,15 @@ async function api(path, opts = {}) {
 }
 
 function unlock() {
-  return new Promise((resolve) => {
+  // Startup reads can be refused together. All of them wait for one login; a
+  // second 401 must not strand the first request by replacing its resolver.
+  if (S.unlockPromise) return S.unlockPromise;
+  S.unlockPromise = new Promise((resolve) => {
     S.afterUnlock = resolve;
     $("#login").hidden = false;
     setTimeout(() => $("#login-pin").focus(), 60);
   });
+  return S.unlockPromise;
 }
 
 async function doLogin() {
@@ -80,6 +85,7 @@ async function doLogin() {
     $("#login-pin").value = "";
     const wait = S.afterUnlock;
     S.afterUnlock = null;
+    S.unlockPromise = null;
     if (wait) wait(true);
     else location.reload();
   } catch (e) {
@@ -100,13 +106,29 @@ function toast(text) {
 const escapeHtml = (s) =>
   s.replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 
+/** Only passive links are clickable. HTML escaping alone does not neutralize
+ * javascript: or browser-normalized control characters inside a URL. */
+function markdownLink(label, escapedTarget) {
+  const decoder = document.createElement("textarea");
+  decoder.innerHTML = escapedTarget;
+  const target = decoder.value.trim();
+  if (!target || /[\u0000-\u0020\u007f]/.test(target)) return label;
+  try {
+    const url = new URL(target, location.href);
+    if (!["http:", "https:", "mailto:"].includes(url.protocol)) return label;
+  } catch {
+    return label;
+  }
+  return '<a href="' + escapeHtml(target) + '" target="_blank" rel="noopener noreferrer">' + label + "</a>";
+}
+
 /** Inline spans, applied to text that has already been HTML-escaped. */
 function inline(text) {
   return text
     .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
     .replace(/(^|[^*])\*([^*\n]+)\*/g, "$1<em>$2</em>")
     .replace(/`([^`]+)`/g, "<code>$1</code>")
-    .replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
+    .replace(/\[([^\]]+)\]\(([^)]+)\)/g, (_, label, target) => markdownLink(label, target));
 }
 
 /** One table row's cells. `\|` is a pipe in the text, not a separator. */
@@ -172,7 +194,7 @@ function tableFrom(lines, at) {
   return { html, next: i };
 }
 
-/** A small Markdown subset: what a model actually emits on a 2 KB budget. */
+/** A small Markdown subset for model replies, with raw HTML kept as text. */
 function markdown(text) {
   const blocks = [];
   let src = escapeHtml(text || "").replace(/```([\s\S]*?)```/g, (_, code) => {
