@@ -535,13 +535,45 @@ async function syncEventCursor() {
 }
 
 const CONVERSATION_TEXT = {
-  confirm: "Clear this conversation and its compressed history? Instructions, skills, files and model settings stay.\n\n清空会话及压缩历史？指令、技能、文件和模型设置会保留。",
-  busy: "Agent is working. Wait for this turn to finish; clearing does not cancel it.\nAgent 正在运行，请等本轮结束；清空会话不能取消运行。",
-  failed: "Could not change the conversation. History was kept.\n操作失败，历史已保留。",
-  cleared: "Conversation cleared. / 会话已清空。",
-  kept: "Kept the last exchange. / 已保留最后一轮对话。",
-  refreshFailed: "Conversation changed, but refresh failed. Reload the page to retry.\n会话已更新，但刷新失败；请重新加载页面。",
+  confirm: "This clears the conversation and its compressed history. Instructions, skills, files and model settings stay.",
+  busy: "The agent is working. Wait for this turn to finish; clearing does not cancel it.",
+  failed: "Could not change the conversation. History was kept.",
+  cleared: "Conversation cleared.",
+  kept: "Kept the last exchange.",
+  refreshFailed: "Conversation changed, but the refresh failed. Reload the page to retry.",
 };
+
+/** Our own confirmation, because window.confirm() draws its title and buttons in the
+ * device's language: an English page grew Chinese buttons on a Chinese phone. Resolves
+ * true for the action button, false for cancel, Escape or a tap outside the card. */
+function askConfirm(title, body, okLabel) {
+  return new Promise((resolve) => {
+    const dialog = $("#confirm-dialog");
+    const ok = $("#confirm-ok");
+    const cancel = $("#confirm-cancel");
+    const done = (answer) => {
+      dialog.hidden = true;
+      dialog.removeEventListener("keydown", onKey);
+      ok.onclick = null;
+      cancel.onclick = null;
+      dialog.onclick = null;
+      resolve(answer);
+    };
+    const onKey = (event) => {
+      if (event.key === "Escape") { event.preventDefault(); done(false); }
+      else if (event.key === "Enter") { event.preventDefault(); done(true); }
+    };
+    $("#confirm-title").textContent = title;
+    $("#confirm-body").textContent = body;
+    ok.textContent = okLabel;
+    ok.onclick = () => done(true);
+    cancel.onclick = () => done(false);
+    dialog.onclick = (event) => { if (event.target === dialog) done(false); };
+    dialog.addEventListener("keydown", onKey);
+    dialog.hidden = false;
+    cancel.focus();
+  });
+}
 
 function conversationControls() {
   for (const id of ["#clear-chat", "#forget-tail", "#forget-all"]) {
@@ -556,7 +588,7 @@ function conversationControls() {
 async function changeConversation(path, body, clearAll) {
   if (S.changingConversation) return;
   if (S.busy || S.sending) { toast(CONVERSATION_TEXT.busy); return; }
-  if (clearAll && !confirm(CONVERSATION_TEXT.confirm)) return;
+  if (clearAll && !(await askConfirm("Clear conversation", CONVERSATION_TEXT.confirm, "Clear"))) return;
   S.changingConversation = true;
   ++S.historyRevision;
   conversationControls();
@@ -1396,8 +1428,12 @@ function init() {
   };
 
   $("#reboot").onclick = async () => {
-    if (!confirm("Reboot the board?")) return;
-    try { await api("/api/reboot", { method: "POST", body: {} }); toast("rebooting"); }
+    if (!(await askConfirm(
+      "Restart the board?",
+      "The agent, its tools and any open stream stop answering until it boots again.",
+      "Restart",
+    ))) return;
+    try { await api("/api/reboot", { method: "POST", body: {} }); toast("restarting"); }
     catch (e) { toast(e.message); }
   };
 

@@ -185,11 +185,32 @@ window.__esp32Clear = async function () {
     return { promise, resolve };
   };
   const tick = () => new Promise((r) => setTimeout(r, 0));
+  // Answer the page's own confirmation whenever one is open. `f.confirmations` records what
+  // it said, so a test can still check the wording, and `f.accept` decides the answer. Doing
+  // it here means every waiter — not only `click` — makes progress instead of timing out with
+  // a dialog on screen.
+  const answerDialog = () => {
+    const dialog = q("#confirm-dialog");
+    if (!dialog || dialog.hidden) return false;
+    f.confirmations.push(q("#confirm-title").textContent + "\n" + q("#confirm-body").textContent);
+    if (!f.dialogButtons) f.dialogButtons = [q("#confirm-ok").textContent, q("#confirm-cancel").textContent];
+    (f.accept ? q("#confirm-ok") : q("#confirm-cancel")).click();
+    return true;
+  };
   const until = async (test) => {
-    for (let i = 0; i < 100; i++) { if (test()) return; await tick(); }
+    for (let i = 0; i < 400; i++) {
+      // Answering a dialog starts asynchronous work on the next microtask; checking the
+      // predicate in the same turn would call an unfinished clear "settled".
+      if (answerDialog()) { await tick(); continue; }
+      if (test()) return;
+      await tick();
+    }
     throw new Error("fixture did not settle");
   };
-  const click = async (button) => { button.click(); await until(() => !S.changingConversation && !S.sending); };
+  const click = async (button) => {
+    button.click();
+    await until(() => !S.changingConversation && !S.sending);
+  };
   const old = [
     { role: "user", seq: 0, text: "OLD USER QUESTION" },
     { role: "assistant", seq: 1, text: "OLD INTERMEDIATE NOTE",
@@ -211,13 +232,11 @@ window.__esp32Clear = async function () {
   };
   const nativeFetch = window.fetch;
   const nativeSource = window.EventSource;
-  const nativeConfirm = window.confirm;
   const token = S.token;
   const storedToken = localStorage.getItem("esp32-agent.token");
   const response = (body, status = 200) => Promise.resolve(new Response(JSON.stringify(body), {
     status, headers: { "Content-Type": "application/json" },
   }));
-  window.confirm = (text) => { f.confirmations.push(text); return f.accept; };
   window.fetch = async (url, opts = {}) => {
     const path = new URL(url, location.href).pathname;
     if (!["/api/agent/history", "/api/agent/events", "/api/agent/reset", "/api/agent/forget",
@@ -297,13 +316,15 @@ window.__esp32Clear = async function () {
     clear.focus();
     out.header = { button: rect(clear), title: rect(q("#title")), menu: rect(q("#menu-btn")),
       sheetHidden: q("#sheet").hidden, label: clear.textContent.trim(), aria: clear.getAttribute("aria-label"),
-      chineseLanguage: clear.querySelector("[lang=zh]").textContent, focused: document.activeElement === clear,
+      chineseLanguage: /[\u3000-\u9fff\uac00-\ud7af\uff00-\uffef]/.test(clear.textContent),
+      focused: document.activeElement === clear,
       focusOutline: getComputedStyle(clear).outlineStyle, enabled: !clear.disabled };
 
     const beforeCancel = q("#chat").innerHTML;
     f.accept = false;
     await click(clear);
     out.cancel = { posts: posts("/api/agent/reset").length, confirmations: f.confirmations.slice(),
+      dialogButtons: f.dialogButtons || [],
       preserved: q("#chat").innerHTML === beforeCancel, enabled: !clear.disabled };
 
     f.accept = true; f.resetMode = "failed";
@@ -459,7 +480,7 @@ window.__esp32Clear = async function () {
     return out;
   } finally {
     stopStream(); S.busy = false;
-    window.fetch = nativeFetch; window.EventSource = nativeSource; window.confirm = nativeConfirm;
+    window.fetch = nativeFetch; window.EventSource = nativeSource;
     S.token = token;
     if (storedToken === null) localStorage.removeItem("esp32-agent.token");
     else localStorage.setItem("esp32-agent.token", storedToken);
@@ -769,22 +790,28 @@ fn assert_conversation_clear(metrics: &Value, width: u32) {
     for key in ["sheetHidden", "focused", "enabled"] {
         expect("header", key, json!(true));
     }
-    expect("header", "aria", json!("Clear conversation / 清空会话"));
-    expect("header", "chineseLanguage", json!("清空会话"));
+    expect("header", "aria", json!("Clear conversation"));
+    expect("header", "chineseLanguage", json!(false));
     assert!(text("header", "label").contains("Clear chat"), "the clear action must be named");
     assert_ne!(text("header", "focusOutline"), "none", "{width} px: invisible keyboard focus");
 
     expect("cancel", "posts", json!(0));
     expect("cancel", "preserved", json!(true));
     expect("cancel", "enabled", json!(true));
+    // The dialog's own words, not the browser's: these are the buttons the device's
+    // language used to draw, and they are ours now.
+    expect("cancel", "dialogButtons", json!(["Clear", "Cancel"]));
     let confirmations = clear["cancel"]["confirmations"].as_array().expect("confirmation fixture");
     assert_eq!(confirmations.len(), 1, "{width} px: confirmation was not offered exactly once");
     let confirmation = confirmations[0].as_str().unwrap_or("");
-    assert!(confirmation.contains("Clear this conversation") && confirmation.contains("清空会话"));
+    assert!(confirmation.contains("Clear conversation"), "the dialog names the action: {confirmation}");
     assert!(
-        confirmation.contains("Instructions, skills, files and model settings stay.")
-            && confirmation.contains("指令、技能、文件和模型设置会保留"),
+        confirmation.contains("Instructions, skills, files and model settings stay."),
         "{width} px: confirmation must state the boundary: {confirmation}"
+    );
+    assert!(
+        !confirmation.chars().any(|c| ('\u{3000}'..='\u{9fff}').contains(&c)),
+        "{width} px: the dialog must be English only: {confirmation}"
     );
 
     expect("failure", "posts", json!(1));
@@ -795,7 +822,6 @@ fn assert_conversation_clear(metrics: &Value, width: u32) {
     expect("failure", "lastMsg", json!(3));
     expect("failure", "lastEvent", json!(80));
     assert!(text("failure", "toast").contains("History was kept."));
-    assert!(text("failure", "toast").contains("历史已保留"));
     assert!(text("failure", "toast").contains("fixture reset failed"));
 
     for key in ["disabled", "sendDisabled", "noOtherRequests"] {
@@ -817,7 +843,6 @@ fn assert_conversation_clear(metrics: &Value, width: u32) {
     expect("success", "contentType", json!("application/json"));
     expect("success", "draft", json!("draft kept during clear"));
     assert!(text("success", "toast").contains("Conversation cleared."));
-    assert!(text("success", "toast").contains("会话已清空"));
 
     expect("fresh", "after", json!("80"));
     expect("fresh", "lastEvent", json!(82));
@@ -841,7 +866,6 @@ fn assert_conversation_clear(metrics: &Value, width: u32) {
     }
     assert!(text("busy", "toast").contains("Wait for this turn to finish"));
     assert!(text("busy", "toast").contains("clearing does not cancel it"));
-    assert!(text("busy", "toast").contains("清空会话不能取消运行"));
     for key in ["pending", "noClearPost", "noConfirmation"] {
         expect("sending", key, json!(true));
     }
