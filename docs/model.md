@@ -14,7 +14,7 @@ The board is the loop; the model is a setting. Everything here is `POST /api/age
 | `reasoning` | empty | `off`/`low`/`medium`/`high`; empty sends nothing and leaves it to the provider |
 | `vision` | `true` | Whether image attachments go out as content parts |
 | `context_tokens` | `262144` | Transcript budget; compaction fires at 80% of it |
-| `max_output_tokens` | `32768` | Reply ceiling, sent as `max_tokens` and reserved out of the window |
+| `max_output_tokens` | `32768` | Reply ceiling, sent as `max_tokens` on Chat/Messages and `max_output_tokens` on Responses; reserved out of the window |
 | `timeout_s` | `45` | Per model call |
 
 ```bash
@@ -34,7 +34,12 @@ A request built for one is a 400 on the others, so the choice is explicit:
 | Tools | nested under `function` | flat | `input_schema` |
 | Tool results | a `role: tool` message | a `function_call_output` item | a `tool_result` block in a user turn |
 | Auth header | `Authorization: Bearer` | same | `x-api-key` + `anthropic-version` |
-| `max_tokens` | optional | optional | required |
+| Reply ceiling field | `max_tokens` | `max_output_tokens` | `max_tokens` (required) |
+| Image content parts | `text` / nested `image_url` | `input_text` / flat `input_image` | `text` / base64 `image` |
+
+All adapters reject malformed or non-object tool input as a tool error, preserving the
+call id so the next request can carry its result. They never run that call with guessed
+empty arguments; the echoed call carries `{}` instead of the private parse-error field.
 
 ## When it fails
 
