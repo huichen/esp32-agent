@@ -95,14 +95,15 @@ works for every board it can reach. Without a key at all, `base_url` set to
 |---|---|
 | `agent-core` | 840 unit tests and 5 integration tests pass; `scripts/smoke.ps1` passes end to end |
 | Simulator | console, MCP and the agent loop run end to end |
-| Firmware | historical bench firmware on an ESP32-S3-DevKitC-1 N16R8 (IDF v5.5.2): 42 tools, OLED 128×32, I²S mic and amp, WS2812, TLS console, model turns over HTTPS; audit changes not board-verified |
+| Firmware | flashed on an ESP32-S3-DevKitC-1 N16R8 (IDF v5.5.2) at commit `d5d8927` on 2026-11-13: 42 tools, OLED 128×32, I²S mic and amp, WS2812, TLS console, model turns over HTTPS; what that flash did not verify is listed in `ROADMAP.md` |
 | Not implemented / unverified | Firmware DVP camera capture is not implemented. SD raw-sector and DHT11/22 drivers have host tests, not board verification. See `ROADMAP.md` |
 
 Historical bench numbers: a four-tool turn in 13.7 s; console over TLS in 0.55 s; I²C scan
 stable over 8 runs. The early 5–6 kB internal-SRAM reading after a TLS page predates allocator
 fixes (`10b16dd`) and is not a current limit. Later pool measurements and provenance are in
-[Troubleshooting](docs/troubleshooting.md#how-much-memory-the-board-has). The audit firmware
-has not been flashed or board-tested.
+[Troubleshooting](docs/troubleshooting.md#how-much-memory-the-board-has).
+The current firmware was flashed and answers on the bench board; power-cut durability,
+ENOSPC behaviour and the audio/camera paths are still unverified, as `ROADMAP.md` says.
 
 ## Documentation
 
