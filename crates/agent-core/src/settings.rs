@@ -160,6 +160,12 @@ const BOARD: &[Field] = &[
 const SCHEDULE: &[Field] = &[
     f("tasks[].id", "string", "", "stable id"),
     f("tasks[].prompt", "string", "", "what to ask the agent"),
+    f(
+        "tasks[].after_s",
+        "integer",
+        "0",
+        "fire once N seconds from now, then remove the task; use it instead of every_s/at_hhmm",
+    ),
     f("tasks[].every_s", "integer", "0", "repeat every N seconds"),
     f("tasks[].at_hhmm", "string", "\"\"", "run at a wall-clock time, UTC"),
     f("tasks[].enabled", "boolean", "true", "pause without deleting"),
