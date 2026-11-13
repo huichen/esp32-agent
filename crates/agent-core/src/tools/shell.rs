@@ -127,6 +127,11 @@ pub const PIPE_USAGE: &str =
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Pipeline {
     pub stages: Vec<Stage>,
+    /// The line started with `time`, so the caller owes the answer a wall-clock figure.
+    ///
+    /// It is a property of the line, not a stage: `time cat /f | wc -l` measures the whole
+    /// pipeline, which is what a person typing it means.
+    pub timed: bool,
 }
 
 /// One stage: the command, plus the file it reads (`<`) and the file it writes (`>`, `>>`).
@@ -313,7 +318,9 @@ fn starts_a_command(after: &str) -> bool {
     if word.is_empty() {
         return false;
     }
-    route(&word).is_some()
+    // `time` is a prefix to a command, so `echo a; time sleep 1` is two commands even
+    // though `time` is not in the table.
+    route(&word).is_some() || word.eq_ignore_ascii_case("time")
 }
 
 pub fn split_sequence(line: &str) -> Result<Option<Vec<String>>, String> {
@@ -375,6 +382,17 @@ pub fn split_sequence(line: &str) -> Result<Option<Vec<String>>, String> {
 }
 
 pub fn parse_pipeline(line: &str) -> Result<Pipeline, String> {
+    let mut tokens = tokenize(line)?;
+    // `time` is a prefix, not a command: it is taken off here so every stage below is the
+    // command that actually runs, and a line that is only `time` says what it wants.
+    let mut timed = false;
+    if matches!(tokens.first(), Some(Token::Word(word)) if word.eq_ignore_ascii_case("time")) {
+        tokens.remove(0);
+        timed = true;
+        if tokens.is_empty() {
+            return Err("`time` needs a command after it".to_string());
+        }
+    }
     let mut stages: Vec<Stage> = Vec::new();
     let mut words: Vec<String> = Vec::new();
     let mut stdin: Option<String> = None;
@@ -382,7 +400,7 @@ pub fn parse_pipeline(line: &str) -> Result<Pipeline, String> {
     // The operator that is waiting for its file name or its next stage.
     let mut pending: Option<Token> = None;
 
-    for token in tokenize(line)? {
+    for token in tokens {
         match token {
             Token::Word(word) => match pending.take() {
                 Some(Token::Out) => stdout = Some(Redirect { path: word, append: false }),
@@ -421,7 +439,7 @@ pub fn parse_pipeline(line: &str) -> Result<Pipeline, String> {
         });
     }
     stages.push(stage_from(words, stdin, stdout)?);
-    Ok(Pipeline { stages })
+    Ok(Pipeline { stages, timed })
 }
 
 fn missing_target(operator: &Token) -> String {
@@ -1069,6 +1087,7 @@ pub fn help_text() -> String {
         }
     }
     out.push_str("\nSeparate tools: read <path> · write <path> <text> · edit <path> <find> <replace>");
+    out.push_str("\ntime <command> measures one line; -h on any command prints its usage");
     out
 }
 

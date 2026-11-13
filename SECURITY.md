@@ -37,7 +37,7 @@ page.
 | Untrusted upstream (outbound) | `https://` is verified against the ESP-IDF CA bundle; there is no "skip verification" switch | point the model endpoint at an `https://` provider rather than a plain `http://` one on an untrusted network |
 | Credentials in plaintext NVS | ESP-IDF NVS is not encrypted by default | NVS encryption (`CONFIG_NVS_ENCRYPTION`) is available but needs keys flashed first |
 | Arbitrary I2C writes | `i2c_write` and the manifest primitive are by design | point it at trusted models only; omit the write primitive when you do not need it |
-| No firmware signature check | OTA is not implemented | see ROADMAP; flashing is over serial today |
+| No firmware signature check | OTA is not implemented | flashing is over serial; see [Flashing](docs/flashing.md) |
 
 ## Reporting a vulnerability
 

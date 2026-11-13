@@ -48,21 +48,23 @@ mod tests {
         );
     }
 
-    /// The console ships in English only. One pasted Chinese label would reach the bench
-    /// as text nobody there reads, and a paste is all it takes, so the absence is pinned
-    /// here instead of being remembered.
+    /// Clearing is available in the conversation itself, with both languages named and
+    /// an accessible status for cancellation/refusal feedback. It is not a settings reset.
     #[test]
-    fn the_portal_is_english_only() {
-        for (name, text) in [("index.html", INDEX_HTML), ("app.js", APP_JS), ("style.css", STYLE_CSS)] {
-            if let Some((offset, ch)) = text.char_indices().find(|(_, c)| is_cjk(*c)) {
-                let line = text[..offset].lines().count() + 1;
-                panic!("{name}:{line} contains the CJK character {ch:?}");
-            }
-        }
-        // A language switch left behind would have nothing to switch to.
-        assert!(!INDEX_HTML.contains("data-i18n"), "index.html still carries i18n hooks");
-        assert!(!APP_JS.contains("I18N"), "app.js still carries an I18N table");
-        assert!(INDEX_HTML.contains("<html lang=\"en\">"), "the document language must be English");
+    fn conversation_clearing_is_accessible_in_both_languages() {
+        let header = INDEX_HTML.split("</header>").next().expect("the chat header");
+        assert!(header.contains("id=\"clear-chat\""), "clearing must not require a sheet");
+        assert!(header.contains("type=\"button\" aria-label=\"Clear conversation / 清空会话\""));
+        assert!(header.contains("<span>Clear chat</span><span lang=\"zh\">清空会话</span>"));
+        assert!(INDEX_HTML.contains("role=\"status\" aria-live=\"polite\""));
+        assert!(APP_JS.contains("changeConversation(\"/api/agent/reset\", {}, true)"));
+        assert!(APP_JS.contains("changeConversation(\"/api/agent/forget\", { keep: 1 }, false)"));
+        assert!(APP_JS.contains("!confirm(CONVERSATION_TEXT.confirm)"));
+        assert!(APP_JS.contains("Instructions, skills, files and model settings stay."));
+        assert!(APP_JS.contains("指令、技能、文件和模型设置会保留"));
+        assert!(!APP_JS.contains("/api/factory-reset"), "clearing must not erase the workspace or config");
+        assert!(STYLE_CSS.contains(".clear-chat:focus-visible"), "keyboard focus must be visible");
+        assert!(INDEX_HTML.contains("<html lang=\"en\">"), "the rest of the portal stays English");
     }
 
     /// Five tabs, and only five: the conversation is the page, so everything else has to
@@ -123,11 +125,5 @@ mod tests {
         assert!(APP_JS.contains("<details") || APP_JS.contains("document.createElement(\"details\")"));
         assert!(APP_JS.contains("tool_result") && APP_JS.contains("result: "));
         assert!(STYLE_CSS.contains("details.tool") || STYLE_CSS.contains(".tool"), "the row needs a style");
-    }
-
-    /// CJK punctuation and fullwidth forms are rejected along with the ideographs: a
-    /// Chinese full stop in an otherwise English sentence is the same problem.
-    fn is_cjk(c: char) -> bool {
-        matches!(c, '\u{3000}'..='\u{303f}' | '\u{4e00}'..='\u{9fff}' | '\u{ff00}'..='\u{ffef}')
     }
 }

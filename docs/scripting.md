@@ -95,8 +95,8 @@ legacy name. `tool("script", …)` is refused to prevent recursion through the t
 
 | Limit | Value | Why |
 |---|---|---|
-| Wall clock | 30 s | stop a runaway program with a message |
-| `sleep(ms)` | 2 s per call, 5 s per script | bound the time the caller waits |
+| Wall clock | 30 s, or less | stop a runaway program with a message; a script started by a tool call inherits that call's remaining budget, so the smaller of the two is the deadline |
+| `sleep(ms)` | whatever the call has left | one budget instead of a second cap: a wait longer than the remaining milliseconds is refused with both numbers |
 | Steps | 5 000 000 | backstop for a loop that only computes |
 | Nesting | 32 blocks | bound recursive interpreter execution |
 | Function recursion | 32 calls | bound stack frames and local maps |
@@ -104,7 +104,10 @@ legacy name. `tool("script", …)` is refused to prevent recursion through the t
 | Log lines | 64 | bound run output independently of transport limits |
 | Source | 8 KiB | bound lexing and parsing work |
 
-`sleep` parks the thread rather than spinning, but the caller still waits. Synchronous
+`sleep` parks the thread rather than spinning, but the caller still waits. A script run by
+a tool call shares that call's deadline (`agent.tool_timeout_s`, 30 s by default), so it
+cannot outlive the call that started it, and a `sleep` is bounded by what is left rather
+than by a constant of its own. Synchronous
 scripts execute under the shared App lock, so other callers needing that lock are delayed;
 a background job is not permission to monopolize hardware indefinitely. Longer waits belong
 in scheduled work (`every_s`), whose idle interval does not hold the App lock.
