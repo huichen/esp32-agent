@@ -54,7 +54,7 @@ pub fn board_tools() -> Vec<ToolDef> {
         }),
         ToolDef::new(
             "board_status",
-            "Board status: chip, firmware, uptime, temperature, heap, WiFi, detected device count, tool counters",
+            "Board status: chip, firmware, uptime, die temperature, heap and internal RAM, WiFi, detected device count, tool counters, and what the store still owes — `pending`, `failed`, `last_failure`. The first call on an unfamiliar board",
         )
         .title("Board status")
         .category("board")
@@ -64,8 +64,7 @@ pub fn board_tools() -> Vec<ToolDef> {
             let info = ctx.hw.board_info();
             let wifi = ctx.hw.wifi_status();
             let internal = ctx.hw.heap_internal();
-            Ok(json!({
-                "device_name": ctx.cfg.device_name,
+            Ok(json!({                "device_name": ctx.cfg.device_name,
                 "board_profile": ctx.profile.id,
                 "board_name": ctx.profile.name,
                 "soc": info.soc,
@@ -95,6 +94,9 @@ pub fn board_tools() -> Vec<ToolDef> {
                 "capabilities": ctx.caps.to_json(),
                 "session_count": ctx.runtime.sessions.len(),
                 "counters": ctx.runtime.counters_json(),
+                // "Did the write reach flash?" — the one reading a tool that answers "queued"
+                // leaves open. Sampled by `App::settle` after every call.
+                "store": ctx.runtime.store_stats,
             }))
         }),
         ToolDef::new(
@@ -139,7 +141,7 @@ pub fn board_tools() -> Vec<ToolDef> {
                 "board_extra": ctx.hw.inventory_extra(),
             }))
         }),
-        ToolDef::new("devices_list", "List the peripherals this board detected, with their capabilities")
+        ToolDef::new("devices_list", "Every peripheral this board detected, with the tools each one answers to, its pins, its bus and its address")
             .title("Devices")
             .category("board")
             .core()
@@ -331,7 +333,7 @@ pub fn board_tools() -> Vec<ToolDef> {
                 ctx.hw.delay_us(ms * 1000);
                 Ok(json!({ "ok": true, "ms": ms }))
             }),
-        ToolDef::new("logs_tail", "Read the board's recent log lines (boot and tool history)")
+        ToolDef::new("logs_tail", "The board's ring log, newest last: level, target, sequence number and the message, for boot and for every tool that failed")
             .title("Logs")
             .category("system")
             .core()
@@ -380,7 +382,11 @@ pub fn system_tools() -> Vec<ToolDef> {
         }),
         ToolDef::new(
             "schedule",
-            "Manage the board's own schedule: `action` is list, add, remove, enable or disable. A task re-runs a prompt every `every_s` seconds or daily at `at_hhmm`, and fires into the same queue a user message uses — the board works on its own. Every task is recurring: there is no \"run once in N seconds\", so a request for a one-off belongs in `script` or a direct tool call, and a task created for one is one the caller has to remove afterwards.",
+            "The board's own calendar, run without a host: `action` is list, add, remove, enable or disable. \
+             A task either repeats (`every_s`), runs daily at a wall-clock time (`at_hhmm`, UTC), or fires \
+             once and removes itself (`after_s`). What it does is a prompt for the board's model or a small \
+             `script` that costs no tokens. A fired task lands in the same queue as a user message, so the \
+             board works on its own and its answer arrives in the transcript.",
         )
         .title("Schedule")
         .category("system")
@@ -389,8 +395,13 @@ pub fn system_tools() -> Vec<ToolDef> {
         .schema(object_schema(
             &[
                 ("action", enumeration(&["list", "add", "remove", "enable", "disable"], "what to do")),
-                ("id", string("task id (remove/enable/disable)")),
-                ("prompt", string("what to ask when it fires")),
+                (
+                    "id",
+                    string("task id: `add` uses it when given (else one is derived), the others require it"),
+                ),
+                ("prompt", string("what to ask the board's model when it fires")),
+                ("script", string("a board script to run instead of asking the model; costs no tokens")),
+                ("after_s", integer(1, 86_400, "fire once this many seconds from now, then remove the task")),
                 ("every_s", integer(0, 86_400, "repeat every N s; 0 = use at_hhmm")),
                 ("at_hhmm", string("daily \"07:30\" (UTC)")),
                 ("enabled", boolean("default true")),
@@ -404,6 +415,8 @@ pub fn system_tools() -> Vec<ToolDef> {
                     "tasks": ctx.tasks.iter().map(|t| json!({
                         "id": t.id,
                         "prompt": t.prompt,
+                        "script": t.script,
+                        "after_s": t.after_s,
                         "every_s": t.every_s,
                         "at_hhmm": t.at_hhmm,
                         "enabled": t.enabled,
@@ -414,18 +427,37 @@ pub fn system_tools() -> Vec<ToolDef> {
                     if ctx.tasks.len() >= crate::app::MAX_TASKS {
                         return Err(McpError::invalid_params(format!("at most {} scheduled tasks", crate::app::MAX_TASKS)));
                     }
-                    // The id is derived, not asked for, and remains unique after removals.
-                    let id = crate::app::next_schedule_task_id(ctx.tasks);
+                    // A caller that names the task keeps that name: it can then `remove` or
+                    // `enable` it without reading this response first, and adding it twice is a
+                    // refusal instead of a second task nobody can address. Without a name the
+                    // id is derived, and stays unique after removals.
+                    let id = match j::opt_str(args, "id").map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) {
+                        Some(id) => {
+                            if id.len() > 32 || id.chars().any(|c| c.is_whitespace() || c.is_control()) {
+                                return Err(McpError::invalid_params(
+                                    "`id` is at most 32 characters and holds no spaces",
+                                ));
+                            }
+                            if ctx.tasks.iter().any(|t| t.id == id) {
+                                return Err(McpError::invalid_params(format!(
+                                    "task `{id}` already exists: use `remove`, or `add` with another id"
+                                )));
+                            }
+                            id
+                        }
+                        None => crate::app::next_schedule_task_id(ctx.tasks),
+                    };
                     let mut input = args.clone();
                     input["id"] = json!(id);
                     // The tool creates a new task, so its clock always starts now. An
                     // existing REST edit/replacement may instead preserve its old clock.
                     input["last_run_ms"] = json!(crate::app::now_ms());
                     let task = crate::app::task_from_api(&input, &id)?;
+                    let one_shot = task.after_s > 0;
                     ctx.tasks.push(task);
                     ctx.runtime.sched_dirty = true;
                     ctx.log.info("agent", format!("schedule: task `{id}` added from a tool call"));
-                    Ok(json!({ "ok": true, "id": id, "count": ctx.tasks.len() }))
+                    Ok(json!({ "ok": true, "id": id, "count": ctx.tasks.len(), "one_shot": one_shot }))
                 }
                 "remove" | "enable" | "disable" => {
                     let id = j::opt_str(args, "id").unwrap_or_default();
@@ -480,7 +512,7 @@ pub fn agent_extra_specs() -> Value {
             "type": "function",
             "function": {
                 "name": "read",
-                "description": "Read a text file from the board workspace. `/` is the root.",
+                "description": "Read one UTF-8 text file from the board workspace, which is its own filesystem: `/` holds `MEMORY.md`, `notes/`, `skills/` and `memory/`. `shell` with `ls /` lists a directory; this tool reads a file.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -495,7 +527,7 @@ pub fn agent_extra_specs() -> Value {
             "type": "function",
             "function": {
                 "name": "write",
-                "description": format!("Create or overwrite a UTF-8 text file in the board workspace. Parent directories are created. A file is limited to {} bytes and the workspace to {} bytes of text in total. Success reports queue admission, not storage completion.", fs::MAX_FILE_BYTES, crate::app::WORKSPACE_TOTAL_MAX),
+                "description": format!("Create or overwrite a UTF-8 text file in the board workspace, creating parent directories. Overwrites whatever is there: use `edit` to change one place. A file is limited to {} bytes and the workspace to {} bytes of text in total. The answer is queue admission, not storage: `board status` reports the store's `pending`/`failed` for the outcome.", fs::MAX_FILE_BYTES, crate::app::WORKSPACE_TOTAL_MAX),
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -511,7 +543,7 @@ pub fn agent_extra_specs() -> Value {
             "type": "function",
             "function": {
                 "name": "edit",
-                "description": "Replace exactly one occurrence of `find` in a file. Fails when it occurs zero or several times, so an ambiguous edit never rewrites the wrong place. Success reports queue admission, not storage completion.",
+                "description": "Replace exactly one occurrence of `find` in a file. Fails when it occurs zero times or several, so an ambiguous edit never rewrites the wrong place. The answer is queue admission, not storage: `board status` reports the store's `pending`/`failed` for the outcome.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -547,7 +579,7 @@ pub fn script_specs() -> Value {
         "type": "function",
         "function": {
             "name": "script",
-            "description": "Run a small script on the board — the way to write a loop or a condition the fixed tools cannot express: `let`, assignment, `if`/`else`, `while` with `break`, numbers, strings, bools, nil, lists, maps, and `tool(name, args)` to call any other board tool. `args` is optional: a map, or a list of words, and the program reads it back as the globals `args` and `argv`, so one script can be run with different values without being rewritten. `{\"help\": true}` (or `section`: overview|builtins|examples) returns the syntax reference; `{\"lint\": true}` checks `source` without running it. Bounded by 30 s and 5 000 000 steps.",
+            "description": "Run a small script on the board — the way to write a loop or a condition the fixed tools cannot express: `let`, assignment, `if`/`else`, `while` with `break`, `for`, `fn`, numbers, strings, bools, nil, lists, maps, and `tool(name, args)` to call any other board tool. The program's result is the value of its last expression (a map is returned as a map), and `return` ends it early. `args` is optional: a map, or a list of words, and the program reads it back as the globals `args` and `argv`, so one script can be run with different values without being rewritten. `{\"help\": true}` (or `section`: overview|builtins|examples) returns the syntax reference; `{\"lint\": true}` checks `source` without running it. Bounded by 30 s and 5 000 000 steps.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -579,6 +611,28 @@ pub fn script_specs() -> Value {
     }]))
 }
 
+/// What a device family is for, in one sentence.
+///
+/// A family is declared by the drivers that join it (`display`, `indicators`, `audio`), so the
+/// sentence lives here rather than in `DeviceInfo`: the family is the board's own vocabulary,
+/// and "display: 6 commands" told a caller that had never seen this board nothing it could act
+/// on. A family without a sentence keeps the count, which is at least true.
+pub fn family_summary(family: &str) -> Option<&'static str> {
+    Some(match family {
+        "display" => {
+            "The OLED panel: draw text, a rectangle or a whole 1-bpp bitmap, read back what is \
+             there, set contrast. `oled_read` returns text rows, not pixels: a bitmap reads back \
+             as `?`"
+        }
+        "indicators" => "The LED and the buttons: set or blink the LED, read the buttons or wait for a press",
+        "audio" => {
+            "The microphone and the speaker: measure the mic level, record it into a WAV result, \
+             or play a tone or a short melody through the amplifier"
+        }
+        _ => return None,
+    })
+}
+
 /// Every tool that needs no device at all.
 pub fn always_tools() -> Vec<ToolDef> {
     let mut v = board_tools();
@@ -593,7 +647,7 @@ pub fn always_tools() -> Vec<ToolDef> {
 fn device_invoke_tool() -> ToolDef {
     ToolDef::new(
         "device_invoke",
-        "Call a tool of a detected device by id (use devices_list to see ids and tool names)",
+        "Call a tool of a detected device by id — `devices_list` names the ids and the tools under them",
     )
     .title("Invoke device tool")
     .category("manifest")
@@ -647,11 +701,12 @@ pub fn board_commands() -> Vec<ToolDef> {
     pick(&mut pool, BOARD_COMMANDS)
 }
 
-/// The `board` family: one tool, nine commands.
+/// The `board` family: one tool, seven commands.
 pub fn board_family() -> ToolDef {
     Family::new(
         "board",
-        "The board itself: status, config, chip temperature, logs, restart, delay, inventory; `command: help` gives each one's arguments",
+        "The board itself: status, config, chip temperature, logs, delay, inventory. \
+         Nothing here reboots the board or clears its storage; `command: help` lists each one's arguments",
         board_commands(),
     )
     .into_tool()
@@ -683,7 +738,7 @@ const BUS_COMMANDS: &[&str] = &[
 pub fn bus_family() -> ToolDef {
     Family::new(
         "bus",
-        "Raw access to the pins and buses: I2C scan/read/write/identify, GPIO mode/read/write, one ADC pin. For chips without a driver; `command: help` gives each one's arguments",
+        "Raw pins and buses, for a chip that has no driver: I2C scan/read/write/identify, GPIO mode/read/write, and one ADC pin in millivolts; `command: help` lists each one's arguments",
         bus_commands(),
     )
     .into_tool()

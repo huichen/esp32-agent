@@ -815,6 +815,22 @@ impl Parser {
         Ok(out)
     }
 
+    /// `{` at the start of a statement: a map literal, or a bare block?
+    ///
+    /// Both start with the same token, and the parser picked the block. A map is what is
+    /// almost always meant there, because the blocks in this language only ever follow
+    /// `if`/`else`/`while`/`fn`, and those call [`Parser::block`] directly rather than going
+    /// through a statement. What is left to tell them apart is a key before a colon: `{a: 1}`
+    /// is a map, `{ echo(x) }` is not. `{}` counts as the empty map, since an empty block
+    /// would do nothing.
+    fn brace_opens_a_map(&self) -> bool {
+        let at = |n: usize| self.toks.get(self.pos + n).map(|t| &t.tok);
+        matches!(
+            (at(1), at(2)),
+            (Some(Tok::RBrace), _) | (Some(Tok::Ident(_)) | Some(Tok::Str(_)), Some(Tok::Colon))
+        )
+    }
+
     fn stmt(&mut self) -> Result<Stmt, String> {
         if let Some(parsed) = self.keyword_stmt() {
             return parsed;
@@ -858,6 +874,15 @@ impl Parser {
                 self.next();
                 self.eat(&Tok::Semi);
                 Ok(Stmt::Break)
+            }
+            Tok::LBrace if self.brace_opens_a_map() => {
+                // A map literal where a statement starts. Documented as a value (`{a: 1}`) and
+                // the parser used to see a block, so a program whose last line was a map
+                // failed with "unexpected token Colon" - the answer `{ok: true}` a model writes
+                // was the one shape it could not return.
+                let e = self.expr()?;
+                self.eat(&Tok::Semi);
+                Ok(Stmt::Expr(e))
             }
             Tok::LBrace => Ok(Stmt::Expr({
                 // A bare block runs for its side effects; reuse the statement list.
@@ -2023,6 +2048,37 @@ len(r.issues)"#),
         assert_eq!(host.calls[0].0, "i2c_scan");
         assert_eq!(outcome.result, json!("0x3C"));
         assert_eq!(outcome.output, vec!["found 1".to_string()]);
+    }
+
+    /// A map literal is a value, including where a statement starts.
+    ///
+    /// `{a: 1}` is documented as a value, but the parser saw a brace at the start of a
+    /// statement and read a block, so the answer a model writes first — `{ok: true}` as the
+    /// last line — failed with "unexpected token Colon" on the board.
+    #[test]
+    fn a_map_literal_is_a_value_where_a_statement_starts() {
+        let mut host = NoHost;
+        let out = run("{a: 1, b: \"two\"}", &mut host).expect("a map as the last statement");
+        assert_eq!(out.result, json!({"a": 1, "b": "two"}));
+
+        // The colon is what tells a map from a block; an empty pair of braces is the empty map.
+        let out = run("{}", &mut host).expect("the empty map");
+        assert_eq!(out.result, json!({}));
+        let out = run("let m = {k: 2}\nm.k + 1", &mut host).expect("runs");
+        assert_eq!(out.result, json!(3));
+
+        // Blocks are unchanged: an `if` or `while` body comes through `block()`, not through a
+        // statement, so only a brace followed by `key:` is read as a map. (`if` is a statement
+        // here, so its value is not the script's result — the `3` is.)
+        let out = run("if true { 1 } else { 2 }\n3", &mut host).expect("runs");
+        assert_eq!(out.result, json!(3));
+        let out = run("let i = 0\nwhile i < 2 {\n  i = i + 1\n}\ni", &mut host).expect("runs");
+        assert_eq!(out.result, json!(2));
+
+        // A map is also what a function returns: that is the shape a script hands back to
+        // the caller, and it was the one shape the parser refused.
+        let out = run("fn one() {\n  return {n: 1}\n}\nlet r = one()\nr.n", &mut host).expect("runs");
+        assert_eq!(out.result, json!(1));
     }
 
     #[test]
