@@ -132,6 +132,12 @@ const BOARD: &[Field] = &[
     f("ui.theme", "string", "dark", "portal theme"),
     f("agent.tick_ms", "integer", "1000", "how often the agent thread and scheduler tick"),
     f(
+        "agent.tool_timeout_s",
+        "integer",
+        "30",
+        "seconds one tool call may spend, 0 to 300; 0 disables the deadline. `shell sleep` and `script sleep` wait against this budget instead of a cap of their own, and a tool inside a script inherits the outer call's budget",
+    ),
+    f(
         "agent.persist_transcript",
         "boolean",
         "true",

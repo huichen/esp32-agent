@@ -141,12 +141,12 @@ partial effect. See [storage](storage.md#workspace-publication-and-rollback).
 |---|---|---|
 | POST | `/api/agent/message` | `{text}` — queue a user message; answers `202` with the queued count |
 | GET | `/api/agent/history?after=<n>` | Transcript entries after `n`, plus `usage`. Each tool call carries its `arguments`; past 1024 bytes they arrive as a string with `arguments_elided_bytes`, so a client can say what it is not showing |
-| POST | `/api/agent/reset` | Clear the conversation |
+| POST | `/api/agent/reset` | Clear the conversation. `409` while a model turn is in flight: its question would be gone and its answer would arrive in a thread that no longer holds it |
 | GET | `/api/agent/config` | Model connection, `tick_ms`, `last_run`/`total` usage |
 | POST | `/api/agent/config` | Update model connection, `protocol`, `reasoning`, `vision`, `temperature`, `timeout_s`, context/output/step budgets and `tick_ms`; reads omit `api_key` and report `api_key_set` |
 | GET | `/api/agent/prompt` | The system prompt as the model receives it, memory and skills included ([context layers](context.md)) |
 | POST | `/api/agent/prompt` | The standing orders: `{action: set\|append\|clear, text}` |
-| POST | `/api/agent/forget` | `{keep: N}`, keep the last N exchanges and drop the rest ([memory](agent-memory.md)) |
+| POST | `/api/agent/forget` | `{keep: N}`, keep the last N exchanges and drop the rest ([memory](agent-memory.md)); `409` under the same rule as `reset` |
 | GET | `/api/agent/events?after=<seq>` | The run journal as JSON (polling) |
 | GET | `/api/agent/stream?after=<seq>` | The same journal as **SSE**: replay, then follow. 503 with `Retry-After: 5` when two streams are already open |
 | GET | `/api/sched` | Scheduled tasks and sensor rules |
@@ -169,6 +169,17 @@ Model `timeout_s` is clamped to 5–180 seconds and passed at request time to Ch
 Responses, Anthropic and `image_read`. The host transport uses one whole-request deadline;
 platform DNS resolution cannot necessarily be interrupted by it. This is not a measured
 firmware or real-provider latency guarantee.
+
+Each tool call has its own budget: `agent.tool_timeout_s`, clamped to 0–300 seconds and
+30 by default, with `0` meaning "no deadline". It is one deadline for the whole call, and
+a nested call (a `tool(…)` inside a script, a family command, a shell stage) inherits the
+outer one instead of starting a fresh budget. Commands that wait spend it rather than
+carrying a cap of their own — `shell sleep`, `script sleep` and the HTTP client ask what is
+left — so raising this number is what makes a longer wait possible. A call that begins
+after the budget is gone is refused with JSON-RPC `-32007`; one that finishes anyway keeps
+its result and adds `deadline_exceeded: {timeout_ms, elapsed_ms, note}`. This is cooperative:
+it cannot interrupt work already inside a driver or a socket call, and a tool that ignores
+the clock can still overrun its budget.
 
 ### Streaming audio
 

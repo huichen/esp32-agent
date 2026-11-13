@@ -20,10 +20,13 @@ const S = {
   // `?after=` skipped every event of the run — which is exactly what "no streaming"
   // looked like.
   lastMsg: 0,
-  lastEvent: 0,
+  lastEvent: null, // seed the journal head before sending, never replay the old conversation
   rendered: 0,
+  historyRevision: 0, // invalidate reads that were started before a conversation change
   stream: null,
   busy: false,
+  sending: false,
+  changingConversation: false,
   panel: "status",
   afterUnlock: null,
   unlockPromise: null,
@@ -48,7 +51,11 @@ async function api(path, opts = {}) {
   const text = await res.text();
   let data = null;
   try { data = text ? JSON.parse(text) : null; } catch { data = { raw: text }; }
-  if (!res.ok) throw new Error((data && data.error) || res.status + " " + res.statusText);
+  if (!res.ok) {
+    const error = new Error((data && data.error) || res.status + " " + res.statusText);
+    error.status = res.status;
+    throw error;
+  }
   return data;
 }
 
@@ -473,26 +480,117 @@ function renderTurn(turn) {
   }
 }
 
-async function loadHistory() {
+function renderHistory(data) {
+  $("#chat").innerHTML = "";
+  const msgs = (data && data.messages) || [];
+  S.rendered = msgs.length;
+  S.lastMsg = 0;
+  for (const m of msgs) S.lastMsg = Math.max(S.lastMsg, m.seq || 0);
+  if (!msgs.length) {
+    const { bubble } = addRow("agent");
+    bubble.innerHTML =
+      "<p>This is the board's own agent. Ask it about the hardware, tell it to change something, or give it a job &mdash; it calls its tools by itself.</p>";
+    return;
+  }
+  for (const turn of groupTurns(msgs)) renderTurn(turn);
+  scrollToEnd();
+}
+
+async function loadHistory(duringChange = false) {
+  if (S.changingConversation && !duringChange) return false;
+  const revision = ++S.historyRevision;
   try {
     const data = await api("/api/agent/history");
-    const chat = $("#chat");
-    chat.innerHTML = "";
-    const msgs = (data && data.messages) || [];
-    if (!msgs.length) {
-      const { bubble } = addRow("agent");
-      bubble.innerHTML =
-        "<p>This is the board's own agent. Ask it about the hardware, tell it to change something, or give it a job &mdash; it calls its tools by itself.</p>";
-      return;
-    }
-    for (const turn of groupTurns(msgs)) renderTurn(turn);
-    S.rendered = msgs.length;
-    for (const m of msgs) S.lastMsg = Math.max(S.lastMsg, m.seq || 0);
-    scrollToEnd();
+    if (revision !== S.historyRevision || (S.changingConversation && !duringChange)) return false;
+    renderHistory(data);
+    return true;
   } catch (e) {
-    if (String(e.message).includes("PIN")) return;
-    toast("history: " + e.message);
+    if (revision === S.historyRevision && !String(e.message).includes("PIN")) toast("history: " + e.message);
+    return false;
   }
+}
+
+/** Polls and explicit reloads share the same read fence: a response captured before a
+ * clear must not redraw the old transcript, even if it arrives after the clear finished. */
+async function pollHistory() {
+  if (S.busy || S.stream || S.changingConversation || S.sending) return;
+  const revision = S.historyRevision;
+  try {
+    const data = await api("/api/agent/history");
+    if (revision !== S.historyRevision || S.busy || S.stream || S.changingConversation || S.sending) return;
+    const count = ((data && data.messages) || []).length;
+    if (count !== S.rendered) await loadHistory();
+  } catch {
+    /* offline or locked: the next tick tries again */
+  }
+}
+
+/** The event journal can outlive the transcript, including a Memory forget. Read its
+ * head instead of guessing from message indices or replaying from zero. If this read
+ * fails after a clear, the next send retries it before submitting a new turn. */
+async function syncEventCursor() {
+  const data = await api("/api/agent/events?after=" + (S.lastEvent || 0));
+  if (!data || !Number.isSafeInteger(data.seq) || data.seq < 0) throw new Error("invalid event cursor");
+  S.lastEvent = data.seq;
+}
+
+const CONVERSATION_TEXT = {
+  confirm: "Clear this conversation and its compressed history? Instructions, skills, files and model settings stay.\n\n清空会话及压缩历史？指令、技能、文件和模型设置会保留。",
+  busy: "Agent is working. Wait for this turn to finish; clearing does not cancel it.\nAgent 正在运行，请等本轮结束；清空会话不能取消运行。",
+  failed: "Could not change the conversation. History was kept.\n操作失败，历史已保留。",
+  cleared: "Conversation cleared. / 会话已清空。",
+  kept: "Kept the last exchange. / 已保留最后一轮对话。",
+  refreshFailed: "Conversation changed, but refresh failed. Reload the page to retry.\n会话已更新，但刷新失败；请重新加载页面。",
+};
+
+function conversationControls() {
+  for (const id of ["#clear-chat", "#forget-tail", "#forget-all"]) {
+    $(id).disabled = S.changingConversation;
+    $(id).setAttribute("aria-busy", String(S.changingConversation));
+  }
+  $("#send").disabled = S.changingConversation || S.sending;
+}
+
+/** Both the chat-header clear and the Memory controls use this path. A refused POST
+ * changes nothing visible and leaves a running stream alone: reset is not cancellation. */
+async function changeConversation(path, body, clearAll) {
+  if (S.changingConversation) return;
+  if (S.busy || S.sending) { toast(CONVERSATION_TEXT.busy); return; }
+  if (clearAll && !confirm(CONVERSATION_TEXT.confirm)) return;
+  S.changingConversation = true;
+  ++S.historyRevision;
+  conversationControls();
+  try {
+    await api(path, { method: "POST", body });
+  } catch (e) {
+    toast(e.status === 409 ? CONVERSATION_TEXT.busy : CONVERSATION_TEXT.failed + "\n" + e.message);
+    S.changingConversation = false;
+    conversationControls();
+    return;
+  }
+
+  // Only a successful mutation retires the old stream and its live DOM references.
+  stopStream();
+  hideLiveNote();
+  liveTrace = null;
+  liveBubble = null;
+  liveCalls = 0;
+  S.busy = false;
+  S.lastEvent = null;
+  S.lastMsg = 0;
+  S.rendered = 0;
+  $("#chat").innerHTML = "";
+  if (clearAll) renderHistory({ messages: [] });
+  const [historyLoaded, cursorSynced] = await Promise.all([
+    loadHistory(true),
+    syncEventCursor().then(() => true, () => false),
+  ]);
+  S.changingConversation = false;
+  conversationControls();
+  toast(historyLoaded && cursorSynced
+    ? (clearAll ? CONVERSATION_TEXT.cleared : CONVERSATION_TEXT.kept)
+    : CONVERSATION_TEXT.refreshFailed);
+  if (!$("#sheet").hidden && S.panel === "agent") loadAgent();
 }
 
 /** Downscale an image in the browser, before it crosses the LAN.
@@ -548,15 +646,18 @@ function showAttach() {
 
 async function send(text) {
   const trimmed = text.trim();
-  if (!trimmed) return;
-  const { bubble } = addRow("user");
-  bubble.innerHTML = markdown(trimmed + (S.attach ? "\n\n_[image: " + S.attach.name + "]_" : ""));
-  $("#input").value = "";
-  autosize();
-  const attachment = S.attach;
-  S.attach = null;
-  showAttach();
+  if (!trimmed || S.changingConversation || S.sending) return;
+  S.sending = true;
+  conversationControls();
   try {
+    if (S.lastEvent === null) await syncEventCursor();
+    const { bubble } = addRow("user");
+    bubble.innerHTML = markdown(trimmed + (S.attach ? "\n\n_[image: " + S.attach.name + "]_" : ""));
+    $("#input").value = "";
+    autosize();
+    const attachment = S.attach;
+    S.attach = null;
+    showAttach();
     const payload = { text: trimmed };
     if (attachment) payload.attachments = [attachment];
     await api("/api/agent/message", { method: "POST", body: payload });
@@ -568,6 +669,9 @@ async function send(text) {
     connectStream();
   } catch (e) {
     toast(e.message);
+  } finally {
+    S.sending = false;
+    conversationControls();
   }
 }
 
@@ -649,7 +753,8 @@ function ensureLiveBubble() {
 }
 
 function handleEvent(name, data) {
-  S.lastEvent = Math.max(S.lastEvent, data.seq || 0);
+  if (data.seq && S.lastEvent !== null && data.seq <= S.lastEvent) return;
+  S.lastEvent = Math.max(S.lastEvent || 0, data.seq || 0);
   switch (name) {
     case "message_start":
       S.busy = true;
@@ -741,7 +846,10 @@ function handleEvent(name, data) {
       // the answer and what belongs in the collapsed trace.
       loadHistory();
       // The run is over: give the board its 8 kB back.
-      setTimeout(stopStream, 500);
+      {
+        const stream = S.stream;
+        setTimeout(() => { if (!S.busy && S.stream === stream) stopStream(); }, 500);
+      }
       break;
   }
 }
@@ -753,7 +861,7 @@ const EVENT_KINDS = [
 ];
 
 function connectStream() {
-  if (S.stream) return;
+  if (S.stream || S.changingConversation || S.lastEvent === null) return;
   // EventSource cannot set request headers. The server accepts only a minted,
   // expiring portal token here (never a raw PIN), and only for reads.
   const es = new EventSource("/api/agent/stream?after=" + S.lastEvent +
@@ -761,19 +869,21 @@ function connectStream() {
   S.stream = es;
   for (const kind of EVENT_KINDS) {
     es.addEventListener(kind, (ev) => {
+      if (S.stream !== es) return; // a queued callback from a retired conversation
       let data = {};
       try { data = JSON.parse(ev.data); } catch { return; }
       handleEvent(kind, data);
     });
   }
-  es.onopen = () => { $("#link").className = S.busy ? "dot busy" : "dot live"; };
+  es.onopen = () => { if (S.stream === es) $("#link").className = S.busy ? "dot busy" : "dot live"; };
   // The board closes the stream after 30 s of silence or 120 s total; EventSource would
   // resume with Last-Event-ID, which this server does not read, so reconnect by hand.
   es.onerror = () => {
+    if (S.stream !== es) return;
     es.close();
     S.stream = null;
     $("#link").className = "dot off";
-    if (S.busy) setTimeout(connectStream, 1500);
+    if (S.busy) setTimeout(() => { if (S.busy && !S.changingConversation) connectStream(); }, 1500);
   };
 }
 
@@ -1162,24 +1272,14 @@ function init() {
     send($("#input").value);
   };
 
-  // One image per message. It is downscaled in the browser, because what crosses the LAN
-  // has to fit the request the board can send and the heap it can spare.
-  // A run can start without this page — a schedule, another client — and the event
-// stream only follows the run this page asked for. So look every 20 s, and only redraw
-// when the transcript actually changed: a phone should not spend its battery on a page
-// that has nothing new to say.
-setInterval(async () => {
-  if (S.busy || S.stream) return;
-  try {
-    const data = await api("/api/agent/history");
-    const count = ((data && data.messages) || []).length;
-    if (count !== S.rendered) loadHistory();
-  } catch {
-    /* offline or locked: the next tick tries again */
-  }
-}, 20000);
+  $("#clear-chat").onclick = () => changeConversation("/api/agent/reset", {}, true);
 
-$("#attach").onclick = () => $("#attach-input").click();
+  // A schedule or another client can start a run without this page's stream. Redraw only
+  // when the transcript changes, and never let an old poll race a clear or a local send.
+  setInterval(pollHistory, 20000);
+
+  // One image per message, downscaled to fit the request and the board's heap.
+  $("#attach").onclick = () => $("#attach-input").click();
   $("#attach-input").onchange = async (ev) => {
     const file = ev.target.files && ev.target.files[0];
     ev.target.value = "";
@@ -1232,14 +1332,8 @@ $("#attach").onclick = () => $("#attach-input").click();
     catch (e) { toast(e.message); }
   };
 
-  $("#forget-tail").onclick = async () => {
-    try { const r = await api("/api/agent/forget", { method: "POST", body: { keep: 1 } }); toast("forgot " + r.removed); loadHistory(); }
-    catch (e) { toast(e.message); }
-  };
-  $("#forget-all").onclick = async () => {
-    try { const r = await api("/api/agent/forget", { method: "POST", body: {} }); toast("forgot " + r.removed); loadHistory(); }
-    catch (e) { toast(e.message); }
-  };
+  $("#forget-tail").onclick = () => changeConversation("/api/agent/forget", { keep: 1 }, false);
+  $("#forget-all").onclick = () => changeConversation("/api/agent/forget", {}, true);
 
   $("#sched-add").onclick = async () => {
     try {

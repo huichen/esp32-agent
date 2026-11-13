@@ -26,6 +26,8 @@ pub mod code {
     pub const FORBIDDEN: i32 = -32005;
     /// Authenticated path required and the caller did not authenticate.
     pub const UNAUTHORIZED: i32 = -32006;
+    /// The tool's configured time budget ran out before or during the call.
+    pub const TIMEOUT: i32 = -32007;
 }
 
 #[derive(Debug, Clone)]
@@ -74,6 +76,12 @@ impl McpError {
         Self::new(code::UNAUTHORIZED, message)
     }
 
+    /// A tool whose deadline has already passed, or one that asked for a wait longer
+    /// than the budget has left.
+    pub fn timeout(message: impl Into<String>) -> Self {
+        Self::new(code::TIMEOUT, message)
+    }
+
     /// JSON-RPC error object (`{"code":..,"message":..,"data":..}`).
     pub fn to_json(&self) -> Value {
         let mut v = json!({ "code": self.code, "message": self.message });
@@ -117,5 +125,13 @@ mod tests {
         assert_eq!(v["code"], code::HARDWARE);
         assert_eq!(v["message"], "ds18b20 crc mismatch");
         assert_eq!(v["data"]["pin"], 4);
+    }
+
+    #[test]
+    fn a_timeout_is_its_own_code_not_a_wrong_argument() {
+        let e = McpError::timeout("out of budget").with_data(json!({ "timeout_ms": 30_000 }));
+        assert_eq!(e.code, code::TIMEOUT);
+        assert_ne!(e.code, code::INVALID_PARAMS, "a deadline is not a malformed argument");
+        assert_eq!(e.to_json()["data"]["timeout_ms"], 30_000);
     }
 }

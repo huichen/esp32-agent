@@ -9,6 +9,9 @@
 //! wrong. So this test renders the shipped page in a headless browser, at the widths a
 //! phone reports, and asserts on `getBoundingClientRect()`.
 //!
+//! The same rendered fixture exercises the chat clear control: confirmation, auth retry,
+//! failure/busy preservation and successful clearing across delayed reads and SSE replay.
+//!
 //! It needs a Chromium-family browser. `ESP32_AGENT_BROWSER` points at one that is not in
 //! a standard place (see `browser()`).
 
@@ -165,6 +168,306 @@ window.__esp32Measure = function () {
 </script>
 "##;
 
+/// Deterministic transport fixtures, but the actual shipped UI, event handlers and DOM.
+/// The journal deliberately retains old events after reset, like a Memory forget can:
+/// success must seed its head, not depend on a backend erasing the replay ring.
+const CLEAR_JS: &str = r##"
+<script>
+window.__esp32Clear = async function () {
+  const q = (s) => document.querySelector(s);
+  const rect = (el) => {
+    const b = el.getBoundingClientRect();
+    return { left: b.left, right: b.right, top: b.top, bottom: b.bottom, width: b.width, height: b.height };
+  };
+  const defer = () => {
+    let resolve;
+    const promise = new Promise((r) => { resolve = r; });
+    return { promise, resolve };
+  };
+  const tick = () => new Promise((r) => setTimeout(r, 0));
+  const until = async (test) => {
+    for (let i = 0; i < 100; i++) { if (test()) return; await tick(); }
+    throw new Error("fixture did not settle");
+  };
+  const click = async (button) => { button.click(); await until(() => !S.changingConversation && !S.sending); };
+  const old = [
+    { role: "user", seq: 0, text: "OLD USER QUESTION" },
+    { role: "assistant", seq: 1, text: "OLD INTERMEDIATE NOTE",
+      tool_calls: [{ id: "old-call", name: "old_tool", arguments: '{"value":1}' }] },
+    { role: "tool", seq: 2, text: "OLD TOOL RESULT", tool_call_id: "old-call" },
+    { role: "assistant", seq: 3, text: "OLD ASSISTANT ANSWER" },
+  ];
+  const f = {
+    messages: old.slice(), head: 80, requests: [], streams: [], confirmations: [], accept: true,
+    resetMode: "success", resetGate: null, historyGate: null, messageGate: null, eventsFail: false,
+    authRequired: false, issued: "fixture-" + Math.random(),
+    journal: [
+      { kind: "message_start", seq: 70 },
+      { kind: "text_delta", seq: 71, text: "OLD REPLAY ANSWER" },
+      { kind: "tool_use", seq: 72, name: "old_replay_tool", text: "{}" },
+      { kind: "tool_result", seq: 73, text: "OLD REPLAY RESULT" },
+      { kind: "run_end", seq: 80 },
+    ],
+  };
+  const nativeFetch = window.fetch;
+  const nativeSource = window.EventSource;
+  const nativeConfirm = window.confirm;
+  const token = S.token;
+  const storedToken = localStorage.getItem("esp32-agent.token");
+  const response = (body, status = 200) => Promise.resolve(new Response(JSON.stringify(body), {
+    status, headers: { "Content-Type": "application/json" },
+  }));
+  window.confirm = (text) => { f.confirmations.push(text); return f.accept; };
+  window.fetch = async (url, opts = {}) => {
+    const path = new URL(url, location.href).pathname;
+    if (!["/api/agent/history", "/api/agent/events", "/api/agent/reset", "/api/agent/forget",
+          "/api/agent/message", "/api/auth", "/api/agent/config", "/api/agent/prompt",
+          "/api/sched", "/api/devices"].includes(path)) return nativeFetch(url, opts);
+    f.requests.push({ path, method: opts.method || "GET", body: opts.body || "",
+      authorization: (opts.headers || {}).Authorization || "",
+      contentType: (opts.headers || {})["Content-Type"] || "" });
+    if (path === "/api/agent/history") {
+      const messages = f.messages.slice();
+      const gate = f.historyGate;
+      if (gate) await gate.promise;
+      return response({ messages, seq: messages.length });
+    }
+    if (path === "/api/agent/events") {
+      if (f.eventsFail) return response({ error: "fixture cursor unavailable" }, 503);
+      return response({ seq: f.head, events: f.journal });
+    }
+    if (path === "/api/auth") return response({ token: f.issued });
+    if (path === "/api/agent/reset") {
+      if (f.authRequired && (opts.headers || {}).Authorization !== "Bearer " + f.issued)
+        return response({ error: "PIN required" }, 401);
+      const gate = f.resetGate;
+      if (gate) await gate.promise;
+      if (f.resetMode === "busy") return response({ error: "agent run is active" }, 409);
+      if (f.resetMode === "failed") return response({ error: "fixture reset failed" }, 500);
+      const removed = f.messages.length;
+      f.messages = [];
+      return response({ reset: true, removed, kept: 0 });
+    }
+    if (path === "/api/agent/forget") {
+      const body = JSON.parse(opts.body || "{}");
+      const before = f.messages.length;
+      let lastUser = -1;
+      f.messages.forEach((m, i) => { if (m.role === "user") lastUser = i; });
+      f.messages = body.keep && lastUser >= 0 ? f.messages.slice(lastUser) : [];
+      return response({ ok: true, removed: before - f.messages.length, kept: f.messages.length });
+    }
+    if (path === "/api/agent/message") {
+      const gate = f.messageGate;
+      if (gate) await gate.promise;
+      f.messages.push({ role: "user", seq: f.messages.length, text: JSON.parse(opts.body).text });
+      return response({ ok: true });
+    }
+    if (path === "/api/agent/config") return response({ model: "fixture model", max_steps: 0,
+      temperature: 0.2, tick_ms: 1000, run: { runs: 1 } });
+    if (path === "/api/agent/prompt") return response({ history: f.messages.length, archive_lines: 0, bytes: 100 });
+    if (path === "/api/sched") return response({ tasks: [] });
+    return response({ devices: [], candidates: [], unidentified: [] });
+  };
+  window.EventSource = class extends EventTarget {
+    constructor(url) {
+      super();
+      this.url = url;
+      this.closed = false;
+      f.streams.push(this);
+      const after = Number(new URL(url, location.href).searchParams.get("after"));
+      Promise.resolve().then(() => {
+        if (this.closed) return;
+        if (this.onopen) this.onopen();
+        f.journal.filter((e) => e.seq > after).forEach((e) => this.emit(e.kind, e));
+      });
+    }
+    // Still deliver after close to model already-queued browser callbacks.
+    emit(kind, data) { this.dispatchEvent(new MessageEvent(kind, { data: JSON.stringify(data) })); }
+    close() { this.closed = true; }
+  };
+  const posts = (path) => f.requests.filter((r) => r.method === "POST" && r.path === path);
+  const clean = () => !/OLD |old_tool|old_replay_tool/.test(q("#chat").textContent);
+  const out = {};
+  try {
+    stopStream(); S.busy = false; S.lastEvent = 80;
+    await loadHistory();
+    q("#title").textContent = "esp32-agent with a very long board name";
+    q("#sub").textContent = "4 devices · 42 tools · a long model identifier";
+    const clear = q("#clear-chat");
+    clear.focus();
+    out.header = { button: rect(clear), title: rect(q("#title")), menu: rect(q("#menu-btn")),
+      sheetHidden: q("#sheet").hidden, label: clear.textContent.trim(), aria: clear.getAttribute("aria-label"),
+      chineseLanguage: clear.querySelector("[lang=zh]").textContent, focused: document.activeElement === clear,
+      focusOutline: getComputedStyle(clear).outlineStyle, enabled: !clear.disabled };
+
+    const beforeCancel = q("#chat").innerHTML;
+    f.accept = false;
+    await click(clear);
+    out.cancel = { posts: posts("/api/agent/reset").length, confirmations: f.confirmations.slice(),
+      preserved: q("#chat").innerHTML === beforeCancel, enabled: !clear.disabled };
+
+    f.accept = true; f.resetMode = "failed";
+    const beforeFailure = q("#chat").innerHTML;
+    const firstRow = q("#chat").firstElementChild;
+    await click(clear);
+    out.failure = { posts: posts("/api/agent/reset").length, preserved: q("#chat").innerHTML === beforeFailure,
+      sameRow: q("#chat").firstElementChild === firstRow, rendered: S.rendered, lastMsg: S.lastMsg,
+      lastEvent: S.lastEvent, enabled: !clear.disabled, toast: q("#toast").textContent };
+
+    // A read and a poll both captured the old history before reset; release them only
+    // after the successful clear and its fresh history read have completed.
+    f.historyGate = defer();
+    const oldGate = f.historyGate;
+    const staleRead = loadHistory();
+    const stalePoll = pollHistory();
+    f.historyGate = null;
+    connectStream();
+    const retired = S.stream;
+    ensureLiveTrace(); liveCalls = 1;
+    chip(liveTrace, "old live tool", [["result", "OLD LIVE RESULT"]]);
+    ensureLiveBubble().textContent = "OLD LIVE ANSWER";
+    showLiveNote();
+    f.resetMode = "success"; f.authRequired = true; S.token = "";
+    f.resetGate = defer();
+    const beforeSuccess = posts("/api/agent/reset").length;
+    clear.click();
+    await until(() => !q("#login").hidden);
+    const requestsDuring = f.requests.length;
+    clear.click();
+    q("#forget-all").onclick(); // also guarded if called outside the disabled button
+    q("#input").value = "draft kept during clear";
+    q("#input").dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+    await pollHistory();
+    out.pending = { disabled: clear.disabled && q("#forget-tail").disabled && q("#forget-all").disabled,
+      sendDisabled: q("#send").disabled, ariaBusy: clear.getAttribute("aria-busy"),
+      noOtherRequests: f.requests.length === requestsDuring, draft: q("#input").value };
+    q("#login-go").click(); // fixture auth is local and does not need a real PIN
+    await until(() => posts("/api/agent/reset").length === beforeSuccess + 2 && q("#login").hidden);
+    f.resetGate.resolve();
+    await until(() => !S.changingConversation);
+    f.resetGate = null;
+    oldGate.resolve();
+    await Promise.all([staleRead, stalePoll]);
+    retired.emit("text_delta", { seq: 900, text: "OLD QUEUED CALLBACK" });
+    const successfulPost = posts("/api/agent/reset").slice(-1)[0];
+    out.success = { clean: clean(), rows: q("#chat").querySelectorAll(".row").length,
+      toolRows: q("#chat").querySelectorAll("details.tool").length, rendered: S.rendered, lastMsg: S.lastMsg,
+      lastEvent: S.lastEvent, busy: S.busy, retiredClosed: retired.closed, streamStopped: S.stream === null,
+      liveCleared: liveTrace === null && liveBubble === null && liveNote === null && liveCalls === 0,
+      postsIncludingAuthRetry: posts("/api/agent/reset").length - beforeSuccess,
+      authorized: successfulPost.authorization === "Bearer " + f.issued,
+      body: successfulPost.body, contentType: successfulPost.contentType,
+      draft: q("#input").value, enabled: !clear.disabled, toast: q("#toast").textContent };
+
+    q("#input").value = "fresh question";
+    q("#composer").dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
+    await until(() => !S.sending);
+    const freshStream = S.stream;
+    freshStream.emit("message_start", { seq: 81 });
+    freshStream.emit("text_delta", { seq: 82, text: "fresh answer" });
+    retired.emit("text_delta", { seq: 901, text: "OLD LATE ANSWER" });
+    if (retired.onerror) retired.onerror();
+    out.fresh = { after: new URL(freshStream.url, location.href).searchParams.get("after"),
+      clean: clean(), text: q("#chat").textContent, activeStreamPreserved: S.stream === freshStream,
+      lastEvent: S.lastEvent };
+    f.messages.push({ role: "assistant", seq: 1, text: "fresh answer" }); f.head = 83;
+    freshStream.emit("run_end", { seq: 83 });
+    await until(() => S.rendered === 2);
+    // An earlier run_end's delayed close must not close the next running turn.
+    q("#input").value = "another fresh question";
+    q("#composer").dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
+    await until(() => !S.sending);
+    await new Promise((r) => setTimeout(r, 550));
+    out.fresh.nextTurnStreamKept = S.stream === freshStream && !freshStream.closed && S.busy;
+    S.busy = false; stopStream(); hideLiveNote();
+
+    // A remote run wins the race after confirmation: 409 preserves both the old history
+    // and the live turn, rather than pretending the clear cancelled that run.
+    f.messages = old.slice(); f.head = 80; S.lastEvent = 80;
+    await loadHistory(); connectStream();
+    const busyStream = S.stream;
+    f.resetMode = "busy"; f.resetGate = defer();
+    clear.click();
+    busyStream.emit("message_start", { seq: 81 });
+    busyStream.emit("text_delta", { seq: 82, text: "still running" });
+    const duringRun = q("#chat").innerHTML;
+    f.resetGate.resolve();
+    await until(() => !S.changingConversation);
+    f.resetGate = null;
+    out.busy = { preserved: q("#chat").innerHTML === duringRun,
+      activeStreamPreserved: S.stream === busyStream && !busyStream.closed, busy: S.busy,
+      liveNoteKept: !!liveNote, enabled: !clear.disabled, toast: q("#toast").textContent };
+    const busyPosts = posts("/api/agent/reset").length;
+    const busyConfirmations = f.confirmations.length;
+    await click(clear);
+    q("#forget-tail").onclick(); q("#forget-all").onclick();
+    out.busy.localNoPost = posts("/api/agent/reset").length === busyPosts;
+    out.busy.localNoConfirmation = f.confirmations.length === busyConfirmations;
+    out.busy.forgetNoPost = posts("/api/agent/forget").length === 0;
+    S.busy = false; stopStream(); hideLiveNote();
+
+    f.resetMode = "success"; f.messageGate = defer();
+    q("#input").value = "posting a turn";
+    q("#composer").dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
+    const beforeSendingClear = posts("/api/agent/reset").length;
+    const beforeSendingConfirm = f.confirmations.length;
+    clear.click();
+    out.sending = { pending: S.sending, noClearPost: posts("/api/agent/reset").length === beforeSendingClear,
+      noConfirmation: f.confirmations.length === beforeSendingConfirm };
+    f.messageGate.resolve(); await until(() => !S.sending); f.messageGate = null;
+    S.busy = false; stopStream();
+
+    // A failed cursor refresh never re-enables replay from zero: retry the head before
+    // sending, and leave the draft and empty conversation alone if that also fails.
+    f.eventsFail = true;
+    await click(clear);
+    const beforeCursorSend = posts("/api/agent/message").length;
+    q("#input").value = "retry after cursor failure";
+    q("#composer").dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
+    await until(() => !S.sending);
+    out.cursorFailure = { clean: clean(), lastEvent: S.lastEvent,
+      noMessagePost: posts("/api/agent/message").length === beforeCursorSend,
+      draft: q("#input").value, noStream: S.stream === null };
+    f.eventsFail = false; f.head = 120;
+    q("#composer").dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
+    await until(() => !S.sending);
+    out.cursorFailure.retryAfter = new URL(S.stream.url, location.href).searchParams.get("after");
+    out.cursorFailure.retryPosted = posts("/api/agent/message").length === beforeCursorSend + 1;
+    S.busy = false; stopStream();
+
+    f.messages = [
+      { role: "user", seq: 0, text: "OLD FIRST EXCHANGE" },
+      { role: "assistant", seq: 1, text: "OLD FIRST ANSWER" },
+      { role: "user", seq: 2, text: "last question" },
+      { role: "assistant", seq: 3, text: "last answer" },
+    ];
+    f.head = 200;
+    await loadHistory();
+    q("#menu-btn").click(); q('[data-panel="agent"]').click();
+    await click(q("#forget-tail"));
+    await until(() => q("#conversation-kv").textContent.includes("Messages2"));
+    out.memory = { tailBody: posts("/api/agent/forget")[0].body, tailClean: clean(),
+      tailText: q("#chat").textContent, tailRendered: S.rendered, tailCursor: S.lastEvent,
+      summaryRefreshed: q("#conversation-kv").textContent.includes("Messages2") };
+    await click(q("#forget-all"));
+    out.memory.allBody = posts("/api/agent/forget")[1].body;
+    out.memory.allClean = clean(); out.memory.allRendered = S.rendered; out.memory.allCursor = S.lastEvent;
+    out.memory.mutations = f.requests.filter((r) => r.method === "POST").map((r) => r.path);
+    return out;
+  } catch (e) {
+    out.error = String(e.stack || e);
+    return out;
+  } finally {
+    stopStream(); S.busy = false;
+    window.fetch = nativeFetch; window.EventSource = nativeSource; window.confirm = nativeConfirm;
+    S.token = token;
+    if (storedToken === null) localStorage.removeItem("esp32-agent.token");
+    else localStorage.setItem("esp32-agent.token", storedToken);
+  }
+};
+</script>
+"##;
+
 /// The ports the headless browser will not connect to, so the harness never picks one.
 ///
 /// The list is Chromium's `kRestrictedPorts` for the ranges an ephemeral port can land in;
@@ -177,7 +480,7 @@ fn chrome_allows_port(port: u16) -> bool {
 /// files and the origin is a normal one (`localStorage`, `fetch` and the module-scope
 /// helpers behind `showAttach` all behave as they do on the board).
 fn page() -> String {
-    INDEX_HTML.replace("</body>", &format!("{MEASURE_JS}</body>"))
+    INDEX_HTML.replace("</body>", &format!("{MEASURE_JS}{CLEAR_JS}</body>"))
 }
 
 /// The harness: one iframe per phone width, because an iframe *is* the viewport — that is
@@ -199,15 +502,19 @@ const frames = widths.map((w) => {{
   document.body.appendChild(f);
   return {{ w, f }};
 }});
-function measure() {{
-  const out = frames.map(({{ w, f }}) => ({{
-    requested: w,
-    metrics: f.contentWindow && f.contentWindow.__esp32Measure ? f.contentWindow.__esp32Measure() : null,
+let measuring = false;
+async function measure() {{
+  if (measuring || frames.some(({{ f }}) => !f.contentWindow || !f.contentWindow.__esp32Measure)) return;
+  measuring = true;
+  const out = await Promise.all(frames.map(async ({{ w, f }}) => {{
+    const metrics = f.contentWindow.__esp32Measure();
+    metrics.clear = await f.contentWindow.__esp32Clear();
+    return {{ requested: w, metrics }};
   }}));
   document.body.dataset.esp32Layout = encodeURIComponent(JSON.stringify(out));
 }}
-// The dump happens at the end of the virtual time budget; `load` normally lands first, and
-// the timer is the same measurement again in case it did not.
+// Never run the async interaction fixture twice in the same iframe. The timer is only a
+// fallback if `load` happened before the child scripts exposed their measurement hooks.
 window.addEventListener("load", measure);
 setTimeout(measure, 300);
 </script>
@@ -217,9 +524,9 @@ setTimeout(measure, 300);
     )
 }
 
-/// The three files the board would serve, on a loopback port. The test does not need the
-/// rest of the API: `/api/*` answers 404 and the page's own error handling is what it does
-/// on a board whose agent is not configured.
+/// The three files the board would serve, on a loopback port. Startup API calls answer
+/// 404, as on an unconfigured board; the interaction fixture supplies controlled responses
+/// once measurement starts so failures and response ordering are reproducible.
 fn serve() -> String {
     let routes: Vec<(String, String)> = vec![
         ("/harness".into(), harness()),
@@ -435,6 +742,142 @@ fn rect(metrics: &Value, state: &str, part: &str) -> Rect {
     }
 }
 
+/// Frontend regressions are asserted against the shipped controls and actual DOM, not
+/// just a helper's return value. Keep these in the existing layout test (no test-count drift).
+fn assert_conversation_clear(metrics: &Value, width: u32) {
+    let clear = &metrics["clear"];
+    assert!(clear["error"].is_null(), "{width} px: clear fixture failed: {clear}");
+    let expect = |section: &str, key: &str, value: Value| {
+        assert_eq!(clear[section][key], value, "{width} px: clear {section}.{key}: {clear}");
+    };
+    let text = |section: &str, key: &str| clear[section][key].as_str().unwrap_or("");
+    let button = rect(clear, "header", "button");
+    let title = rect(clear, "header", "title");
+    let menu = rect(clear, "header", "menu");
+    assert!(
+        button.width >= 44.0 && button.height >= 44.0,
+        "{width} px: clear needs a touch target, not {button:?}"
+    );
+    assert!(
+        button.left >= 0.0 && button.right <= width as f64 + 0.01 && button.top >= 0.0,
+        "{width} px: clear is outside the viewport: {button:?}"
+    );
+    assert!(
+        menu.right <= title.left && title.right <= button.left,
+        "{width} px: header controls overlap: menu {menu:?}, title {title:?}, clear {button:?}"
+    );
+    for key in ["sheetHidden", "focused", "enabled"] {
+        expect("header", key, json!(true));
+    }
+    expect("header", "aria", json!("Clear conversation / 清空会话"));
+    expect("header", "chineseLanguage", json!("清空会话"));
+    assert!(text("header", "label").contains("Clear chat"), "the clear action must be named");
+    assert_ne!(text("header", "focusOutline"), "none", "{width} px: invisible keyboard focus");
+
+    expect("cancel", "posts", json!(0));
+    expect("cancel", "preserved", json!(true));
+    expect("cancel", "enabled", json!(true));
+    let confirmations = clear["cancel"]["confirmations"].as_array().expect("confirmation fixture");
+    assert_eq!(confirmations.len(), 1, "{width} px: confirmation was not offered exactly once");
+    let confirmation = confirmations[0].as_str().unwrap_or("");
+    assert!(confirmation.contains("Clear this conversation") && confirmation.contains("清空会话"));
+    assert!(
+        confirmation.contains("Instructions, skills, files and model settings stay.")
+            && confirmation.contains("指令、技能、文件和模型设置会保留"),
+        "{width} px: confirmation must state the boundary: {confirmation}"
+    );
+
+    expect("failure", "posts", json!(1));
+    for key in ["preserved", "sameRow", "enabled"] {
+        expect("failure", key, json!(true));
+    }
+    expect("failure", "rendered", json!(4));
+    expect("failure", "lastMsg", json!(3));
+    expect("failure", "lastEvent", json!(80));
+    assert!(text("failure", "toast").contains("History was kept."));
+    assert!(text("failure", "toast").contains("历史已保留"));
+    assert!(text("failure", "toast").contains("fixture reset failed"));
+
+    for key in ["disabled", "sendDisabled", "noOtherRequests"] {
+        expect("pending", key, json!(true));
+    }
+    expect("pending", "ariaBusy", json!("true"));
+    expect("pending", "draft", json!("draft kept during clear"));
+    for key in ["clean", "retiredClosed", "streamStopped", "liveCleared", "authorized", "enabled"] {
+        expect("success", key, json!(true));
+    }
+    expect("success", "rows", json!(1));
+    expect("success", "toolRows", json!(0));
+    expect("success", "rendered", json!(0));
+    expect("success", "lastMsg", json!(0));
+    expect("success", "lastEvent", json!(80));
+    expect("success", "busy", json!(false));
+    expect("success", "postsIncludingAuthRetry", json!(2));
+    expect("success", "body", json!("{}"));
+    expect("success", "contentType", json!("application/json"));
+    expect("success", "draft", json!("draft kept during clear"));
+    assert!(text("success", "toast").contains("Conversation cleared."));
+    assert!(text("success", "toast").contains("会话已清空"));
+
+    expect("fresh", "after", json!("80"));
+    expect("fresh", "lastEvent", json!(82));
+    for key in ["clean", "activeStreamPreserved", "nextTurnStreamKept"] {
+        expect("fresh", key, json!(true));
+    }
+    assert!(
+        text("fresh", "text").contains("fresh question") && text("fresh", "text").contains("fresh answer")
+    );
+    for key in [
+        "preserved",
+        "activeStreamPreserved",
+        "busy",
+        "liveNoteKept",
+        "enabled",
+        "localNoPost",
+        "localNoConfirmation",
+        "forgetNoPost",
+    ] {
+        expect("busy", key, json!(true));
+    }
+    assert!(text("busy", "toast").contains("Wait for this turn to finish"));
+    assert!(text("busy", "toast").contains("clearing does not cancel it"));
+    assert!(text("busy", "toast").contains("清空会话不能取消运行"));
+    for key in ["pending", "noClearPost", "noConfirmation"] {
+        expect("sending", key, json!(true));
+    }
+    for key in ["clean", "noMessagePost", "noStream", "retryPosted"] {
+        expect("cursorFailure", key, json!(true));
+    }
+    expect("cursorFailure", "lastEvent", Value::Null);
+    expect("cursorFailure", "draft", json!("retry after cursor failure"));
+    expect("cursorFailure", "retryAfter", json!("120"));
+
+    expect("memory", "tailBody", json!("{\"keep\":1}"));
+    expect("memory", "tailClean", json!(true));
+    expect("memory", "tailRendered", json!(2));
+    expect("memory", "tailCursor", json!(200));
+    expect("memory", "summaryRefreshed", json!(true));
+    assert!(
+        text("memory", "tailText").contains("last question")
+            && text("memory", "tailText").contains("last answer")
+    );
+    expect("memory", "allBody", json!("{}"));
+    expect("memory", "allClean", json!(true));
+    expect("memory", "allRendered", json!(0));
+    expect("memory", "allCursor", json!(200));
+    let mutations = clear["memory"]["mutations"].as_array().expect("recorded POST requests");
+    assert!(
+        mutations.iter().all(|path| [
+            "/api/auth",
+            "/api/agent/reset",
+            "/api/agent/forget",
+            "/api/agent/message",
+        ]
+        .contains(&path.as_str().unwrap_or(""))),
+        "{width} px: clearing wrote to settings or the workspace: {mutations:?}"
+    );
+}
+
 #[test]
 fn the_composer_fits_a_phone_screen() {
     let browser = browser();
@@ -528,6 +971,7 @@ fn the_composer_fits_a_phone_screen() {
                 send.width
             );
         }
+        assert_conversation_clear(metrics, *width);
     }
 }
 
