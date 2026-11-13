@@ -1765,12 +1765,7 @@ impl App {
     /// An explicit disable applies to aliases, family members and underlying file
     /// operations too; a listing profile only changes how a tool is advertised.
     fn ensure_enabled(&self, name: &str) -> Result<()> {
-        crate::tool::ensure_tool_enabled(&self.cfg, name)?;
-        if let Some(reached) = self.family_members.get(name) {
-            if let Some(family) = reached.split_whitespace().next() {
-                crate::tool::ensure_tool_enabled(&self.cfg, family)?;
-            }
-        }
+        crate::tool::ensure_tool_enabled_in(&self.cfg, &self.family_members, name)?;
         let dependencies: &[&str] = match name {
             "edit" | "fs_edit" | "fs_cp" => &["fs_read", "fs_write"],
             "fs_mv" => &["fs_read", "fs_write", "fs_rm"],
@@ -1792,11 +1787,8 @@ impl App {
             let text = self.fs_or_net_call(name, args).map_err(McpError::invalid_params)?;
             return Ok(serde_json::from_str(&text).unwrap_or_else(|_| json!({ "text": text })));
         }
-        if name == "device_invoke" {
-            if let Some(target) = args.get("tool").and_then(Value::as_str) {
-                self.ensure_enabled(target)?;
-            }
-        }
+        // Generic device dispatch resolves the instance's public name before checking
+        // its switch, so a stored raw alias cannot bypass a suffixed tool's disable.
         // The script tool is the one tool that needs the dispatcher itself: `tool()` inside
         // a script calls any other tool, so it cannot live in the registry where handlers
         // only see a `ToolCtx`.
@@ -1898,6 +1890,7 @@ impl App {
                 manifest,
                 tasks,
                 rules,
+                family_members,
                 ..
             } = self;
             let def = match tools.get(name) {
@@ -1923,6 +1916,7 @@ impl App {
                 taken: &taken,
                 tasks,
                 rules,
+                families: family_members,
             };
             (def.handler)(&mut ctx, args)
         };
@@ -11662,6 +11656,45 @@ mod tests {
             app.call_tool("device_invoke", &json!({"device": "bme280", "tool": "bme280_read"})).is_ok(),
             "generic visibility is not a disable"
         );
+
+        let board = crate::virtual_board::VirtualBoard::new();
+        let calls = board.hw_calls.clone();
+        let mut app =
+            App::new(Box::new(board), Box::new(MemoryStore::new()), LogBuf::new(32), FwMeta::default());
+        let applied = app.call_tool("manifest_apply", &json!({"manifest": {"tools": [
+            {"name": "wrapped_read", "exec": {"type": "driver", "driver": "bme280", "action": "bme280_read"}},
+            {"name": "nested_read", "safety": {"max_calls_per_min": 1}, "exec": {"type": "sequence", "steps": [
+                {"exec": {"type": "gpio_write", "pin": 12, "level": 1}},
+                {"exec": {"type": "sequence", "steps": [{"exec": {"type": "gpio_read", "pin": 0}}]}}
+            ]}},
+            {"name": "wrapped_delay", "exec": {"type": "sequence", "steps": [
+                {"exec": {"type": "gpio_write", "pin": 12, "level": 1}},
+                {"ms": 1, "exec": {"type": "gpio_write", "pin": 12, "level": 0}}
+            ]}}
+        ]}})).unwrap();
+        assert_eq!(applied["applied"], true, "{applied}");
+        for (disabled, tool) in [
+            ("bme280_read", "wrapped_read"),
+            ("gpio_read", "nested_read"),
+            ("bus", "nested_read"),
+            ("delay", "wrapped_delay"),
+        ] {
+            app.cfg.mcp.disabled_tools = vec![disabled.into()];
+            let before = calls.load(std::sync::atomic::Ordering::SeqCst);
+            let err =
+                app.call_tool(tool, &json!({})).expect_err("a manifest cannot bypass its target's disable");
+            assert!(err.message.contains("disabled"), "{disabled} via {tool}: {err}");
+            assert_eq!(
+                calls.load(std::sync::atomic::Ordering::SeqCst),
+                before,
+                "a disabled later step must be found before the first hardware effect"
+            );
+        }
+        app.cfg.mcp.disabled_tools.clear();
+        assert!(
+            app.call_tool("nested_read", &json!({})).is_ok(),
+            "a refused preflight must not consume the rate-limit allowance"
+        );
     }
 
     #[test]
@@ -12858,6 +12891,33 @@ mod tests {
         // ... and the second one is answered by the strip, not refused as unknown.
         let out = app.call_tool("led_set_2", &json!({ "color": "#102030" })).unwrap();
         assert_eq!(out["ok"], json!(true), "{out}");
+        for tool in ["led_set_2", "led_set"] {
+            let out = app
+                .call_tool(
+                    "device_invoke",
+                    &json!({
+                        "device": "lamp", "tool": tool, "arguments": {"color": "#203040"}
+                    }),
+                )
+                .expect("both the published name and the stored raw alias reach the second strip");
+            assert_eq!(out["ok"], true, "{tool}: {out}");
+        }
+        app.cfg.mcp.disabled_tools = vec!["led_set_2".into()];
+        for tool in ["led_set_2", "led_set"] {
+            let err = app
+                .call_tool(
+                    "device_invoke",
+                    &json!({
+                        "device": "lamp", "tool": tool, "arguments": {"color": "#203040"}
+                    }),
+                )
+                .expect_err("a raw alias cannot bypass an instance's disable");
+            assert!(err.message.contains("disabled"), "{tool}: {err}");
+        }
+        assert!(
+            app.call_tool("led_set", &json!({"color": "#102030"})).is_ok(),
+            "disabling the second strip does not disable the first"
+        );
     }
 
     #[test]
@@ -13216,6 +13276,13 @@ mod tests {
             .unwrap_err();
         assert_eq!(err.code, code::FORBIDDEN, "got {}", err.message);
         assert!(err.message.contains("confirm"), "{}", err.message);
+        for (name, args) in [
+            ("bme280_read", json!({})),
+            ("device_invoke", json!({"device": "bme280", "tool": "bme280_read"})),
+        ] {
+            let err = app.call_tool(name, &args).expect_err("the driver and generic views share the policy");
+            assert!(err.message.contains("confirm"), "{name}: {err}");
+        }
         // With the confirmation the same call goes through the policy and works.
         assert!(app
             .call_tool(

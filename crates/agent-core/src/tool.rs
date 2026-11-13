@@ -41,6 +41,23 @@ pub struct ToolCtx<'a> {
     /// app writes NVS after the call returns — the same path `POST /api/sched` uses.
     pub tasks: &'a mut Vec<crate::sched::ScheduledTask>,
     pub rules: &'a mut Vec<crate::sched::SensorRule>,
+    /// Public action names and the families that own them, including suffixed instances.
+    pub families: &'a BTreeMap<String, String>,
+}
+
+impl ToolCtx<'_> {
+    pub fn ensure_enabled(&self, name: &str) -> Result<()> {
+        ensure_tool_enabled_in(self.cfg, self.families, name)
+    }
+}
+
+/// Enforce a public action's switch and the switch of the family containing it.
+pub fn ensure_tool_enabled_in(cfg: &Config, families: &BTreeMap<String, String>, name: &str) -> Result<()> {
+    ensure_tool_enabled(cfg, name)?;
+    if let Some(family) = families.get(name).and_then(|reached| reached.split_whitespace().next()) {
+        ensure_tool_enabled(cfg, family)?;
+    }
+    Ok(())
 }
 
 /// The explicit disable that applies to a name, including supported legacy aliases.

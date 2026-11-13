@@ -142,7 +142,16 @@ error before any I2C write.
   to catch a hallucinating model.
 - `max_calls_per_min`: sliding-window rate limit, so a model in a loop cannot use a relay
   as a drum.
-- `confirm: true`: the call must carry `"confirm": true`.
+- `confirm: true`: the call must carry `"confirm": true`. A direct driver call, a family
+  command and `device_invoke` share the manifest policy for the same device/action;
+  choosing another entry point does not skip confirmation, ranges or rate limiting.
+- `mcp.disabled_tools` applies at execution time, not just to `tools/list`. Manifest
+  driver actions resolve the device's published name (including `_2` suffixes) before
+  checking that switch and its family. Legacy raw names remain accepted by
+  `device_invoke`, but cannot evade a disabled instance. GPIO/I2C/ADC primitives and
+  explicit waits check their underlying command switches too. Every nested sequence
+  is preflighted before hardware access or rate accounting, so a disabled late step
+  cannot leave an earlier actuator energized.
 
 Error codes: an out-of-range argument is `-32602`; a safety range, a missing confirmation
 or rate limiting is `-32005` (forbidden), with the range in the message.

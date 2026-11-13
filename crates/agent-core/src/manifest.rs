@@ -984,8 +984,44 @@ fn safety_refused(
     .with_data(json!({ "tool": tool, "param": param, "value": value }))
 }
 
+/// Check the complete operation tree before any hardware effect or rate accounting.
+/// A disabled late step must not leave an earlier actuator energized.
+fn preflight_enabled(exec: &Exec, ctx: &ToolCtx<'_>) -> Result<()> {
+    let names: &[&str] = match exec {
+        Exec::GpioWrite { .. } => &["gpio_mode", "gpio_write"],
+        Exec::GpioRead { .. } => &["gpio_mode", "gpio_read"],
+        Exec::Toggle { .. } => &["gpio_mode", "gpio_write", "delay"],
+        Exec::Adc { .. } => &["adc_read"],
+        Exec::I2cRead { .. } => &["i2c_read"],
+        Exec::I2cWrite { .. } => &["i2c_write"],
+        Exec::Delay { .. } => &["delay"],
+        Exec::Rgb { .. } => &["rgb", "indicators"],
+        Exec::Pwm { .. } => &["pwm"],
+        Exec::Driver { driver, action } => {
+            let (public, _) = ctx.devices.resolve_tool(driver, action)?;
+            ctx.ensure_enabled(&public)?;
+            &[]
+        }
+        Exec::Sequence { steps } => {
+            for step in steps {
+                if step.ms != 0 {
+                    ctx.ensure_enabled("delay")?;
+                }
+                preflight_enabled(&step.exec, ctx)?;
+            }
+            &[]
+        }
+    };
+    for name in names {
+        ctx.ensure_enabled(name)?;
+    }
+    Ok(())
+}
+
 pub(crate) fn run_tool(t: &ManifestTool, ctx: &mut ToolCtx, args: &Value) -> Result<Value> {
+    ctx.ensure_enabled(&t.name)?;
     check_args(t, args)?;
+    preflight_enabled(&t.exec, ctx)?;
     // Resolve every wait before any hardware access. Refusing halfway through a
     // pump sequence could leave it energized without reaching its release step.
     let delay = t.exec.delay_ms(&|n| n.resolve_u32(args))?;
@@ -1089,7 +1125,8 @@ fn run_exec(exec: &Exec, ctx: &mut ToolCtx, args: &Value) -> Result<Value> {
         Exec::Driver { driver, action } => {
             // The device id equals the driver id unless the manifest renamed it.
             let id = driver.clone();
-            let value = ctx.devices.call(&id, action, args, &mut *ctx.hw)?;
+            let (_, raw) = ctx.devices.resolve_tool(&id, action)?;
+            let value = ctx.devices.call(&id, &raw, args, &mut *ctx.hw)?;
             Ok(value)
         }
         Exec::Sequence { steps } => {
@@ -1186,8 +1223,15 @@ mod tests {
     }
 
     fn run_recorded(t: &ManifestTool, args: &Value) -> (Result<Value>, RecordedHardware) {
+        run_recorded_with_config(t, args, crate::config::Config::default())
+    }
+
+    fn run_recorded_with_config(
+        t: &ManifestTool,
+        args: &Value,
+        mut cfg: crate::config::Config,
+    ) -> (Result<Value>, RecordedHardware) {
         let mut hw = RecordedHardware::default();
-        let mut cfg = crate::config::Config::default();
         let mut devices = crate::device::Devices::new();
         let mut runtime = crate::state::Runtime::new(0, "test", "test");
         let log = crate::logbuf::LogBuf::new(8);
@@ -1211,6 +1255,7 @@ mod tests {
                 taken: &[],
                 tasks: &mut tasks,
                 rules: &mut rules,
+                families: &std::collections::BTreeMap::new(),
             },
             args,
         );
@@ -1345,6 +1390,23 @@ mod tests {
         assert_eq!(e.code, code::INVALID_PARAMS);
         assert!(check_args(&t, &json!({ "brightness": 3.5 })).is_err(), "integer params reject fractions");
         assert!(check_args(&t, &json!({ "brightness": 10 })).is_ok());
+
+        let blocked = Manifest::from_json_str(
+            &tool(json!({"type": "sequence", "steps": [
+                {"exec": {"type": "gpio_write", "pin": 12, "level": 1}},
+                {"exec": {"type": "sequence", "steps": [{"exec": {"type": "gpio_read", "pin": 0}}]}}
+            ]}))
+            .to_string(),
+        )
+        .unwrap();
+        let mut cfg = crate::config::Config::default();
+        cfg.mcp.disabled_tools = vec!["gpio_read".into()];
+        let (result, hw) = run_recorded_with_config(&blocked.tools[0], &json!({}), cfg);
+        assert_eq!(result.unwrap_err().code, code::FORBIDDEN);
+        assert!(
+            hw.calls.is_empty(),
+            "a disabled nested step must be rejected before energizing the first pin"
+        );
 
         let m = Manifest::from_json_str(
             &json!({ "tools": [{

@@ -657,20 +657,11 @@ fn device_invoke_tool() -> ToolDef {
     .bind(|ctx, args| {
         let device = j::str_arg(args, "device")?;
         let tool = j::str_arg(args, "tool")?;
-        crate::tool::ensure_tool_enabled(ctx.cfg, &tool)?;
         let inner = j::field(args, "arguments").cloned().unwrap_or_else(|| json!({}));
         if !inner.is_object() {
             return Err(crate::error::McpError::invalid_params("device tool arguments must be an object"));
         }
-        // One gate for every entry point: if a manifest tool wraps this driver
-        // action, its confirm / safety / rate-limit policy is what applies. Going
-        // straight to the driver here would let a write with `confirm: true` slip
-        // through without the confirmation.
-        if let Some(policy) = ctx.manifest.driver_tool(&device, &tool).cloned() {
-            crate::tool::ensure_tool_enabled(ctx.cfg, &policy.name)?;
-            return crate::manifest::run_tool(&policy, ctx, &inner);
-        }
-        ctx.devices.call(&device, &tool, &inner, ctx.hw)
+        crate::device::invoke(ctx, &device, &tool, &inner)
     })
 }
 
