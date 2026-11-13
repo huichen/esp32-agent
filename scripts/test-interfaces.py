@@ -674,6 +674,17 @@ def rpc(rec, sim, fake):
     rec.note("TTL expiry (minimum 30 s) is not waited out; allocation, reuse, initialization, deletion and the configured session cap are exercised.")
 
 
+def default_tool_arguments(path="/tool.txt"):
+    """Safe default-board calls, shared by external MCP and each internal adapter."""
+    return {"board": {"command": "status"}, "bus": {"command": "i2c_scan"}, "manifest": {"command": "get"},
+            "display": {"command": "oled_text", "arguments": {"text": "AUDIT", "line": 0}},
+            "indicators": {"command": "led_set", "arguments": {"color": "#002010"}},
+            "schedule": {"action": "list"}, "script": {"source": "1 + 2"}, "shell": {"command": "echo fixture"},
+            "write": {"path": path, "text": "fixture"}, "read": {"path": path},
+            "edit": {"path": path, "find": "fixture", "replace": "changed"},
+            "device_invoke": {"device": "bme280", "tool": "bme280_read", "arguments": {}}}
+
+
 def tools(rec, sim, fake):
     specs = sim.rpc("tools/list").json()["result"]["tools"]
     names = [t["name"] for t in specs]
@@ -688,13 +699,7 @@ def tools(rec, sim, fake):
     rec.equal("portal-MCP-visible-set", sorted(t["name"] for t in portal["tools"] if t["visible"]), names)
     rec.equal("status-visible-count", sim.get("/api/status")["mcp"]["tools_visible"], len(names))
     rec.check("advertised-schemas", all(t["inputSchema"]["type"] == "object" and t.get("description") for t in specs))
-    safe = {"board": {"command": "status"}, "bus": {"command": "i2c_scan"}, "manifest": {"command": "get"},
-            "display": {"command": "oled_text", "arguments": {"text": "AUDIT", "line": 0}},
-            "indicators": {"command": "led_set", "arguments": {"color": "#002010"}},
-            "schedule": {"action": "list"}, "script": {"source": "1 + 2"}, "shell": {"command": "echo fixture"},
-            "write": {"path": "/tool.txt", "text": "fixture"}, "read": {"path": "/tool.txt"},
-            "edit": {"path": "/tool.txt", "find": "fixture", "replace": "changed"},
-            "device_invoke": {"device": "bme280", "tool": "bme280_read", "arguments": {}}}
+    safe = default_tool_arguments()
     # Writes precede read/edit, regardless of the advertised alphabetic order.
     for name in ["write", "read", "edit"] + [n for n in names if n not in {"write", "read", "edit"}]:
         rec.check("safe-fixture-exists:" + name, name in safe or next(t for t in specs if t["name"] == name)["inputSchema"].get("required", []) == [], name)
@@ -1269,6 +1274,8 @@ def agent(rec, sim, fake):
 
 def transport(rec, sim, fake):
     key = secrets.token_hex(16)  # ephemeral dummy, never a provider key
+    catalog_specs = sim.rpc("tools/list").json()["result"]["tools"]
+    catalog_names = sorted(t["name"] for t in catalog_specs)
     for protocol in ["chat", "responses", "anthropic"]:
         sim.post("/api/agent/reset", {})
         path = "/wire-" + protocol
@@ -1302,6 +1309,52 @@ def transport(rec, sim, fake):
                 rec.check(protocol + ".tool-result-message", any(m.get("role") == "tool" and m.get("tool_call_id") == "wire-call" for m in second["messages"]))
                 rec.equal(protocol + ".reasoning", first.get("reasoning_effort"), "high")
         rec.check(protocol + ".secret-redacted", key not in short(sim.get("/api/agent/config"), 30000))
+
+        # Calling every advertised tool over MCP does not prove that each adapter can
+        # carry its input/result through the internal agent. Exercise the same safe
+        # catalogue, then inspect both retained results and the actual second request.
+        sim.post("/api/agent/reset", {})
+        catalog_path = "/catalog-" + protocol
+        file_path = catalog_path + ".txt"
+        safe = default_tool_arguments(file_path)
+        for spec in catalog_specs:
+            rec.check(protocol + ".catalog-fixture:" + spec["name"], spec["name"] in safe
+                      or spec["inputSchema"].get("required", []) == [], spec["name"])
+        order = [n for n in ["write", "read", "edit"] if n in catalog_names]
+        order += [n for n in catalog_names if n not in {"write", "read", "edit"}]
+        calls = [(protocol + "-catalog-" + name, name, safe.get(name, {})) for name in order]
+        final = protocol + " catalog complete"
+        url = fake.fixture(catalog_path, [model_reply(protocol, text="", calls=calls),
+                                         model_reply(protocol, text=final)], dialect=protocol)
+        sim.post("/api/agent/config", {"base_url": url})
+        hist, _ = run_turn(sim, "exercise the complete safe tool catalogue via " + protocol)
+        rec.equal(protocol + ".catalog-final", hist["messages"][-1]["text"], final)
+        rec.check(protocol + ".catalog-pairing", paired(hist["messages"]))
+        results = {m["tool_call_id"]: m for m in hist["messages"] if m["role"] == "tool"}
+        rec.equal(protocol + ".catalog-one-result-per-call", list(results), [ident for ident, _, _ in calls])
+        requests = fake.requests(catalog_path)
+        rec.equal(protocol + ".catalog-two-model-requests", len(requests), 2)
+        first, second = requests[0]["body"], requests[1]["body"]
+        wire_names = sorted(t["function"]["name"] if protocol == "chat" else t["name"] for t in first["tools"])
+        rec.equal(protocol + ".catalog-advertised-set", wire_names, catalog_names)
+        if protocol == "chat":
+            outputs = {m["tool_call_id"]: m["content"] for m in second["messages"] if m.get("role") == "tool"}
+        elif protocol == "responses":
+            outputs = {m["call_id"]: m["output"] for m in second["input"] if m.get("type") == "function_call_output"}
+        else:
+            outputs = {b["tool_use_id"]: b["content"] for m in second["messages"]
+                       for b in m.get("content", []) if isinstance(b, dict) and b.get("type") == "tool_result"}
+        rec.equal(protocol + ".catalog-wire-result-ids", sorted(outputs), sorted(results))
+        for ident, name, _ in calls:
+            result = results.get(ident, {})
+            rec.check(protocol + ".catalog-exec:" + name, bool(result) and not result.get("is_error"), short(result))
+            rec.equal(protocol + ".catalog-wire-result:" + name,
+                      json.loads(outputs.get(ident, "null")), json.loads(result.get("text", "null")))
+        rec.equal(protocol + ".catalog-file-effects", sim.get("/api/files/read?path=" + file_path)["text"], "changed")
+        for name in ["write", "edit"]:
+            value = json.loads(results[protocol + "-catalog-" + name]["text"])
+            rec.equal(protocol + ".catalog-save-admission:" + name, (value.get("queued"), value.get("saved")), (True, False))
+
         # image_read must use the configured dialect too, not force Chat.
         image_path = "/image-" + protocol
         image_url = fake.fixture(image_path, [model_reply(protocol, text="image fixture")], dialect=protocol)
@@ -1371,7 +1424,7 @@ def transport(rec, sim, fake):
     rec.equal("timeout-setting", config["timeout_s"], 5)
     _, events = run_turn(sim, "timeout must be applied", seconds=22)
     rec.check("configured-model-timeout-is-enforced", any(e["event"] == "error" for e in events), short(events))
-    rec.note("Chat/Responses/Anthropic request shapes, auth, tool results, image_read, chunked/close/interim decoding, errors, retries and the configured timeout use local fake endpoints. TLS, real providers, billing and provider-specific reasoning signatures are unverified.")
+    rec.note("Chat/Responses/Anthropic request shapes, auth, every initially advertised safe default-board tool, result roundtrips, image_read, chunked/close/interim decoding, errors, retries and the configured timeout use local fake endpoints. TLS, real providers, billing and provider-specific reasoning signatures are unverified.")
 
 
 def network(rec, sim, fake):
