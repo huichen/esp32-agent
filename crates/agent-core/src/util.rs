@@ -18,21 +18,63 @@ fn b64_val(c: u8) -> Option<u8> {
 /// Decode base64 (standard or URL-safe, padding optional). Data URLs are
 /// accepted so a bitmap pasted from a browser works unchanged.
 pub fn b64_decode(s: &str, out: &mut Vec<u8>) -> Result<()> {
+    b64_decode_limit(s, out, usize::MAX)
+}
+
+/// Validate the complete encoding and decoded length before reserving output.
+/// Optional padding and whitespace are accepted, but torn groups, misplaced
+/// padding and non-zero unused bits are errors, not silently discarded data.
+pub fn b64_decode_limit(s: &str, out: &mut Vec<u8>, max_bytes: usize) -> Result<()> {
     out.clear();
     let s = s.trim();
     let s = match s.find(',') {
-        Some(i) if s[..i].starts_with("data:") => &s[i + 1..],
+        Some(i) if s[..i].starts_with("data:") => {
+            if !s[..i].to_ascii_lowercase().ends_with(";base64") {
+                return Err(McpError::invalid_params("base64: data URL must use ;base64"));
+            }
+            &s[i + 1..]
+        }
         _ => s,
     };
+    let (mut symbols, mut padding, mut last) = (0usize, 0usize, 0u8);
+    for &c in s.as_bytes() {
+        if c.is_ascii_whitespace() {
+            continue;
+        }
+        if c == b'=' {
+            padding += 1;
+            if padding > 2 {
+                return Err(McpError::invalid_params("base64: too much padding"));
+            }
+            continue;
+        }
+        if padding != 0 {
+            return Err(McpError::invalid_params("base64: data after padding"));
+        }
+        last = b64_val(c).ok_or_else(|| {
+            McpError::invalid_params(format!("base64: unexpected character {:?}", c as char))
+        })?;
+        symbols += 1;
+    }
+    let remainder = symbols % 4;
+    if remainder == 1 || (padding != 0 && padding != (4 - remainder) % 4) {
+        return Err(McpError::invalid_params("base64: incomplete group or incorrect padding"));
+    }
+    if (remainder == 2 && last & 0x0f != 0) || (remainder == 3 && last & 0x03 != 0) {
+        return Err(McpError::invalid_params("base64: non-zero unused bits"));
+    }
+    let bytes = symbols / 4 * 3 + remainder.saturating_sub(1);
+    if bytes > max_bytes {
+        return Err(McpError::invalid_params(format!(
+            "base64: decoded length is {bytes} bytes; the limit is {max_bytes}"
+        )));
+    }
+    out.try_reserve_exact(bytes)
+        .map_err(|_| McpError::invalid_params("base64: output allocation was refused"))?;
     let mut acc: u32 = 0;
     let mut bits = 0u32;
     for &c in s.as_bytes() {
-        if c.is_ascii_whitespace() || c == b'=' {
-            continue;
-        }
-        let v = b64_val(c).ok_or_else(|| {
-            McpError::invalid_params(format!("base64: unexpected character {:?}", c as char))
-        })?;
+        let Some(v) = b64_val(c) else { continue };
         acc = (acc << 6) | v as u32;
         bits += 6;
         if bits >= 8 {
@@ -40,6 +82,7 @@ pub fn b64_decode(s: &str, out: &mut Vec<u8>) -> Result<()> {
             out.push(((acc >> bits) & 0xFF) as u8);
         }
     }
+    debug_assert_eq!(out.len(), bytes);
     Ok(())
 }
 
@@ -112,6 +155,32 @@ pub fn hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn base64_rejects_torn_encodings_before_allocating() {
+        for malformed in
+            ["A", "=Zg==", "Zg=", "Zg===", "Zg==AAAA", "Zh==", "Zm9=", "====", "data:text/plain,hello"]
+        {
+            let mut decoded = vec![7];
+            assert!(b64_decode(malformed, &mut decoded).is_err(), "accepted {malformed:?}");
+            assert!(decoded.is_empty(), "a refusal retained partial bytes");
+        }
+        for (encoded, expected) in [
+            ("Zg", b"f".as_slice()),
+            (" Zm8=\n", b"fo"),
+            ("data:text/plain;base64,Zm9v", b"foo"),
+            ("_-4=", &[255, 238]),
+        ] {
+            let mut decoded = Vec::new();
+            b64_decode(encoded, &mut decoded).unwrap();
+            assert_eq!(decoded, expected, "{encoded:?}");
+        }
+        let mut decoded = Vec::new();
+        assert!(b64_decode_limit("Zm9v", &mut decoded, 2).is_err());
+        assert_eq!(decoded.capacity(), 0, "over-limit output must not reserve");
+        b64_decode_limit("Zm9v", &mut decoded, 3).unwrap();
+        assert_eq!(decoded, b"foo");
+    }
 
     #[test]
     fn base64_roundtrip_and_padding() {
