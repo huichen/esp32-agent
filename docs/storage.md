@@ -21,7 +21,16 @@ and records `STORE_QUEUE_FULL`/`STORE_QUEUE_ALLOC` in the failure diagnostics.
 The writer drains every 100 ms on an internal-RAM stack. Inspect
 `/api/status.store.pending`, `failed` and `last_failure` to distinguish admitted
 requests from durable writes. Backend refusals are drained once, not automatically
-retried forever. A streamed write executes synchronously on the calling thread and
+retried forever.
+
+The periodic writer drains outside the global App mutex, then reacquires it for
+receipt acknowledgements and logging. A newer queued generation is not acknowledged
+by an older flush report. Queue/backend access remains serialized for the complete
+drain: operations that touch those locks can still block, including callers holding
+the App mutex. The reboot flush deliberately keeps the App lock for its final batch
+and returns `false` if any operation in that drain is refused.
+
+A streamed write executes synchronously on the calling thread and
 therefore requires an internal-RAM stack too. A successful stream supersedes any
 older queued write/removal for that key; a failed stream leaves it intact and is
 counted in the same failure diagnostics.
@@ -69,8 +78,10 @@ Single-file replacement preservation is the backend guarantee described below.
 
 `workspace_edit` restores the complete RAM workspace if its closure partially mutates
 and then returns an error, or if publication admission is refused. Such an error does
-not leave partially changed RAM or a partially admitted replacement batch. A later
-asynchronous backend refusal is a different event: it is logged and counted, not
+not leave partially changed RAM or a partially admitted replacement batch. A completed
+backend result arriving during an edit is retained: RAM rollback does not undo its
+saved-hash acknowledgement or failure invalidation. A later asynchronous backend
+refusal is a different event: it is logged and counted, not
 returned as a synchronous edit error or silently treated as durable success.
 
 ## LittleFS replacement and recovery
