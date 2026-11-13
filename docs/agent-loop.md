@@ -36,7 +36,11 @@ works towards an objective on its own between turns.
   excerpts (truncation marker included), and the compressed index keeps at most 40 lines.
   Byte trimming deliberately keeps one oversized newest message; the payload ceiling
   excludes allocator overhead, request copies and the archive index, so it is not a
-  measured peak-RAM guarantee.
+  measured peak-RAM guarantee. Saved JSONL is serialized newest-first into one capped
+  buffer (512 KiB, header included), stopping at the cap instead of serializing the whole
+  history or joining a second full copy. A saved cut keeps complete user exchanges and
+  call/result pairs; an exchange too large to fit is counted as dropped, never saved as
+  an orphaned tail.
 - **Storage is a filesystem.** The transcript and the file workspace are files on the 12 MB
   `storage` partition (LittleFS); NVS keeps the configuration and the secrets, and nothing
   that grows. A workspace file may be 256 KB and the whole workspace 4 MB. See section 4
