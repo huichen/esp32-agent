@@ -11447,7 +11447,11 @@ mod tests {
         let mut wave = Vec::new();
         crate::util::b64_decode(rec["wav_b64"].as_str().unwrap(), &mut wave).expect("the payload is base64");
         assert_eq!(&wave[0..4], b"RIFF", "the header travels with the samples");
-        assert!(rec["wav_b64"].as_str().unwrap().len() <= 2048, "a tool result is capped at 2 KB");
+        assert!(
+            rec["wav_b64"].as_str().unwrap().len() <= crate::agent::MAX_TOOL_RESULT_BYTES,
+            "a tool result is capped at {} bytes",
+            crate::agent::MAX_TOOL_RESULT_BYTES
+        );
 
         let tone = app.call_tool("speaker_tone", &json!({ "freq_hz": 440, "ms": 50 })).unwrap();
         assert_eq!(tone["ok"], json!(true), "{tone}");

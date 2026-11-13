@@ -19,11 +19,12 @@
 //!
 //! ## Why a thumbnail
 //!
-//! A tool result is cut to [`crate::agent::MAX_TOOL_RESULT_BYTES`] (2 KB). A QVGA frame
-//! is 320x240x3 = 230400 bytes, over a hundred times the limit, so the frame itself can
-//! never cross the wire. `camera_capture` returns the geometry, the byte count and a
-//! 32x24 greyscale thumbnail: 768 bytes, 1024 characters of base64, which fits with room
-//! for the rest of the JSON. The thumbnail is an image summary, not the picture.
+//! A tool result is cut to [`crate::agent::MAX_TOOL_RESULT_BYTES`] (64 KB). A QVGA frame
+//! is 320x240x3 = 230,400 bytes, so even the smallest useful frame does not cross the wire.
+//! `camera_capture` returns the geometry, the byte count and a 160x120 greyscale thumbnail:
+//! 19,200 bytes, 25,600 characters of base64, about 40% of one result. The thumbnail is an
+//! image summary, not the picture — a 1080p frame is 6.2 MB, which is why a real frame
+//! belongs on an HTTP route rather than in a tool result.
 //!
 //! ## Which ids are accepted
 //!
@@ -59,10 +60,12 @@ const RESET_SETTLE_US: u32 = 5_000;
 pub const PID_OV2640: u8 = 0x26;
 pub const PID_OV3660: u8 = 0x36;
 
-/// Thumbnail size returned by `camera_capture`. Small enough that 768 bytes of grey
-/// level plus base64 padding stay well inside a tool result.
-pub const THUMB_W: u32 = 32;
-pub const THUMB_H: u32 = 24;
+/// Thumbnail size returned by `camera_capture`. 19,200 bytes of grey level is 25,600
+/// characters of base64 — about 40% of a 64 KB result, which leaves the geometry and the
+/// note the other 60%. 32x24 and then 64x48 were the earlier sizes; each move came from a
+/// result budget that was bigger than the code assumed.
+pub const THUMB_W: u32 = 160;
+pub const THUMB_H: u32 = 120;
 
 const DEFAULT_WIDTH: u32 = 320;
 const DEFAULT_HEIGHT: u32 = 240;
@@ -232,7 +235,7 @@ fn block(i: u32, n: u32, src: u32) -> (u32, u32) {
     (start, end)
 }
 
-/// 32x24 greyscale thumbnail of a packed RGB888 frame, as block averages of luma.
+/// 64x48 greyscale thumbnail of a packed RGB888 frame, as block averages of luma.
 ///
 /// The one job this has is to be predictable: with a 320x240 frame each cell covers
 /// exactly 10x10 source pixels, so a frame made of four constant quadrants produces four
@@ -374,7 +377,9 @@ impl Camera {
                 "bytes": thumb.len(),
                 "data_b64": crate::util::b64_encode(&thumb),
             },
-            "note": "thumbnail only: 32x24 block averages of BT.601 luma, not the frame; a full frame is 100x the tool-result limit",
+            "note": format!(
+                "thumbnail only: {THUMB_W}x{THUMB_H} block averages of BT.601 luma, not the frame; the frame itself is {want} bytes"
+            ),
         }))
     }
 
@@ -476,7 +481,7 @@ impl Device for Camera {
             .bind(move |ctx, args| ctx.devices.call(&id, "camera_info", args, ctx.hw)),
             ToolDef::new(
                 "camera_capture",
-                "Take one frame and return its metadata plus a 32x24 greyscale thumbnail as \
+                "Take one frame and return its metadata plus a 160x120 greyscale thumbnail as \
                  base64. The thumbnail is block averages of luma, not the frame: a full frame is \
                  far larger than a tool result can carry",
             )
@@ -747,38 +752,39 @@ mod tests {
         assert_eq!(out["bytes"], 320 * 240 * 3);
         assert_eq!(out["frame_bytes_used"], 320 * 240 * 3);
         assert_eq!(out["extra_bytes_ignored"], 0);
-        assert_eq!(out["thumbnail"]["width"], 32);
-        assert_eq!(out["thumbnail"]["height"], 24);
-        assert_eq!(out["thumbnail"]["bytes"], 768);
+        assert_eq!(out["thumbnail"]["width"], THUMB_W);
+        assert_eq!(out["thumbnail"]["height"], THUMB_H);
+        assert_eq!(out["thumbnail"]["bytes"], (THUMB_W * THUMB_H) as u64);
 
         let thumb = thumb_bytes(&out);
-        assert_eq!(thumb.len(), 768, "32 x 24 bytes");
-        // Each cell covers 10x10 pixels of a 320x240 frame, so the quadrant boundaries
-        // fall exactly between cells 15 and 16 and between rows 11 and 12.
+        let (w, h) = (THUMB_W as usize, THUMB_H as usize);
+        assert_eq!(thumb.len(), w * h, "{THUMB_W} x {THUMB_H} bytes");
+        // Each cell covers 5x5 pixels of a 320x240 frame, so the quadrant boundaries
+        // fall exactly between cells 31 and 32 and between rows 23 and 24.
         assert_eq!(thumb[0], 0, "top-left quadrant is black");
-        assert_eq!(thumb[31], 64, "top-right quadrant");
-        assert_eq!(thumb[23 * 32], 128, "bottom-left quadrant");
-        assert_eq!(thumb[23 * 32 + 31], 255, "bottom-right quadrant");
-        assert_eq!(thumb[11 * 32 + 15], 0, "last cell of the top-left quadrant");
-        assert_eq!(thumb[11 * 32 + 16], 64, "first cell of the top-right quadrant");
-        assert_eq!(thumb[12 * 32], 128, "the quadrant split is exactly between rows 11 and 12");
+        assert_eq!(thumb[w - 1], 64, "top-right quadrant");
+        assert_eq!(thumb[(h - 1) * w], 128, "bottom-left quadrant");
+        assert_eq!(thumb[(h - 1) * w + w - 1], 255, "bottom-right quadrant");
+        assert_eq!(thumb[(h / 2 - 1) * w + w / 2 - 1], 0, "last cell of the top-left quadrant");
+        assert_eq!(thumb[(h / 2 - 1) * w + w / 2], 64, "first cell of the top-right quadrant");
+        assert_eq!(thumb[(h / 2) * w], 128, "the quadrant split is exactly between rows {h}/2 - 1 and {h}/2");
         assert_eq!(cam.frames, 1);
         assert!(cam.last_error.is_none());
     }
 
     #[test]
     fn the_thumbnail_averages_each_block_instead_of_sampling_it() {
-        // 64x24: one thumbnail cell covers two source columns and one row, so a column
+        // 320x240: one thumbnail cell covers two source columns and two rows, so a column
         // pattern of 0/200 averages to 100 everywhere. Sampling would give 0 or 200.
-        let mut frame = Vec::with_capacity(64 * 24 * 3);
-        for _ in 0..24 {
-            for x in 0..64u32 {
+        let mut frame = Vec::with_capacity(320 * 240 * 3);
+        for _ in 0..240 {
+            for x in 0..320u32 {
                 let v = if x % 2 == 0 { 0u8 } else { 200 };
                 frame.extend_from_slice(&[v, v, v]);
             }
         }
-        let thumb = grey_thumbnail(&frame, 64, 24);
-        assert_eq!(thumb.len(), 768);
+        let thumb = grey_thumbnail(&frame, 320, 240);
+        assert_eq!(thumb.len(), (THUMB_W * THUMB_H) as usize);
         assert!(thumb.iter().all(|v| *v == 100), "every cell is the block average: {thumb:?}");
     }
 
@@ -797,7 +803,7 @@ mod tests {
     #[test]
     fn a_source_smaller_than_the_thumbnail_does_not_read_out_of_bounds() {
         let thumb = grey_thumbnail(&[10, 20, 30], 1, 1);
-        assert_eq!(thumb.len(), 768);
+        assert_eq!(thumb.len(), (THUMB_W * THUMB_H) as usize);
         assert_eq!(luma(10, 20, 30), 18);
         assert!(thumb.iter().all(|v| *v == 18), "one pixel spreads over every cell");
     }
