@@ -788,6 +788,7 @@ impl App {
         }
         self.family_members = members;
         tools.register_all(self.devices.tool_defs());
+        tools.register_all(board_tools::media::tools(&self.devices));
         // Device tools that belong together answer to one family name: six `oled_*` become
         // `display`, four audio tools become `audio`, and the LED and the buttons become
         // `indicators`. The grouping is the board's own vocabulary — a kind of device it

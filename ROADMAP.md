@@ -5,7 +5,7 @@ what is not done or not verified.
 
 ## Verified / unverified
 
-- ✅ `agent-core`: 861 unit tests and 5 integration tests (protocol, HTTP, manifest
+- ✅ `agent-core`: 867 unit tests and 5 integration tests (protocol, HTTP, manifest
   validation, driver conversion, capability filtering, auth, hot reload, the agent loop,
   shell and script, the file tools, sched, SSE streams, a streamed request body)
 - ✅ Simulator end to end: the PowerShell smoke gate; `scripts/smoke.sh` is the Unix
@@ -79,7 +79,9 @@ what is not done or not verified.
 
 6. **Audio beyond the current bounded calls**: change the I2S TX rate at runtime (only
    24000 Hz is wired), permit overlapping uploads, add long microphone file recording or
-   background 60 s score playback. None is implemented. On-board Opus/ADPCM encoding is
+   a background score/media worker. None is implemented. `media_play` paces a bounded
+   score and OLED frames in one synchronous call; it is not background playback.
+   On-board Opus/ADPCM encoding is
    deferred pending an actual build and measurements; the old 5–6 kB SRAM reading is not
    evidence that a codec cannot fit. See [audio](docs/audio.md).
 7. **A usable firmware camera capture path.** OV2640/OV3660 probing and camera host tests
