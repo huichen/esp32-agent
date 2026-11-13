@@ -114,7 +114,7 @@ pub fn index(ws: &dyn Workspace) -> Vec<Skill> {
 /// The host's skills use YAML front matter; on the board this is read line by line rather
 /// than parsed, because the only keys that matter are `name` and `description` and a YAML
 /// parser is more heap than the whole feature is worth.
-fn split_front_matter(text: &str) -> (&str, &str) {
+pub fn split_front_matter(text: &str) -> (&str, &str) {
     let Some(rest) = text.strip_prefix("---") else { return ("", text) };
     let Some(end) = rest.find("\n---") else { return ("", text) };
     (rest[..end].trim_matches('\n'), rest[end + 4..].trim_start_matches(['\n', '\r']))

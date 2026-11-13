@@ -1,28 +1,29 @@
 //! The skills a freshly flashed board starts with.
 //!
 //! A board comes out of the box with an empty workspace: no instructions, no skills, and
-//! an agent that has to be told how to do everything. Three skills are baked into the
-//! firmware instead — writing the next skill, discovering what is wired, recovering a
-//! board that looks broken — so the first boot has them without a network, a download or
-//! a second store. `include_str!` is the whole mechanism: the repository's `skills/` is
-//! the source, and the build fails if one of those files disappears.
+//! an agent that has to be told how to do everything. One skill is baked into the firmware
+//! instead — how to write the next one — because that is the skill that cannot be looked up
+//! and the one every other procedure needs first. `include_str!` is the whole mechanism: the
+//! repository's `skills/` is the source, and the build fails if the file disappears.
 //!
-//! Nothing about them is special after that. They land in `/skills/<name>/SKILL.md`, the
-//! same place an owner's own skill goes, and [`crate::tools::knowledge::index`] picks
-//! them up like any other file. A path that already holds text — a seeded skill the owner
-//! rewrote — is never touched again, which is what makes the seed safe to run on every
-//! boot.
+//! Nothing about it is special after that. It lands in `/skills/<name>/SKILL.md`, the same
+//! place an owner's own skill goes, and [`crate::tools::knowledge::index`] picks it up like
+//! any other file. A path that already holds text — a seeded skill the owner rewrote — is
+//! never touched again, which is what makes the seed safe to run on every boot. A path the
+//! owner *deleted* is empty, so the next boot writes it back: deleting a seeded skill means
+//! removing it here, not on the board.
+//!
+//! The file carries the standard header (YAML front matter with `name` and `description`),
+//! the same shape the host's skills use, so one skill written by hand and one written by the
+//! agent look alike and the index reads them the same way.
 
 use crate::app::AppWorkspace;
 use crate::tools::fs::Workspace;
 use crate::tools::knowledge::SKILLS_DIR;
 
 /// The skills the firmware carries: directory name and the file itself.
-pub const DEFAULT_SKILLS: &[(&str, &str)] = &[
-    ("create-skill", include_str!("../../../skills/create-skill/SKILL.md")),
-    ("pinout", include_str!("../../../skills/pinout/SKILL.md")),
-    ("recover-board", include_str!("../../../skills/recover-board/SKILL.md")),
-];
+pub const DEFAULT_SKILLS: &[(&str, &str)] =
+    &[("create-skill", include_str!("../../../skills/create-skill/SKILL.md"))];
 
 /// The workspace path of one of them, which is also what the prompt index prints.
 pub fn skill_path(name: &str) -> String {
@@ -31,10 +32,10 @@ pub fn skill_path(name: &str) -> String {
 
 /// The default set for a board profile.
 ///
-/// Every profile gets the same three today: none of the procedures is board-specific, and
-/// the pinout skill exists precisely because the firmware cannot know what is wired. A
-/// profile that needs its own set adds itself here and nowhere else — the board has one
-/// place for skills, and this function is the seam over it.
+/// Every profile gets the same one today: writing a skill is not board-specific, and a
+/// procedure that *is* board-specific belongs in a skill the owner writes, which is what
+/// this one teaches. A profile that needs its own set adds itself here and nowhere else —
+/// the board has one place for skills, and this function is the seam over it.
 pub fn defaults_for(_profile: &str) -> &'static [(&'static str, &'static str)] {
     DEFAULT_SKILLS
 }
@@ -88,11 +89,11 @@ mod tests {
     }
 
     #[test]
-    fn a_fresh_workspace_gets_the_three_skills_and_the_index_names_them() {
+    fn a_fresh_workspace_gets_the_skill_and_the_index_names_it() {
         let ws = seeded("esp32s3-xiaozhi-bread");
         let index = knowledge::index(&ws);
         let names: Vec<&str> = index.iter().map(|s| s.name.as_str()).collect();
-        assert_eq!(names, vec!["create-skill", "pinout", "recover-board"]);
+        assert_eq!(names, vec!["create-skill"]);
         for skill in &index {
             assert_eq!(skill.path, skill_path(&skill.name), "the index must carry the path to open");
             assert!(!skill.description.is_empty(), "{} reached the prompt without a line", skill.name);
@@ -111,24 +112,28 @@ mod tests {
     #[test]
     fn a_skill_the_owner_rewrote_is_never_overwritten() {
         let mut ws = seeded("generic");
-        let mine = "# pinout\ndescription: the bench, as I wired it\n12 relay\n";
-        ws.write(&skill_path("pinout"), mine).expect("the owner edits");
+        let mine =
+            "---\nname: create-skill\ndescription: our own house style\n---\n# create-skill\n12 relay\n";
+        ws.write(&skill_path("create-skill"), mine).expect("the owner edits");
 
         assert_eq!(seed(&mut ws, "generic"), 0, "the shipped copy must not come back");
-        assert_eq!(ws.read(&skill_path("pinout")).unwrap(), mine);
-        // Everything the owner did not touch is still exactly what shipped.
-        for (name, text) in DEFAULT_SKILLS {
-            if *name == "pinout" {
-                continue;
-            }
-            assert_eq!(ws.read(&skill_path(name)).unwrap(), *text, "{name} was rewritten");
-        }
+        assert_eq!(ws.read(&skill_path("create-skill")).unwrap(), mine);
+    }
+
+    /// The seed fills an empty path and is safe on every boot, so a skill deleted on the
+    /// board comes back. Removing one for good is a change here, not a `rm`.
+    #[test]
+    fn a_skill_deleted_on_the_board_is_seeded_again() {
+        let mut ws = seeded("generic");
+        ws.remove(&skill_path("create-skill")).expect("the owner deletes it");
+        assert_eq!(seed(&mut ws, "generic"), 1, "the next boot writes it back");
+        assert!(ws.read(&skill_path("create-skill")).is_ok());
     }
 
     #[test]
     fn the_flag_stops_the_seed_and_is_on_by_default() {
         let fresh = app_with_config("{}");
-        assert_eq!(fresh.workspace.len(), DEFAULT_SKILLS.len(), "a new board starts with the three");
+        assert_eq!(fresh.workspace.len(), DEFAULT_SKILLS.len(), "a new board starts with it");
         for (name, _) in DEFAULT_SKILLS {
             assert!(fresh.workspace.read(&skill_path(name)).is_ok(), "{name} is not in the workspace");
         }
@@ -139,8 +144,8 @@ mod tests {
     }
 
     /// The guard that keeps this a build failure instead of a board that silently seeds a
-    /// file it cannot write: three skills have to leave room for one full memory beside
-    /// them, and each has to carry the one line the prompt shows.
+    /// file it cannot write: the skill has to leave room for one full memory beside it, and
+    /// it has to carry the standard header — the same one a hand-written skill uses.
     #[test]
     fn the_shipped_skills_fit_the_board_and_carry_a_description() {
         let mut total = 0;
@@ -149,10 +154,20 @@ mod tests {
             assert!(text.len() < MAX_FILE_BYTES, "{name} is {} bytes; a stored file is smaller", text.len());
             assert!(text.is_ascii(), "{name} carries non-ASCII text");
 
-            let line = text
+            // The standard header, not a `#` line with keys under it: front matter opened
+            // and closed by `---`, carrying the name and the description.
+            let (meta, body) = knowledge::split_front_matter(text);
+            assert!(!meta.is_empty(), "{name} has no front matter");
+            assert!(
+                meta.lines().any(|l| l.trim() == format!("name: {name}")),
+                "{name}: front matter must carry `name: {name}`\n{meta}"
+            );
+            assert!(body.trim_start().starts_with('#'), "{name}: the body starts with a heading");
+
+            let line = meta
                 .lines()
                 .find_map(|l| l.trim().strip_prefix("description:"))
-                .unwrap_or_else(|| panic!("{name} has no `description:` line"));
+                .unwrap_or_else(|| panic!("{name} has no `description:` in its header"));
             let line = line.trim();
             assert!(!line.is_empty(), "{name} has an empty description");
             assert!(line.chars().count() <= 80, "{name} would be clipped in the prompt: {line}");
