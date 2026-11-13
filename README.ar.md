@@ -106,7 +106,7 @@ bash scripts/build-firmware.sh --flash --port /dev/ttyACM0
 [HTTP وMCP](docs/http-api.md) · [إضافة جهاز](docs/adding-a-device.md) · [الحرق](docs/flashing.md) ·
 [استكشاف الأخطاء](docs/troubleshooting.md) · [حلقة الوكيل](docs/agent-loop.md) · [التدفق](docs/agent-stream.md) ·
 [المهارات](docs/agent-skills.md) · [الذاكرة](docs/agent-memory.md) · [Scripting](docs/scripting.md) ·
-[Model](docs/model.md) · [Web console](docs/web-console.md) · [Scheduling](docs/scheduling.md) · [Shell](docs/shell.md) · [Context layers](docs/context.md) · [Security](docs/security.md) · [Simulator](docs/simulator.md) · [Audio](docs/audio.md)
+[Model](docs/model.md) · [Web console](docs/web-console.md) · [Scheduling](docs/scheduling.md) · [Shell](docs/shell.md) · [Context layers](docs/context.md) · [Security](docs/security.md) · [Simulator](docs/simulator.md) · [Audio](docs/audio.md) · [تقرير التدقيق](docs/audit-2026-11.md)
 
 ## المساهمة
 

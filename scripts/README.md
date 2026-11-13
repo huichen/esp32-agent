@@ -47,8 +47,11 @@ The suite uses Python's standard library, temporary isolated state and random lo
 ports. Each selected area starts its own simulator; local fake Chat/Responses/Anthropic
 and image endpoints exercise agent adapters without provider credentials. The 14 areas
 cover discovery, RPC, tools/permissions, files/formats, scripts, agent protocols/lifecycle,
-scheduling, media and transport. A failed assertion makes the process exit nonzero; the
-optional UTF-8 JSON report records assertions, exercised routes/methods/tools and gaps.
+scheduling, media and transport. The same safe initially advertised default-board tool
+catalogue is exercised over external MCP and the internal agent in each model dialect;
+every internal result is compared with the actual follow-up model request. A failed
+assertion makes the process exit nonzero; the optional UTF-8 JSON report records assertions,
+exercised routes/methods/tools and gaps.
 
 Use `--sim <binary>` for a non-default build location, `--verbose` for passing case names,
 and `--deadline <seconds>` to change the overall run budget (default 240 seconds, plus

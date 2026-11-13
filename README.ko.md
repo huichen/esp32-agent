@@ -110,7 +110,7 @@ I²C 스캔은 8회 실행에서 안정적이었습니다. TLS 페이지를 읽�
 [HTTP 및 MCP](docs/http-api.md) · [장치 추가](docs/adding-a-device.md) · [플래시](docs/flashing.md) ·
 [문제 해결](docs/troubleshooting.md) · [에이전트 루프](docs/agent-loop.md) · [스트림](docs/agent-stream.md) ·
 [스킬](docs/agent-skills.md) · [메모리](docs/agent-memory.md) · [스크립트](docs/scripting.md) ·
-[모델](docs/model.md) · [웹 콘솔](docs/web-console.md) · [스케줄링](docs/scheduling.md) · [셸](docs/shell.md) · [컨텍스트 계층](docs/context.md) · [보안](docs/security.md) · [시뮬레이터](docs/simulator.md) · [오디오](docs/audio.md)
+[모델](docs/model.md) · [웹 콘솔](docs/web-console.md) · [스케줄링](docs/scheduling.md) · [셸](docs/shell.md) · [컨텍스트 계층](docs/context.md) · [보안](docs/security.md) · [시뮬레이터](docs/simulator.md) · [오디오](docs/audio.md) · [감사 보고서](docs/audit-2026-11.md)
 
 ## 기여
 
