@@ -1975,6 +1975,38 @@ impl App {
     ///   workspace would come back as a file list no boot ever wrote, which is the same rule
     ///   the transcript follows.
     fn load_workspace(&mut self) {
+        // Two layouts live under this key. `ws1 ...` is the chunked one written while the store
+        // could only take values; a document that starts with `{` is the current one, and it is
+        // parsed as it is read, so a 4 MB workspace never exists as one `String`.
+        let mut peek = [0u8; 4];
+        let head = match self.store.read_at(NVS_KEY_WORKSPACE, 0, &mut peek) {
+            Some(n) if n > 0 => n,
+            _ => return,
+        };
+        if head >= 4 && &peek == b"ws1 " {
+            self.load_workspace_chunked();
+            return;
+        }
+        let reader = match self.store.reader(NVS_KEY_WORKSPACE) {
+            Some(reader) => reader,
+            None => return,
+        };
+        match AppWorkspace::from_reader(reader) {
+            Ok(ws) => self.workspace = ws,
+            Err(e) => {
+                // The value cannot be read by this build or any other, so leaving it in
+                // flash only costs the space and hides the fact from the next boot.
+                self.log.error(
+                    "agent",
+                    format!("the stored workspace is unreadable ({e}); starting with an empty one"),
+                );
+                store::clear_blob(self.store.as_mut(), NVS_KEY_WORKSPACE, WORKSPACE_PLAN);
+            }
+        }
+    }
+
+    /// The chunked layout: a `ws1` header under `ws` and the document in `ws.1`, `ws.2`, ...
+    fn load_workspace_chunked(&mut self) {
         let (text, legacy) = match store::read_blob(self.store.as_ref(), NVS_KEY_WORKSPACE, WORKSPACE_PLAN) {
             store::BlobState::Missing => return,
             store::BlobState::Stored(text) => (text, false),
@@ -2441,15 +2473,44 @@ impl App {
     /// The write itself is a request (see [`App::flush_store`]): this runs on whatever
     /// thread made the change, and on this board only the store writer may touch flash.
     fn persist_workspace(&mut self) -> std::result::Result<(), String> {
-        let text = self.workspace.to_json().to_string();
-        match store::write_blob(self.store.as_mut(), NVS_KEY_WORKSPACE, &text, WORKSPACE_PLAN) {
-            Ok(_) => Ok(()),
-            Err(e) => {
-                let why = format!("the file workspace was not saved: {e}");
-                self.log.error("agent", why.clone());
-                Err(why)
+        // Two paths, same document. A thread whose stack is in internal RAM may write flash
+        // itself, and then the workspace is streamed straight out: no copy of it exists as one
+        // string, which is what a 1.25 MB workspace could not afford (it asked for a 1.64 MB
+        // contiguous block and the board rebooted). Any other thread queues it as before.
+        let direct = self.hw.stack_is_internal();
+        let saved = if direct {
+            // Streamed: the caller has a flash-safe stack, so the store can write while the
+            // document is being generated. Nothing holds the whole workspace as one string.
+            let workspace = &self.workspace;
+            self.store.set_stream(NVS_KEY_WORKSPACE, &mut |out| workspace.write_json(out))
+        } else {
+            // Queued: the writer task has that stack, this thread does not. The document is
+            // built once and moved into the queue (no second copy).
+            let mut bytes: Vec<u8> = Vec::new();
+            if let Err(e) = self.workspace.write_json(&mut bytes) {
+                return Err(format!("the file workspace was not saved: {e}"));
             }
+            match String::from_utf8(bytes) {
+                Ok(text) => self.store.set(NVS_KEY_WORKSPACE, &text),
+                Err(e) => return Err(format!("the file workspace was not saved: {e}")),
+            }
+        };
+        if saved {
+            // The chunked layout wrote `ws.1`..`ws.N`; a streamed save does not, and a leftover
+            // chunk next to a document is a second copy of half the workspace taking space. One
+            // read per index until the first gap keeps the usual case to a single lookup.
+            for index in 1..=WORKSPACE_PLAN.chunks_max {
+                let key = crate::keys::workspace_chunk(index);
+                if self.store.get(&key).is_none() {
+                    break;
+                }
+                self.store.remove(&key);
+            }
+            return Ok(());
         }
+        let why = "the file workspace was not saved: the store refused it, see /api/status.store";
+        self.log.error("agent", why);
+        Err(why.to_string())
     }
 
     /// One change to the workspace, durable or undone.
@@ -2458,10 +2519,25 @@ impl App {
     /// "the file is there" cannot both be true. Without the rollback a failed save left the
     /// new text in RAM: `write` answered ok, `read` served the file, and the next boot came
     /// back without it - the failure was only visible in a log line nobody was reading.
+    /// PSRAM free right now, in bytes, when the platform can say.
+    ///
+    /// Asked before a change that needs a copy of the workspace, so that running out is a
+    /// refusal with numbers in it instead of the allocator's `abort()`.
+    fn psram_free_bytes(&mut self) -> Option<usize> {
+        self.hw.heap_pools().into_iter().find(|p| p.pool == "spiram").map(|p| p.free_kb as usize * 1024)
+    }
+
     fn workspace_edit<T>(
         &mut self,
         change: impl FnOnce(&mut AppWorkspace) -> std::result::Result<T, String>,
     ) -> std::result::Result<T, String> {
+        // The rollback below needs a copy of the whole map, so this is the moment the board can
+        // run out of PSRAM. Ask first: a refused write is a sentence the caller can act on, and
+        // an allocation that fails is `memory allocation of N bytes failed` followed by
+        // `abort()` - a reboot, measured on this board.
+        if let Some(free) = self.psram_free_bytes() {
+            workspace_fits(self.workspace.bytes(), Some(free))?;
+        }
         let before = self.workspace.clone();
         let outcome = change(&mut self.workspace)?;
         match self.persist_workspace() {
@@ -6024,7 +6100,69 @@ pub struct AppWorkspace {
     files: std::collections::BTreeMap<String, String>,
 }
 
+/// Whether a change of `bytes` can be made with `free` bytes of PSRAM.
+///
+/// Two copies: the rollback keeps the map as it was, and the change builds the new text. The
+/// margin is the allocator's overhead and whatever else a turn is holding. The point of asking
+/// is that the failure has two shapes and only one of them is usable: a refusal here says
+/// "nothing was changed", while an allocation that fails prints `memory allocation of N bytes
+/// failed` and calls `abort()` - measured on this board, at a 1.25 MB workspace.
+pub fn workspace_fits(bytes: usize, free: Option<usize>) -> std::result::Result<(), String> {
+    let Some(free) = free else { return Ok(()) };
+    let need = bytes.saturating_mul(2).saturating_add(64 * 1024);
+    if free >= need {
+        return Ok(());
+    }
+    Err(format!(
+        "the file workspace is {bytes} bytes and a change needs about {need} bytes of PSRAM \
+         (a rollback copy plus the new text); {free} is free, so nothing was changed"
+    ))
+}
+
 impl AppWorkspace {
+    /// Serialise this workspace into `out`, one file at a time.
+    ///
+    /// This replaces `to_json().to_string()`, which built a `serde_json::Value` copy of every
+    /// file and then a second full copy as one `String`. Measured on the board: a 1.25 MB
+    /// workspace asked for a 1,638,752-byte contiguous allocation, PSRAM could not give it,
+    /// and Rust's allocation-failure path called `abort()` - a reboot, not an error. Streaming
+    /// needs a few kilobytes however big the workspace is.
+    pub fn write_json(&self, out: &mut dyn std::io::Write) -> std::io::Result<()> {
+        out.write_all(b"{\"version\":1,\"files\":{")?;
+        let mut first = true;
+        for (path, text) in &self.files {
+            if !first {
+                out.write_all(b",")?;
+            }
+            first = false;
+            // The JSON escaping of one string, straight into the sink: no intermediate copy of
+            // the text, which is the whole point.
+            serde_json::to_writer(&mut *out, path).map_err(|e| std::io::Error::other(e.to_string()))?;
+            out.write_all(b":")?;
+            serde_json::to_writer(&mut *out, text).map_err(|e| std::io::Error::other(e.to_string()))?;
+        }
+        out.write_all(b"}}")
+    }
+
+    /// Parse the document [`AppWorkspace::write_json`] writes, straight into the map.
+    ///
+    /// `from_json(&Value)` needed the whole document as a `String`, then a `Value` of it, then
+    /// the map - three copies on every boot. serde deserialises into the map directly, so the
+    /// peak is the map plus the parser's own buffer.
+    /// Incremental, and buffered: serde_json's reader pulls one byte at a time while it parses a
+    /// string, so handing it the store's reader directly meant a file open and seek per byte.
+    /// 8 KB of buffer turns that into one pull per 8 KB of document.
+    pub fn from_reader(reader: impl std::io::Read) -> std::result::Result<Self, serde_json::Error> {
+        #[derive(serde::Deserialize)]
+        struct Doc {
+            #[serde(default)]
+            files: std::collections::BTreeMap<String, String>,
+        }
+        let mut buffered = std::io::BufReader::with_capacity(8192, reader);
+        let doc: Doc = serde_json::from_reader(&mut buffered)?;
+        Ok(Self { files: doc.files })
+    }
+
     pub fn to_json(&self) -> Value {
         let mut files = serde_json::Map::new();
         for (path, text) in &self.files {
@@ -10085,15 +10223,55 @@ mod tests {
         let read =
             ToolHost::call_tool(&mut app, "fs_read", &json!({ "path": "/notes/a.txt" })).expect("fs_read");
         assert!(read.contains("hello"), "got {read}");
-        // The workspace is persisted, so the file survives a reboot. It is not under the
-        // base key any more: `ws` holds the header, `ws.1` the first chunk of the blob.
-        match store::read_blob(app.store.as_ref(), NVS_KEY_WORKSPACE, WORKSPACE_PLAN) {
-            store::BlobState::Stored(blob) => assert!(blob.contains("/notes/a.txt"), "got {blob}"),
-            other => panic!("the workspace was never saved: {other:?}"),
-        }
+        // The workspace is persisted, so the file survives a reboot. It is one document under
+        // `ws` now - written as it is generated, so it never exists as one `String` first.
+        let blob = app.store.get(NVS_KEY_WORKSPACE).expect("the workspace was never saved");
+        assert!(blob.starts_with('{'), "not a document: {blob}");
+        assert!(blob.contains("/notes/a.txt"), "got {blob}");
     }
 
     // ------------------------------------------------- the workspace across a reboot
+
+    /// The document is written as it is generated and parsed as it is read, so the two halves
+    /// of the streaming path have to agree - and the result has to still be the JSON every
+    /// other reader expects.
+    #[test]
+    fn the_streamed_document_round_trips_and_is_still_json() {
+        use crate::tools::fs::Workspace as _;
+        let mut ws = AppWorkspace::default();
+        ws.write("/a.txt", "plain").expect("a file");
+        ws.write("/notes/quo\"tes.md", "a \"quoted\" line\nand a backslash \\\n").expect("escaping");
+        ws.write("/empty.md", "").expect("an empty file");
+
+        let mut bytes: Vec<u8> = Vec::new();
+        ws.write_json(&mut bytes).expect("streams");
+        let text = String::from_utf8(bytes.clone()).expect("utf-8");
+
+        // Same shape as `to_json`: a version and a map.
+        let as_value: Value = serde_json::from_str(&text).expect("valid JSON");
+        assert_eq!(as_value["version"], 1);
+        assert_eq!(as_value["files"]["/a.txt"], "plain");
+
+        let back = AppWorkspace::from_reader(&bytes[..]).expect("parses");
+        assert_eq!(back.bytes(), ws.bytes(), "same text out as in");
+        for (path, text) in ws.paths() {
+            assert_eq!(&back.read(path).unwrap(), text, "{path} came back different");
+        }
+    }
+
+    /// The guard that turns "PSRAM cannot give it" into a sentence: two copies of the workspace
+    /// (the rollback and the change) plus a margin, against what is actually free.
+    #[test]
+    fn a_workspace_change_is_refused_before_psram_runs_out() {
+        // 1 MB of workspace needs ~2.06 MB free; a board with 7.9 MB says yes.
+        assert!(super::workspace_fits(1_000_000, Some(7_900_000)).is_ok());
+        // The same board with 1 MB left says no, and says why.
+        let err = super::workspace_fits(1_000_000, Some(1_000_000)).unwrap_err();
+        assert!(err.contains("nothing was changed"), "{err}");
+        assert!(err.contains("PSRAM"), "{err}");
+        // A platform that cannot answer is not blocked: no measurement is not a refusal.
+        assert!(super::workspace_fits(1_000_000, None).is_ok());
+    }
 
     /// A store whose workspace writes always fail, which is what a full NVS looks like from
     /// the App's side. Everything else is delegated, so only the `ws` keys are affected.
@@ -10144,17 +10322,12 @@ mod tests {
         // What the writer task would have done before the reboot.
         drain_store(&mut app);
 
-        // The blob is past the old 4000-byte single-value ceiling: the size that used to be
-        // written nowhere while the tool answered ok. The store takes whole values now, so it
-        // is one chunk rather than a run of them - the run is what `store::tests` still drives.
-        let blob = match store::read_blob(&store.clone(), NVS_KEY_WORKSPACE, WORKSPACE_PLAN) {
-            store::BlobState::Stored(blob) => blob,
-            other => panic!("the workspace was never saved: {other:?}"),
-        };
+        // One document under `ws`, written as it is generated: past the old 4000-byte
+        // single-value ceiling, and still one value because the store takes whole values.
+        let blob = store.get("ws").expect("the workspace was never saved");
         assert!(blob.len() > store::VALUE_MAX, "{} bytes is one value", blob.len());
-        assert_eq!(store.get("ws.1").map(|v| v.len()), Some(blob.len()), "one value holds it all");
-        assert!(store.get("ws.2").is_none(), "a second chunk means it was split");
-        assert!(store.get("ws").unwrap().starts_with("ws1 "), "{:?}", store.get("ws"));
+        assert!(blob.starts_with('{'), "not a document: {}", &blob[..blob.len().min(40)]);
+        assert!(store.get("ws.1").is_none(), "a chunk means it was split");
 
         // A reboot is a new App over the same keys.
         let rebooted = app_with(&store);
@@ -10188,53 +10361,46 @@ mod tests {
         assert!(!read.contains("second"), "{read}");
     }
 
+    /// The chunked layout is what the board wrote while one value could not exceed ~4 KB. It is
+    /// still read: an upgrade mid-life keeps every file it had, and the next save rewrites it as
+    /// one document.
     #[test]
-    fn a_workspace_written_as_one_value_by_an_older_build_is_migrated() {
+    fn a_chunked_workspace_from_an_older_build_is_read_and_rewritten() {
         let store = SharedStore::new();
-        // Exactly what the previous firmware wrote: one JSON value under `ws`.
         let old = json!({
             "version": 1,
             "files": {
-                "/MEMORY.md": "- [pins](/memory/pins.md) — GPIO18 is the strip (2026-11-11)\n",
+                "/MEMORY.md": "- [pins](/memory/pins.md) - GPIO18 is the strip\n",
                 "/memory/pins.md": "# pins\nGPIO18 is the WS2812 strip, active high.\n",
             }
         })
         .to_string();
-        assert!(store.clone().set(NVS_KEY_WORKSPACE, &old));
+        // The older shape: a `ws1` header under `ws`, the document under `ws.1`, `ws.2`, ...
+        store::write_blob(&mut store.clone(), NVS_KEY_WORKSPACE, &old, WORKSPACE_PLAN)
+            .expect("the chunked layout");
+        assert!(store.get("ws").unwrap().starts_with("ws1 "), "the fixture is not chunked");
 
-        let (mut app, log) = app_with_log(&store);
+        let mut app = app_with(&store);
         assert_eq!(
             fs_tools::Workspace::read(&app.workspace, "/memory/pins.md").unwrap(),
             "# pins\nGPIO18 is the WS2812 strip, active high.\n",
             "every file the old value held is still there"
         );
         assert!(fs_tools::Workspace::read(&app.workspace, "/MEMORY.md").unwrap().contains("pins"));
-        // The migration is queued like every other write; the writer makes it durable.
+        // The rewrite is queued like every other write; the writer makes it durable.
         drain_store(&mut app);
-        // The same boot wrote it back in the chunked format, and said so.
-        assert!(store.get("ws").unwrap().starts_with("ws1 "), "{:?}", store.get("ws"));
-        assert!(
-            log.tail(50, 0).iter().any(|l| l.message.contains("migrated the stored workspace")),
-            "{:?}",
-            log.tail(50, 0).iter().map(|l| &l.message).collect::<Vec<_>>()
-        );
-        match store::read_blob(&store.clone(), NVS_KEY_WORKSPACE, WORKSPACE_PLAN) {
-            store::BlobState::Stored(blob) => assert!(blob.contains("/memory/pins.md"), "{blob}"),
-            other => panic!("the migration did not reach the store: {other:?}"),
-        }
+        let rewritten = store.get("ws").unwrap();
+        assert!(rewritten.starts_with('{'), "not rewritten as a document: {rewritten}");
+        assert!(store.get("ws.1").is_none(), "the old chunk is still there");
 
-        // A second boot reads the new format, so the migration was stored, not just served
-        // from RAM once.
+        // A second boot reads the document, so the rewrite was stored, not served from RAM once.
         let again = app_with(&store);
         assert!(fs_tools::Workspace::read(&again.workspace, "/memory/pins.md").is_ok());
-        assert!(matches!(
-            store::read_blob(&store.clone(), NVS_KEY_WORKSPACE, WORKSPACE_PLAN),
-            store::BlobState::Stored(_)
-        ));
     }
 
+    /// Half a document must not come back as a file list no boot ever wrote.
     #[test]
-    fn a_torn_workspace_blob_starts_empty_and_says_why() {
+    fn a_torn_workspace_document_starts_empty_and_says_why() {
         let store = SharedStore::new();
         let mut app = app_with(&store);
         app.workspace = AppWorkspace::default();
@@ -10243,11 +10409,11 @@ mod tests {
         }
         assert!(fs_tools::Workspace::read(&app.workspace, "/notes/a.md").unwrap().len() > 1000);
         drain_store(&mut app);
-        assert!(store.get("ws.1").is_some(), "the blob has to be on flash for this test");
+        let whole = store.get("ws").expect("the document has to be on flash for this test");
+        assert!(whole.starts_with('{'));
 
-        // A power cut in the middle of a save leaves a chunk that does not match the header.
-        // One chunk or several, the header carries one checksum per chunk either way.
-        store.clone().set("ws.1", "a chunk from a write that never finished");
+        // A power cut in the middle of a save leaves half a document.
+        store.clone().set("ws", &whole[..whole.len() / 2]);
 
         let (rebooted, log) = app_with_log(&store);
         assert!(
@@ -10255,7 +10421,7 @@ mod tests {
             "half a workspace must not come back"
         );
         assert!(
-            log.tail(80, 0).iter().any(|l| l.level == "error" && l.message.contains("does not check out")),
+            log.tail(80, 0).iter().any(|l| l.level == "error" && l.message.contains("unreadable")),
             "{:?}",
             log.tail(80, 0).iter().map(|l| &l.message).collect::<Vec<_>>()
         );

@@ -315,6 +315,14 @@ impl Hardware for VirtualBoard {
         ]
     }
 
+    /// The simulator has no flash to write, so it answers "not on this thread": every write
+    /// takes the queued path, exactly as it does on a board whose calling thread has a PSRAM
+    /// stack. That keeps `no_edit_writes_flash_where_it_was_made` honest instead of letting a
+    /// streamed write slip past the queue on the host and not on the board.
+    fn stack_is_internal(&self) -> bool {
+        false
+    }
+
     /// Two pools, because the point of the reading is that the firmware asks instead of
     /// assuming: a client sees the shape here and reads real numbers off a board. The
     /// values are fixed, like the virtual board's other memory figures.

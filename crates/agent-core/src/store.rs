@@ -351,6 +351,55 @@ pub trait KvStore: Send {
     fn whole_value_bytes(&self) -> Option<usize> {
         None
     }
+
+    /// Write `key` from a callback, so a value that would be a megabyte never has to exist as
+    /// one `String`.
+    ///
+    /// The default builds it anyway and calls [`KvStore::set`], which keeps every backend that
+    /// does not care correct. A filesystem overrides this and streams into a file, and that is
+    /// the difference between "a 4 MB workspace needs 4 MB free" and "it needs 4 MB, twice,
+    /// in one contiguous block".
+    fn set_stream(
+        &mut self,
+        key: &str,
+        fill: &mut dyn FnMut(&mut dyn std::io::Write) -> std::io::Result<()>,
+    ) -> bool {
+        let mut bytes: Vec<u8> = Vec::new();
+        if fill(&mut bytes).is_err() {
+            return false;
+        }
+        match String::from_utf8(bytes) {
+            Ok(text) => self.set(key, &text),
+            Err(_) => false,
+        }
+    }
+
+    /// A reader over the stored value, when the backend can offer one without building it.
+    ///
+    /// A file can be read as it is; NVS has to assemble its values first, so it answers `None`
+    /// and the caller falls back to [`KvStore::get`]. This is the read half of
+    /// [`KvStore::set_stream`]: loading a 4 MB workspace through one `String` costs 4 MB for
+    /// the text and 4 MB again for the map.
+    fn reader(&self, _key: &str) -> Option<Box<dyn std::io::Read + '_>> {
+        None
+    }
+
+    /// Read at most `buf.len()` bytes of `key`, starting at `offset`.
+    ///
+    /// The primitive a streaming read is built on: the caller asks for the next few kilobytes
+    /// instead of the whole value. The default materialises the value through [`KvStore::get`],
+    /// which is right for a backend whose values are small (NVS caps one at ~4 KB, the
+    /// simulator has no cap and no 4 MB workspace either). A file backend seeks.
+    fn read_at(&self, key: &str, offset: usize, buf: &mut [u8]) -> Option<usize> {
+        let text = self.get(key)?;
+        let bytes = text.as_bytes();
+        if offset >= bytes.len() {
+            return Some(0);
+        }
+        let end = (offset + buf.len()).min(bytes.len());
+        buf[..end - offset].copy_from_slice(&bytes[offset..end]);
+        Some(end - offset)
+    }
 }
 
 /// One reason a store gave for refusing an operation: the platform's numeric code and the
@@ -651,6 +700,18 @@ impl StoreQueue {
         }
     }
 
+    /// Run `f` against the backend with the queue's lock held.
+    ///
+    /// Used by a caller that can write flash itself (its stack is in internal RAM) and wants
+    /// to stream a value instead of building it as one `String` first. Taking the same lock
+    /// the writer takes is what keeps the two from overlapping.
+    pub fn with_inner<R>(&self, f: impl FnOnce(&mut dyn KvStore) -> R) -> R {
+        match self.inner.lock() {
+            Ok(mut store) => f(store.as_mut()),
+            Err(poisoned) => f(poisoned.into_inner().as_mut()),
+        }
+    }
+
     /// How many writes are queued and waiting for the writer.
     pub fn pending(&self) -> usize {
         match self.pending.lock() {
@@ -742,6 +803,19 @@ impl QueuedStore {
     pub fn new(queue: StoreQueue) -> Self {
         Self { queue }
     }
+
+    /// Run `f` against the backend with the queue's lock held.
+    ///
+    /// The reader below pulls through this, one chunk at a time: a value never has to exist as
+    /// one `String` on the way in *or* on the way out.
+    pub fn with_inner<R>(&self, f: impl FnOnce(&mut dyn KvStore) -> R) -> R {
+        self.queue.with_inner(f)
+    }
+
+    /// A reader over a stored value, pulling `chunk` bytes at a time through the queue.
+    pub fn reader<'a>(&'a self, key: &str, chunk: usize) -> QueueReader<'a> {
+        QueueReader { store: self, key: key.to_string(), offset: 0, buf: vec![0; chunk], len: chunk }
+    }
 }
 
 impl KvStore for QueuedStore {
@@ -756,6 +830,19 @@ impl KvStore for QueuedStore {
         self.queue.enqueue(key, Some(value.to_string()))
     }
 
+    /// Streamed *through the queue's lock*, on this thread.
+    ///
+    /// The caller must be able to write flash itself - its stack in internal RAM
+    /// (`Hardware::stack_is_internal`). Taking the lock the writer takes keeps the two from
+    /// overlapping; what it avoids is building the value as one `String` first, which for a
+    /// workspace is the difference between a few kilobytes and a megabyte.
+    fn set_stream(
+        &mut self,
+        key: &str,
+        fill: &mut dyn FnMut(&mut dyn std::io::Write) -> std::io::Result<()>,
+    ) -> bool {
+        self.queue.with_inner(|inner| inner.set_stream(key, fill))
+    }
     /// Whether the key exists *now*: a queued value counts, a queued removal does not.
     fn remove(&mut self, key: &str) -> bool {
         let had = self.queue.read(key).is_some();
@@ -767,16 +854,61 @@ impl KvStore for QueuedStore {
         self.queue.keys()
     }
 
+    /// Reads are streamed too: the reader pulls chunks through the queue, so loading a
+    /// workspace does not need it as one `String` first. 64 KB per pull, because each one is a
+    /// file open and a seek.
+    fn reader(&self, key: &str) -> Option<Box<dyn std::io::Read + '_>> {
+        Some(Box::new(QueuedStore::reader(self, key, 64 * 1024)))
+    }
+
     /// Forwarded, not defaulted: the App asks this before it decides whether a blob is one
     /// value or a run of them, and `StoreQueue` is what it holds.
     fn whole_value_bytes(&self) -> Option<usize> {
         self.queue.whole_value_bytes()
     }
 
-    /// Forwarded for the same reason: "how much room is left" is a question about the backend,
-    /// and `StoreQueue`'s copy is the one sampled at the last flush.
+    /// Forwarded for the same reason: "how much room is left" is a question about the backend.
+    ///
+    /// Asked of the store itself, not of the queue's cached copy: a streamed write goes straight
+    /// to the backend and never passes through a flush, so the cached figure would freeze at
+    /// the last queued write - which is exactly what happened (3 012 bytes reported while 1.75 MB
+    /// of workspace sat on flash).
     fn space(&self) -> Option<StoreSpace> {
-        self.queue.space()
+        self.queue.with_inner(|inner| inner.space())
+    }
+}
+
+/// A [`std::io::Read`] over a stored value, pulling it through the queue in fixed chunks.
+///
+/// Used by the workspace load: parsing the document straight out of this reader means the
+/// 4 MB never exists as one `String`, and the map it is parsed into is the only copy.
+pub struct QueueReader<'a> {
+    store: &'a QueuedStore,
+    key: String,
+    offset: usize,
+    buf: Vec<u8>,
+    len: usize,
+}
+
+impl std::fmt::Debug for QueueReader<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "QueueReader({}, at {})", self.key, self.offset)
+    }
+}
+
+impl std::io::Read for QueueReader<'_> {
+    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+        if out.is_empty() {
+            return Ok(0);
+        }
+        let want = self.len.min(out.len());
+        let got = self
+            .store
+            .with_inner(|inner| inner.read_at(&self.key, self.offset, &mut self.buf[..want]))
+            .ok_or_else(|| std::io::Error::other("the stored value cannot be read"))?;
+        self.offset += got;
+        out[..got].copy_from_slice(&self.buf[..got]);
+        Ok(got)
     }
 }
 
