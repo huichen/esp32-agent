@@ -87,6 +87,9 @@ CORS is on by default (`mcp.cors`), so a browser MCP client can connect directly
 | POST | `/api/wifi/connect` | `{ssid, password}`, save and reconnect |
 | POST | `/api/wifi/forget` | Clear the credentials |
 | GET | `/api/logs?n=&since=` | Ring log |
+| GET | `/api/files/tree` | The whole workspace in one answer: every directory (derived from the paths) and file with `size_bytes`, plus `total_bytes` / `total_max` / `file_max`. What the portal's Files tab reads |
+| GET | `/api/files?path=<dir>` | One directory of the workspace, directories first (the same rows `ls` returns) |
+| GET | `/api/files/read?path=<file>` | One file as text |
 | GET | `/api/catalog` | Driver catalog |
 | GET | `/api/sessions` | MCP sessions |
 | GET | `/api/clients` | Client configuration, ready to copy |
