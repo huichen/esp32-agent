@@ -732,7 +732,10 @@ const EVENT_KINDS = [
 
 function connectStream() {
   if (S.stream) return;
-  const es = new EventSource("/api/agent/stream?after=" + S.lastEvent);
+  // EventSource cannot set request headers. The server accepts only a minted,
+  // expiring portal token here (never a raw PIN), and only for reads.
+  const es = new EventSource("/api/agent/stream?after=" + S.lastEvent +
+    (S.token ? "&token=" + encodeURIComponent(S.token) : ""));
   S.stream = es;
   for (const kind of EVENT_KINDS) {
     es.addEventListener(kind, (ev) => {

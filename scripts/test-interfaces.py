@@ -747,7 +747,7 @@ def permissions(rec, sim, fake):
     sim.post("/api/config", {"auth": {"portal_pin": pin, "mcp_token": token},
                              "wifi": {"password": token, "ap_password": token}})
     credential = {"X-Portal-Pin": pin}
-    for path in ["/api/config", "/api/agent/history", "/api/agent/prompt", "/api/files", "/api/files/tree", "/api/files/read", "/api/attachment/x"]:
+    for path in ["/api/config", "/api/agent/history", "/api/agent/prompt", "/api/agent/events", "/api/agent/stream", "/api/logs", "/api/script/missing", "/api/files", "/api/files/tree", "/api/files/read", "/api/attachment/x"]:
         rec.equal("private-read:" + path, sim.request("GET", path).status, 401)
     for path in ["/healthz", "/agent.json", "/api/status", "/api/tools", "/api/sched"]:
         rec.equal("public-read:" + path, sim.request("GET", path).status, 200)
