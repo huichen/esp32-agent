@@ -19,13 +19,39 @@ misconfiguration costs a URL and not the board. `mcp.plain_http: false` closes i
 | Chat (the page itself) | talk to the model; each turn shows the answer and folds its tool calls and reasoning into one line you can open |
 | Devices | what the probe found, pins and addresses, `Probe devices`, and the candidates waiting to be adopted |
 | Tools | every tool with its input schema, and why one is hidden |
-| Agent | endpoint, model, key, protocol, thinking level, temperature, context and output size |
-| Schedule | timed prompts and sensor rules |
-| Logs | the ring buffer, newest first |
-| Settings | WiFi with gateway and DNS overrides, and the portal PIN |
+| Agent | endpoint, model, key, protocol, thinking level, temperature, context and output size; and the schedule (timed prompts and sensor rules) |
+| Files | the whole workspace as one tree; tap a file to read it |
+| Terminal | one command line on the board, through the `shell` tool |
+| Settings | WiFi with gateway and DNS overrides, the portal PIN, and the ring log |
 
 The page keeps a bearer token from `POST /api/auth` and retries once when a write is refused,
 so the PIN is asked for once per session and not per click.
+
+## Terminal
+
+The last panel is a terminal for the board, and it is the only one that does not use a REST
+route: a command goes to `POST /mcp` as `tools/call` on `shell`, in one MCP session the page
+keeps for as long as the tab is open. That is deliberate — it is the same door an external
+agent uses, so a command typed here behaves exactly like one a model calls, including the
+range checks, the disables and the tool budget. Nothing has a PTY: the board runs one
+command line, answers, and returns.
+
+| Typed | What happens |
+|---|---|
+| `ls /`, `cat /MEMORY.md`, `df`, `free`, `ps`, `date`, `curl … \| head -n 5` | the board's `shell` tool, see [shell](shell.md) |
+| `help` | what the terminal can do, in the page |
+| `clear` (or `Ctrl-L`) | empty the screen, in the page |
+| `!name {json}` | any tool, e.g. `!board {"command":"chip_temp"}` or `!indicators {"command":"led_set","arguments":{"color":"#00ff00"}}` |
+
+Up and down walk the history and stop at the line being typed rather than losing it. The
+answer is printed as a person reads it — one string field (`echo`, `cat`, `jq`) prints that
+string, a directory listing prints as names — and anything else prints as indented JSON,
+which is the shape the tool actually returned. Errors go up in red with the board's own
+sentence, and the session is dropped so the next command opens a fresh one: a reboot or an
+expired `mcp.session_ttl_s` costs a command, not a reload.
+
+The scrollback lives in the page and is capped at 400 entries. The board's RAM is not the
+constraint here; a tab left open overnight is.
 
 ## Live updates
 

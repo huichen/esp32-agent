@@ -9612,6 +9612,15 @@ mod tests {
         assert!(web::STYLE_CSS.contains(".dot-anim"), "no live indicator in the stylesheet");
         assert!(web::STYLE_CSS.contains(".bubble"), "bubbles are the transcript");
         assert!(web::STYLE_CSS.contains("100dvh"), "mobile height, not a guessed one");
+
+        // The terminal tab is the one panel that reaches the board through `/mcp` rather than
+        // a REST route, so the declaration, the transport and the screen all have to ship.
+        assert!(web::INDEX_HTML.contains("data-panel=\"terminal\""), "the tab is missing");
+        assert!(web::INDEX_HTML.contains("id=\"term-screen\""), "the screen is missing");
+        assert!(web::INDEX_HTML.contains("id=\"term-input\""), "nothing to type in");
+        assert!(web::APP_JS.contains("method: \"tools/call\""), "the terminal never calls a tool");
+        assert!(web::APP_JS.contains("Mcp-Session-Id"), "the terminal opens a session per command");
+        assert!(web::STYLE_CSS.contains(".term-screen"), "the screen has no style of its own");
     }
 
     #[test]
