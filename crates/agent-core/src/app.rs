@@ -9593,13 +9593,14 @@ mod tests {
         }
         let resp = shared.lock().unwrap().agent_stream_from(
             1,
-            limits(Duration::from_millis(400), Duration::from_secs(5), Duration::from_secs(10)),
+            limits(Duration::from_millis(200), Duration::from_secs(5), Duration::from_secs(10)),
         );
         // The turn keeps running while the stream is open: the next event has to
-        // arrive without the client asking again.
+        // arrive without the client asking again. 40 ms is inside the 200 ms idle budget,
+        // so the frame cannot arrive from the replay — it has to be followed live.
         let writer = shared.clone();
         let turn = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(80));
+            std::thread::sleep(Duration::from_millis(40));
             writer.lock().unwrap().agent.events.push_back(journal_event(4, "run_end", ""));
         });
         let body = run_stream(resp);
@@ -9658,8 +9659,11 @@ mod tests {
         );
         let writer = shared.clone();
         let turn = std::thread::spawn(move || {
-            for seq in 1..=40 {
-                std::thread::sleep(Duration::from_millis(20));
+            // Events have to outlast the 200 ms total budget, or the stream would simply
+            // run out of them: 60 events at the 5 ms the poller already wakes on is the
+            // shortest pace that keeps it busy past the deadline.
+            for seq in 1..=60 {
+                std::thread::sleep(Duration::from_millis(5));
                 writer.lock().unwrap().agent.events.push_back(journal_event(seq, "tool_use", "x"));
             }
         });
@@ -10204,16 +10208,27 @@ mod tests {
         use std::sync::{Arc, Mutex};
         use std::time::{Duration, Instant};
 
-        /// A model that takes 600 ms and then answers plainly.
-        struct SlowModel;
-        impl crate::llm::ChatTransport for SlowModel {
+        /// A model that holds the reply until the test lets go.
+        ///
+        /// "The model is thinking" is then a state the test observes rather than a 600 ms
+        /// guess: the signal arrives from inside the model call, so there is no window in
+        /// which the portal may or may not be looking at a run that is in flight.
+        struct HeldModel {
+            entered: std::sync::mpsc::Sender<()>,
+            release: std::sync::mpsc::Receiver<()>,
+        }
+        impl crate::llm::ChatTransport for HeldModel {
             fn post_json(
                 &mut self,
                 _url: &str,
                 _headers: &[(&str, &str)],
                 _body: &str,
             ) -> std::result::Result<String, String> {
-                std::thread::sleep(Duration::from_millis(600));
+                let _ = self.entered.send(());
+                // The test releases as soon as it has measured the portal. The bounded wait
+                // is what keeps a regression - the lock held across the call - a red
+                // assertion instead of a hung suite: /api/status would block for this long.
+                let _ = self.release.recv_timeout(Duration::from_millis(400));
                 Ok(json!({
                     "choices": [{ "message": { "role": "assistant", "content": "slow answer" } }]
                 })
@@ -10232,13 +10247,15 @@ mod tests {
         }
 
         let app_for_run = app.clone();
+        let (entered_tx, entered) = std::sync::mpsc::channel();
+        let (release, release_rx) = std::sync::mpsc::channel();
         let run = std::thread::spawn(move || {
-            let mut model = SlowModel;
+            let mut model = HeldModel { entered: entered_tx, release: release_rx };
             drive_agent(&app_for_run, &mut model)
         });
 
-        // Let the run get as far as the model call, then act like the portal.
-        std::thread::sleep(Duration::from_millis(150));
+        // The model call is in flight — observed, not waited out.
+        entered.recv_timeout(Duration::from_secs(5)).expect("the run reached the model");
         let started = Instant::now();
         let resp = {
             let mut guard = app.lock().unwrap();
@@ -10247,7 +10264,7 @@ mod tests {
         let waited = started.elapsed();
         assert_eq!(resp.status, 200, "the portal must still answer");
         assert!(
-            waited < Duration::from_millis(300),
+            waited < Duration::from_millis(200),
             "the app lock was held for {waited:?} while the model was thinking"
         );
 
@@ -10259,6 +10276,8 @@ mod tests {
         };
         assert_eq!(mid_run.status, 200);
 
+        // Let the model answer, so the turn can finish.
+        let _ = release.send(());
         let outcome = run.join().expect("the run thread");
         assert!(matches!(outcome, Some(Ok(_))), "the turn still finishes");
     }
@@ -10828,7 +10847,23 @@ mod tests {
             assert_eq!(declared, helped, "{family}: the schema and `help` disagree");
 
             for command in helped.iter().chain(std::iter::once(&"help".to_string())) {
-                if let Err(e) = app.call_tool(&family, &json!({ "command": command })) {
+                // A command that waits on the board gets the shortest wait its own schema
+                // allows: `button_wait` defaults to five seconds, and all this loop proves is
+                // that dispatch reaches the handler. Sitting out that default is what made
+                // this test 5.05 s — the slowest thing in the suite after the ring test.
+                let waits = app
+                    .tools
+                    .get(command.as_str())
+                    .map(|def| def.spec.input_schema["properties"].get("timeout_ms").is_some())
+                    .unwrap_or(false);
+                // A family nests its command's arguments under `arguments`; the top level is
+                // only `command` (and `help` needs nothing).
+                let args = if waits {
+                    json!({ "command": command, "arguments": { "timeout_ms": 10 } })
+                } else {
+                    json!({ "command": command })
+                };
+                if let Err(e) = app.call_tool(&family, &args) {
                     assert!(
                         !e.message.contains("no command"),
                         "{family}: `help` lists `{command}` but dispatch refuses it: {}",
