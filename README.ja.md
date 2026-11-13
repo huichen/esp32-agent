@@ -112,7 +112,7 @@ I²C スキャンは 8 回の実行で安定していました。TLS ページ�
 [HTTP と MCP](docs/http-api.md) · [デバイスの追加](docs/adding-a-device.md) · [書き込み](docs/flashing.md) ·
 [トラブルシューティング](docs/troubleshooting.md) · [エージェントループ](docs/agent-loop.md) · [ストリーム](docs/agent-stream.md) ·
 [スキル](docs/agent-skills.md) · [メモリ](docs/agent-memory.md) · [スクリプト](docs/scripting.md) ·
-[モデル](docs/model.md) · [Web コンソール](docs/web-console.md) · [スケジューリング](docs/scheduling.md) · [シェル](docs/shell.md) · [コンテキストの階層](docs/context.md) · [セキュリティ](docs/security.md) · [シミュレーター](docs/simulator.md) · [オーディオ](docs/audio.md)
+[モデル](docs/model.md) · [Web コンソール](docs/web-console.md) · [スケジューリング](docs/scheduling.md) · [シェル](docs/shell.md) · [コンテキストの階層](docs/context.md) · [セキュリティ](docs/security.md) · [シミュレーター](docs/simulator.md) · [オーディオ](docs/audio.md) · [監査レポート](docs/audit-2026-11.md)
 
 ## 貢献
 

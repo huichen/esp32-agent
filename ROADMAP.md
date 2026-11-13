@@ -22,8 +22,10 @@ what is not done or not verified.
 - ✅ Model latency is outside the `App` lock: a turn in flight no longer queues the
   portal (historical bench: `/api/status` ≤ 253 ms while a 2.5 s model call runs)
 - ✅ Live journal over SSE (`/api/agent/stream`), `tool_progress`, `agent.tick_ms`
-- ✅ Audit firmware release compilation reported for `5dc35c0` with ESP-IDF v5.5.2
-  (2026-11-13); this is a build check, not hardware validation
+- ✅ Audit firmware release compiled and linked at runtime revision `6e78043` with
+  ESP-IDF v5.5.2 (2026-11-13); 35 warnings reported, 20 duplicates. This is a build check,
+  not hardware validation. The [audit report](docs/audit-2026-11.md) records hashes and
+  the 1,089-check live HTTP/MCP/internal-agent run
 - ⚠️ Audit firmware has not been flashed or board-tested. Earlier flashes do not validate
   subsequent source changes
 - ⚠️ Not measured: WS2812/RMT, ADC/PWM values, boot time and power draw under a full
