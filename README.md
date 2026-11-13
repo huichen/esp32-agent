@@ -22,7 +22,7 @@ sensor can be declared in JSON while the board runs.
 | Unattended operation | Timed prompts, and sensor rules that fire a prompt when a reading crosses a threshold. [Scheduling](docs/scheduling.md) |
 | Shell and script | `shell` with 57 NuttX-named commands, and an interpreter for loops over tool calls. [Shell](docs/shell.md) · [Script](docs/scripting.md) |
 | Long-term memory | Standing orders, `/AGENTS.md`, a `/MEMORY.md` index and skills, assembled into the prompt on every turn. [Context layers](docs/context.md) |
-| Built-in skills | Three procedures ship in the firmware — write a skill, find the pinout, recover a broken board — and land in `/skills` on the first boot; edit one and it stays yours. [Skills](docs/agent-skills.md) |
+| Built-in skills | One procedure ships in the firmware, `create-skill`, written with the standard `---` header — and it teaches the rest: what a skill is, how to write one. It lands in `/skills` on the first boot, and an edit stays yours. [Skills](docs/agent-skills.md) |
 | The board is the server | HTTPS from the board, a certificate it generates, one PIN for three callers. [Security](docs/security.md) |
 | Hardware-free testing | The simulator runs the same `agent-core` against a virtual board. [Simulator](docs/simulator.md) |
 
@@ -46,7 +46,7 @@ model, list the devices the probe found, turn tools on and off, read the log, se
 route with its method, body and auth, the MCP surface, the settings table with types and
 defaults, and the limits. An agent that can fetch a URL needs nothing else.
 
-**A new board already knows three things.** `/skills/create-skill` says how the agent writes its next procedure, `/skills/pinout` how to find out what is wired and record it in `/MEMORY.md`, `/skills/recover-board` what to do when the board looks broken. They are ordinary workspace files, installed on the first boot wherever the path is empty; a factory reset restores them and `skills.seed_defaults=false` stops that. The first useful sentence to a freshly flashed board can be "write down your own pinout".
+**A new board already knows how to learn.** `/skills/create-skill` is the one seeded procedure: it says what a skill is, the `---` header it must carry, and how to write one the next session will find. Everything else — the pinout of your bench, what to do when a board looks dead — is a skill the agent writes and then keeps. It is an ordinary workspace file, installed on the first boot wherever the path is empty; a factory reset restores it and `skills.seed_defaults=false` stops that. The first useful sentence to a freshly flashed board can be "write down your own pinout".
 
 ## Give it a model
 
@@ -84,7 +84,7 @@ works for every board it can reach. Without a key at all, `base_url` set to
 
 | Part | State |
 |---|---|
-| `agent-core` | 749 unit tests and 5 integration tests pass; `scripts/smoke.ps1` passes end to end |
+| `agent-core` | 750 unit tests and 5 integration tests pass; `scripts/smoke.ps1` passes end to end |
 | Simulator | console, MCP and the agent loop run end to end |
 | Firmware | flashed on an ESP32-S3-DevKitC-1 N16R8 (IDF v5.5.2): 42 tools, OLED 128×32, I²S mic and amp, WS2812, TLS console, model turns over HTTPS |
 | Not implemented | OTA, SD card, DHT11/22, camera. See `ROADMAP.md` |

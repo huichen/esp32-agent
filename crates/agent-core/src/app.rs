@@ -11198,10 +11198,12 @@ mod tests {
         assert_eq!(app.skills().len(), crate::seed::DEFAULT_SKILLS.len(), "{:?}", app.skills());
     }
 
-    /// The seed is an install, not a rewrite, and it runs on every boot: a deleted skill
-    /// comes back, an edited one does not — the path is what decides, nothing else.
+    /// The seed is an install, not a rewrite, and it runs on every boot: a path that already
+    /// holds text is left alone, so an owner's edit survives a power cut. (The other half -
+    /// a deleted skill coming back - is `seed::tests::a_skill_deleted_on_the_board_is_seeded_again`,
+    /// which needs one skill and no app.)
     #[test]
-    fn a_reboot_keeps_the_owners_edit_and_reinstalls_a_deleted_skill() {
+    fn a_reboot_keeps_the_owners_edit_to_a_seeded_skill() {
         let store = SharedStore::new();
         {
             let mut app = app_with(&store);
@@ -11210,32 +11212,25 @@ mod tests {
                 &mut app,
                 "fs_edit",
                 &json!({
-                    "path": "/skills/pinout/SKILL.md",
-                    "find": "description: discover and record what is wired to this board, so the next session knows",
-                    "replace": "description: the bench, as I wired it"
+                    "path": "/skills/create-skill/SKILL.md",
+                    "find": "description: write a new skill for this board when a procedure had to be worked out",
+                    "replace": "description: our own house style for skills"
                 }),
             )
-            .expect("the owner edits a skill");
-            ToolHost::call_tool(
-                &mut app,
-                "fs_rm",
-                &json!({ "path": "/skills/recover-board/SKILL.md", "confirm": true }),
-            )
-            .expect("and deletes another");
-            // The owner's edits are queued; the writer flushes them, and then the power
-            // goes out.
+            .expect("the owner edits the skill");
+            // The owner's edit is queued; the writer flushes it, and then the power goes out.
             drain_store(&mut app);
         }
 
         // The power goes out, and comes back to a new App over the same flash.
         let (mut app, log) = app_with_log(&store);
         let index = app.skills();
-        assert_eq!(index.len(), crate::seed::DEFAULT_SKILLS.len(), "the deleted skill came back: {index:?}");
-        let pinout = index.iter().find(|s| s.name == "pinout").expect("pinout is indexed");
-        assert_eq!(pinout.description, "the bench, as I wired it", "the owner's edit was overwritten");
+        assert_eq!(index.len(), crate::seed::DEFAULT_SKILLS.len(), "{index:?}");
+        let skill = index.iter().find(|s| s.name == "create-skill").expect("it is indexed");
+        assert_eq!(skill.description, "our own house style for skills", "the edit was overwritten");
         assert!(
-            log.tail(50, 0).iter().any(|l| l.message.contains("seeded 1 of 3")),
-            "the boot log says what was installed: {:?}",
+            !log.tail(50, 0).iter().any(|l| l.message.contains("seeded")),
+            "nothing was installed over an existing skill: {:?}",
             log.tail(50, 0).iter().map(|l| &l.message).collect::<Vec<_>>()
         );
         // A second boot over a complete workspace writes nothing at all.

@@ -23,7 +23,7 @@ répond avec eux ; un nouveau capteur peut être déclaré en JSON pendant que
 | Il agit sans surveillance | Prompts à heure fixe et règles de capteur qui en déclenchent une invite quand un relevé franchit un seuil. [Planification](docs/scheduling.md) |
 | Un shell et un langage de script | `shell` avec 57 commandes nommées comme dans NuttX, et un interpréteur pour boucler sur des appels d’outils. [Shell](docs/shell.md) · [Script](docs/scripting.md) |
 | Il retient ce qu'on lui a dit | Consignes permanentes, `/AGENTS.md`, un index `/MEMORY.md` et des compétences, assemblés dans le prompt à chaque tour. [Ce que le modèle voit à chaque tour](docs/context.md) |
-| Il arrive avec des compétences | Trois procédures embarquées — écrire une compétence, relever le câblage, récupérer une carte qui semble cassée — installées dans `/skills` au premier démarrage ; une modification reste à vous. [Skills](docs/agent-skills.md) |
+| Compétences intégrées | Une seule procédure est livrée dans le firmware, `create-skill`, avec l'en-tête standard `---`, et elle enseigne le reste : ce qu'est une compétence et comment en écrire une. Elle arrive dans `/skills` au premier démarrage, et ta modification reste. [Compétences](docs/agent-skills.md) |
 | La carte est le serveur | HTTPS servi par la carte, un certificat qu’elle génère, un seul PIN pour trois appelants. [Authentification](docs/security.md) |
 | Testable sans matériel | Le simulateur exécute le même `agent-core` contre une carte virtuelle. [Simulateur](docs/simulator.md) |
 
@@ -49,7 +49,7 @@ route avec sa méthode, son corps et son authentification, la surface MCP, la ta
 réglages avec types et valeurs par défaut, et les limites. Un agent qui sait récupérer une URL
 n'a besoin de rien d'autre.
 
-**Une carte neuve sait déjà trois choses.** `/skills/create-skill` explique comment l'agent écrit sa prochaine procédure, `/skills/pinout` comment relever le câblage et le consigner dans `/MEMORY.md`, `/skills/recover-board` quoi faire quand la carte semble cassée. Ce sont des fichiers ordinaires de l'espace de travail, installés au premier démarrage partout où le chemin est vide ; une réinitialisation d'usine les remet et `skills.seed_defaults=false` l'empêche. La première phrase utile à une carte fraîchement flashée peut être « note ton câblage ».
+**Une carte neuve sait déjà apprendre.** `/skills/create-skill` est la seule procédure livrée : elle dit ce qu'est une compétence, l'en-tête `---` qu'elle doit porter, et comment en écrire une que la prochaine session trouvera. Tout le reste — le câblage de ton banc, quoi faire quand une carte semble morte — est une compétence que l'agent écrit puis conserve. C'est un fichier ordinaire de l'espace de travail, installé au premier démarrage partout où le chemin est vide ; une réinitialisation d'usine le remet et `skills.seed_defaults=false` l'empêche. La première phrase utile à une carte fraîchement flashée peut être « note ton câblage ».
 
 ## Donnez-lui un modèle
 
@@ -87,7 +87,7 @@ pour chaque carte qu'il peut joindre. Sans aucune clé, `base_url` sur
 
 | Partie | État |
 |---|---|
-| `agent-core` | 749 tests unitaires et 5 tests d’intégration passent ; `scripts/smoke.ps1` passe de bout en bout |
+| `agent-core` | 750 tests unitaires et 5 tests d’intégration passent ; `scripts/smoke.ps1` passe de bout en bout |
 | Simulateur | console, MCP et la boucle d’agent fonctionnent de bout en bout |
 | Firmware | flashé sur un ESP32-S3-DevKitC-1 N16R8 (IDF v5.5.2) : 42 outils, OLED 128×32, micro et ampli I²S, WS2812, console TLS, tours de modèle en HTTPS |
 | Non implémenté | OTA, carte SD, DHT11/22, caméra. Voir `ROADMAP.md` |
