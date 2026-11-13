@@ -4341,6 +4341,57 @@ impl App {
                     "archive_cleared": true,
                 }))
             }
+            // Compress the conversation now instead of waiting for the budget. It is the
+            // same deterministic projection the trigger uses, so it costs no model call and
+            // loses no fact: the dropped exchanges become archive lines. Refused mid-turn
+            // for the same reason `reset` is - the turn being answered would be dropped out
+            // from under the answer.
+            ("POST", "/api/agent/compact") => {
+                if let Err(r) = self.require_pin(req) {
+                    return r;
+                }
+                if let Some(r) = self.refuse_while_running("compress the conversation") {
+                    return r;
+                }
+                let body: Value = serde_json::from_str(&req.body_str()).unwrap_or(Value::Null);
+                let keep = match body.get("keep") {
+                    None | Some(Value::Null) => None,
+                    Some(v) => match v.as_u64() {
+                        Some(n) => Some(n as usize),
+                        None => return Response::error_json(400, "`keep` must be a non-negative integer"),
+                    },
+                };
+                let report = self.agent.compact_now(keep);
+                // The dropped messages must not come back after a reboot, exactly as for
+                // `forget`. The archive itself lives in RAM; the transcript is what is stored.
+                let stored = self.persist_transcript();
+                self.log.info(
+                    "agent",
+                    format!(
+                        "compressed the conversation: {} -> {} message(s), {} -> {} byte(s), kept {} exchange(s)",
+                        report.messages_before,
+                        report.messages_after,
+                        report.bytes_before,
+                        report.bytes_after,
+                        report.kept_turns
+                    ),
+                );
+                Response::json(&json!({
+                    "ok": true,
+                    "kept_turns": report.kept_turns,
+                    "removed": report.removed,
+                    "messages_before": report.messages_before,
+                    "messages_after": report.messages_after,
+                    "bytes_before": report.bytes_before,
+                    "bytes_after": report.bytes_after,
+                    "tokens_before": report.tokens_before,
+                    "tokens_after": report.tokens_after,
+                    "archive_lines": report.archive_lines,
+                    "demoted_answers": report.demoted_answers,
+                    // Freeing RAM is a different state from telling flash about it.
+                    "stored": stored,
+                }))
+            }
             ("GET", "/api/agent/config") => Response::json(&self.agent_config_json()),
             // What the model is actually told, system part only. Memory, instructions and
             // the compressed index live here, and a client that cannot see them cannot
@@ -8726,6 +8777,122 @@ mod tests {
         assert_eq!(saved, json!({ "text": pending.text, "source": pending.source, "at_ms": pending.at_ms }));
         assert_eq!(pending.text, "scheduled", "newest text wins");
         assert_eq!(pending.source, "schedule:t1,http,sensor:r1", "repeated sources are not duplicated");
+    }
+
+    #[test]
+    fn manual_compaction_reports_what_it_dropped_and_keeps_the_newest_exchange() {
+        let mut app = test_app();
+        // Four exchanges, and a tool call inside the oldest one: the archive has to carry
+        // the call and its result, not just the prose.
+        app.agent.history.push(crate::agent::Message::assistant(
+            "",
+            vec![llm::ToolCall {
+                id: "c0".into(),
+                name: "board".into(),
+                arguments: json!({ "command": "status" }),
+            }],
+            0,
+        ));
+        app.agent.history.push(crate::agent::Message::tool_result("c0", "ok", false, 0));
+        for turn in 0..4u64 {
+            app.agent.history.push(crate::agent::Message::user(&format!("question {turn}"), "http", turn));
+            app.agent.history.push(crate::agent::Message::assistant(&format!("answer {turn}"), vec![], turn));
+        }
+        assert_eq!(app.agent.history.len(), 10, "four exchanges plus the call/result pair");
+
+        let compacted = app.route(&post("/api/agent/compact", r#"{"keep":1}"#));
+        assert_eq!(compacted.status, 200);
+        let body = body_json(&compacted);
+        assert_eq!(body["ok"], true);
+        assert_eq!(body["kept_turns"], 1);
+        assert_eq!(body["messages_before"], 10);
+        assert_eq!(body["messages_after"], 2, "one exchange survives verbatim");
+        assert_eq!(body["removed"], 8);
+        assert!(body["bytes_after"].as_u64().unwrap() < body["bytes_before"].as_u64().unwrap());
+        assert!(body["tokens_after"].as_u64().unwrap() < body["tokens_before"].as_u64().unwrap());
+        assert_eq!(body["stored"], true, "a compression flash never hears about comes back after a reboot");
+
+        // What survives is the newest exchange, and it is still a valid request: the first
+        // message is the question, never an orphaned tool result.
+        let messages = app.agent_history_json(0)["messages"].as_array().unwrap().clone();
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0]["role"], "user");
+        assert_eq!(messages[0]["text"], "question 3");
+        assert_eq!(messages[1]["text"], "answer 3");
+
+        // The dropped part is not gone silently: the tool call it contained is in the
+        // index, which is what stops a model repeating a call it already made.
+        assert!(body["archive_lines"].as_u64().unwrap() >= 8, "{} archive lines", body["archive_lines"]);
+        assert!(app.agent.archive.iter().any(|l| l.starts_with("called: board(")), "{:?}", app.agent.archive);
+        assert!(app.agent.archive.iter().any(|l| l == "result: ok"), "{:?}", app.agent.archive);
+        assert!(
+            app.agent.archive.iter().any(|l| l.starts_with("user: question 0")),
+            "{:?}",
+            app.agent.archive
+        );
+
+        // A second pass has nothing left to drop and must say so instead of inventing a
+        // saving.
+        let again = body_json(&app.route(&post("/api/agent/compact", "{}")));
+        assert_eq!(again["removed"], 0);
+        assert_eq!(again["messages_after"], 2);
+    }
+
+    #[test]
+    fn the_default_compaction_budget_keeps_a_resumable_tail() {
+        let mut app = test_app();
+        for turn in 0..3u64 {
+            app.agent.history.push(crate::agent::Message::user(&format!("q{turn}"), "http", turn));
+            app.agent.history.push(crate::agent::Message::assistant(&format!("a{turn}"), vec![], turn));
+        }
+        // No `keep`: the budget the automatic trigger would spend. Every exchange fits in
+        // the default window, so a manual pass must not compress below what the trigger
+        // itself would keep.
+        let body = body_json(&app.route(&post("/api/agent/compact", "{}")));
+        assert_eq!(body["ok"], true);
+        assert_eq!(body["removed"], 0, "{} messages kept", body["messages_after"]);
+        assert!(body["kept_turns"].as_u64().unwrap() >= 3, "{} kept turns", body["kept_turns"]);
+    }
+
+    #[test]
+    fn compaction_refuses_a_bad_keep_and_a_turn_in_flight() {
+        let mut app = test_app();
+        point_at_the_stub(&mut app);
+        assert_eq!(app.route(&post("/api/agent/compact", r#"{"keep":-1}"#)).status, 400);
+        assert_eq!(app.route(&post("/api/agent/compact", r#"{"keep":"two"}"#)).status, 400);
+        assert_eq!(app.agent.history.len(), 0, "a refused request changes nothing");
+        // A turn in flight is answering a question this would drop from under it.
+        assert_eq!(app.route(&post("/api/agent/message", r#"{"text":"hold this"}"#)).status, 202);
+        assert!(matches!(app.agent_begin(), Some(AgentStep::Ask { .. })));
+        let refused = app.route(&post("/api/agent/compact", "{}"));
+        assert_eq!(refused.status, 409);
+        assert_eq!(app.agent.history.len(), 1, "the in-flight question survived");
+    }
+
+    #[test]
+    fn manual_compaction_between_turns_leaves_a_request_that_still_starts_at_a_question() {
+        let mut app = test_app();
+        point_at_the_stub(&mut app);
+        for turn in 0..6u64 {
+            app.agent.history.push(crate::agent::Message::user(&format!("task {turn}"), "http", turn));
+            app.agent.history.push(crate::agent::Message::assistant(&format!("did {turn}"), vec![], turn));
+        }
+        let body = body_json(&app.route(&post("/api/agent/compact", r#"{"keep":2}"#)));
+        assert_eq!(body["removed"], 8);
+        assert_eq!(body["messages_after"], 4, "the last two complete exchanges");
+        // The conversation continues: the next question goes out with a transcript that
+        // still starts at a question, and it is the one the model is being asked.
+        app.agent.push_user("the task that matters", "http", 6);
+        match app.agent_begin().expect("the next turn asks the model") {
+            AgentStep::Ask { messages, .. } => {
+                let sent = messages.as_array().unwrap();
+                assert_eq!(sent[0]["role"], "system");
+                assert_eq!(sent[1]["role"], "user", "no orphaned tool result leads the request");
+                assert_eq!(sent[1]["content"], "task 4");
+                assert_eq!(sent[sent.len() - 1]["content"], "the task that matters");
+            }
+            AgentStep::Done(..) => panic!("the conversation should continue"),
+        }
     }
 
     #[test]

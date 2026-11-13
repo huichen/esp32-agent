@@ -400,6 +400,25 @@ pub enum AgentStep {
     Done(Result<String, String>),
 }
 
+/// What one compaction pass cost and changed, in the numbers an operator can check.
+///
+/// Returned rather than logged because "the conversation got smaller" is not a
+/// measurement. A caller that cannot see `removed` and `archive_lines` cannot tell a
+/// compaction that dropped two exchanges from one that did nothing at all.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CompactReport {
+    pub kept_turns: usize,
+    pub removed: usize,
+    pub messages_before: usize,
+    pub messages_after: usize,
+    pub bytes_before: usize,
+    pub bytes_after: usize,
+    pub tokens_before: u32,
+    pub tokens_after: u32,
+    pub archive_lines: usize,
+    pub demoted_answers: usize,
+}
+
 /// The transcript plus the queue. Lives behind the app mutex.
 pub struct Agent {
     pub history: Vec<Message>,
@@ -1059,6 +1078,43 @@ impl Agent {
         self.pending = None;
         self.last_error.clear();
         (removed, self.history.len())
+    }
+
+    /// Compress the transcript now, on request, instead of waiting for the budget.
+    ///
+    /// This is the same deterministic projection the automatic trigger uses — the dropped
+    /// messages become archive lines carrying the tool name, its arguments and a clipped
+    /// result — so a manual pass costs no model call and cannot invent a fact. It is also
+    /// why it is safe to call before the budget is reached: nothing is paraphrased.
+    ///
+    /// `keep_turns` is how many trailing question-and-answer groups stay verbatim. `None`
+    /// spends the same budget the trigger would, which is the honest default: a manual
+    /// pass should not leave a transcript that the next turn immediately compacts again.
+    pub fn compact_now(&mut self, keep_turns: Option<usize>) -> CompactReport {
+        let keep = match keep_turns {
+            Some(n) => n.min(self.history.len()),
+            None => self.turns_within(keep_recent_tokens(self.context_tokens, self.max_output_tokens)),
+        };
+        // Take the readings in locals: `history_tokens` memoises, so it needs the mutable
+        // borrow the struct literal would otherwise hold across.
+        let tokens_before = self.history_tokens();
+        let mut report = CompactReport {
+            kept_turns: keep,
+            messages_before: self.history.len(),
+            bytes_before: self.history_bytes(),
+            tokens_before,
+            ..CompactReport::default()
+        };
+        self.compress(keep);
+        // `compress` returns without touching anything when the tail already is the whole
+        // transcript, so a second pass reports `removed: 0` rather than a phantom saving.
+        report.removed = report.messages_before.saturating_sub(self.history.len());
+        report.messages_after = self.history.len();
+        report.bytes_after = self.history_bytes();
+        report.tokens_after = self.history_tokens_uncached();
+        report.archive_lines = self.archive.len();
+        report.demoted_answers = self.demoted_answers;
+        report
     }
 
     /// Whether the transcript has outgrown its budget and compaction should run.

@@ -92,6 +92,34 @@ guarantee.
 The index is rendered into the system prompt under *Earlier in this conversation*, with one
 instruction that matters: a tool call listed there has already been made.
 
+### Compressing on request
+
+`POST /api/agent/compact {"keep": N}` runs the same projection before the budget is
+reached. `keep` is optional: without it the call spends exactly the budget the automatic
+trigger would, so a manual pass cannot leave a transcript the next turn immediately
+compresses again. With it, the last `N` exchanges stay verbatim.
+
+| Field | Meaning |
+|---|---|
+| `kept_turns` | exchanges left verbatim |
+| `removed` | messages moved into the archive (`0` means there was nothing to drop) |
+| `messages_before` / `messages_after` | message counts either side |
+| `bytes_before` / `bytes_after` | payload bytes either side |
+| `tokens_before` / `tokens_after` | the same estimate the trigger uses |
+| `archive_lines`, `demoted_answers` | how much index the model now gets |
+| `stored` | whether flash accepted the shorter transcript |
+
+The call is refused with `409` while a model turn is running: that turn is answering a
+question this would remove from under it. It is a **command, not a tool the model can
+call** — the model does not know where the task boundary is, and compacting its own live
+context mid-turn is how an agent loses the instruction it was working from. `409` also
+covers the case where the operator forgot to wait; the console and any client should
+retry after `run_end`.
+
+`stored: false` is a real state, not a rounding: the conversation is smaller in RAM but
+the dropped part is still on flash, so a reboot restores it. It happens when
+`persist_transcript` is off or the store queue rejected the write.
+
 ## 3. Forgetting
 
 `POST /api/agent/forget {"keep": N}`
