@@ -457,33 +457,6 @@ pub fn system_tools() -> Vec<ToolDef> {
                 ctx.runtime.reprobe_requested = true;
                 Ok(json!({ "ok": true, "note": "re-probe scheduled; call devices_list again in a moment" }))
             }),
-        ToolDef::new("reboot", "Restart the board")
-            .title("Reboot")
-            .category("system")
-            .core()
-            .mutating()
-            .schema(object_schema(&[], &[]))
-            .bind(|ctx, _args| {
-                ctx.log.warn("system", "reboot requested via MCP");
-                ctx.runtime.restart_requested = true;
-                Ok(json!({ "ok": true, "note": "restarting" }))
-            }),
-        ToolDef::new("factory_reset", "Erase the stored configuration and restart with defaults")
-            .title("Factory reset")
-            .category("system")
-            .core()
-            .mutating()
-            .schema(object_schema(&[("confirm", boolean("must be true"))], &["confirm"]))
-            .bind(|ctx, args| {
-                if !j::opt_bool(args, "confirm").unwrap_or(false) {
-                    return Err(McpError::invalid_params("set confirm=true to erase the configuration"));
-                }
-                *ctx.cfg = crate::config::Config::default();
-                ctx.runtime.config_dirty = true;
-                ctx.runtime.restart_requested = true;
-                ctx.log.warn("system", "factory reset: configuration erased");
-                Ok(json!({ "ok": true }))
-            }),
     ]
 }
 
@@ -656,10 +629,10 @@ const BOARD_COMMANDS: &[&str] = &[
     "config_set",
     "chip_temp",
     "logs_tail",
-    // `reboot` is not here. It restarts the board mid-turn — a model that calls it loses the
-    // run it is in, and nothing it could learn from the restart is worth that. The tool still
-    // exists and still answers; `App::NEVER_OFFERED` is what keeps it out of the listing.
-    "factory_reset",
+    // Neither `reboot` nor `factory_reset` is a tool any more, and neither is a command
+    // here: both end the run, or wipe the board, that the caller is standing on. The
+    // platform still restarts itself when a configuration change needs it
+    // (`runtime.restart_requested`); nothing can ask it to.
     "delay",
     "inventory",
 ];

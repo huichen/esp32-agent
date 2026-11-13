@@ -137,7 +137,7 @@ authoritative when this table and a firmware disagree.
 
 | Tool | Answers |
 |---|---|
-| `board` | the board about itself, in eight commands: `status` (chip, firmware, uptime, die temperature, heap, WiFi, device count, tool counters), `inventory` (profile, buses scanned, every device with pins and address, addresses nothing claimed), `config_get`/`config_set`, `chip_temp` (the die's own sensor, not a board thermometer), `logs_tail`, `factory_reset`, `delay`; `command: help` lists each. Restarting is not among them: a model that reboots destroys the run it is in, so `POST /api/reboot` (behind the PIN) is the way, for a person |
+| `board` | the board about itself, in seven commands: `status` (chip, firmware, uptime, die temperature, heap, WiFi, device count, tool counters), `inventory` (profile, buses scanned, every device with pins and address, addresses nothing claimed), `config_get`/`config_set`, `chip_temp` (the die's own sensor, not a board thermometer), `logs_tail`, `delay`; `command: help` lists each. Neither a restart nor a factory reset is offered here or anywhere else: both end the run, or wipe the board, that the caller is standing on. The platform still restarts itself when a configuration change needs it |
 | `devices_list`, `devices_probe` | the detected devices and their capabilities; re-scan the buses |
 | `bus` | raw access for chips without a driver, in eight commands: `i2c_scan`, `i2c_read`, `i2c_write`, `i2c_identify`, `gpio_mode`, `gpio_read`, `gpio_write`, `adc_read` — the command names are exactly the `exec` primitives they wrap; `command: help` lists what each takes |
 | `device_invoke` | one detected device's tool, by id — what `tools_mode: generic` collapses the device tools into |

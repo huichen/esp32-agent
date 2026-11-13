@@ -207,7 +207,6 @@ pub const ROUTES: &[Route] = &[
         "{ssid, password}",
         "{ok}",
     ),
-    r("POST", "/api/wifi/forget", "wifi", Auth::Pin, "Clear the stored credentials", "", "{ok}"),
     // --- the agent -----------------------------------------------------------------
     r(
         "POST",
@@ -355,18 +354,6 @@ pub const ROUTES: &[Route] = &[
         "Check a portal PIN and take a bearer token (12 h) in exchange; with a PIN set, every mutation and the reads that expose the transcript or the config need one",
         "{pin}",
         "{ok, token, expires_in}",
-    ),
-    // The one route whose tool is deliberately hidden: a model must not restart the board,
-    // so the only way to do it is the portal, which is the reason a person has a page at all.
-    p(
-        "POST",
-        "/api/reboot",
-        "system",
-        Auth::Pin,
-        "reboot (hidden from the model on purpose)",
-        "Reboot the board",
-        "",
-        "{ok}",
     ),
     r("POST", "/mcp", "mcp", Auth::Mcp,
       "The MCP transport itself: initialize, tools/list, tools/call, resources/*. The path is `mcp.path`, so read it from the dynamic section before you connect",
@@ -609,7 +596,6 @@ mod tests {
         for (method, path) in [
             ("POST", "/api/tools"),
             ("POST", "/api/sched/run"),
-            ("POST", "/api/wifi/forget"),
             ("POST", "/selftest/chat/completions"),
             ("GET", "/api/attachment/<name>"),
             ("DELETE", "/mcp"),
@@ -617,11 +603,9 @@ mod tests {
             assert!(has(listed, method, path), "implemented route omitted from discovery: {method} {path}");
         }
         // A route the portal owns is listed apart and names the tool that replaces it.
-        for (method, path, tool) in [
-            ("GET", "/api/status", "board status"),
-            ("GET", "/api/files/read", "read"),
-            ("POST", "/api/reboot", "reboot (hidden from the model on purpose)"),
-        ] {
+        for (method, path, tool) in
+            [("GET", "/api/status", "board status"), ("GET", "/api/files/read", "read")]
+        {
             assert!(
                 !has(listed, method, path),
                 "{method} {path} repeats a tool but is listed as an agent endpoint"

@@ -14,11 +14,35 @@ firmware; keep the reported units and source commit with them.
 | `i2c bus 0 (SDA 8, SCL 9) failed` | The pin does not exist or is taken; change `config.bus.i2c` or pick other pins in the console |
 | `no stored config` in the log | Normal: first power-up, so it falls back to provisioning |
 
+## A configuration mistake has made the board unreachable
+
+There is no way back through the network. `POST /api/reboot`, `POST /api/factory-reset` and
+`POST /api/wifi/forget` are gone on purpose (see [capabilities](capabilities.md)): all three
+act on the machine rather than on the workload, so the board offers them to nobody. What is
+left is the serial port.
+
+That cost is real, not hypothetical. On 2026-11-13 at 01:29 a firmware change put this board
+in an `Interrupt wdt timeout` panic loop that never rejoined WiFi; USB was the only way back
+(the revert is `816e376`, whose message carries the stack). Treat "I changed a setting and now
+nothing answers" as a serial job from the first minute: the console is not coming back on its
+own, and no route will restart it for you.
+
+| What is wrong | What to do |
+|---|---|
+| A setting needs a restart the board cannot make, it restarted into a setting it cannot survive, or the WiFi password is wrong so the setup AP never appears | `python -m esptool -p COM3 erase-region 0x9000 0x6000` erases the stored configuration and secrets; the board then boots with defaults (setup AP, no WiFi, no model key) |
+| The image itself is wrong (panic loop, silent console) | Flash it again: `powershell scripts/build-firmware.ps1 -Flash -Port COM3`, or `bash scripts/build-firmware.sh --flash --port /dev/ttyACM0`; then compare `firmware.commit` in `/api/status` with `git rev-parse HEAD` |
+| Start over completely | `python -m esptool -p COM3 erase-flash`, then flash again |
+
+`0x9000` and `0x6000` are the `nvs` row of `firmware/partitions.csv`, where the configuration
+lives. An NVS erase keeps the LittleFS partition at `0x410000`, so the transcript and the
+workspace survive it; `erase-flash` is the one that takes those too. The full serial workflow,
+including why `--no-stub` breaks FlashEnd on this board, is in [flashing](flashing.md#7-recovery).
+
 ## Provisioning
 
 | Symptom | Check |
 |---|---|
-| The phone cannot see `esp32-agent-setup` | The board still has old credentials → the serial log says `wifi: joining ...`; `POST /api/wifi/forget` then reboot |
+| The phone cannot see `esp32-agent-setup` | The board still has old credentials → the serial log says `wifi: joining ...`. There is no route that forgets them any more: erase NVS over serial, `python -m esptool -p COM3 erase-region 0x9000 0x6000` (see [a configuration mistake has made the board unreachable](#a-configuration-mistake-has-made-the-board-unreachable)) |
 | Joined the access point but no page | It must be `http://192.168.4.1:80/` — note the port; the captive DNS only makes HTTP pop up automatically |
 | Credentials entered but it will not connect | 2.4 GHz and WPA2 are what works (the ESP32 has no 5 GHz radio); watch `wifi: status=…` in the log; check for trailing spaces in a pasted password |
 | Connected but no IP found | Look for hostname `esp32-agent` in the router's DHCP list, or the `ip=` line in the serial log |

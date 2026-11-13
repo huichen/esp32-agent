@@ -92,8 +92,10 @@ CORS is on by default (`mcp.cors`), so a browser MCP client can connect directly
 What follows exists because the console is a browser: it cannot hold an MCP session, so it
 calls REST. Where a route only repeats a tool, the table says which tool, and
 `/agent.json` keeps those rows out of `endpoints` for exactly that reason. The exceptions
-to "call the tool instead" are the three places a browser does something a model must not
-or cannot: it signs in, it reboots, and it serves its own assets.
+to "call the tool instead" are the two places a browser does something a model must not
+or cannot: it signs in, and it serves its own assets. Neither a restart nor a factory reset
+is on that list, because neither is offered anywhere — see
+[capabilities](capabilities.md).
 
 | Method | Path | Purpose |
 |---|---|---|
@@ -109,7 +111,6 @@ or cannot: it signs in, it reboots, and it serves its own assets.
 | POST | `/api/tools` | `{mode: auto|generic|all, disabled: [...]}` — no tool changes visibility, so this one stays a route |
 | GET | `/api/wifi/scan` | Scan |
 | POST | `/api/wifi/connect` | `{ssid, password}`, save and reconnect |
-| POST | `/api/wifi/forget` | Clear the credentials |
 | GET | `/api/logs?n=&since=` | Ring log |
 | GET | `/api/files/tree` | The whole workspace in one answer: every directory (derived from the paths) and file with `size_bytes`, plus `total_bytes` / `total_max` / `file_max`. What the portal's Files tab reads |
 | GET | `/api/files/read?path=<file>` | One file as text |
@@ -117,7 +118,6 @@ or cannot: it signs in, it reboots, and it serves its own assets.
 | POST | `/av` | Play audio and draw frames from one body: `tag|u16le len|payload` records — `A` audio, `F` a 512-byte 128x32 or 1024-byte 128x64 bitmap, `E` end — in order ([sound with a picture](audio.md#8-sound-with-a-picture-post-av)) |
 | GET | `/api/attachment/<name>` | The file attached to the last message, with its own mime type ([attachments](#5-attachments)) |
 | POST | `/api/auth` | `{pin}`, check the console PIN |
-| POST | `/api/reboot` | Reboot. The `reboot` tool exists but is hidden: a person restarts the board, a model does not |
 
 `/assets/app.js` and `/assets/style.css` are served separately from the console HTML.
 All three carry `Cache-Control: no-store` so old assets are not reused with new firmware.
