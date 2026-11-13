@@ -283,7 +283,10 @@ throughout, is what it took.
 before anything was measured; it is **2 MiB of accounted payload** today, with
 `MAX_HISTORY_MESSAGES` at 1,024. Accounting includes attachment payloads/metadata,
 reasoning, serialized tool arguments, IDs and source, not only visible text. One oversized
-newest message can remain, and allocator/request/archive overhead is separate.
+newest message can remain, and allocator/request/archive overhead is separate. The archive
+itself is bounded independently: at most 40 lines and 96 KiB of excerpt text, older lines
+truncated to 2 KiB and the newest question to 32 KiB — the count alone used to allow
+40 × 32 KiB ≈ 1.25 MB of PSRAM for the index.
 The historical ladders below reach **507 KB**. They do not exercise the current 2 MiB
 ceiling or establish its peak heap footprint.
 
