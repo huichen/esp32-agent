@@ -276,6 +276,25 @@ pub struct HwView {
     pub threads: Vec<Value>,
 }
 
+/// The one store reading that needs the backend's lock, sampled **before** the App mutex.
+///
+/// `status_json` used to ask the queue for its free/used bytes directly, which meant the App
+/// mutex was held while taking the backend's lock. The writer holds that lock for the whole
+/// flash drain and takes the App mutex afterwards to acknowledge generations, so the two
+/// orders meet. Sampling on the writer's thread between the drain and the acknowledgement
+/// keeps the order one-way: store locks, then App.
+#[derive(Debug, Clone, Default)]
+pub struct StoreSpaceSample {
+    pub space: Option<store::StoreSpace>,
+}
+
+impl StoreSpaceSample {
+    /// Never call this while holding the App lock.
+    pub fn sample(queue: &store::StoreQueue) -> Self {
+        Self { space: queue.space() }
+    }
+}
+
 pub struct App {
     pub cfg: Config,
     pub manifest: Manifest,
@@ -374,6 +393,8 @@ pub struct App {
     workspace_stale_keys: std::collections::BTreeSet<String>,
     /// The hardware's view as of the last tick. See [`HwView`].
     hw_view: HwView,
+    /// The store's free/used bytes as of the last drain. See [`StoreSpaceSample`].
+    store_space: StoreSpaceSample,
     /// When the tool call now running must stop, from `agent.tool_timeout_s`.
     ///
     /// Nested calls inherit the outer deadline instead of starting a new one: a script that
@@ -473,6 +494,7 @@ impl App {
         // writer task is what turns a request into an `spi_flash` call. Reads pass straight
         // through (after checking the queue), which is why boot is unchanged.
         let queue = store::StoreQueue::new(store);
+        let queue_sample = queue.clone();
         let store: Box<dyn KvStore> = Box::new(store::QueuedStore::new(queue.clone()));
         let cfg = store
             .get(crate::config::NVS_KEY_CONFIG)
@@ -547,6 +569,7 @@ impl App {
             workspace_admissions: 0,
             workspace_stale_keys: Default::default(),
             hw_view: HwView::default(),
+            store_space: StoreSpaceSample::sample(&queue_sample),
             tool_deadline: None,
             run_active: false,
             cancel_requested: false,
@@ -654,7 +677,9 @@ impl App {
     /// no such thing as a flash window.
     pub fn flush_store(&mut self, who: &str) -> store::FlushReport {
         let report = self.store_queue.flush();
-        self.acknowledge_store_flush(who, &report);
+        // Tests and the host simulator only: no flash window, no competing writer.
+        let sample = StoreSpaceSample::sample(&self.store_queue);
+        self.acknowledge_store_flush(who, &report, sample);
         report
     }
 
@@ -665,14 +690,22 @@ impl App {
     pub fn flush_shared_store(shared: &Shared, who: &str) -> store::FlushReport {
         let queue = app_lock(shared).store_queue();
         let report = queue.flush();
-        app_lock(shared).acknowledge_store_flush(who, &report);
+        // Sampled before the App lock is re-taken: one order, store then App.
+        let sample = StoreSpaceSample::sample(&queue);
+        app_lock(shared).acknowledge_store_flush(who, &report, sample);
         report
     }
 
     /// Complete app bookkeeping after the queue was drained, including generation-specific
     /// workspace receipts. This method does no backend writes; platforms may drain outside
     /// the app lock and then call it under a short mutable app lock.
-    pub fn acknowledge_store_flush(&mut self, who: &str, report: &store::FlushReport) {
+    pub fn acknowledge_store_flush(
+        &mut self,
+        who: &str,
+        report: &store::FlushReport,
+        sample: StoreSpaceSample,
+    ) {
+        self.store_space = sample;
         self.acknowledge_workspace();
         // One line per refusal, not one line for all of them: a count says something is
         // wrong, and only the key says *what* is. `report.failed` is still the count, and
@@ -1318,7 +1351,7 @@ impl App {
         for (key, count) in self.store_queue.refused_keys() {
             refused.insert(key, json!(count));
         }
-        let store_space = match self.store_queue.space() {
+        let store_space = match &self.store_space.space {
             Some(space) => space.to_json(),
             None => Value::Null,
         };

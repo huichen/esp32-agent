@@ -96,7 +96,9 @@ pub fn flush_now(shared: &Shared, log: &LogBuf, who: &str) -> bool {
         );
         return false;
     }
-    with_app_mut(shared, |app| app.flush_store(who).failed == 0)
+    // Two phases, like the periodic writer: drain, sample, then acknowledge under a short app
+    // lock. `flush_store` would take the queue's locks while holding the app mutex.
+    App::flush_shared_store(shared, who).failed == 0
 }
 
 /// Is the calling task's stack in internal RAM?
