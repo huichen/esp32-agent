@@ -58,7 +58,14 @@ def main():
 
     initial = control()
     firmware = initial['firmware']['commit']
-    assert not initial['agent'].get('run_active'), 'Do not start the test over a live user turn'
+    # A just-published startup snapshot can precede recovery of a persisted turn.
+    # Give the runner an idle window before we add tools or change model settings.
+    idle_until = time.monotonic() + 5
+    while time.monotonic() < idle_until:
+        s = control()
+        assert not (s['agent'].get('run_active') or s['agent'].get('pending')), \
+            'Do not start the test over a live or queued user turn'
+        time.sleep(0.2)
 
     def exercise(name, calls):
         before = len(latencies)
@@ -91,15 +98,19 @@ def main():
     if args.agent:
         cfg = request('/api/agent/config')
         saved = {key: cfg[key] for key in ('base_url', 'model', 'protocol')}
+        own_turn = False
         try:
             # The existing key never leaves the board for a new host.
             request('/api/agent/config', {'base_url': host + '/selftest/chat/completions',
                 'model': 'selftest', 'protocol': 'chat'})
+            own_turn = True
             request('/api/agent/message', {'text': 'concurrency regression: run the scripted test'})
             deadline = time.monotonic() + 35
             while time.monotonic() < deadline:
                 s = control()
-                if s['agent'].get('run_active') and s['age_ms'] > 1000:
+                activity = s['agent'].get('active_tool') or {}
+                if s['agent'].get('run_active') and activity.get('owner') == 'agent' \
+                        and activity.get('name') == 'script':
                     break
                 time.sleep(0.1)
             else:
@@ -119,6 +130,23 @@ def main():
                   'stopped_ms=', round((time.monotonic()-start)*1000,1), flush=True)
             assert history, 'History remains available after interrupt'
         finally:
+            # Never restore a real provider while our test is still queued/running.
+            # In particular, age_ms alone does not prove the Agent entered script.
+            if own_turn:
+                s = control()
+                if s['agent'].get('run_active'):
+                    request('/api/agent/cancel', {}, timeout=2)
+                end_cleanup = time.monotonic() + 70
+                idle_since = None
+                while time.monotonic() < end_cleanup:
+                    s = control()
+                    busy = s['agent'].get('run_active') or s['agent'].get('pending')
+                    idle_since = None if busy else (idle_since or time.monotonic())
+                    if idle_since and time.monotonic() - idle_since >= 3:
+                        break
+                    time.sleep(0.2)
+                else:
+                    raise AssertionError('Own test did not finish; do not restore a provider mid-turn')
             request('/api/agent/config', saved)
             restored = request('/api/agent/config')
             assert all(restored[k] == v for k, v in saved.items()), 'Model settings were not restored'
