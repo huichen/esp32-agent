@@ -495,12 +495,6 @@ fn tick(
     // answering while the model thinks.
     let queued = {
         let mut app = lock(shared);
-        // The wall clock only becomes real when SNTP lands, a second or two in. Until
-        // then `uptime_s` reports zero rather than the decades between 1970 and now;
-        // this is where it gets re-anchored, once.
-        if app.runtime.rebase_uptime(now) {
-            log.info("agent", "wall clock set; uptime counts from this tick onwards");
-        }
         // A portal edit to the timeout must reach the next request, not the next boot.
         let configured = clamp_timeout(app.llm.timeout_s);
         if timeout_s.load(Ordering::Relaxed) != configured {

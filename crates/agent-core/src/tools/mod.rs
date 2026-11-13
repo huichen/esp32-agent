@@ -29,15 +29,6 @@ fn default_bus(ctx: &mut ToolCtx) -> u8 {
     ctx.cfg.bus.i2c.first().map(|b| b.bus).unwrap_or(0)
 }
 
-fn now_ms(ctx: &mut ToolCtx) -> u64 {
-    let hw_ms = ctx.hw.millis();
-    if hw_ms > 0 {
-        hw_ms
-    } else {
-        ctx.log.uptime_ms()
-    }
-}
-
 pub fn board_tools() -> Vec<ToolDef> {
     vec![
         ToolDef::new(
@@ -69,7 +60,6 @@ pub fn board_tools() -> Vec<ToolDef> {
         .bind(|ctx, _args| {
             let info = ctx.hw.board_info();
             let wifi = ctx.hw.wifi_status();
-            let now = now_ms(ctx);
             let internal = ctx.hw.heap_internal();
             Ok(json!({
                 "device_name": ctx.cfg.device_name,
@@ -81,7 +71,7 @@ pub fn board_tools() -> Vec<ToolDef> {
                 "psram_kb": info.psram_kb,
                 "firmware": ctx.runtime.firmware,
                 "build": ctx.runtime.build,
-                "uptime_s": ctx.runtime.uptime_s(now),
+                "uptime_s": ctx.runtime.uptime_s(ctx.hw.millis()),
                 "temperature_c": info.temp_c,
                 // `free_heap_kb` is the whole heap with PSRAM in it, which on this board
                 // reads in the megabytes; the internal SRAM that sockets, TLS records and
