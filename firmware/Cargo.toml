@@ -23,6 +23,15 @@ anyhow = "1"
 log = "0.4"
 serde_json = "1"
 
+
+# LittleFS, from the ESP component registry: the filesystem the storage partition holds.
+# `bindings_header` is what makes the C API visible from Rust (`esp_vfs_littlefs_register`,
+# `esp_littlefs_info`); without it the component builds and stays unreachable.
+[[package.metadata.esp-idf-sys.extra_components]]
+remote_component = { name = "joltwallet/littlefs", version = "1.23.1" }
+bindings_header = "littlefs_bindings.h"
+bindings_module = "littlefs"
+
 [build-dependencies]
 embuild = "0.33"
 

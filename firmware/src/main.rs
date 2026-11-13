@@ -18,7 +18,7 @@ mod esp_hw;
 mod nvs_store;
 mod nvs_writer;
 mod runner;
-mod spiffs_store;
+mod file_store;
 mod threads;
 mod tls_server;
 mod wifi;
@@ -174,8 +174,8 @@ fn run() -> anyhow::Result<()> {
     // The transcript and the workspace are files on `storage`; everything else stays in NVS.
     // Mounting before the first config read costs nothing and makes a partition that will not
     // mount a boot-time error rather than a surprise on the first turn.
-    let files = spiffs_store::mount()?;
-    let mut store = spiffs_store::SplitStore::new(files, store);
+    let files = file_store::mount()?;
+    let mut store = file_store::SplitStore::new(files, store);
     // Read the config once before touching hardware: it says which pins the I2C
     // buses live on.
     let mut cfg = store
