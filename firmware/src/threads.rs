@@ -41,7 +41,12 @@ impl TaskLabel {
     fn register(name: String) -> Self {
         // Safe: this thread owns its current task's lifetime until it exits.
         let task = unsafe { sys::xTaskGetCurrentTaskHandle() };
-        let id = unsafe { sys::uxTaskGetTaskNumber(task) } as u32;
+        // uxTaskGetTaskNumber reads the application-set tag (normally zero),
+        // not the trace/creation number used by uxTaskGetSystemState. Read our
+        // own live task's scalar info to use the same ID as status snapshots.
+        let mut info: sys::TaskStatus_t = unsafe { std::mem::zeroed() };
+        unsafe { sys::vTaskGetInfo(task, &mut info, 0, sys::eTaskState_eInvalid) };
+        let id = info.xTaskNumber as u32;
         let affinity = unsafe { sys::xTaskGetCoreID(task) };
         LABELS
             .get_or_init(Default::default)

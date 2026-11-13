@@ -87,6 +87,7 @@ def main():
         'sleep(5000)\ntool("shell", {command: "echo concurrency"})'})])
     exercise('two-serialized-tools', [('shell', {'command': 'sleep 4'}),
         ('script', {'source': 'sleep(4000)\n1'})])
+    exercise('three-serialized-tools', [('script', {'source': 'sleep(2000)\n1'})] * 3)
     clip = '_mutex_probe'
     tool('clip_new', {'name': clip, 'kind': 'pcm', 'bytes': 48000, 'rate_hz': 24000})
     try:
@@ -125,9 +126,10 @@ def main():
                 time.sleep(0.05)
             else:
                 raise AssertionError('Cancelled script did not stop within 3 seconds')
+            stopped_ms = (time.monotonic()-start)*1000
             history = request('/api/agent/history')
             print('agent-interrupt accepted_ms=', round(accepted_ms,1),
-                  'stopped_ms=', round((time.monotonic()-start)*1000,1), flush=True)
+                  'stopped_ms=', round(stopped_ms,1), flush=True)
             assert history, 'History remains available after interrupt'
         finally:
             # Never restore a real provider while our test is still queued/running.
@@ -153,21 +155,37 @@ def main():
 
     end = time.monotonic() + args.soak
     last = control()['uptime_s']
-    while time.monotonic() < end:
-        s = control()
-        assert s['uptime_s'] >= last, 'Unexpected board reset'
-        assert s['firmware']['commit'] == firmware, 'Firmware changed during test'
-        assert s['agent']['thread'] == 'running', s['agent']
-        last = s['uptime_s']
-        control('/healthz')
-        time.sleep(1)
+    soak_calls = 0
+    # Keep real tools in flight throughout the soak, rather than just idling.
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        future = None
+        while time.monotonic() < end:
+            if future is None or future.done():
+                if future is not None:
+                    future.result()
+                future = pool.submit(tool, 'script', {'source': 'sleep(2000)\n1'})
+                soak_calls += 1
+            s = control()
+            assert s['uptime_s'] >= last, 'Unexpected board reset'
+            assert s['firmware']['commit'] == firmware, 'Firmware changed during test'
+            assert s['agent']['thread'] == 'running', s['agent']
+            last = s['uptime_s']
+            control('/healthz')
+            time.sleep(1)
+        if future is not None:
+            future.result()
+    time.sleep(1)
     final = control()
     samples = sorted(latencies)
     print(json.dumps({'firmware': firmware, 'checks': checks, 'control_reads': len(samples),
         'median_ms': round(statistics.median(samples),1),
         'p95_ms': round(samples[int((len(samples)-1)*0.95)],1),
         'max_ms': round(max(samples),1), 'uptime_s': final['uptime_s'],
-        'soak_s': args.soak}, indent=2), flush=True)
+        'soak_s': args.soak, 'soak_tool_calls': soak_calls,
+        'memory': {p['pool']: {k: p[k] for k in ('free_kb', 'largest_kb', 'min_free_kb')}
+                   for p in final['memory']['pools']},
+        'owned_stack_headroom_kb': {t['name']: t['high_water_kb'] for t in final['threads']
+                                   if t.get('core') is not None}}, indent=2), flush=True)
 
 
 if __name__ == '__main__':
