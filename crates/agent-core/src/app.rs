@@ -78,36 +78,26 @@ pub const RESUME_SOURCE: &str = "resume";
 /// a text-payload budget, not a measurement of the RAM needed by the map and request copies.
 pub const WORKSPACE_FILE_MAX: usize = crate::tools::fs::MAX_FILE_BYTES;
 pub const WORKSPACE_TOTAL_MAX: usize = 4 * 1024 * 1024;
-/// How the workspace blob is spread over the store.
+/// Legacy `ws1` workspace chunk plan, retained for reading/migration.
 ///
-/// Not one value under `ws`: ESP-IDF refuses a string above about 4000 bytes, and a
-/// workspace with a few files in it is already past that. The board then logged
-/// `nvs write 'ws': ESP_ERR_NVS_VALUE_TOO_LONG` while `write` answered `ok: true` and
-/// `read` served the file out of RAM until the next boot - a write that looked fine and
-/// silently was not. The blob is now `ws` (header: count, total length, one checksum per
-/// chunk) plus `ws.1`, `ws.2`, ... as the transcript is stored, with one difference: the
-/// header carries a checksum per chunk, so a rejected blob can name the value that
-/// disagrees.
-///
-/// Five values of 3500 bytes is 17,500 bytes of serialised JSON, against
-/// [`WORKSPACE_TOTAL_MAX`] of *text*: JSON escapes a newline to two bytes, so the same
-/// 8 KB of Markdown weighs about 10 KB stored. The ceiling is stated here rather than left
-/// to arithmetic in a log line; [`store::write_blob`] refuses the blob and says so when it
-/// is passed.
+/// This was five values of 3500 bytes (17,500 encoded JSON bytes), with checksums in
+/// the `ws` header and payloads in `ws.1`, `ws.2`, ... . It replaced a single NVS
+/// string that exceeded ESP-IDF's value limit. It is not the current workspace budget:
+/// new saves publish an index and one filesystem value per path, and cleanup of these
+/// historical chunks follows a confirmed publication.
 pub const WORKSPACE_PLAN: store::Plan =
     store::Plan { tag: "ws1", chunk_bytes: store::CHUNK_BYTES, chunks_max: 5 };
 
 /// The longest `sleep` / `usleep` waits this board will actually wait.
 ///
-/// One loop serves the MCP endpoint, the portal and the agent, so a sleeping command
-/// blocks everything else — a `sleep 30` would look like a hung device. The cap is what
-/// keeps the command useful without letting it become an outage.
+/// Tool calls hold the shared App lock, so a sleeping command delays other callers
+/// needing that lock. The cap is an execution policy, independent of heap capacity.
 pub const MAX_SHELL_SLEEP_MS: u64 = 10_000;
 
 /// How much of a pipeline's last stage reaches the answer.
 ///
-/// The same reason `hexdump` and `unzip` have budgets: a tool result is about 2 KB, and a
-/// pipeline can multiply what a single command would have returned.
+/// A pipeline can multiply intermediate output. Its 8 KiB stdout policy is deliberately
+/// separate from the agent's 64 KiB tool-text ceiling and the workspace's file budgets.
 pub const PIPE_RESULT_MAX: usize = 8192;
 
 /// How many scheduled prompts and sensor rules the board keeps. The scheduler
@@ -2905,11 +2895,9 @@ impl App {
                     crate::tools::knowledge::SKILLS_DIR
                 ),
             );
-            // The workspace is one persisted blob; a skill that exists only in RAM would be
-            // installed again next boot, and would be missing from what the portal and an
-            // MCP client read today. Seeding is best effort - there is nothing to roll back
-            // to, since this is the boot that had no workspace - so a failure is a log line
-            // rather than an error nobody could act on.
+            // Seeded files use the same incremental workspace publication. A RAM-only
+            // skill would be seeded again after reboot. Seeding is best effort, so an
+            // admission/backend refusal is a log/store diagnostic, not a startup error.
             if let Err(e) = self.persist_workspace() {
                 self.log.error("boot", format!("the seeded skills are in RAM only: {e}"));
             }
@@ -5376,8 +5364,8 @@ impl App {
         let octal = args.get("octal").and_then(|v| v.as_bool()).unwrap_or(false);
         let (path, text) = self.shell_input(args, if octal { "od" } else { "hexdump" })?;
         let data = text.into_bytes();
-        // A tool result is 2 KB; a column per byte eats 4 (octal) or 5 (hex) bytes, so dump
-        // as much as arrives whole and say what was left out.
+        // Keep a compact roughly 1.8 KiB dump, independent of the global tool-text cap.
+        // Octal/hex columns expand each input byte; report what this local policy omits.
         let lines_that_fit = 1800 / (width * if octal { 4 } else { 5 } + 12);
         let mut out = String::new();
         for (row, chunk) in data.chunks(width).enumerate() {
@@ -7325,16 +7313,16 @@ pub fn make_handler(app: Shared) -> Handler {
 
 /// Where a host streams PCM into the speaker: `POST /audio/pcm` (docs/audio.md §6).
 ///
-/// The alternative the board had was a tool argument, and a tool result is capped at 2 KB,
-/// so `speaker_play` carries 43 ms — a note, never a song. A request body has no such cap
-/// and, with [`crate::http::BodySink`], no buffer either: the bytes go to the amplifier as
-/// they arrive, and the speaker's own pacing is what throttles the socket.
+/// Unlike `speaker_play`, which synthesizes the whole bounded score, this route accepts
+/// PCM without retaining the complete clip or putting its samples into a tool envelope.
+/// [`crate::http::BodySink`] reuses small chunk buffers; the upload has its own 30 s/byte
+/// limits, and the speaker's pacing throttles the socket.
 pub const AUDIO_STREAM_PATH: &str = "/audio/pcm";
 
 /// How much audio one upload may carry: 30 s at 24 kHz, 16-bit mono.
 ///
-/// Not a memory budget — nothing is held — but a bound on how long one request may hold
-/// the speaker, and on how long a client that never stops sending can keep it. Longer audio
+/// Not a full-clip memory budget — only chunk buffers are held — but a bound on how long
+/// one request may hold the speaker and how long a sending client can keep it. Longer audio
 /// is a second request, which is also the honest shape for a retry.
 pub const AUDIO_STREAM_MAX_SECONDS: u32 = 30;
 pub const AUDIO_STREAM_MAX_BYTES: usize = 24_000 * 2 * AUDIO_STREAM_MAX_SECONDS as usize;
@@ -9285,7 +9273,10 @@ mod tests {
         for section in ["overview", "builtins", "examples"] {
             let doc = app.call_tool("script", &json!({"section": section})).expect("section");
             let bytes = doc["text"].as_str().unwrap().len();
-            assert!(bytes < 2048, "{section} is {bytes} bytes; a tool result is capped at 2 KB");
+            assert!(
+                bytes < 2048,
+                "{section} is {bytes} bytes; the reference section's compact policy is 2 KiB"
+            );
         }
         assert!(app.call_tool("script", &json!({"section": "nope"})).is_err());
         // An empty call is a help request too, not a confusing "source required".
@@ -10368,8 +10359,8 @@ mod tests {
         assert_eq!(sh(&mut app, "cat /second.txt")["text"], json!("hello\n"));
     }
 
-    /// The 8 KB workspace is the same limit a redirect has to respect, and a refusal says
-    /// how many bytes it wanted.
+    /// A redirect shares the file/aggregate workspace limits and reports the requested
+    /// size when it cannot fit.
     #[test]
     fn a_redirect_that_would_not_fit_says_how_much_it_needed() {
         let mut app = empty_workspace_app();
@@ -14960,8 +14951,8 @@ mod tests {
         assert_eq!(body["ok"], false, "{body}");
     }
 
-    /// The tree: every file in one answer, and the directories derived from the paths. One
-    /// request for the whole workspace, because the whole workspace is 8 KB.
+    /// The tree lists file metadata and directories derived from bounded canonical paths,
+    /// without returning every file's contents.
     #[test]
     fn the_files_tree_lists_directories_and_files() {
         use crate::tools::fs::Workspace as _;

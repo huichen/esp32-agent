@@ -2356,8 +2356,8 @@ mod tests {
     #[test]
     fn compression_keeps_the_last_exchanges_and_indexes_the_rest() {
         let mut agent = Agent::new();
-        // Enough answered exchanges to exceed the byte budget on their own: each tool
-        // result is capped at 2 KB, so this needs more than a dozen of them.
+        // Populate several bounded tool exchanges, then request manual compression.
+        // This test does not rely on crossing the automatic byte-budget threshold.
         for i in 0..14 {
             agent.history.push(Message::user(&format!("question {i}"), "http", 10 * i));
             let call = ToolCall { id: "c".into(), name: "board_status".into(), arguments: json!({}) };

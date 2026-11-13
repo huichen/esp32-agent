@@ -966,13 +966,11 @@ async function schedOp(id, op) {
 
 /** The workspace as one tree: directories fold, a file opens below.
  *
- * It used to be a directory-at-a-time list with breadcrumbs, which cost a request per level
- * for a workspace that is at most 8 KB. One `/api/files/tree` answers the whole thing, and
- * the hierarchy is the one the paths already carry.
+ * One `/api/files/tree` returns metadata, not all file contents. File-count/path budgets
+ * bound the tree, and its hierarchy is the one the canonical paths already carry.
  *
- * Read-only on purpose. Every write goes through the agent or the `write` tool, where the
- * 8 KB budget and the one-blob-in-NVS storage are enforced; a portal editor that writes
- * would need the same checks a second time and would be the place they drift apart. */
+ * Read-only on purpose. Writes go through the agent/file tools, where shared workspace
+ * admission and incremental publication are enforced, rather than a second editor path. */
 async function loadTree() {
   try {
     const d = await api("/api/files/tree");
