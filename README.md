@@ -95,7 +95,7 @@ works for every board it can reach. Without a key at all, `base_url` set to
 |---|---|
 | `agent-core` | 840 unit tests and 5 integration tests pass; `scripts/smoke.ps1` passes end to end |
 | Simulator | console, MCP and the agent loop run end to end |
-| Firmware | flashed on an ESP32-S3-DevKitC-1 N16R8 (IDF v5.5.2) at commit `d5d8927` on 2026-11-13: 42 tools, OLED 128×32, I²S mic and amp, WS2812, TLS console, model turns over HTTPS; what that flash did not verify is listed in `ROADMAP.md` |
+| Firmware | flashed on an ESP32-S3-DevKitC-1 N16R8 (IDF v5.5.2) from the tree at `84a85fe` on 2026-11-13: 42 tools, OLED 128×32, I²S mic and amp, WS2812, TLS console, model turns over HTTPS; what that flash did not verify is listed in `ROADMAP.md` |
 | Not implemented / unverified | Firmware DVP camera capture is not implemented. SD raw-sector and DHT11/22 drivers have host tests, not board verification. See `ROADMAP.md` |
 
 Historical bench numbers: a four-tool turn in 13.7 s; console over TLS in 0.55 s; I²C scan
