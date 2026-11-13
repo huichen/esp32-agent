@@ -286,6 +286,11 @@ window.__esp32Clear = async function () {
       temperature: 0.2, tick_ms: 1000, run: { runs: 1 } });
     if (path === "/api/agent/prompt") return response({ history: f.messages.length, archive_lines: 0, bytes: 100 });
     if (path === "/api/sched") return response({ tasks: [] });
+    if (path === "/api/devices") {
+      const gate = f.deviceGate;
+      if (gate) await gate.promise;
+      return response({ devices: [], candidates: [], unidentified: [] });
+    }
     return response({ devices: [], candidates: [], unidentified: [] });
   };
   window.EventSource = class extends EventTarget {
@@ -472,6 +477,18 @@ window.__esp32Clear = async function () {
     out.sendFailure = { failed: !!q("#chat").querySelector(".bubble.failed"),
       draft: q("#input").value, toast: q("#toast").textContent };
     f.messageFail = false; q("#input").value = "";
+
+    // Opening a tab shows a loader while the board answers, instead of an empty panel.
+    f.deviceGate = defer();
+    q('[data-panel="devices"]').click();
+    await until(() => !q("#panel-loading").hidden);
+    out.panelLoading = {
+      label: q("#panel-loading-label").textContent,
+      spinning: getComputedStyle(q("#panel-loading").querySelector(".spinner")).display !== "none",
+    };
+    f.deviceGate.resolve(); f.deviceGate = null;
+    await until(() => q("#panel-loading").hidden);
+    out.panelLoading.hiddenAfter = q("#panel-loading").hidden;
 
     // Pulling past the last message refreshes the transcript instead of doing nothing.
     const historyReads = () => f.requests.filter((r) => r.path === "/api/agent/history").length;
@@ -983,6 +1000,15 @@ fn assert_conversation_clear(metrics: &Value, width: u32) {
         "{width} px: a refused send has to say so: {}",
         text("sendFailure", "toast")
     );
+
+    // Opening a tab says it is loading rather than showing an empty panel.
+    assert!(
+        text("panelLoading", "label").contains("Loading devices"),
+        "{width} px: the loader has to name the tab: {}",
+        text("panelLoading", "label")
+    );
+    expect("panelLoading", "spinning", json!(true));
+    expect("panelLoading", "hiddenAfter", json!(true));
 
     // Pulling past the last message refreshes the transcript in place, and says it is working.
     expect("pullSpinner", "shown", json!(true));
