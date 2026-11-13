@@ -269,14 +269,24 @@ impl KvStore for SpiffsStore {
         })();
         if let Err(e) = written {
             let _ = std::fs::remove_file(&tmp);
-            log::error!("spiffs stream `{key}`: {e} (the previous value is untouched)");
+            log::error!(
+                "spiffs stream `{key}` refused: {e}; esp_spiffs_info total_bytes {} used_bytes {} free_bytes {}",
+                capacity().0,
+                capacity().1,
+                capacity().0.saturating_sub(capacity().1)
+            );
             self.last_error = Some(StoreError { code: e.raw_os_error().unwrap_or(0), name: format!("{e}") });
             return false;
         }
         match self.publish(key, &tmp) {
             Ok(()) => true,
             Err(e) => {
-                log::error!("spiffs publish `{key}`: {e} (the previous value is untouched)");
+                log::error!(
+                    "spiffs publish `{key}` refused: {e}; esp_spiffs_info total_bytes {} used_bytes {} free_bytes {}",
+                    capacity().0,
+                    capacity().1,
+                    capacity().0.saturating_sub(capacity().1)
+                );
                 self.last_error =
                     Some(StoreError { code: e.raw_os_error().unwrap_or(0), name: format!("{e}") });
                 false
