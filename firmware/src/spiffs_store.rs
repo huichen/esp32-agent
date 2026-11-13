@@ -16,8 +16,13 @@ use std::path::{Path, PathBuf};
 
 /// Where the partition is mounted.
 const MOUNT: &str = "/storage";
-/// One file per key, in here.
-const KV_DIR: &str = "/storage/kv";
+/// One file per key, directly under the mount point.
+///
+/// SPIFFS in ESP-IDF has no directories: `esp_spiffs.c`'s `vfs_spiffs_mkdir` returns `ENOTSUP`
+/// (measured on this board: `Error: Not supported (os error 134)` after a 38 s format, which is
+/// the format doing its job and the `mkdir` right after it failing). A flat namespace is also
+/// what SPIFFS is: the key names are already unique and short.
+const KV_DIR: &str = "/storage";
 
 pub struct SpiffsStore {
     dir: PathBuf,
@@ -37,11 +42,12 @@ fn error_of(code: i32, context: &str) -> StoreError {
     StoreError { code, name }
 }
 
-/// Mount `storage` and make the key directory.
+/// Mount `storage`.
 ///
 /// `format_if_mount_failed` is on: the partition is empty on a board that has just been given
 /// this table, and a board that refuses to boot because a filesystem was not formatted yet is
-/// worse than one that formats it once.
+/// worse than one that formats it once. That first format is slow - 38 s for 11.9 MB, measured
+/// on this board - so a freshly flashed board takes that long before its first packet.
 pub fn mount() -> anyhow::Result<SpiffsStore> {
     let label = c"storage";
     let path = c"/storage";
@@ -59,7 +65,6 @@ pub fn mount() -> anyhow::Result<SpiffsStore> {
             return Err(anyhow::anyhow!("esp_vfs_spiffs_register: {}", error_of(rc, "mount").name));
         }
     }
-    std::fs::create_dir_all(KV_DIR)?;
     let (total, used) = capacity();
     log::info!("storage: SPIFFS on `storage`, mounted at {MOUNT}, {used} of {total} bytes used");
     Ok(SpiffsStore { dir: PathBuf::from(KV_DIR), last_error: None })
