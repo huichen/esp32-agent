@@ -1284,14 +1284,14 @@ fn openai_message(message: &Message, vision: bool) -> Value {
                 "reasoning_content": message.reasoning,
             })
         }
-        Role::User if vision && !message.attachments.is_empty() => {
-            // OpenAI's multimodal shape: one text part, then one image part per file. A
-            // text-only endpoint refuses this outright, which is why `llm.vision` gates it.
+        Role::User if vision && message.attachments.iter().any(|a| a.mime.starts_with("image/")) => {
+            // Only images use multimodal parts. A PDF or text attachment is downloadable,
+            // but putting its bytes into image_url makes every provider reject the turn.
             let mut parts: Vec<Value> = Vec::with_capacity(message.attachments.len() + 1);
             if !message.text.is_empty() {
                 parts.push(json!({ "type": "text", "text": message.text }));
             }
-            for a in &message.attachments {
+            for a in message.attachments.iter().filter(|a| a.mime.starts_with("image/")) {
                 parts.push(json!({
                     "type": "image_url",
                     "image_url": { "url": format!("data:{};base64,{}", a.mime, a.data_b64) },
@@ -1573,6 +1573,21 @@ mod tests {
         let plain = openai_message(&message, false);
         assert!(plain["content"].is_string(), "{plain}");
         assert_eq!(plain["content"], "what is this?");
+
+        let mut mixed = message.clone();
+        mixed.attachments.push(Attachment {
+            name: "notes.pdf".into(),
+            mime: "application/pdf".into(),
+            data_b64: "eA==".into(),
+        });
+        let mixed_wire = openai_message(&mixed, true);
+        assert_eq!(
+            mixed_wire["content"].as_array().unwrap().len(),
+            2,
+            "non-images must not become image parts"
+        );
+        mixed.attachments.remove(0);
+        assert!(openai_message(&mixed, true)["content"].is_string(), "a file-only message is text");
     }
 
     /// Canned transport: replies in order, requests recorded.

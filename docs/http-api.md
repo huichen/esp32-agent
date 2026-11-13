@@ -203,8 +203,8 @@ error. Only protocol errors (unknown method, malformed JSON) use the `error` obj
 
 ## 5. Attachments
 
-A message can carry files, which the board stores and hands back — it does not show them
-and does not put the bytes in the prompt:
+A message can carry files. The board keeps them in RAM and serves them back; image
+attachments also become image content parts when the configured model has `vision: true`:
 
 ```bash
 curl -sS -X POST http://<ip>:80/api/agent/message -H 'Content-Type: application/json' -d '{
@@ -212,16 +212,23 @@ curl -sS -X POST http://<ip>:80/api/agent/message -H 'Content-Type: application/
   "attachments": [{"name":"shot.png","mime":"image/png","data_b64":"iVBORw0…"}]}'
 ```
 
-- At most **2** attachments, each ≤ **24 KB** decoded; more is `413`.
-- The model is told a file arrived — the user message gets the line
-  `[attached: shot.png, image/png, 17 kB — fetch with GET /api/attachment/shot.png]` — and
-  nothing else. Only the last message's attachments are kept.
-- `GET /api/attachment/<name>` serves the bytes with that mime type, and needs the PIN when
-  one is set (it is one of the reads that expose the conversation).
-- `image_read {name?, prompt?}` is the tool that asks a model about the file: it sends the
-  image to the configured endpoint as a `data:` URL with `vision` forced on, and returns
-  the model's answer (1800 bytes). It needs a configured model and refuses without one,
-  so it is not a way to read a file locally.
+- At most **2** attachments, each ≤ **24 KB** decoded; excess size is `413`. Malformed
+  base64, duplicate names, wrong field types or invalid metadata are `400`. Names are
+  1–128 bytes without control characters; MIME is a bare `type/subtype` of at most 128 bytes.
+- Admission is all-or-nothing: a refused message preserves the previous downloads and
+  queued message. A successful text-only message clears the download list. A running turn
+  retains its own attachments if a newer message is queued.
+- Every file adds a note such as
+  `[attached: shot.png, image/png, 17 kB — fetch with GET /api/attachment/shot.png]`.
+  Non-image files, or images with `vision: false`, send only that note, not their bytes.
+- `GET /api/attachment/<name>` serves the latest accepted message's bytes with that MIME
+  type; percent-encode the name in the URL. It needs the PIN when one is set (it exposes
+  conversation data). Attachments are not saved across reboots.
+- `image_read {name?, prompt?}` asks the configured vision model about an attached image,
+  without requiring a camera. It uses the selected `chat`, `responses` or `anthropic`
+  adapter and returns at most 1800 bytes of answer text. It refuses non-image files,
+  disabled vision, oversized prompts, or a missing model/transport before making a call.
+  It is a second paid model call, not local OCR.
 
 ## 6. Connecting a client
 
