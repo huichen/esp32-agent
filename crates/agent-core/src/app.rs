@@ -13762,6 +13762,40 @@ mod tests {
         }
     }
 
+    /// A refusal has to name the words the schema accepts.
+    ///
+    /// The family keeps its commands under their inner names (`board_status`) and answers to
+    /// the short ones (`status`). The refusal used to list the inner names, so a caller that
+    /// retried with the word it had just been told to use was refused again — measured on the
+    /// board, where `board restart` answered "the commands are board_status, board_config_get, …"
+    /// while the schema offered `status` and `config_get`.
+    #[test]
+    fn a_refused_family_command_names_the_words_the_schema_accepts() {
+        let mut app = test_app();
+        let spec = ToolHost::tool_specs(&app)
+            .as_array()
+            .expect("array")
+            .iter()
+            .find(|t| t["function"]["name"] == "board")
+            .cloned()
+            .expect("the board family");
+        let declared: Vec<String> = spec["function"]["parameters"]["properties"]["command"]["enum"]
+            .as_array()
+            .expect("enum")
+            .iter()
+            .map(|v| v.as_str().unwrap_or_default().to_string())
+            .collect();
+        let err = app.call_tool("board", &json!({ "command": "restart" })).unwrap_err();
+        assert!(err.message.contains("no command `restart`"), "{err:?}");
+        for word in ["status", "chip_temp", "logs_tail"] {
+            assert!(declared.contains(&word.to_string()), "the schema lost `{word}`: {declared:?}");
+            assert!(err.message.contains(word), "the refusal does not name `{word}`: {err:?}");
+        }
+        for inner in ["board_status", "board_config_get"] {
+            assert!(!err.message.contains(inner), "the refusal names `{inner}`: {err:?}");
+        }
+    }
+
     #[test]
     fn tools_list_only_shows_detected_hardware() {
         let mut app = test_app();
