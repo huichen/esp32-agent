@@ -158,8 +158,8 @@ impl Family {
                 ))
             }
         };
-        crate::tool::ensure_tool_enabled(ctx.cfg, self.name)?;
-        crate::tool::ensure_tool_enabled(ctx.cfg, &sub.spec.name)?;
+        ctx.ensure_enabled(self.name)?;
+        ctx.ensure_enabled(&sub.spec.name)?;
         (sub.handler)(ctx, &inner)
     }
 }
