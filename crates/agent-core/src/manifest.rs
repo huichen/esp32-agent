@@ -1080,6 +1080,9 @@ fn bytes_from_value(v: &Value) -> Result<Vec<u8>> {
             if cleaned.len() % 2 != 0 {
                 return Err(McpError::invalid_params("hex strings need an even number of digits"));
             }
+            if !cleaned.bytes().all(|b| b.is_ascii_hexdigit()) {
+                return Err(McpError::invalid_params("invalid hex digit in data"));
+            }
             let mut out = Vec::with_capacity(cleaned.len() / 2);
             for i in (0..cleaned.len()).step_by(2) {
                 out.push(
@@ -1591,6 +1594,12 @@ mod tests {
         assert_eq!(err.code, code::INVALID_PARAMS);
         let err = resolve_bytes(&json!("1g"), &json!({})).unwrap_err();
         assert!(err.message.contains("hex"), "{}", err.message);
+        // Even byte length does not mean byte-pair boundaries are UTF-8 boundaries.
+        for text in ["a界", "é01", "界a"] {
+            let err = resolve_bytes(&json!({ "param": "bytes" }), &json!({ "bytes": text })).unwrap_err();
+            assert_eq!(err.code, code::INVALID_PARAMS);
+            assert!(err.message.contains("hex"), "{}", err.message);
+        }
         let err = resolve_bytes(&json!({ "param": "bytes" }), &json!({})).unwrap_err();
         assert!(err.message.contains("bytes"), "{}", err.message);
     }

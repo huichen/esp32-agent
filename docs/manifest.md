@@ -113,6 +113,11 @@ Any value field may be a literal or `{"param": "name"}` to read a call argument.
 `sequence` is the entry point for composing basics: pulse a relay, blink then read a light
 sensor, sweep a servo and take a reading.
 
+An `i2c_write` data parameter may contain a hex string, e.g. `"01:02 ff"`. Spaces,
+commas and colons are ignored; the remaining characters must be ASCII hex digits in
+complete byte pairs. Invalid text, including non-ASCII characters, returns an argument
+error before any I2C write.
+
 ## 5. safety (enforced on the board)
 
 ```json
