@@ -443,10 +443,14 @@ fn run() -> anyhow::Result<()> {
         // here is the two things that really need the rest of the system to move:
         // a restart, and a changed listen port.
         let (restart, port_now) = {
-            let guard = match app.lock() {
+            let mut guard = match app.lock() {
                 Ok(g) => g,
                 Err(p) => p.into_inner(),
             };
+            // The 20 KB maintenance task is the sole periodic status producer.
+            // Readers use an Arc snapshot even if this task waits for a long tool.
+            // No status JSON is built on the 6 KB store-writer stack.
+            guard.publish_status_view();
             (guard.runtime.restart_requested, guard.cfg.mcp.port)
         };
         if restart {

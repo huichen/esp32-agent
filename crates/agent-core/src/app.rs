@@ -1,9 +1,9 @@
 //! The application: config + manifest + devices + tools + sessions, the MCP
 //! dispatcher, and the HTTP routes for the MCP endpoint and the HTML portal.
 //!
-//! One `App` lives behind a single mutex. The hardware is inherently shared (one
-//! I2C bus, one display), so serialising tool calls costs nothing real and
-//! removes a whole class of concurrency bugs.
+//! Mutable tool/device state remains serialized behind App because peripherals
+//! share buses. Public status and authenticated turn cancellation use independent
+//! short-lived locks, so a slow tool does not block those control-plane requests.
 
 use crate::agent::{Agent, AgentStep, ToolHost};
 use crate::boards::{self, BoardProfile};
@@ -257,12 +257,9 @@ pub struct ScriptJob {
     pub error: String,
 }
 
-/// The hardware's own view, sampled where no other lock is held.
-///
-/// `board_info`, `wifi_status`, `heap_internal` and `tasks` each take a lock of its own — the
-/// radio's status mutex, the driver's, FreeRTOS' task list. Taking them *under* the App mutex
-/// is one leg of a lock-order cycle, so the platform tick samples them into plain data and the
-/// status path reads that instead.
+/// Hardware data sampled by the platform maintenance task. Public cached reads
+/// never acquire the WiFi/status mutex or query the FreeRTOS task list. Sampling
+/// still requires App ownership; this is not evidence of an App/WiFi lock cycle.
 #[derive(Debug, Clone, Default)]
 pub struct HwView {
     pub info: BoardInfo,
@@ -271,20 +268,17 @@ pub struct HwView {
     pub threads: Vec<Value>,
 }
 
-/// The one store reading that needs the backend's lock, sampled **before** the App mutex.
-///
-/// `status_json` used to ask the queue for its free/used bytes directly, which meant the App
-/// mutex was held while taking the backend's lock. The writer holds that lock for the whole
-/// flash drain and takes the App mutex afterwards to acknowledge generations, so the two
-/// orders meet. Sampling on the writer's thread between the drain and the acknowledgement
-/// keeps the order one-way: store locks, then App.
+/// The writer's last sampled store-space statistics. StoreQueue::space reads
+/// cached queue statistics, not the backend. Backend I/O finishes and releases its
+/// locks before the writer acknowledges under App; there is no demonstrated reverse
+/// lock edge. Keep the sample to give status an explicit publication boundary.
 #[derive(Debug, Clone, Default)]
 pub struct StoreSpaceSample {
     pub space: Option<store::StoreSpace>,
 }
 
 impl StoreSpaceSample {
-    /// Never call this while holding the App lock.
+    /// Read the queue's already-cached statistics, without new backend I/O.
     pub fn sample(queue: &store::StoreQueue) -> Self {
         Self { space: queue.space() }
     }
@@ -324,6 +318,8 @@ pub struct App {
     pub tls: TlsInfo,
     /// The on-board agent: transcript, the one-slot queue and the last error.
     pub agent: Agent,
+    status_views: crate::status_view::StatusViews,
+    run_gate: crate::run_gate::RunGate,
     /// Where the model lives and how far one run may go. `api_key` is kept in
     /// NVS but never echoed back by the portal API.
     pub llm: LlmConfig,
@@ -398,15 +394,6 @@ pub struct App {
     /// calls ten tools is one call as far as the portal is concerned, and ten fresh budgets
     /// would be ten ways to hold the board.
     tool_deadline: Option<std::time::Instant>,
-    /// Whether a model turn is in flight, so clearing the transcript can refuse instead of
-    /// deleting the question whose answer is about to arrive.
-    run_active: bool,
-    /// Set by `POST /api/agent/cancel`, taken by the loop at the next boundary.
-    ///
-    /// Cooperative by construction: a socket already open cannot be withdrawn, so the turn
-    /// stops between model calls and between tool calls. `run_end` is emitted either way, so a
-    /// client sees the turn finish rather than wait for an answer that will not come.
-    cancel_requested: bool,
 }
 
 /// Whether the thread that runs the agent loop is up.
@@ -546,6 +533,8 @@ impl App {
             active_attachments: None,
             tls: TlsInfo::default(),
             agent: Agent::new(),
+            status_views: Default::default(),
+            run_gate: Default::default(),
             llm: LlmConfig::default(),
             tasks: Vec::new(),
             rules: Vec::new(),
@@ -568,8 +557,6 @@ impl App {
             hw_view: HwView::default(),
             store_space: StoreSpaceSample::sample(&queue_sample),
             tool_deadline: None,
-            run_active: false,
-            cancel_requested: false,
         };
         app.log.info(
             "boot",
@@ -1292,6 +1279,37 @@ impl App {
         })
     }
 
+    fn sync_run_gate(&mut self) {
+        self.run_gate.set_sessions(self.runtime.sessions.len());
+        self.run_gate.sync(
+            &self.cfg.auth.portal_pin,
+            &self.runtime.auth_tokens,
+            &self.cfg.mcp.path,
+            self.cfg.mcp.cors,
+        );
+        self.runtime.counters.auth_failures =
+            self.runtime.counters.auth_failures.saturating_add(self.run_gate.take_auth_failures());
+        self.runtime.counters.http_requests =
+            self.runtime.counters.http_requests.saturating_add(self.run_gate.take_http_requests());
+    }
+
+    /// Only the platform maintenance task (or server construction after WiFi is
+    /// up) constructs a full view. Never call on the storage writer or inside a
+    /// tool: its stack and critical path must remain bounded independently.
+    #[inline(never)]
+    pub fn publish_status_view(&mut self) {
+        self.refresh_hw_view();
+        self.sync_run_gate();
+        let status = self.status_json();
+        let sampled_ms = self.hw.millis();
+        self.status_views.publish(crate::status_view::StatusView {
+            status,
+            boot_ms: self.runtime.boot_ms,
+            sampled_ms,
+            sampled_at: Instant::now(),
+        });
+    }
+
     pub fn status_json(&mut self) -> Value {
         // Plain data from the last tick: no radio lock, no FreeRTOS task list.
         let info = self.hw_view.info.clone();
@@ -1398,6 +1416,7 @@ impl App {
             },
             "counters": self.runtime.counters_json(),
             "agent": {
+                "run_active": self.run_gate.active(),
                 "runs": self.agent.runs,
                 "history": self.agent.history.len(),
                 "pending": self.agent.pending.is_some(),
@@ -1646,6 +1665,9 @@ impl App {
             app: &'a mut App,
         }
         impl crate::script::ScriptHost for Host<'_> {
+            fn cancelled(&self) -> bool {
+                self.app.run_gate.cancelled()
+            }
             fn call_tool(&mut self, name: &str, arguments: &Value) -> std::result::Result<Value, String> {
                 if name == "script" {
                     return Err("a script may not call `script`".into());
@@ -1874,16 +1896,14 @@ impl App {
         // A call that starts after the budget is gone never reaches a driver: its caller has
         // already been written off as timed out, and starting hardware work now would be
         // doing it for nobody.
-        let result = match (self.cancel_requested, self.remaining_tool_ms(), budget) {
-            (true, _, Some(budget)) => Err(McpError::timeout(format!(
-                "`{name}` did not run: the turn was interrupted"
-            ))
-            .with_data(json!({
-                "tool": name,
-                "timeout_ms": budget,
-                "interrupted": true,
-                "suggestion": "the turn was stopped from the console; ask again to continue",
-            }))),
+        let result = match (self.run_gate.cancelled(), self.remaining_tool_ms(), budget) {
+            (true, _, _) => Err(McpError::timeout(format!("`{name}` did not run: the turn was interrupted"))
+                .with_data(json!({
+                    "tool": name,
+                    "timeout_ms": budget.unwrap_or(0),
+                    "interrupted": true,
+                    "suggestion": "the turn was stopped from the console; ask again to continue",
+                }))),
             (_, Some(0), Some(budget)) => {
                 // Quote the budget the call was given, not the zero that is left of it: the
                 // number a reader needs is how much time the whole call had.
@@ -1907,6 +1927,7 @@ impl App {
         // The outer deadline comes back whatever the result was, or a refused call would
         // leave the next one with a budget that has already been spent.
         self.tool_deadline = outer;
+        self.sync_run_gate();
         if self.workspace_admissions == before {
             return result;
         }
@@ -1939,7 +1960,7 @@ impl App {
     pub fn remaining_tool_ms(&self) -> Option<u64> {
         // A cancelled turn gives its remaining tools no time at all: a script drawing 700
         // frames must stop at the next call, not finish the frames nobody is waiting for.
-        if self.cancel_requested && self.tool_deadline.is_some() {
+        if self.run_gate.cancelled() && self.tool_deadline.is_some() {
             return Some(0);
         }
         let deadline = self.tool_deadline?;
@@ -1952,7 +1973,7 @@ impl App {
     /// A playback loop asks this between chunks: the alternative is finishing a two-minute
     /// clip for a caller that has already given up.
     pub(crate) fn out_of_time(&self) -> bool {
-        self.remaining_tool_ms() == Some(0)
+        self.run_gate.cancelled() || self.remaining_tool_ms() == Some(0)
     }
 
     /// A refusal for a route that would delete the question a running turn is answering.
@@ -1962,7 +1983,7 @@ impl App {
     /// the transcript, and the reply would then be appended to a thread that no longer holds
     /// its question. Waiting is the honest answer, and 409 says "try again".
     fn refuse_while_running(&self, action: &str) -> Option<Response> {
-        self.run_active.then(|| {
+        self.run_gate.active().then(|| {
             Response::error_json(
                 409,
                 &format!(
@@ -1976,17 +1997,17 @@ impl App {
 
     /// Ask the running turn to stop at its next boundary. Returns whether there was one.
     pub fn request_cancel(&mut self) -> bool {
-        if !self.run_active {
+        if !self.run_gate.request() {
             return false;
         }
-        self.cancel_requested = true;
+
         self.log.info("agent", "cancel requested; the turn stops at its next boundary");
         true
     }
 
     /// Take the request, so one cancel stops one turn and cannot poison the next.
     pub fn take_cancel(&mut self) -> bool {
-        std::mem::take(&mut self.cancel_requested)
+        self.run_gate.take_cancel()
     }
 
     /// Say so when a call finished after its budget, without pretending it did nothing.
@@ -2809,8 +2830,7 @@ impl App {
         // did not finish, and a marker written afterwards would only describe turns that
         // already survived.
         self.mark_run_in_flight(&source);
-        self.run_active = true;
-        self.run_active = true;
+        self.run_gate.set_active(true);
         let step = self.with_agent(move |agent, host| {
             agent.set_budget(context_tokens, max_output_tokens);
             agent.begin(host, now_ms, max_steps)
@@ -2831,10 +2851,10 @@ impl App {
         let step = self.with_agent(move |agent, host| agent.apply(host, reply, now_ms));
         if matches!(&step, AgentStep::Done(_)) {
             self.active_attachments = None;
-            self.run_active = false;
+            self.run_gate.set_active(false);
             // A cancel that arrived after the final step has nothing left to stop, and must
             // not carry into the next turn (whose first boundary would otherwise stop it).
-            self.cancel_requested = false;
+            self.run_gate.set_cancelled(false);
             // The turn is over, so a reboot from here must not ask it again. Clearing the
             // marker before the final save means the worst case is a lost reply, never a
             // reply the board repeats.
@@ -4056,6 +4076,7 @@ impl App {
         self.runtime.counters.http_requests += 1;
         let resp = self.route_inner(req);
         self.settle();
+        self.sync_run_gate();
         resp
     }
 
@@ -4203,7 +4224,7 @@ impl App {
                     return r;
                 }
                 let cancelling = self.request_cancel();
-                Response::json(&json!({ "cancelling": cancelling, "run_active": self.run_active }))
+                Response::json(&json!({ "cancelling": cancelling, "run_active": self.run_gate.active() }))
             }
             ("POST", "/api/agent/reset") => {
                 if let Err(r) = self.require_pin(req) {
@@ -6058,8 +6079,15 @@ impl App {
                  ask for less, split the work, or raise the budget"
             ));
         }
-        if wanted > 0 {
-            std::thread::sleep(Duration::from_millis(wanted));
+        let end = Instant::now() + Duration::from_millis(wanted);
+        while Instant::now() < end {
+            if self.run_gate.cancelled() {
+                return Err(format!("{op}: interrupted by the user"));
+            }
+            if self.remaining_tool_ms() == Some(0) {
+                return Err(format!("{op}: tool deadline exceeded while waiting"));
+            }
+            std::thread::sleep(end.saturating_duration_since(Instant::now()).min(Duration::from_millis(25)));
         }
         Ok(json!({
             "slept_ms": wanted,
@@ -6067,7 +6095,7 @@ impl App {
             "budget_ms": cap,
             "budget": source,
             "clamped": false,
-            "note": "one loop serves the endpoint, the portal and the agent: a wait is bounded by `agent.tool_timeout_s`",
+            "note": "waits are bounded by agent.tool_timeout_s and check interruption every 25 ms",
         })
         .to_string())
     }
@@ -7189,7 +7217,9 @@ fn selftest_completion(req: &Request) -> Value {
     // or Internet access merely to exercise the transport and tool result path.
     let local_url = format!("{}://{}/selftest/ping", req.scheme, req.header("host").unwrap_or("127.0.0.1"));
     let net_args = json!({"url": local_url}).to_string();
-    let steps: &[(&str, &str)] = if has_word(&ask, "edit") || ask.contains("改") {
+    let steps: &[(&str, &str)] = if has_word(&ask, "concurrency") {
+        &[("script", r#"{"source":"sleep(20000)\n42"}"#)]
+    } else if has_word(&ask, "edit") || ask.contains("改") {
         &[WRITE, EDIT, READ]
     } else if has_word(&ask, "file") || ask.contains("文件") {
         &[WRITE, READ, GREP]
@@ -7404,6 +7434,14 @@ fn event_stream_body(shared: Shared, slot: EventStreamSlot, after: u64, limits: 
 }
 
 pub fn make_handler(app: Shared) -> Handler {
+    // Called by the platform after WiFi startup. No publication in App::new,
+    // store acknowledgment, tool recursion, or the 6 KB store-writer task.
+    let (views, gate) = {
+        let mut state = app_lock(&app);
+        state.sync_run_gate();
+        state.publish_status_view();
+        (state.status_views.clone(), state.run_gate.clone())
+    };
     // The stream endpoint polls its own journal after the request has returned, so
     // it needs the handle it lives in. Weak, so this cannot become a cycle.
     App::attach_shared(&app);
@@ -7421,6 +7459,19 @@ pub fn make_handler(app: Shared) -> Handler {
             return Response::json(
                 &json!({ "ok": true, "service": "selftest-net", "purpose": "lock-free target for net_get" }),
             );
+        }
+        if req.method == "GET" && matches!(req.path.as_str(), "/api/status" | "/healthz") {
+            gate.note_request();
+            if let Some(response) = gate.mcp_get(req) {
+                return response;
+            }
+            return match views.current() {
+                Some(view) => view.response(req.path == "/healthz", gate.active(), gate.sessions()),
+                None => Response::error_json(503, "status has not been sampled yet"),
+            };
+        }
+        if let Some(response) = gate.cancel_route(req, now_ms()) {
+            return response;
         }
         let mut guard = match app.lock() {
             Ok(g) => g,
@@ -7941,6 +7992,155 @@ mod tests {
     fn test_app() -> App {
         let log = LogBuf::new(256);
         App::new(Box::new(VirtualBoard::new()), Box::new(MemoryStore::new()), log, FwMeta::default())
+    }
+
+    // Read/control paths must work even while a tool owns the App mutex.
+    #[test]
+    fn cached_status_does_not_acquire_the_tool_mutex() {
+        let shared: Shared = Arc::new(Mutex::new(test_app()));
+        let handler = make_handler(shared.clone());
+        let held = app_lock(&shared);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            tx.send((handler(&get("/api/status")), handler(&get("/healthz")))).unwrap();
+        });
+        let answer = rx.recv_timeout(Duration::from_secs(1));
+        drop(held);
+        worker.join().unwrap();
+        let (status, health) = answer.expect("cached reads waited for App");
+        assert_eq!(status.status, 200);
+        assert_eq!(health.status, 200);
+        assert_eq!(body_json(&status)["snapshot"], true);
+        assert_eq!(body_json(&health)["ok"], true);
+    }
+
+    #[test]
+    fn status_publication_is_explicit_and_not_on_the_storage_writer() {
+        let mut app = test_app();
+        assert!(app.status_views.current().is_none(), "constructor must not build JSON");
+        app.attach_store_writer("test-writer", true);
+        assert!(app.status_views.current().is_none(), "writer must not build status JSON");
+        app.publish_status_view();
+        let old = app.status_views.current().unwrap();
+        app.cfg.device_name = "published-later".into();
+        assert_ne!(old.status["device_name"], "published-later");
+        app.publish_status_view();
+        assert_eq!(app.status_views.current().unwrap().status["device_name"], "published-later");
+        assert_ne!(old.status["device_name"], "published-later", "old Arc was mutated");
+    }
+
+    #[test]
+    fn cached_uptime_advances_without_a_hardware_read() {
+        let view = crate::status_view::StatusView {
+            status: json!({"devices":{"count":5}}),
+            boot_ms: 100,
+            sampled_ms: 1099,
+            sampled_at: Instant::now() - Duration::from_millis(10),
+        };
+        assert_eq!(body_json(&view.response(true, false, 0))["uptime_s"], 1);
+        assert_eq!(body_json(&view.response(false, false, 0))["uptime_s"], 1);
+    }
+
+    #[test]
+    fn independent_cancel_preserves_pin_and_token_authentication() {
+        let mut app = test_app();
+        app.cfg.auth.portal_pin = "1234".into();
+        app.runtime.auth_tokens = vec![
+            ("valid-test-token".into(), now_ms() + 60_000),
+            ("expired-test-token".into(), now_ms().saturating_sub(1)),
+        ];
+        app.run_gate.set_active(true);
+        let shared: Shared = Arc::new(Mutex::new(app));
+        let handler = make_handler(shared.clone());
+        let held = app_lock(&shared);
+        let plain = post("/api/agent/cancel", "{}");
+        assert_eq!(handler(&plain).status, 401);
+        let mut req = plain.clone();
+        req.query.insert("token".into(), "valid-test-token".into());
+        assert_eq!(handler(&req).status, 401, "POST cannot use URL token");
+        req = plain.clone();
+        req.headers.insert("authorization".into(), "Bearer expired-test-token".into());
+        assert_eq!(handler(&req).status, 401);
+        req.headers.insert("authorization".into(), "Bearer valid-test-token".into());
+        assert_eq!(handler(&req).status, 200);
+        assert!(held.run_gate.cancelled());
+        held.run_gate.set_cancelled(false);
+        req = plain;
+        req.headers.insert("x-portal-pin".into(), "1234".into());
+        assert_eq!(handler(&req).status, 200);
+        assert!(held.run_gate.cancelled());
+    }
+
+    #[test]
+    fn run_gate_policy_updates_without_waiting_for_full_status_publication() {
+        let shared: Shared = Arc::new(Mutex::new(test_app()));
+        let handler = make_handler(shared.clone());
+        {
+            let mut app = app_lock(&shared);
+            app.cfg.auth.portal_pin = "new-pin".into();
+            app.cfg.mcp.path = "/healthz".into();
+            app.sync_run_gate();
+        }
+        let held = app_lock(&shared);
+        assert_eq!(handler(&post("/api/agent/cancel", "{}")).status, 401);
+        assert_eq!(handler(&get("/healthz")).status, 405);
+        assert_eq!(handler(&get("/api/status")).status, 200);
+        drop(held);
+    }
+
+    #[test]
+    fn long_script_and_shell_sleeps_can_be_interrupted_while_app_is_locked() {
+        for (name, args) in
+            [("shell", json!({"command":"sleep 10"})), ("script", json!({"source":"sleep(10000)\n1"}))]
+        {
+            let mut app = test_app();
+            app.run_gate.set_active(true);
+            let shared: Shared = Arc::new(Mutex::new(app));
+            let handler = make_handler(shared.clone());
+            let running = shared.clone();
+            let (tx, rx) = std::sync::mpsc::channel();
+            let worker = std::thread::spawn(move || {
+                let mut app = app_lock(&running);
+                tx.send(()).unwrap();
+                app.call_tool(name, &args)
+            });
+            rx.recv_timeout(Duration::from_secs(1)).unwrap();
+            std::thread::sleep(Duration::from_millis(50));
+            let started = Instant::now();
+            let cancel = handler(&post("/api/agent/cancel", "{}"));
+            assert_eq!(body_json(&cancel)["cancelling"], true);
+            let error = worker.join().unwrap().unwrap_err();
+            assert!(error.message.contains("interrupted"), "{error}");
+            assert!(started.elapsed() < Duration::from_secs(1));
+        }
+    }
+
+    #[test]
+    fn concurrency_selftest_requests_a_real_interruptible_script() {
+        let app = test_app();
+        let request = json!({"messages":[{"role":"user","content":"concurrency regression"}],
+            "tools": ToolHost::tool_specs(&app)});
+        let reply = selftest_completion(&post("/selftest/chat/completions", &request.to_string()));
+        let function = &reply["choices"][0]["message"]["tool_calls"][0]["function"];
+        assert_eq!(function["name"], "script");
+        let arguments: Value = serde_json::from_str(function["arguments"].as_str().unwrap()).unwrap();
+        assert_eq!(arguments["source"], "sleep(20000)\n42");
+    }
+
+    #[test]
+    fn cancellation_still_refuses_tools_when_deadlines_are_disabled() {
+        let mut app = test_app();
+        app.cfg.agent.tool_timeout_s = 0;
+        app.run_gate.set_cancelled(true);
+        assert!(app
+            .call_tool("shell", &json!({"command":"echo must-not-run"}))
+            .unwrap_err()
+            .message
+            .contains("interrupted"));
+        app.run_gate.set_active(false);
+        assert!(!app.run_gate.cancelled(), "ending a turn must clear cancellation");
+        app.run_gate.set_active(true);
+        assert!(!app.run_gate.cancelled(), "next turn must not inherit cancellation");
     }
 
     /// An app whose workspace is empty.
@@ -10693,13 +10893,13 @@ mod tests {
     fn clearing_refuses_while_a_model_turn_is_in_flight() {
         let mut app = test_app();
         assert_eq!(app.route(&post("/api/agent/reset", "{}")).status, 200, "nothing is running yet");
-        app.run_active = true;
+        app.run_gate.set_active(true);
         let busy = app.route(&post("/api/agent/reset", "{}"));
         assert_eq!(busy.status, 409, "a clear would drop the question being answered");
         let body = body_json(&busy);
         assert!(body["error"].as_str().unwrap_or("").contains("model turn is running"), "{body}");
         assert_eq!(app.route(&post("/api/agent/forget", r#"{"keep":1}"#)).status, 409);
-        app.run_active = false;
+        app.run_gate.set_active(false);
         assert_eq!(app.route(&post("/api/agent/reset", "{}")).status, 200);
     }
 
@@ -10710,7 +10910,7 @@ mod tests {
     fn a_cancel_stops_the_turn_at_the_next_boundary_without_calling_the_model() {
         let mut app = test_app();
         app.queue_user("play something long", "http", 1_000);
-        app.run_active = true;
+        app.run_gate.set_active(true);
         assert!(app.request_cancel(), "a running turn can be cancelled");
         assert!(app.take_cancel(), "the flag is handed to the loop exactly once");
         assert!(!app.take_cancel(), "and is gone after that");
@@ -10724,8 +10924,8 @@ mod tests {
         assert!(err.contains("interrupted"), "{err}");
         assert!(model.seen.lock().unwrap().is_empty(), "the model was called after the cancel");
         let finished = app_lock(&shared);
-        assert!(!finished.run_active, "the turn is over");
-        assert!(!finished.cancel_requested, "the flag does not leak into the next turn");
+        assert!(!finished.run_gate.active(), "the turn is over");
+        assert!(!finished.run_gate.cancelled(), "the flag does not leak into the next turn");
     }
 
     /// Tools stop when the turn is cancelled: a script mid-flight must not keep drawing.
@@ -10733,12 +10933,12 @@ mod tests {
     fn a_cancelled_turn_refuses_further_tool_calls() {
         let mut app = test_app();
         app.tool_deadline = Some(std::time::Instant::now() + std::time::Duration::from_secs(30));
-        app.cancel_requested = true;
+        app.run_gate.set_cancelled(true);
         let err = app.call_tool("board", &json!({ "command": "status" })).unwrap_err();
         assert!(err.message.contains("interrupted"), "{}", err.message);
         assert_eq!(err.data.as_ref().unwrap()["interrupted"], json!(true));
         // The cancelled call installs no deadline of its own: the next turn starts clean.
-        app.cancel_requested = false;
+        app.run_gate.set_cancelled(false);
         assert!(app.call_tool("board", &json!({ "command": "status" })).is_ok());
     }
 
@@ -10746,14 +10946,14 @@ mod tests {
     fn cancel_is_only_accepted_while_a_turn_is_running() {
         let mut app = test_app();
         assert!(!app.request_cancel(), "nothing to interrupt");
-        app.run_active = true;
+        app.run_gate.set_active(true);
         assert!(app.request_cancel());
         // The route reports what it did, so a console can tell a no-op from a stop.
-        app.run_active = false;
-        app.cancel_requested = false;
+        app.run_gate.set_active(false);
+        app.run_gate.set_cancelled(false);
         let idle = body_json(&app.route(&post("/api/agent/cancel", "{}")));
         assert_eq!(idle["cancelling"], json!(false), "{idle}");
-        app.run_active = true;
+        app.run_gate.set_active(true);
         let busy = body_json(&app.route(&post("/api/agent/cancel", "{}")));
         assert_eq!(busy["cancelling"], json!(true), "{busy}");
         assert_eq!(busy["run_active"], json!(true), "{busy}");

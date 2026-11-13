@@ -5,7 +5,7 @@ what is not done or not verified.
 
 ## Verified / unverified
 
-- ✅ `agent-core`: 912 unit tests and 5 integration tests (protocol, HTTP, manifest
+- ✅ `agent-core`: 928 unit tests and 5 integration tests (protocol, HTTP, manifest
   validation, driver conversion, capability filtering, auth, hot reload, the agent loop,
   shell and script, the file tools, sched, SSE streams, a streamed request body)
 - ✅ Simulator end to end: the PowerShell smoke gate; `scripts/smoke.sh` is the Unix
@@ -88,8 +88,9 @@ what is not done or not verified.
 6. **Audio beyond the current bounded calls**: change the I2S TX rate at runtime (only
    24000 Hz is wired), permit overlapping uploads, add a background score/media worker.
    Clips (below) remove the *result-size* wall — a take lives in PSRAM and plays in one
-   call — but playback is still synchronous, so nothing plays while the board does
-   something else, and nothing is recorded longer than one tool budget. `media_play` paces
+   call — but playback is still synchronous and competes for shared tool/device
+   resources. Public status/cancellation reads have an independent control plane;
+   this is not background media, and recording still has one tool budget. `media_play` paces
    a bounded score and OLED frames in one synchronous call; it is not background playback.
    On-board Opus/ADPCM encoding is
    deferred pending an actual build and measurements; the old 5–6 kB SRAM reading is not
