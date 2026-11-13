@@ -81,8 +81,9 @@ hard-coding an endpoint has to be a deliberate act with a failing test to justif
 
 ## 4. Transcript persistence and interrupted runs
 
-`agent.persist_transcript` (default on) saves a bounded tail, and `run_in_flight` records
-that a turn started. They aid recovery; they do not establish exactly-once execution.
+With `agent.persist_transcript` (default on), the board saves a bounded tail and the
+queued question; `run_in_flight` records that a turn started. They aid recovery, not
+exactly-once execution. With retention off, a newly queued question is not stored either.
 
 The transcript is `/storage/transcript`, a JSON Lines file on LittleFS. Its header carries
 format version 1, a dropped-message count and a checksum over the body. Saved text is cut
@@ -92,12 +93,36 @@ header included**, and restores chronological order in place. It does not serial
 whole history and then join a second full-size copy. A refused checksum/version/message
 structure is logged and not half-adopted.
 
-At boot, a surviving in-flight marker is consumed and the saved transcript's last user
-message is queued with `source: "resume"`. Saved tool results are passed back to the model.
-That is context for continuing a turn, not proof that the model will never repeat a call:
-a hardware effect can happen before its result reaches storage. A power cut can also lose
-the pending queue entry, model output, marker update or final transcript save. Model work
-may be requested and billed again.
+The depth-1 queue is `/storage/transcript.q`: one JSON object with `text`, `source` and
+`at_ms`. HTTP messages, scheduled prompts, sensor rules, manual schedule runs and reboot
+recovery all request this save after the existing user-text truncation and source
+coalescing. The queued copy is removed only once `agent_begin()` consumes the question
+into history; `agent_run_once()` uses that same boundary before its first model call.
+A missing transport leaves the question queued and re-requests its save. Forget/reset
+also remove this copy, so an unstarted question cannot return after being forgotten.
+Attachments remain RAM-only, as they are for the saved transcript.
+
+At boot, the queued question is restored with its source and enqueue time, and text is
+clamped to the same user byte budget. Torn JSON, missing/wrongly typed fields, unknown
+fields and blank text are ignored, removed and logged with one warning. A retained copy
+is removed without restoration when retention is off. Restoring a valid question is
+logged and does not consume its stored copy: another reboot before the run still keeps it.
+
+The transcript's final user exchange wins over a stale queue copy when **source, enqueue
+`at_ms`, and saved text** match. Saved text is compared with the queued question's 4 KiB
+transcript projection, not its full 32 KiB payload. Text alone is not an identity: the
+same question with another time or source remains a new turn. These fields identify a
+matching stored snapshot, not a globally unique turn across reboots.
+
+A surviving in-flight marker is consumed. If a different queued question was restored,
+it takes the one queue slot rather than replaying the older interrupted question; that
+older turn's saved context remains available. Otherwise the saved transcript's last user
+message is queued with `source: "resume"`, and this resumed question is persisted too.
+Saved tool results are passed back to the model. That is context for continuing a turn,
+not proof that the model will never repeat a call: a hardware effect can happen before
+its result reaches storage. A power cut before the writer drains can still lose a queue
+update, model output, marker update or final transcript save. Model work may be requested
+and billed again.
 
 **Acknowledgement matters.** The firmware queues ordinary configuration/transcript
 writes. A successful `set` or `queued: true` configuration response means admission, not

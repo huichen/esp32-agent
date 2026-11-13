@@ -30,7 +30,13 @@ const S = {
   panel: "status",
   afterUnlock: null,
   unlockPromise: null,
+  /** Bumped every time the board starts a turn, so a queued message can tell "not yet"
+   * from "started and finished" without guessing from timers. */
+  turnStarted: 0,
 };
+
+/** The timer behind the "queued but not started" note; one at a time. */
+let sendTimer = null;
 
 // ---------------------------------------------------------------- transport
 
@@ -496,6 +502,57 @@ function renderHistory(data) {
   scrollToEnd();
 }
 
+/** Reload what the board has, without touching the draft or the settings.
+ *
+ * This is what the pull gesture at the end of the transcript asks for: the same history
+ * read and cursor sync a reload would do, minus a page refresh that would discard a
+ * half-typed message. */
+async function refreshConversation() {
+  if (S.changingConversation || S.sending) return;
+  const ok = await loadHistory(true);
+  if (!ok) return;
+  try { await syncEventCursor(); } catch { /* the next send retries it */ }
+  // The transcript is what was asked for; a status read that fails must not swallow the
+  // confirmation and leave the gesture looking like nothing happened.
+  try { await loadStatus(); } catch { /* offline or busy: the history is still reloaded */ }
+  toast("Conversation refreshed");
+}
+
+/** At the end of the transcript, dragging down used to do nothing: the page bounced and a
+ * person could not tell "the board has nothing more" from "the page is stuck". Past the
+ * last message the drag now offers a refresh, which reloads the transcript in place. */
+function wirePullToRefresh() {
+  const chat = $("#chat");
+  const hint = $("#pull-hint");
+  const THRESHOLD = 60;
+  let startY = null;
+  let pulled = 0;
+  const atEnd = () => chat.scrollTop + chat.clientHeight >= chat.scrollHeight - 4;
+  chat.addEventListener("touchstart", (event) => {
+    startY = atEnd() && event.touches.length === 1 ? event.touches[0].clientY : null;
+    pulled = 0;
+  }, { passive: true });
+  chat.addEventListener("touchmove", (event) => {
+    if (startY === null) return;
+    pulled = event.touches[0].clientY - startY;
+    if (pulled > 12) {
+      hint.textContent = pulled >= THRESHOLD ? "Release to refresh" : "Pull down to refresh";
+      hint.classList.add("show");
+    } else {
+      hint.classList.remove("show");
+    }
+  }, { passive: true });
+  const finish = () => {
+    const shouldRefresh = startY !== null && pulled >= THRESHOLD;
+    startY = null;
+    pulled = 0;
+    hint.classList.remove("show");
+    if (shouldRefresh) refreshConversation();
+  };
+  chat.addEventListener("touchend", finish);
+  chat.addEventListener("touchcancel", finish);
+}
+
 async function loadHistory(duringChange = false) {
   if (S.changingConversation && !duringChange) return false;
   const revision = ++S.historyRevision;
@@ -631,25 +688,64 @@ async function changeConversation(path, body, clearAll) {
  * send, so a 4 MB phone photo is not a thing to upload: 1024 px on the long side as JPEG
  * is ~20 kB and still legible. If it is still too big after that, say so instead of
  * handing the board a request it will refuse. */
+/** The board's attachment ceiling, in decoded bytes. Keep in step with
+ * `MAX_ATTACHMENT_BYTES` in app.rs: the board is the authority, and a refusal after the
+ * upload is the worst place to find out. */
+const ATTACH_BYTES_MAX = 24 * 1024;
+
+/** Decoded size of a base64 payload, exactly: four characters carry three bytes and the
+ * `=` padding is not data. `length * 0.75` was close enough to look right and wrong enough
+ * to send 26 328 bytes into a 24 576-byte limit. */
+function base64Bytes(b64) {
+  const padding = b64.endsWith("==") ? 2 : b64.endsWith("=") ? 1 : 0;
+  return Math.floor((b64.length * 3) / 4) - padding;
+}
+
 function downscale(file) {
   return new Promise((resolve, reject) => {
     const url = URL.createObjectURL(file);
     const img = new Image();
     img.onload = () => {
       URL.revokeObjectURL(url);
-      const max = 1024;
-      const scale = Math.min(1, max / Math.max(img.width, img.height));
-      const w = Math.max(1, Math.round(img.width * scale));
-      const h = Math.max(1, Math.round(img.height * scale));
       const canvas = document.createElement("canvas");
-      canvas.width = w;
-      canvas.height = h;
-      canvas.getContext("2d").drawImage(img, 0, 0, w, h);
-      let dataUrl = canvas.toDataURL("image/jpeg", 0.72);
-      // Step the quality down once if the first pass is over the cap.
-      if (dataUrl.length * 0.75 > 24000) dataUrl = canvas.toDataURL("image/jpeg", 0.5);
-      const data_b64 = dataUrl.split(",", 2)[1] || "";
-      resolve({ name: file.name || "image.jpg", mime: "image/jpeg", data_b64, kb: Math.round((data_b64.length * 0.75) / 1024) });
+      const ctx = canvas.getContext("2d");
+      // Shrink, then give up quality, and stop at the first size that fits. The old code
+      // stepped quality down once and never re-measured, so a 20 MP photo could pass the
+      // check and still be refused by the board.
+      const steps = [
+        { edge: 1024, quality: 0.72 },
+        { edge: 1024, quality: 0.55 },
+        { edge: 768, quality: 0.62 },
+        { edge: 640, quality: 0.6 },
+        { edge: 512, quality: 0.55 },
+        { edge: 384, quality: 0.5 },
+        { edge: 256, quality: 0.5 },
+      ];
+      let best = null;
+      for (const step of steps) {
+        const scale = Math.min(1, step.edge / Math.max(img.width, img.height));
+        const w = Math.max(1, Math.round(img.width * scale));
+        const h = Math.max(1, Math.round(img.height * scale));
+        canvas.width = w;
+        canvas.height = h;
+        ctx.drawImage(img, 0, 0, w, h);
+        const dataUrl = canvas.toDataURL("image/jpeg", step.quality);
+        const data_b64 = dataUrl.split(",", 2)[1] || "";
+        best = { w, h, data_b64, bytes: base64Bytes(data_b64) };
+        if (best.bytes <= ATTACH_BYTES_MAX) break;
+      }
+      if (!best || best.bytes > ATTACH_BYTES_MAX) {
+        reject(new Error(
+          "that image is " + Math.ceil(best.bytes / 1024) + " kB even at " + best.w + "\u00d7" + best.h +
+          "; the board accepts " + ATTACH_BYTES_MAX / 1024 + " kB — crop it or pick a smaller one"));
+        return;
+      }
+      resolve({
+        name: file.name || "image.jpg",
+        mime: "image/jpeg",
+        data_b64: best.data_b64,
+        kb: Math.max(1, Math.round(best.bytes / 1024)),
+      });
     };
     img.onerror = () => {
       URL.revokeObjectURL(url);
@@ -681,30 +777,82 @@ async function send(text) {
   if (!trimmed || S.changingConversation || S.sending) return;
   S.sending = true;
   conversationControls();
+  const attachment = S.attach;
+  const shown = trimmed + (attachment ? "\n\n_[image: " + attachment.name + "]_" : "");
+  let bubble = null;
   try {
     if (S.lastEvent === null) await syncEventCursor();
-    const { bubble } = addRow("user");
-    bubble.innerHTML = markdown(trimmed + (S.attach ? "\n\n_[image: " + S.attach.name + "]_" : ""));
+    bubble = addRow("user").bubble;
+    bubble.innerHTML = markdown(shown);
     $("#input").value = "";
     autosize();
-    const attachment = S.attach;
     S.attach = null;
     showAttach();
     const payload = { text: trimmed };
     if (attachment) payload.attachments = [attachment];
-    await api("/api/agent/message", { method: "POST", body: payload });
+    await postMessage(payload);
     S.busy = true;
     $("#link").className = "dot busy";
     liveTrace = null;
     liveBubble = null;
     liveCalls = 0;
     connectStream();
+    watchTurnStart();
   } catch (e) {
+    // The bubble stays — a question that was typed should not vanish — but it says it was
+    // not delivered, the draft comes back, and the attachment is put back so a retry does
+    // not need the file picker again.
+    if (bubble) {
+      bubble.classList.add("failed");
+      bubble.innerHTML = markdown(shown);
+    }
+    if (!$("#input").value.trim()) {
+      $("#input").value = trimmed;
+      autosize();
+    }
+    if (attachment && !S.attach) {
+      S.attach = attachment;
+      showAttach();
+    }
     toast(e.message);
   } finally {
     S.sending = false;
     conversationControls();
   }
+}
+
+/** One POST with a deadline.
+ *
+ * The board answers 202 as soon as it queues, but while it is busy the request can sit in
+ * the socket for minutes — and a fetch with no deadline looks exactly like a delivered
+ * message. Twenty seconds is longer than a queue admission should ever take. */
+async function postMessage(payload) {
+  let timer = null;
+  const deadline = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(
+      "the board did not answer within 20 s; the message may not have arrived")), 20000);
+  });
+  try {
+    return await Promise.race([api("/api/agent/message", { method: "POST", body: payload }), deadline]);
+  } finally {
+    if (timer !== null) clearTimeout(timer);
+  }
+}
+
+/** Say something when a queued message has produced no run.
+ *
+ * A message can be accepted while the board is still finishing the previous turn; the page
+ * then looks dead for as long as that takes. Nothing here cancels or resends — it only
+ * stops the silence from being read as "the board never got it". */
+function watchTurnStart() {
+  if (sendTimer !== null) clearTimeout(sendTimer);
+  const before = S.turnStarted;
+  sendTimer = setTimeout(() => {
+    sendTimer = null;
+    if (S.turnStarted === before && !S.changingConversation) {
+      toast("Queued. The board has not started this turn yet — it may still be working on the previous one.");
+    }
+  }, 20000);
 }
 
 // ---------------------------------------------------------------- streaming
@@ -789,6 +937,8 @@ function handleEvent(name, data) {
   S.lastEvent = Math.max(S.lastEvent || 0, data.seq || 0);
   switch (name) {
     case "message_start":
+      S.turnStarted += 1;
+      if (sendTimer !== null) { clearTimeout(sendTimer); sendTimer = null; }
       S.busy = true;
       liveTrace = null;
       liveBubble = null;
@@ -1445,6 +1595,7 @@ function init() {
   loadHistory();
   loadStatus();
   trackViewport();
+  wirePullToRefresh();
   // Not connected at load: the stream is opened when a run starts and closed when it ends.
   setInterval(() => {
     if (!$("#sheet").hidden) return;

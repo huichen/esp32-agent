@@ -278,6 +278,7 @@ window.__esp32Clear = async function () {
     if (path === "/api/agent/message") {
       const gate = f.messageGate;
       if (gate) await gate.promise;
+      if (f.messageFail) return response({ error: "fixture message refused" }, 500);
       f.messages.push({ role: "user", seq: f.messages.length, text: JSON.parse(opts.body).text });
       return response({ ok: true });
     }
@@ -319,6 +320,9 @@ window.__esp32Clear = async function () {
       chineseLanguage: /[\u3000-\u9fff\uac00-\ud7af\uff00-\uffef]/.test(clear.textContent),
       focused: document.activeElement === clear,
       focusOutline: getComputedStyle(clear).outlineStyle, enabled: !clear.disabled };
+    // The attachment button and the field are one row: same height, same top edge. It used
+    // to have no CSS rule at all, so it kept a default box beside a 42 px field.
+    out.compose = { attach: rect(q("#attach")), field: rect(q("#input")), send: rect(q("#send")) };
 
     const beforeCancel = q("#chat").innerHTML;
     f.accept = false;
@@ -437,6 +441,55 @@ window.__esp32Clear = async function () {
       noConfirmation: f.confirmations.length === beforeSendingConfirm };
     f.messageGate.resolve(); await until(() => !S.sending); f.messageGate = null;
     S.busy = false; stopStream();
+
+    // An image the old code let through and the board then refused. 1600x1200 of noise is
+    // several hundred kB as PNG; the page has to fit it under the board's limit itself.
+    const photo = document.createElement("canvas");
+    photo.width = 1600; photo.height = 1200;
+    const pctx = photo.getContext("2d");
+    const gradient = pctx.createLinearGradient(0, 0, 1600, 1200);
+    for (let i = 0; i <= 40; i++) gradient.addColorStop(i / 40, "hsl(" + i * 9 + ",85%,50%)");
+    pctx.fillStyle = gradient; pctx.fillRect(0, 0, 1600, 1200);
+    for (let i = 0; i < 6000; i++) {
+      pctx.fillStyle = "hsl(" + (i % 360) + ",90%," + (i % 40 + 30) + "%)";
+      pctx.fillRect((i * 37) % 1600, (i * 61) % 1200, 7, 7);
+    }
+    const photoBlob = await new Promise((r) => photo.toBlob(r, "image/png"));
+    const transfer = new DataTransfer();
+    transfer.items.add(new File([photoBlob], "1124.png", { type: "image/png" }));
+    q("#attach-input").files = transfer.files;
+    q("#attach-input").dispatchEvent(new Event("change"));
+    await until(() => S.attach !== null);
+    out.attach = { bytes: base64Bytes(S.attach.data_b64), limit: ATTACH_BYTES_MAX,
+      kb: S.attach.kb, name: S.attach.name, sourceBytes: photoBlob.size };
+    S.attach = null; showAttach();
+
+    // A refused send keeps the question and says it was not delivered.
+    f.messageFail = true;
+    q("#input").value = "a question the board never got";
+    q("#composer").dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
+    await until(() => !S.sending);
+    out.sendFailure = { failed: !!q("#chat").querySelector(".bubble.failed"),
+      draft: q("#input").value, toast: q("#toast").textContent };
+    f.messageFail = false; q("#input").value = "";
+
+    // Pulling past the last message refreshes the transcript instead of doing nothing.
+    const historyReads = () => f.requests.filter((r) => r.path === "/api/agent/history").length;
+    const beforePull = historyReads();
+    const chat = q("#chat");
+    chat.scrollTop = chat.scrollHeight;
+    const touch = (type, y) => {
+      const point = new Touch({ identifier: 1, target: chat, clientX: 120, clientY: y });
+      chat.dispatchEvent(new TouchEvent(type, {
+        touches: type === "touchend" ? [] : [point], changedTouches: [point], bubbles: true,
+      }));
+    };
+    touch("touchstart", 300); touch("touchmove", 390); touch("touchend", 390);
+    // Wait for what the gesture produces, not merely for the request it starts: the toast is
+    // the part a person sees.
+    await until(() => q("#toast").textContent.includes("Conversation refreshed"));
+    out.pull = { reads: historyReads() - beforePull, toast: q("#toast").textContent,
+      hintHidden: !q("#pull-hint").classList.contains("show") };
 
     // A failed cursor refresh never re-enables replay from zero: retry the head before
     // sending, and leave the draft and empty conversation alone if that also fails.
@@ -793,6 +846,32 @@ fn assert_conversation_clear(metrics: &Value, width: u32) {
     expect("header", "aria", json!("Clear conversation"));
     expect("header", "chineseLanguage", json!(false));
     assert!(text("header", "label").contains("Clear chat"), "the clear action must be named");
+
+    // Composer geometry: the attachment button is part of the row, not a stray box.
+    let attach = rect(clear, "compose", "attach");
+    let field = rect(clear, "compose", "field");
+    assert!(
+        (attach.height - field.height).abs() <= 1.5 && (attach.top - field.top).abs() <= 1.5,
+        "{width} px: the attachment button and the field are not on one line: {attach:?} vs {field:?}"
+    );
+    assert!(
+        attach.right < field.left,
+        "{width} px: the attachment button overlaps the field: {attach:?} vs {field:?}"
+    );
+
+    // A 1600x1200 photo has to be fitted before it is sent, or the board refuses it.
+    let attach_bytes = clear["attach"]["bytes"].as_u64().expect("an attachment size");
+    let attach_limit = clear["attach"]["limit"].as_u64().expect("an attachment limit");
+    let source_bytes = clear["attach"]["sourceBytes"].as_u64().unwrap_or(0);
+    assert!(
+        source_bytes > attach_limit,
+        "{width} px: the fixture must actually be too large ({source_bytes} vs {attach_limit})"
+    );
+    assert!(
+        attach_bytes <= attach_limit,
+        "{width} px: the page sent {attach_bytes} decoded bytes into a {attach_limit}-byte limit"
+    );
+    assert!(text("attach", "name").ends_with(".png"), "the file name survives re-encoding");
     assert_ne!(text("header", "focusOutline"), "none", "{width} px: invisible keyboard focus");
 
     expect("cancel", "posts", json!(0));
@@ -875,6 +954,24 @@ fn assert_conversation_clear(metrics: &Value, width: u32) {
     expect("cursorFailure", "lastEvent", Value::Null);
     expect("cursorFailure", "draft", json!("retry after cursor failure"));
     expect("cursorFailure", "retryAfter", json!("120"));
+
+    // A refused send keeps the question, marks it, and hands the draft back.
+    expect("sendFailure", "failed", json!(true));
+    expect("sendFailure", "draft", json!("a question the board never got"));
+    assert!(
+        text("sendFailure", "toast").contains("fixture message refused"),
+        "{width} px: a refused send has to say so: {}",
+        text("sendFailure", "toast")
+    );
+
+    // Pulling past the last message refreshes the transcript in place.
+    assert_eq!(clear["pull"]["reads"], json!(1), "{width} px: the pull did not reload the transcript");
+    assert!(
+        text("pull", "toast").contains("Conversation refreshed"),
+        "{width} px: the refresh has to be visible: {}",
+        text("pull", "toast")
+    );
+    expect("pull", "hintHidden", json!(true));
 
     expect("memory", "tailBody", json!("{\"keep\":1}"));
     expect("memory", "tailClean", json!(true));
