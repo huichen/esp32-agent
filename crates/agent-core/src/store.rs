@@ -170,13 +170,23 @@ pub fn write_blob(
         Some(bytes) => (bytes.max(1), bytes),
         None => (plan.chunk_bytes, plan.capacity()),
     };
-    let chunks = split(blob, chunk_bytes);
+    if chunk_bytes == 0 {
+        return Err("the storage plan asks for zero-byte chunks; nothing was written".into());
+    }
     if blob.len() > capacity {
         return Err(format!(
             "it is {} bytes and the store keeps at most {} bytes, so it needs {} values; nothing was written",
             blob.len(),
             capacity,
-            chunks.len()
+            blob.len().div_ceil(chunk_bytes)
+        ));
+    }
+    let chunks = split(blob, chunk_bytes);
+    if chunks.len() > plan.chunks_max || chunks.iter().any(|chunk| chunk.len() > chunk_bytes) {
+        return Err(format!(
+            "UTF-8 boundaries need {} values and the storage plan keeps at most {}; nothing was written",
+            chunks.len(),
+            plan.chunks_max
         ));
     }
     if chunk_bytes > VALUE_MAX && max_value.is_none() {
@@ -233,6 +243,12 @@ pub fn read_blob(store: &dyn KvStore, base: &str, plan: Plan) -> BlobState {
     let (Ok(count), Ok(total)) = (count.parse::<usize>(), total.parse::<usize>()) else {
         return BlobState::Corrupt(format!("the `{base}` header is not numbers: `{}`", clip(&header)));
     };
+    let capacity = store.whole_value_bytes().unwrap_or_else(|| plan.capacity());
+    if total > capacity {
+        return BlobState::Corrupt(format!(
+            "the `{base}` header describes {total} bytes and the store keeps at most {capacity}"
+        ));
+    }
     if count > plan.chunks_max {
         return BlobState::Corrupt(format!(
             "the `{base}` header describes {count} values and the store keeps at most {}",
@@ -253,6 +269,9 @@ pub fn read_blob(store: &dyn KvStore, base: &str, plan: Plan) -> BlobState {
     };
     let mut expected = Vec::with_capacity(count);
     for field in checksums.split(',') {
+        if expected.len() == count {
+            return BlobState::Corrupt(format!("the `{base}` header lists too many checksums"));
+        }
         match u64::from_str_radix(field, 16) {
             Ok(value) => expected.push(value),
             Err(_) => {
@@ -266,7 +285,10 @@ pub fn read_blob(store: &dyn KvStore, base: &str, plan: Plan) -> BlobState {
             expected.len()
         ));
     }
-    let mut blob = String::with_capacity(total);
+    let mut blob = String::new();
+    if blob.try_reserve_exact(total).is_err() {
+        return BlobState::Corrupt(format!("the `{base}` header requests more memory than is available"));
+    }
     for (index, want) in expected.iter().enumerate() {
         let key = chunk_key(base, index + 1);
         let Some(chunk) = store.get(&key) else {
@@ -280,6 +302,9 @@ pub fn read_blob(store: &dyn KvStore, base: &str, plan: Plan) -> BlobState {
             return BlobState::Corrupt(format!(
                 "`{key}` does not match the checksum in `{base}` (a write torn by a power cut, or a chunk from another write, looks exactly like this)"
             ));
+        }
+        if chunk.len() > total.saturating_sub(blob.len()) {
+            return BlobState::Corrupt(format!("`{base}` chunks exceed the declared {total} bytes"));
         }
         blob.push_str(&chunk);
     }
@@ -1016,6 +1041,7 @@ impl KvStore for MemoryStore {
 pub struct FileStore {
     path: PathBuf,
     map: BTreeMap<String, String>,
+    last_error: Option<StoreError>,
 }
 
 impl FileStore {
@@ -1025,20 +1051,35 @@ impl FileStore {
             .ok()
             .and_then(|s| serde_json::from_str::<BTreeMap<String, String>>(&s).ok())
             .unwrap_or_default();
-        Self { path, map }
+        Self { path, map, last_error: None }
     }
 
-    fn flush(&self) -> bool {
-        let s = serde_json::to_string_pretty(&self.map).unwrap_or_else(|_| "{}".into());
-        if let Some(dir) = self.path.parent() {
-            let _ = std::fs::create_dir_all(dir);
+    fn flush(&self) -> std::io::Result<()> {
+        use std::io::Write;
+        if let Some(dir) = self.path.parent().filter(|dir| !dir.as_os_str().is_empty()) {
+            std::fs::create_dir_all(dir)?;
         }
-        // Write-then-rename keeps a power cut from leaving half a file.
+        // Stream the JSON rather than making a second copy of every stored value.
+        // Sync the complete temporary file before replacing the published one.
         let tmp = self.path.with_extension("json.tmp");
-        match std::fs::write(&tmp, s) {
-            Ok(()) => std::fs::rename(&tmp, &self.path).is_ok(),
-            Err(_) => false,
+        let saved = (|| {
+            let file = std::fs::File::create(&tmp)?;
+            let mut writer = std::io::BufWriter::new(file);
+            serde_json::to_writer_pretty(&mut writer, &self.map)?;
+            writer.flush()?;
+            writer.get_ref().sync_all()?;
+            drop(writer);
+            std::fs::rename(&tmp, &self.path)
+        })();
+        if saved.is_err() {
+            let _ = std::fs::remove_file(tmp);
         }
+        saved
+    }
+
+    fn note_error(&mut self, error: std::io::Error) {
+        self.last_error =
+            Some(StoreError { code: error.raw_os_error().unwrap_or(0), name: error.to_string() });
     }
 }
 
@@ -1048,18 +1089,44 @@ impl KvStore for FileStore {
     }
 
     fn set(&mut self, key: &str, value: &str) -> bool {
-        self.map.insert(key.to_string(), value.to_string());
-        self.flush()
+        self.last_error = None;
+        let previous = self.map.insert(key.to_string(), value.to_string());
+        match self.flush() {
+            Ok(()) => true,
+            Err(error) => {
+                match previous {
+                    Some(text) => {
+                        self.map.insert(key.to_string(), text);
+                    }
+                    None => {
+                        self.map.remove(key);
+                    }
+                }
+                self.note_error(error);
+                false
+            }
+        }
     }
 
     fn remove(&mut self, key: &str) -> bool {
-        let had = self.map.remove(key).is_some();
-        self.flush();
-        had
+        self.last_error = None;
+        let Some(previous) = self.map.remove(key) else { return false };
+        match self.flush() {
+            Ok(()) => true,
+            Err(error) => {
+                self.map.insert(key.to_string(), previous);
+                self.note_error(error);
+                false
+            }
+        }
     }
 
     fn keys(&self) -> Vec<String> {
         self.map.keys().cloned().collect()
+    }
+
+    fn last_error(&self) -> Option<StoreError> {
+        self.last_error.clone()
     }
 }
 
@@ -1187,9 +1254,19 @@ mod tests {
             let mut s = FileStore::open(&path);
             assert!(s.set("config", "{\"a\":1}"));
         }
-        let s = FileStore::open(&path);
+        let mut s = FileStore::open(&path);
         assert_eq!(s.get("config").as_deref(), Some("{\"a\":1}"));
-        let _ = std::fs::remove_dir_all(&dir);
+        // A deterministic I/O failure: the parent stops being a directory. A failed
+        // save must not become visible in RAM, nor be reported as a successful removal.
+        std::fs::remove_dir_all(&dir).unwrap();
+        std::fs::write(&dir, b"not a directory").unwrap();
+        assert!(!s.set("config", "new"));
+        assert_eq!(s.get("config").as_deref(), Some("{\"a\":1}"));
+        assert!(s.last_error().is_some());
+        assert!(!s.remove("config"));
+        assert_eq!(s.get("config").as_deref(), Some("{\"a\":1}"));
+        assert!(s.last_error().is_some());
+        std::fs::remove_file(&dir).unwrap();
     }
 
     #[test]
@@ -1280,6 +1357,12 @@ mod tests {
             BlobState::Corrupt(why) => assert!(why.contains("at most 5"), "{why}"),
             other => panic!("got {other:?}"),
         }
+        // Header sizes are untrusted. Refuse them before allocating: usize::MAX
+        // otherwise panics with capacity overflow on the host and can abort the board.
+        store.map.insert("ws".into(), format!("ws1 1 {} 0000000000000000", usize::MAX));
+        let result = std::panic::catch_unwind(|| read_blob(&store, "ws", PLAN));
+        assert!(matches!(result, Ok(BlobState::Corrupt(_))), "untrusted size must not panic");
+
         // A header that claims bytes it does not carry is refused as a whole.
         store.map.insert("ws".into(), "ws1 0 4000 ".into());
         match read_blob(&store, "ws", PLAN) {
@@ -1321,6 +1404,12 @@ mod tests {
         let mut store = LimitedStore::default();
         write_blob(&mut store, "ws", &blob, PLAN).expect("fits");
         assert_eq!(read_blob(&store, "ws", PLAN), BlobState::Stored(blob));
+        // UTF-8 slack can require more chunks than raw byte division predicts.
+        // Refuse before touching the old blob when those chunks do not fit the plan.
+        let wide = "界".repeat(PLAN.capacity() / 3);
+        let before = store.map.clone();
+        assert!(write_blob(&mut store, "ws", &wide, PLAN).is_err());
+        assert_eq!(store.map, before);
         // An empty blob is one header with no chunks, and reads back as empty.
         write_blob(&mut store, "ws", "", PLAN).expect("fits");
         assert_eq!(read_blob(&store, "ws", PLAN), BlobState::Stored(String::new()));
