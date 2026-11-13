@@ -1433,7 +1433,7 @@ impl App {
         let info = self.hw.board_info();
         let wifi = self.hw.wifi_status();
         let internal = self.hw.heap_internal();
-        let threads = Self::threads_from(self.hw.tasks());
+        let threads = self.threads_json();
         self.hw_view = HwView { info, wifi, internal, threads };
     }
 
