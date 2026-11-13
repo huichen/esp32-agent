@@ -504,7 +504,11 @@ window.__esp32Clear = async function () {
     // Hold the history read so the refresh is observably in flight: a spinner nobody can
     // catch is the thing this test exists to prevent.
     f.historyGate = defer();
-    touch("touchstart", 300); touch("touchmove", 390); touch("touchend", 390);
+    // The gesture is a drag *upwards* at the end of the list: that is the motion which would
+    // have kept scrolling forward, and the old code measured the opposite one.
+    touch("touchstart", 380); touch("touchmove", 290);
+    out.pullGesture = { armed: q("#pull-label").textContent };
+    touch("touchend", 290);
     await until(() => q("#pull-hint").classList.contains("refreshing"));
     out.pullSpinner = {
       shown: q("#pull-hint").classList.contains("show"),
@@ -1026,7 +1030,12 @@ fn assert_conversation_clear(metrics: &Value, width: u32) {
     );
     expect("pull", "hintHidden", json!(true));
     expect("pull", "refreshingCleared", json!(true));
-    assert_eq!(text("pull", "label"), "Pull down to refresh", "{width} px: the hint must reset");
+    assert_eq!(text("pullGesture", "armed"), "Release to refresh", "{width} px: the armed hint must say so");
+    assert_eq!(
+        text("pull", "label"),
+        "Pull up to refresh",
+        "{width} px: the gesture is a drag upwards, and the hint has to say which way"
+    );
 
     expect("memory", "tailBody", json!("{\"keep\":1}"));
     expect("memory", "tailClean", json!(true));

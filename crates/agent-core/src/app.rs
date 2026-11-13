@@ -437,8 +437,16 @@ struct WorkspaceSave {
 }
 
 impl App {
-    pub fn new(hw: Box<dyn Hardware>, store: Box<dyn KvStore>, log: Arc<LogBuf>, firmware: FwMeta) -> Self {
-        let now = now_ms();
+    pub fn new(
+        mut hw: Box<dyn Hardware>,
+        store: Box<dyn KvStore>,
+        log: Arc<LogBuf>,
+        firmware: FwMeta,
+    ) -> Self {
+        // Uptime is `hw.millis()` minus this reading, so it is monotonic and independent of
+        // whether SNTP ever lands. It used to be the wall clock, which read 0 until the first
+        // sync and then counted from the sync instead of from the boot.
+        let boot_monotonic_ms = hw.millis();
         // Every write below this line is a request: `store` is the queue, and the platform's
         // writer task is what turns a request into an `spi_flash` call. Reads pass straight
         // through (after checking the queue), which is why boot is unchanged.
@@ -473,7 +481,7 @@ impl App {
                 ),
             );
         }
-        let mut runtime = Runtime::new(now, &firmware.version, &firmware.build);
+        let mut runtime = Runtime::new(boot_monotonic_ms, &firmware.version, &firmware.build);
         runtime.manifest_rev = 1;
         // Write the cleaned manifest back, so dropping happens once and not every boot.
         runtime.manifest_dirty = !dropped_names.is_empty();
@@ -1328,7 +1336,7 @@ impl App {
             // constant can come down is guesswork, and a stack that is too small shows up
             // as an assert and a reboot rather than as a number.
             "threads": threads,
-            "uptime_s": self.runtime.uptime_s(now),
+            "uptime_s": self.runtime.uptime_s(self.hw.millis()),
             "wifi": wifi,
             "setup": {
                 "needed": self.setup_needed(),
@@ -4111,7 +4119,7 @@ impl App {
             ("GET", "/assets/style.css") => Response::css(web::STYLE_CSS),
             ("GET", "/favicon.ico") => Response::empty(204),
             ("GET", "/healthz") => {
-                let up = self.runtime.uptime_s(now_ms());
+                let up = self.runtime.uptime_s(self.hw.millis());
                 Response::json(&json!({ "ok": true, "uptime_s": up, "devices": self.devices.len() }))
             }
             // The map an external agent reads before it touches anything. Two paths so a
@@ -5581,7 +5589,7 @@ impl App {
     }
 
     fn shell_uptime(&mut self) -> String {
-        let up = self.runtime.uptime_s(now_ms());
+        let up = self.runtime.uptime_s(self.hw.millis());
         serde_json::json!({
             "uptime_s": up,
             "uptime": format!("{}h {:02}m {:02}s", up / 3600, (up % 3600) / 60, up % 60),

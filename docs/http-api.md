@@ -89,7 +89,7 @@ CORS is on by default (`mcp.cors`), so a browser MCP client can connect directly
 | Method | Path | Purpose |
 |---|---|---|
 | GET | `/` | Console (embedded HTML/CSS/JS, no external links) |
-| GET | `/healthz` | `{ok, uptime_s, devices}` |
+| GET | `/healthz` | `{ok, uptime_s, devices}`; `uptime_s` is seconds on the board's monotonic clock since boot, so it is right before SNTP has ever answered |
 | GET | `/agent.json` | The map for an external agent: every route, the MCP surface, conventions and limits (`/sitemap.json` is an alias) |
 | GET | `/api/status` | Board, memory, WiFi, MCP, device count, counters, `agent.thread` — `running`, `not started`, or `did not start: <why>` — `threads[]`, each task with the stack it has left at its deepest point (`high_water_kb`), and `store`: `{pending, written, failed}` plus `writer`, `last_failure` (`{key, op, err, err_name, at_ms}` or `null`), `refused_keys` (per-key counts), `refused_other` and `space` (`{used_bytes, free_bytes, total_bytes}`, or `{used_entries, free_entries, total_entries, used_bytes, free_bytes, total_bytes}` on NVS) - every number and where it comes from is in [what the store reports](troubleshooting.md#what-the-store-reports) — see [a store write was refused](troubleshooting.md#a-store-write-was-refused) |
 | GET | `/api/memory` | The heap pool by pool: `{available, pools: [{pool, note, total_kb, free_kb, largest_kb, min_free_kb}]}` for internal, DMA and PSRAM (a chip that registers no IRAM heap, like the S3, leaves that row out); `available: false` with a `why` on a platform with one heap |

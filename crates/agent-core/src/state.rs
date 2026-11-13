@@ -6,11 +6,6 @@
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 
-/// Wall-clock epoch below which the system clock counts as unset (September 2020).
-/// A board without a synced clock starts at zero, and subtracting that from a real
-/// timestamp is what made `uptime_s` report decades.
-const SANE_EPOCH_MS: u64 = 1_600_000_000_000;
-
 /// What one detection pass saw, kept for `inventory` and the portal's device
 /// page (including addresses nothing claimed).
 #[derive(Debug, Clone, Default)]
@@ -47,6 +42,8 @@ pub struct Counters {
 
 #[derive(Debug, Default)]
 pub struct Runtime {
+    /// Milliseconds on the platform's monotonic clock at construction. Uptime is measured
+    /// from here, not from the wall clock: a board without SNTP still has an uptime.
     pub boot_ms: u64,
     pub firmware: String,
     pub build: String,
@@ -86,22 +83,20 @@ impl Runtime {
     }
 
     pub fn uptime_s(&self, now_ms: u64) -> u64 {
-        // The wall clock is unset at boot and only becomes real once SNTP lands, so
-        // `now - boot` is meaningless until both ends are on the same calendar.
-        // Reporting zero for a couple of seconds is honest; reporting 56 years is not.
-        if self.boot_ms < SANE_EPOCH_MS || now_ms < SANE_EPOCH_MS {
-            return 0;
-        }
+        // Seconds since boot, from the platform's **monotonic** clock. It used to take the
+        // wall clock and return 0 until SNTP landed, which meant a board that booted without
+        // a working resolver reported zero uptime for its whole run — and every reading in
+        // between was anchored to when the clock synced, not to when the board started.
         now_ms.saturating_sub(self.boot_ms) / 1000
     }
 
-    /// Re-anchor the uptime clock the first time a real wall clock appears.
+    /// Re-anchor the boot reading from a wall clock.
     ///
-    /// Called by the platform tick. After this the uptime counts from the moment the
-    /// clock was set (a few seconds after boot) instead of from the epoch, and stays
-    /// monotonic for the rest of the run. Returns `true` when it re-anchored.
+    /// Only meaningful for a platform that wants its uptime tied to the calendar. It is not
+    /// called by this firmware: `boot_ms` is the monotonic reading taken at construction, and
+    /// overwriting it with an epoch was what made a board without SNTP report zero uptime.
     pub fn rebase_uptime(&mut self, now_ms: u64) -> bool {
-        if self.boot_ms < SANE_EPOCH_MS && now_ms >= SANE_EPOCH_MS {
+        if self.boot_ms == 0 && now_ms > 0 {
             self.boot_ms = now_ms;
             return true;
         }
@@ -239,24 +234,20 @@ impl Runtime {
 mod tests {
     use super::*;
 
-    /// A board boots with the clock at zero and SNTP sets it a second later. Uptime
-    /// must not report the gap between 1970 and now in the meantime, and must stay
-    /// monotonic once re-anchored.
+    /// Uptime is the monotonic clock minus the reading taken at construction, so a board
+    /// with no SNTP still counts, and a clock that jumps backwards cannot rewind it.
     #[test]
-    fn uptime_waits_for_a_real_clock_and_then_counts_forward() {
-        let mut rt = Runtime::new(0, "test", "test");
-        assert_eq!(rt.uptime_s(2_500), 0, "no wall clock yet: unknown, not 56 years");
-        let anchor = SANE_EPOCH_MS + 3_000;
-        assert!(rt.rebase_uptime(anchor));
-        assert!(!rt.rebase_uptime(anchor + 1_000), "re-anchoring is a one-off");
-        assert_eq!(rt.uptime_s(anchor + 5_000), 5);
-        assert!(rt.uptime_s(anchor + 9_000) > rt.uptime_s(anchor + 5_000));
+    fn uptime_counts_from_the_monotonic_boot_reading() {
+        let rt = Runtime::new(5_000, "test", "test");
+        assert_eq!(rt.uptime_s(5_000), 0, "boot is zero seconds");
+        assert_eq!(rt.uptime_s(10_500), 5, "five and a half seconds is five");
+        assert!(rt.uptime_s(65_000) > rt.uptime_s(10_500));
     }
 
     #[test]
     fn uptime_is_zero_when_the_clock_jumps_backwards() {
-        let rt = Runtime::new(SANE_EPOCH_MS, "test", "test");
-        assert_eq!(rt.uptime_s(0), 0);
+        let rt = Runtime::new(5_000, "test", "test");
+        assert_eq!(rt.uptime_s(0), 0, "a reading before boot must not underflow");
     }
 
     #[test]
