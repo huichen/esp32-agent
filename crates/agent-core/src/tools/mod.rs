@@ -647,11 +647,12 @@ pub fn board_commands() -> Vec<ToolDef> {
     pick(&mut pool, BOARD_COMMANDS)
 }
 
-/// The `board` family: one tool, nine commands.
+/// The `board` family: one tool, seven commands.
 pub fn board_family() -> ToolDef {
     Family::new(
         "board",
-        "The board itself: status, config, chip temperature, logs, restart, delay, inventory; `command: help` gives each one's arguments",
+        "The board itself: status, config, chip temperature, logs, delay, inventory. \
+         Nothing here reboots the board or clears its storage; `command: help` lists each one's arguments",
         board_commands(),
     )
     .into_tool()
