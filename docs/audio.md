@@ -240,6 +240,48 @@ Two things are worth reading off that table:
   `[measured]` historical percentages of the then-3-MiB partition (`f95bbba`, 2026-11-12),
   not current factory-slot usage.
 
+### Sound and picture in one tool call: `media_play`
+
+Give `notes`, `frames`, or both. Notes use exactly `speaker_play`'s **64-note / 12,000 ms**
+budget and 24 kHz mono synthesis; `hz: 0` is a rest. `volume` is 0–100, default 30. A frame
+is `{at_ms, rects?, text?, line?}`; its slot is **0–12,000 ms** after playback starts,
+excluding synthesis. At most **360 frames / 64 rectangles per frame** are accepted;
+excess lists are refused with their counts. No `confirm` is needed.
+
+```json
+{"notes":[{"hz":523,"ms":400},{"hz":784,"ms":400}],"frames":[{"at_ms":0,"text":"START"},{"at_ms":400,"rects":[{"x":8,"y":8,"w":16,"h":8,"fill":true}],"text":"NEXT","line":0},{"at_ms":1000,"text":"END"}],"volume":30}
+```
+
+Each frame clears the framebuffer, draws rectangles using `oled_rect`'s filled/outlined
+pixels (`fill` defaults to true), overlays `oled_text`'s 6×8 text and wrapping (`line`
+defaults to 0), then flushes **once**. Origins, dimensions and text rows are checked
+against the detected panel; legal rectangles crossing an edge are clipped. Every frame
+needs non-empty rectangles or text. All parameters are validated before any audio/display
+write; an invalid later frame names its index and field and plays nothing. Action/family
+disables are respected; manifest-policy-wrapped actions are refused, not bypassed.
+
+The melody is synthesized **once**, then played in **4096-sample chunks**. One monotonic
+clock checks frame deadlines before the first write and between writes. Frames are
+stably sorted by `at_ms`, drawn once even at equal timestamps, and never dropped for
+being late. Remaining frames are waited for and drawn even after the sound ends. A full
+chunk is about **171 ms** at 24 kHz `[source: arithmetic]`, so this is chunk-boundary
+pacing, not exact audiovisual synchronisation. `fps` defaults to the rate implied by the
+shortest positive slot spacing, clamped **1–30** (1 without spacing). It bounds idle
+wakeups, not `at_ms` slots, and does not discard frames to enforce a rate.
+
+The result is `{ok, notes, frames_drawn, frames_late, played_ms, synth_ms, write_ms,
+max_late_ms}`: score-entry count, completed flushes, flushes completed after their slots
+(in whole milliseconds), submitted audio duration, synthesis time, summed audio-write
+time, and maximum lateness. Display work/waits are not `write_ms`; submitted samples are
+not an acoustic measurement. Hardware errors carry completed-work counters in error
+data. PCM/frames are not echoed, keeping the result inside **64 KiB**.
+
+**Playback is synchronous:** the call holds its caller through synthesis, writes and
+frame waits; chunking does not release its App lock. This fixes pacing, not concurrency.
+Background playback needs a media worker, still on [the roadmap](../ROADMAP.md#medium-term).
+Host simulator tests cover this tool; firmware not built/verified, and physical timing
+has not been measured on the bench.
+
 ## 8. Sound with a picture: `POST /av`
 
 The bench board played a 30 s clip with its animation on the 128x32 OLED: PCM down one TCP

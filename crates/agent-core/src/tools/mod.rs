@@ -7,6 +7,7 @@
 pub mod family;
 pub mod fs;
 pub mod knowledge;
+pub mod media;
 pub mod net;
 pub mod regex;
 pub mod shell;

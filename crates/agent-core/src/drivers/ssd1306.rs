@@ -16,6 +16,100 @@ use serde_json::{json, Value};
 const CMD: u8 = 0x00;
 const DATA: u8 = 0x40;
 
+/// Internal batched draw, deliberately not a published OLED tool. `media_play` checks
+/// the public rectangle/text switches before using it; a frame needs one flush, not an
+/// intermediate picture for every rectangle. Generic device dispatch cannot expose it.
+pub(crate) const MEDIA_FRAME_TOOL: &str = "__media_frame";
+pub(crate) const MAX_FRAME_RECTS: usize = 64;
+
+pub(crate) struct MediaFrame {
+    rects: Vec<MediaRect>,
+    text: Option<String>,
+    line: i32,
+}
+
+struct MediaRect {
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
+    fill: bool,
+}
+
+impl MediaFrame {
+    /// Validate against the detected panel, not the 64-row public schema. An origin
+    /// outside the panel is an error; a legal rectangle crossing its edge is clipped.
+    pub(crate) fn parse(args: &Value, width: u8, height: u8) -> Result<Self> {
+        if !args.is_object() {
+            return Err(McpError::invalid_params("must be an object"));
+        }
+        let mut rects = Vec::new();
+        if let Some(raw) = args.get("rects") {
+            let entries =
+                raw.as_array().ok_or_else(|| McpError::invalid_params("`rects` must be an array"))?;
+            if entries.len() > MAX_FRAME_RECTS {
+                return Err(McpError::invalid_params(format!(
+                    "`rects` has {} entries; at most {MAX_FRAME_RECTS} are accepted per frame",
+                    entries.len()
+                )));
+            }
+            for (index, rect) in entries.iter().enumerate() {
+                let field = |name, min, max| {
+                    j::required_ranged_i64(rect, name, min, max)
+                        .map(|v| v as i32)
+                        .map_err(|e| McpError::invalid_params(format!("`rects[{index}]` {}", e.message)))
+                };
+                let x = field("x", 0, i64::from(width) - 1)?;
+                let y = field("y", 0, i64::from(height) - 1)?;
+                let w = field("w", 1, i64::from(width))?.min(i32::from(width) - x);
+                let h = field("h", 1, i64::from(height))?.min(i32::from(height) - y);
+                let fill = match rect.get("fill") {
+                    None => true,
+                    Some(Value::Bool(fill)) => *fill,
+                    Some(_) => {
+                        return Err(McpError::invalid_params(format!(
+                            "`rects[{index}].fill` must be a boolean"
+                        )))
+                    }
+                };
+                rects.push(MediaRect { x, y, w, h, fill });
+            }
+        }
+        let text = match args.get("text") {
+            None => None,
+            Some(Value::String(text)) if text.is_empty() => None,
+            Some(Value::String(text)) => Some(text.clone()),
+            Some(_) => return Err(McpError::invalid_params("`text` must be a string")),
+        };
+        let line = j::optional_ranged_i64(args, "line", 0, i64::from(height / 8) - 1)?.unwrap_or(0) as i32;
+        if rects.is_empty() && text.is_none() {
+            return Err(McpError::invalid_params("needs drawable content: non-empty `rects` or `text`"));
+        }
+        Ok(Self { rects, text, line })
+    }
+
+    pub(crate) fn has_rects(&self) -> bool {
+        !self.rects.is_empty()
+    }
+
+    pub(crate) fn has_text(&self) -> bool {
+        self.text.is_some()
+    }
+
+    pub(crate) fn arguments(&self) -> Value {
+        let mut args = json!({
+            "rects": self.rects.iter().map(|r| json!({
+                "x": r.x, "y": r.y, "w": r.w, "h": r.h, "fill": r.fill,
+            })).collect::<Vec<_>>(),
+            "line": self.line,
+        });
+        if let Some(text) = &self.text {
+            args["text"] = json!(text);
+        }
+        args
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Controller {
     Ssd1306,
@@ -206,6 +300,21 @@ impl Ssd1306 {
         for yy in y..y + h {
             for xx in x..x + w {
                 self.set_pixel(xx, yy, on);
+            }
+        }
+    }
+
+    fn draw_rect(&mut self, x: i32, y: i32, w: i32, h: i32, fill: bool, on: bool) {
+        if fill {
+            self.fill_rect(x, y, w, h, on);
+        } else {
+            for xx in x..x + w {
+                self.set_pixel(xx, y, on);
+                self.set_pixel(xx, y + h - 1, on);
+            }
+            for yy in y..y + h {
+                self.set_pixel(x, yy, on);
+                self.set_pixel(x + w - 1, yy, on);
             }
         }
     }
@@ -460,20 +569,24 @@ impl Device for Ssd1306 {
                 let h = j::ranged_i64(args, "h", 1, 1, 64)? as i32;
                 let fill = j::opt_bool(args, "fill").unwrap_or(true);
                 let on = j::opt_bool(args, "on").unwrap_or(true);
-                if fill {
-                    self.fill_rect(x, y, w, h, on);
-                } else {
-                    for xx in x..x + w {
-                        self.set_pixel(xx, y, on);
-                        self.set_pixel(xx, y + h - 1, on);
-                    }
-                    for yy in y..y + h {
-                        self.set_pixel(x, yy, on);
-                        self.set_pixel(x + w - 1, yy, on);
-                    }
-                }
+                self.draw_rect(x, y, w, h, fill, on);
                 self.flush(hw)?;
                 Ok(json!({ "ok": true, "x": x, "y": y, "w": w, "h": h }))
+            }
+            MEDIA_FRAME_TOOL => {
+                // Re-check before changing the framebuffer even though the media planner
+                // already validated the whole call. No raw caller can create a partial
+                // parameter failure inside a frame.
+                let frame = MediaFrame::parse(args, self.width, self.height)?;
+                self.clear();
+                for rect in frame.rects {
+                    self.draw_rect(rect.x, rect.y, rect.w, rect.h, rect.fill, true);
+                }
+                if let Some(text) = frame.text {
+                    self.text(0, frame.line * 8, &text, true);
+                }
+                self.flush(hw)?;
+                Ok(json!({ "ok": true }))
             }
             "oled_bitmap" => {
                 let b64 = j::str_arg(args, "data_b64")?;

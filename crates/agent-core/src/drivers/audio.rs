@@ -321,31 +321,7 @@ impl crate::device::Device for Speaker {
                         "one of `notes` (a melody) or `pcm_b64` (samples) is required",
                     )),
                     (Some(notes), None) => {
-                        if notes.is_empty() {
-                            return Err(McpError::invalid_params(
-                                "`notes` is empty; a melody needs at least one note",
-                            ));
-                        }
-                        if notes.len() > MAX_MELODY_NOTES {
-                            return Err(McpError::invalid_params(format!(
-                                "`notes` has {} entries; at most {MAX_MELODY_NOTES} are accepted",
-                                notes.len()
-                            )));
-                        }
-                        let mut score = Vec::with_capacity(notes.len());
-                        let mut total_ms: u32 = 0;
-                        for (i, note) in notes.iter().enumerate() {
-                            let (hz, ms) = note_of(i, note)?;
-                            total_ms = total_ms.saturating_add(ms);
-                            score.push((hz, ms));
-                        }
-                        if total_ms > MAX_MELODY_MS {
-                            return Err(McpError::invalid_params(format!(
-                                "the melody is {total_ms} ms; at most {MAX_MELODY_MS} are accepted \
-                                 (one contiguous buffer of {} bytes of PCM)",
-                                samples_for(MAX_MELODY_MS) * 2
-                            )));
-                        }
+                        let (score, total_ms) = score_of(notes)?;
                         let volume = j::opt_i64(args, "volume").unwrap_or(30).clamp(0, 100) as f32 / 100.0;
                         // Where the time goes, reported rather than guessed: `synth_ms` is
                         // the float maths, `write_ms` is how long the board held the
@@ -560,6 +536,35 @@ pub fn melody(notes: &[(f32, u32)], volume: f32) -> Vec<i16> {
 /// A sine at `freq` for `ms`: one note, with the melody's own ramps at both ends.
 fn tone(freq: f32, ms: u32, volume: f32) -> Vec<i16> {
     melody(&[(freq, ms)], volume)
+}
+
+/// Validate the complete score before either playback tool can reach the amplifier.
+/// Sharing this keeps `media_play` inside precisely the `speaker_play` melody budget.
+pub(crate) fn score_of(notes: &[Value]) -> crate::error::Result<(Vec<(f32, u32)>, u32)> {
+    if notes.is_empty() {
+        return Err(McpError::invalid_params("`notes` is empty; a melody needs at least one note"));
+    }
+    if notes.len() > MAX_MELODY_NOTES {
+        return Err(McpError::invalid_params(format!(
+            "`notes` has {} entries; at most {MAX_MELODY_NOTES} are accepted",
+            notes.len()
+        )));
+    }
+    let mut score = Vec::with_capacity(notes.len());
+    let mut total_ms: u32 = 0;
+    for (i, note) in notes.iter().enumerate() {
+        let (hz, ms) = note_of(i, note)?;
+        total_ms = total_ms.saturating_add(ms);
+        score.push((hz, ms));
+    }
+    if total_ms > MAX_MELODY_MS {
+        return Err(McpError::invalid_params(format!(
+            "the melody is {total_ms} ms; at most {MAX_MELODY_MS} are accepted \
+             (one contiguous buffer of {} bytes of PCM)",
+            samples_for(MAX_MELODY_MS) * 2
+        )));
+    }
+    Ok((score, total_ms))
 }
 
 /// One note of a score: `{ "hz": 523, "ms": 400 }`. `hz` 0 is a rest.
