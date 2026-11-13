@@ -347,16 +347,6 @@ pub const ROUTES: &[Route] = &[
         "?n=<count>&since=<seq>",
         "{lines}",
     ),
-    r("GET", "/api/sessions", "mcp", Auth::Open, "Open MCP sessions", "", "{sessions}"),
-    r(
-        "GET",
-        "/api/clients",
-        "mcp",
-        Auth::Open,
-        "Ready-to-paste client configuration for this board",
-        "",
-        "{clients}",
-    ),
     r(
         "POST",
         "/api/auth",

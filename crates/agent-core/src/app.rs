@@ -4343,8 +4343,6 @@ impl App {
                 let path = req.query_get("path").unwrap_or("/");
                 Response::json(&self.file_text_json(path))
             }
-            ("GET", "/api/sessions") => Response::json(&json!({ "sessions": self.runtime.session_json() })),
-            ("GET", "/api/clients") => Response::json(&self.client_snippets()),
             ("POST", "/api/auth") => {
                 let pin = req
                     .json()
@@ -4668,25 +4666,6 @@ impl App {
             })),
             Err(e) => Response::json_status(500, &json!({ "ok": false, "error": e.message })),
         }
-    }
-
-    fn client_snippets(&mut self) -> Value {
-        let url = self.mcp_url();
-        json!({
-            "url": url,
-            "curl_list": format!(
-                "curl -sS -X POST {url} -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' -d '{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}}'"
-            ),
-            "curl_call": format!(
-                "curl -sS -X POST {url} -H 'Content-Type: application/json' -d '{{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{{\"name\":\"board_status\",\"arguments\":{{}}}}}}'"
-            ),
-            "mcp_servers_json": {
-                "mcpServers": {
-                    self.firmware.name.clone(): { "type": "http", "url": url }
-                }
-            },
-            "note": "Clients that speak the Streamable HTTP transport only need the URL; stdio-only clients need a bridge such as mcp-remote.",
-        })
     }
 }
 
