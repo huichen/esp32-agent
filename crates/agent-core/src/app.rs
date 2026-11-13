@@ -10442,7 +10442,7 @@ mod tests {
 
         fn set(&mut self, key: &str, value: &str) -> bool {
             // Every key the workspace is made of: the per-file values and their index.
-            if key.starts_with("wf") || key == crate::keys::WORKSPACE_INDEX {
+            if key.starts_with("ws.") {
                 return false;
             }
             self.0.set(key, value)
@@ -10491,7 +10491,7 @@ mod tests {
         }
         assert!(total > store::VALUE_MAX, "{total} bytes across the files");
         assert!(store.get("ws").is_none(), "the old document is still there");
-        assert!(store.get("wsmap").is_some(), "no index");
+        assert!(store.get(crate::keys::WORKSPACE_INDEX).is_some(), "no index");
 
         // A reboot is a new App over the same keys.
         let rebooted = app_with(&store);
@@ -10555,7 +10555,7 @@ mod tests {
         drain_store(&mut app);
         assert!(store.get("ws").is_none(), "the chunked layout is still there");
         assert!(store.get("ws.1").is_none(), "the old chunk is still there");
-        let index = store.get("wsmap").expect("no index after the migration");
+        let index = store.get(crate::keys::WORKSPACE_INDEX).expect("no index after the migration");
         assert!(index.contains("/memory/pins.md"), "{index}");
 
         // A second boot reads the document, so the rewrite was stored, not served from RAM once.
