@@ -1,6 +1,6 @@
 # esp32-agent
 
-**Español** · [English](README.md) · [简体中文](README.zh.md) · [Français](README.fr.md) · [Русский](README.ru.md) · [العربية](README.ar.md)
+[English](README.md) · [简体中文](README.zh.md) · [Français](README.fr.md) · **Español** · [Русский](README.ru.md) · [العربية](README.ar.md) · [日本語](README.ja.md) · [한국어](README.ko.md)
 
 Firmware para un ESP32 que ejecuta su propio bucle de agente y sirve un endpoint MCP, de modo
 que un modelo puede gobernar la placa directamente y cualquier agente externo puede usar las
