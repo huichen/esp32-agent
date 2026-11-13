@@ -462,7 +462,7 @@ fn run() -> anyhow::Result<()> {
             // without the task. Flush here, on this thread, which has been writing NVS since
             // boot — and let `flush_now` refuse if that is ever no longer true.
             if !nvs_writer::flush_now(&app, &log, "mcp-main") {
-                log.warn("system", "restarting with store writes still queued");
+                log.warn("system", "store flush was refused or had backend failures; restarting may lose unsaved changes");
             }
             FreeRtos::delay_ms(200);
             esp_idf_svc::hal::reset::restart();

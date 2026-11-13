@@ -1230,7 +1230,7 @@ $("#attach").onclick = () => $("#attach-input").click();
     };
     const key = $("#agent-key").value.trim();
     if (key) body.api_key = key;
-    try { await api("/api/agent/config", { method: "POST", body }); $("#agent-key").value = ""; toast("saved"); loadStatus(); }
+    try { await api("/api/agent/config", { method: "POST", body }); $("#agent-key").value = ""; toast("applied; save queued"); loadStatus(); }
     catch (e) { toast(e.message); }
   };
 
@@ -1278,7 +1278,7 @@ $("#attach").onclick = () => $("#attach-input").click();
         method: "POST",
         body: { ssid: $("#wifi-ssid").value.trim(), password: $("#wifi-password").value },
       });
-      $("#wifi-result").textContent = "saved; the board is joining";
+      $("#wifi-result").textContent = "credentials queued; the board is joining";
       setTimeout(loadStatus, 4000);
     } catch (e) { $("#wifi-result").textContent = e.message; }
   };
@@ -1299,7 +1299,7 @@ $("#attach").onclick = () => $("#attach-input").click();
       $("#auth-pin").value = "";
       // A new PIN invalidates the token the page is holding.
       if (pin) { S.token = ""; localStorage.removeItem("esp32-agent.token"); }
-      toast("saved");
+      toast("applied; save queued");
     } catch (e) { toast(e.message); }
   };
 

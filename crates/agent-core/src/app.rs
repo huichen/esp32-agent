@@ -1968,21 +1968,24 @@ impl App {
     /// the writer (`/api/status.store.failed` and the `store` log line), because the caller
     /// here is very often the agent thread, which cannot touch flash at all — see
     /// [`App::flush_store`].
-    fn persist_config(&mut self) {
+    fn persist_config(&mut self) -> bool {
         let json = self.cfg.to_json_string();
-        if self.store.set(crate::config::NVS_KEY_CONFIG, &json) {
-            self.log.info("config", "saved");
+        let queued = self.store.set(crate::config::NVS_KEY_CONFIG, &json);
+        if queued {
+            self.log.info("config", "queued for saving");
         } else {
             self.log.error("config", "the config could not even be queued for saving");
         }
         self.runtime.config_dirty = false;
+        queued
     }
 
     fn persist_manifest(&mut self) {
         let json = self.manifest.to_json_string();
         if self.store.set(NVS_KEY_MANIFEST, &json) {
             self.runtime.manifest_rev += 1;
-            self.log.info("manifest", format!("saved, revision {}", self.runtime.manifest_rev));
+            self.log
+                .info("manifest", format!("queued for saving, live revision {}", self.runtime.manifest_rev));
         } else {
             self.log.error("manifest", "the manifest could not even be queued for saving");
         }
@@ -2127,7 +2130,7 @@ impl App {
             Ok(()) => self.log.info(
                 "agent",
                 format!(
-                    "migrated the stored workspace from {from} to one value per file: {files} file(s), {bytes} bytes"
+                    "queued workspace migration from {from} to one value per file: {files} file(s), {bytes} bytes; the old layout stays until publication succeeds"
                 ),
             ),
             // Not fatal: the old value is untouched until the new index lands, so the next boot
@@ -2649,17 +2652,19 @@ impl App {
         v
     }
 
-    fn persist_agent_cfg(&mut self) {
+    fn persist_agent_cfg(&mut self) -> bool {
         let text = llm_json(&self.llm, true).to_string();
-        if !self.store.set(NVS_KEY_AGENT_CFG, &text) {
-            self.log.error("agent", "could not save the model config");
+        let queued = self.store.set(NVS_KEY_AGENT_CFG, &text);
+        if !queued {
+            self.log.error("agent", "could not queue the model config for saving");
         }
+        queued
     }
 
     fn persist_sched(&mut self) {
         let text = self.sched_json().to_string();
         if !self.store.set(NVS_KEY_SCHED, &text) {
-            self.log.error("agent", "could not save the schedule");
+            self.log.error("agent", "could not queue the schedule for saving");
         }
     }
 
@@ -3216,7 +3221,7 @@ impl App {
             self.runtime.config_dirty = true;
             self.log.info("agent", format!("scheduler tick is now {clamped} ms"));
         }
-        self.persist_agent_cfg();
+        let queued = self.persist_agent_cfg();
         self.log.info(
             "agent",
             format!(
@@ -3227,8 +3232,15 @@ impl App {
             ),
         );
         let mut v = self.agent_config_json();
-        v["saved"] = json!(true);
-        Response::json(&v)
+        v["saved"] = json!(false);
+        v["queued"] = json!(queued);
+        v["note"] = json!("applied in RAM; queue admission is not flash acknowledgement. Check /api/status.store for pending writes and failures");
+        if queued {
+            Response::json(&v)
+        } else {
+            v["error"] = json!("model config was applied in RAM but could not be queued for saving");
+            Response::json_status(503, &v)
+        }
     }
 
     fn sched_json(&self) -> Value {
@@ -4537,10 +4549,18 @@ impl App {
             self.cfg.mcp.disabled_tools = disabled;
         }
         self.runtime.config_dirty = true;
-        self.persist_config();
+        let queued = self.persist_config();
         let mut v = self.tools_portal_json();
-        v["ok"] = json!(true);
-        Response::json(&v)
+        v["ok"] = json!(queued);
+        v["applied"] = json!(true);
+        v["queued"] = json!(queued);
+        v["saved"] = json!(false);
+        if queued {
+            Response::json(&v)
+        } else {
+            v["error"] = json!("tool selection was applied in RAM but could not be queued for saving");
+            Response::json_status(503, &v)
+        }
     }
 
     fn wifi_connect(&mut self, req: &Request) -> Response {
@@ -5934,12 +5954,16 @@ impl App {
                 }
                 let previous = self.cfg.wifi.hostname.clone();
                 self.cfg.wifi.hostname = name.clone();
-                self.persist_config();
+                if !self.persist_config() {
+                    self.cfg.wifi.hostname = previous;
+                    return Err("hostname: config could not be queued for saving; name unchanged".into());
+                }
                 Ok(json!({
                     "hostname": name,
                     "previous": previous,
-                    "saved": true,
-                    "note": "saved to the config; the DHCP lease carries the new name after the next reconnect",
+                    "saved": false,
+                    "queued": true,
+                    "note": "applied in RAM and queued, not acknowledged on flash; DHCP carries the new name after reconnect. Check /api/status.store for failures",
                 })
                 .to_string())
             }
@@ -9969,7 +9993,8 @@ mod tests {
         let mut app = test_app();
         let set = sh(&mut app, "hostname bench-1");
         assert_eq!(set["hostname"], json!("bench-1"));
-        assert_eq!(set["saved"], json!(true));
+        assert_eq!(set["saved"], json!(false), "queue admission is not a durable acknowledgement");
+        assert_eq!(set["queued"], json!(true));
         assert_eq!(app.cfg.wifi.hostname, "bench-1");
         assert_eq!(sh(&mut app, "hostname")["hostname"], json!("bench-1"));
         let err =
@@ -10598,6 +10623,8 @@ mod tests {
         )));
         assert!(saved.get("api_key").is_none(), "the POST response echoed the key: {saved}");
         assert_eq!(saved["api_key_set"], true);
+        assert_eq!(saved["saved"], false, "a queued request cannot acknowledge durable storage");
+        assert_eq!(saved["queued"], true);
         let got = body_json(&app.route(&get("/api/agent/config")));
         assert!(got.get("api_key").is_none(), "GET echoed the key: {got}");
         assert_eq!(got["api_key_set"], true);
