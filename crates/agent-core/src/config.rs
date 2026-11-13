@@ -367,19 +367,20 @@ impl Config {
         serde_json::from_str::<Config>(s).ok().map(|c| c.sanitized())
     }
 
-    /// The JSON the portal may see: the WiFi password and the MCP token are
-    /// replaced by a "set / not set" flag.
+    /// The JSON any public config reader may see: both WiFi passwords and the
+    /// authentication secrets are replaced by a "set / not set" flag.
     pub fn public_json(&self) -> Value {
         let mut v = serde_json::to_value(self).unwrap_or_else(|_| json!({}));
         v["wifi"]["password"] = json!(if self.wifi.password.is_empty() { "" } else { "__set__" });
+        v["wifi"]["ap_password"] = json!(if self.wifi.ap_password.is_empty() { "" } else { "__set__" });
         v["auth"]["mcp_token"] = json!(if self.auth.mcp_token.is_empty() { "" } else { "__set__" });
         v["auth"]["portal_pin"] = json!(if self.auth.portal_pin.is_empty() { "" } else { "__set__" });
         v
     }
 
     /// Apply a partial JSON object (as posted by the portal) on top of `self`.
-    /// Unknown keys are ignored; secrets sent as `__set__` or `""` keep the
-    /// stored value unless `clear_secrets` is set.
+    /// Unknown keys are ignored; secrets sent as `__set__` keep the stored
+    /// value, while an explicit empty string clears it.
     /// Why `plain_http: false` would leave this board unreachable, when that is knowable from
     /// the configuration alone. The firmware keeps the last TLS failure, so `None` here means
     /// "the config cannot tell", not "a certificate definitely exists".
@@ -728,24 +729,64 @@ mod tests {
         assert_eq!(c.board, "auto");
     }
 
+    fn synthetic_secret(n: u8) -> String {
+        (0..16).map(|i| char::from(b'a' + (i + n) % 26)).collect()
+    }
+
     #[test]
     fn secrets_are_redacted_for_the_portal() {
         let mut c = Config::default();
-        c.wifi.password = "hunter2".into();
-        c.auth.mcp_token = "tok".into();
+        c.wifi.password = synthetic_secret(0);
+        c.wifi.ap_password = synthetic_secret(1);
+        c.auth.mcp_token = synthetic_secret(2);
+        c.auth.portal_pin = synthetic_secret(3);
         let v = c.public_json();
-        assert_eq!(v["wifi"]["password"], "__set__");
-        assert_eq!(v["auth"]["mcp_token"], "__set__");
-        assert!(!v.to_string().contains("hunter2"));
+        let serialized = v.to_string();
+        for (group, field, secret) in [
+            ("wifi", "password", &c.wifi.password),
+            ("wifi", "ap_password", &c.wifi.ap_password),
+            ("auth", "mcp_token", &c.auth.mcp_token),
+            ("auth", "portal_pin", &c.auth.portal_pin),
+        ] {
+            assert_eq!(v[group][field], "__set__", "{group}.{field}");
+            assert!(!serialized.contains(secret), "{group}.{field} leaked into public JSON");
+        }
     }
 
     #[test]
     fn patch_keeps_stored_secret_when_masked() {
         let mut c = Config::default();
-        c.wifi.password = "secret".into();
+        let secret = synthetic_secret(0);
+        c.wifi.password = secret.clone();
         c.apply_patch(&json!({ "wifi": { "ssid": "home", "password": "__set__" } })).unwrap();
         assert_eq!(c.wifi.ssid, "home");
-        assert_eq!(c.wifi.password, "secret");
+        assert_eq!(c.wifi.password, secret);
+    }
+
+    #[test]
+    fn public_config_roundtrip_preserves_secrets_and_explicit_empty_clears_them() {
+        let mut c = Config::default();
+        c.wifi.password = synthetic_secret(0);
+        c.wifi.ap_password = synthetic_secret(1);
+        c.auth.mcp_token = synthetic_secret(2);
+        c.auth.portal_pin = synthetic_secret(3);
+        let before = c.clone();
+        let touched = c.apply_patch(&c.public_json()).unwrap();
+        assert_eq!(c, before);
+        for name in ["wifi.password", "wifi.ap_password", "auth.mcp_token", "auth.portal_pin"] {
+            assert!(!touched.iter().any(|field| field == name), "a mask is not a secret write");
+        }
+        c.apply_patch(&json!({
+            "wifi": { "password": "", "ap_password": "" },
+            "auth": { "mcp_token": "", "portal_pin": "" },
+        }))
+        .unwrap();
+        let v = c.public_json();
+        for (group, field) in
+            [("wifi", "password"), ("wifi", "ap_password"), ("auth", "mcp_token"), ("auth", "portal_pin")]
+        {
+            assert_eq!(v[group][field], "");
+        }
     }
 
     #[test]
