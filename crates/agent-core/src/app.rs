@@ -333,6 +333,11 @@ pub struct App {
     pub rules: Vec<SensorRule>,
     /// The workspace behind the `fs_*` tools.
     pub workspace: AppWorkspace,
+    /// Named media buffers in PSRAM: audio and frames too large for a tool result.
+    ///
+    /// Deliberately not persisted and not in the transcript — a clip is a place to put
+    /// bytes between two tool calls, and `clips` reports where they actually landed.
+    pub clips: crate::clips::Clips,
     /// `setenv`/`env`/`unsetenv`: variables that live in this `App` and nowhere else.
     ///
     /// Deliberately *not* in [`Config`]: a shell variable is not a setting, it is state one
@@ -554,6 +559,7 @@ impl App {
             shared: Weak::new(),
             session_counter: 0,
             agent_thread: AgentThread::NotStarted,
+            clips: crate::clips::Clips::default(),
             store_queue: queue,
             store_writer: StoreWriter::default(),
             workspace_pending: None,
@@ -876,6 +882,7 @@ impl App {
         }
         tools.register(board_tools::board_family());
         tools.register(board_tools::bus_family());
+        tools.register_all(board_tools::bitmap::tools());
         for def in self.devices.tool_defs().into_iter().chain(board_tools::media::tools(&self.devices)) {
             if !owned.contains(&def.spec.name) {
                 tools.register(def);
@@ -1076,6 +1083,11 @@ impl App {
             {
                 Some("no camera or image attachment on this board".to_string())
             }
+            // A clip is ordinary memory, so opening, filling, listing and dropping one
+            // needs nothing. Only playing it needs a medium.
+            "clip_play" if !self.caps.contains("speaker") && !self.caps.contains("display") => {
+                Some("no speaker or display to play a clip on".to_string())
+            }
             _ => None,
         }
     }
@@ -1084,7 +1096,8 @@ impl App {
     ///
     /// One construction feeds three readers — the offered list, the hidden list and the
     /// portal page — so none of them can invent a tool the others do not have. The groups
-    /// are `shell`, `script` and the four file/image tools that need the app's own state.
+    /// are `shell`, `script`, the six clip tools that own PSRAM buffers, and the four
+    /// file/image tools that need the app's own state.
     fn extra_entries() -> Vec<Value> {
         let mut out = Vec::new();
         for group in [
@@ -1092,6 +1105,9 @@ impl App {
             // schema, one name to remember.
             json!([crate::tools::shell::openai_spec()]),
             board_tools::script_specs(),
+            // Clips hold the media a tool result cannot carry. They are ordinary extra
+            // tools, so the model, `/mcp tools/list` and the portal see the same six.
+            board_tools::clip::specs(),
             board_tools::agent_extra_specs(),
         ] {
             out.extend(openai_tools(&group));
@@ -1282,6 +1298,8 @@ impl App {
         let wifi = self.hw_view.wifi.clone();
         let internal = self.hw_view.internal;
         let threads = self.hw_view.threads.clone();
+        // The clips and the pool they reserve: the other half of "where did the PSRAM go".
+        let clips = self.clips.json(self.frame_bytes());
         let now = now_ms();
         // Built before the object literal: `json!` reads a brace after a `:` as a nested
         // object, so a block expression belongs in a local.
@@ -1348,6 +1366,7 @@ impl App {
             // constant can come down is guesswork, and a stack that is too small shows up
             // as an assert and a reboot rather than as a number.
             "threads": threads,
+            "clips": clips,
             "uptime_s": self.runtime.uptime_s(self.hw.millis()),
             "wifi": wifi,
             "setup": {
@@ -1928,6 +1947,14 @@ impl App {
         Some(if deadline <= now { 0 } else { (deadline - now).as_millis().min(u128::from(u64::MAX)) as u64 })
     }
 
+    /// Whether the call now running has no time (or no permission) left to continue.
+    ///
+    /// A playback loop asks this between chunks: the alternative is finishing a two-minute
+    /// clip for a caller that has already given up.
+    pub(crate) fn out_of_time(&self) -> bool {
+        self.remaining_tool_ms() == Some(0)
+    }
+
     /// A refusal for a route that would delete the question a running turn is answering.
     ///
     /// The turn happens with the app lock released while the model thinks, so a clear that
@@ -2054,6 +2081,11 @@ impl App {
         // config and the transport — neither of which a `ToolCtx` carries.
         if name == "image_read" {
             return self.image_read(args);
+        }
+        // Clips are state of this `App` (the buffers), not of a `ToolCtx`: they are reached
+        // here for the same reason the file tools are.
+        if name.starts_with("clip_") {
+            return self.clip_tool(name, args);
         }
         // Family aliases and generic/minimal folding change the listing, not whether
         // a previously learned tool can execute. Only explicit disables and missing
