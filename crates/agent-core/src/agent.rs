@@ -53,9 +53,28 @@ pub const MAX_HISTORY_BYTES: usize = 2 * 1024 * 1024;
 /// Four is enough to keep the thread of a task (what was asked, what the last tools did)
 /// while leaving most of the budget for the retrieval work in progress.
 pub const COMPACT_KEEP_TURNS: usize = 4;
-/// The deterministic index of dropped exchanges is capped too: an index that grows without
-/// limit would take the budget back through the system prompt.
+/// The deterministic index of dropped exchanges is capped by line count *and* bytes: an
+/// index that grows without limit would take the budget back through the system prompt.
 pub const ARCHIVE_MAX_LINES: usize = 40;
+/// Text the whole archive may hold.
+///
+/// A line count alone bounds nothing: the arrangement this replaces kept 40 lines and
+/// clipped each question only to what one message may carry (32 KiB), so the real ceiling
+/// was 40 × 32 KiB ≈ 1.25 MB of PSRAM for an index whose whole purpose is to be cheap.
+/// This is the number that actually bounds it.
+pub const ARCHIVE_MAX_BYTES: usize = 96 * 1024;
+/// Byte ceiling for an excerpt that is no longer the newest one.
+///
+/// Older questions have already been answered; what a resumed conversation needs from them
+/// is enough to avoid repeating a mistake, not the whole paragraph.
+pub const ARCHIVE_LINE_BYTES: usize = 2 * 1024;
+/// Byte ceiling for the newest excerpt.
+///
+/// The line just dropped is the one a resumed conversation needs first, so it keeps up to
+/// what one message may carry instead of the older 2 KiB. It becomes an older line the
+/// moment another is archived, and then the older budget applies — see
+/// [`Agent::archive_message`].
+pub const ARCHIVE_NEWEST_BYTES: usize = MAX_USER_BYTES;
 /// A tool result larger than this is cut with [`llm::TRUNCATED_MARK`].
 ///
 /// This is a *context* budget, not a storage one: whatever a tool returns is sent back to the
@@ -936,9 +955,7 @@ impl Agent {
                 self.archive_message(message);
             }
         }
-        while self.archive.len() > ARCHIVE_MAX_LINES {
-            self.archive.remove(0);
-        }
+        self.trim_archive();
     }
 
     /// Keep the last `keep_turns` question-and-answer groups and move everything older
@@ -969,8 +986,9 @@ impl Agent {
             // statement of what was wanted, and a clipped version of it is what makes a
             // model re-ask something it was already told. The host agent protects user
             // text the same way (its `protected_text` never demotes a user block), so the
-            // whole line is kept here, bounded only by what one message may carry.
-            Role::User => format!("user: {}", head(&message.text, MAX_USER_BYTES)),
+            // newest question gets the message-sized budget. Every line is still cut by
+            // bytes, and the total is capped by [`ARCHIVE_MAX_BYTES`].
+            Role::User => format!("user: {}", excerpt(&message.text, ARCHIVE_NEWEST_BYTES)),
             Role::Assistant => {
                 if message.tool_calls.is_empty() {
                     // Answers are demoted, and the demotion is counted rather than silent:
@@ -995,10 +1013,31 @@ impl Agent {
             Role::System => format!("note: {}", head(&message.text, 90)),
         };
         if line.trim().len() > 6 {
-            if self.archive.len() >= ARCHIVE_MAX_LINES {
-                self.archive.remove(0);
+            // The newest line was built with the newest budget; once another arrives it is
+            // an older line and the older budget applies. Without this step "the newest may
+            // be long" would quietly become "every line that ever was newest may be long".
+            if let Some(previous) = self.archive.len().checked_sub(1) {
+                if self.archive[previous].len() > ARCHIVE_LINE_BYTES {
+                    self.archive[previous] = excerpt(&self.archive[previous], ARCHIVE_LINE_BYTES);
+                }
             }
             self.archive.push(line);
+            self.trim_archive();
+        }
+    }
+
+    /// Hold the archive to both caps: the line count and the total bytes.
+    ///
+    /// The byte cap is the one that matters. A count and a per-line clip only bound the
+    /// total if their product is what somebody meant, which it was not here: 40 lines ×
+    /// 32 KiB was a megabyte of an index that exists to save space. Oldest first, because
+    /// the newest line is the one a resumed conversation starts from.
+    fn trim_archive(&mut self) {
+        while self.archive.len() > ARCHIVE_MAX_LINES {
+            self.archive.remove(0);
+        }
+        while archive_bytes(&self.archive) > ARCHIVE_MAX_BYTES && self.archive.len() > 1 {
+            self.archive.remove(0);
         }
     }
 
@@ -1241,6 +1280,36 @@ fn json_bytes(value: &Value) -> usize {
 }
 
 /// The first `max` characters, newlines flattened: an archive line must stay one line.
+/// One archive line, cut by **bytes** to `max_bytes`, marker included in the budget.
+///
+/// [`head`] counts characters, which is the right unit for a one-line summary of a tool
+/// result and the wrong one for a memory ceiling: 4 000 characters of Chinese are 12 kB,
+/// and the heap is charged in bytes. The ellipsis is counted inside the cap so an excerpt
+/// is never a byte over what its caller promised.
+fn excerpt(text: &str, max_bytes: usize) -> String {
+    let flat = text.replace(['\n', '\r'], " ");
+    let trimmed = flat.trim();
+    if trimmed.len() <= max_bytes {
+        return trimmed.to_string();
+    }
+    const MARK: char = '…';
+    let budget = max_bytes.saturating_sub(MARK.len_utf8());
+    let mut cut = String::with_capacity(max_bytes);
+    for ch in trimmed.chars() {
+        if cut.len() + ch.len_utf8() > budget {
+            break;
+        }
+        cut.push(ch);
+    }
+    cut.push(MARK);
+    cut
+}
+
+/// What an archive costs, measured the way the allocator charges it.
+fn archive_bytes(lines: &[String]) -> usize {
+    lines.iter().map(String::len).sum()
+}
+
 fn head(text: &str, max: usize) -> String {
     let flat = text.replace(['\n', '\r'], " ");
     let trimmed = flat.trim();
@@ -2392,6 +2461,55 @@ mod tests {
         }
         manual.compress(1);
         assert_eq!(manual.archive.len(), ARCHIVE_MAX_LINES);
+    }
+
+    /// The archive is bounded by bytes, not by "40 lines" plus a message-sized clip.
+    ///
+    /// The fixture is the worst case the old arrangement allowed: 40 questions, each as
+    /// large as one message may be. Before the byte budget this archive held 40 × 32 KiB
+    /// ≈ 1.25 MB of PSRAM; the assertions below measure bytes, so a change that only makes
+    /// lines *look* smaller (characters instead of bytes, or a cap on the wrong side of the
+    /// ellipsis) does not pass.
+    #[test]
+    fn the_archive_holds_a_byte_budget_and_keeps_the_newest_question_whole() {
+        let mut agent = Agent::new();
+        let body = "z".repeat(MAX_USER_BYTES - 3);
+        let mut per_line_sum = 0usize;
+        for i in 0..ARCHIVE_MAX_LINES {
+            // A two-digit prefix identifies the newest line among near-identical ones.
+            let text = format!("{i:02} {body}");
+            per_line_sum += "user: ".len() + text.len();
+            agent.archive_message(&Message::user(&text, "http", i as u64));
+        }
+
+        // The caps are real: this fixture is over budget before eviction, which is exactly
+        // why the total cap has to exist. Remove the eviction and the next assertion fails.
+        assert!(
+            per_line_sum > ARCHIVE_MAX_BYTES,
+            "the fixture must be over the byte budget before eviction: {per_line_sum} bytes"
+        );
+        let held = archive_bytes(&agent.archive);
+        // Measured on this fixture: 1 310 960 bytes of excerpt text before the byte budget
+        // existed, 96 262 bytes held afterwards in 32 lines.
+        assert!(
+            held <= ARCHIVE_MAX_BYTES,
+            "archive holds {held} bytes of excerpt text, cap is {ARCHIVE_MAX_BYTES}"
+        );
+        assert!(agent.archive.len() < ARCHIVE_MAX_LINES, "eviction must have removed lines");
+        // The oldest lines are the ones that go, because the newest is what a resumed
+        // conversation starts from.
+        let newest = agent.archive.last().expect("an archive");
+        assert!(newest.starts_with("user: 39 "), "the newest question survived: {newest:.20}");
+        assert_eq!(
+            newest.len(),
+            "user: ".len() + MAX_USER_BYTES,
+            "the newest question is kept whole, not clipped to the older budget"
+        );
+        assert!(!newest.ends_with('\u{2026}'), "the newest line carries no truncation marker");
+        // Every other line is an older line now, and pays the older budget.
+        for line in &agent.archive[..agent.archive.len() - 1] {
+            assert!(line.len() <= ARCHIVE_LINE_BYTES, "an older line kept {} bytes", line.len());
+        }
     }
 
     #[test]

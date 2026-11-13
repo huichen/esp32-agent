@@ -79,7 +79,7 @@ summary:
 | No model call | Compression must never fail, cost tokens, or depend on the network. |
 | Cannot invent facts | The lines are the transcript's own text, truncated — not an interpretation. |
 | Reproducible | The same history compresses the same way. |
-| Bounded | At most 40 archive lines, with bounded excerpts; older lines fall off the front. |
+| Bounded | At most 40 lines **and** 96 KiB of excerpt text: older lines are truncated to 2 KiB, the newest question to 32 KiB, oldest evicted first. |
 
 Recent exchanges are selected by `keep_recent_tokens`: at most a quarter of the 80% token
 trigger, further limited by the output reserve. At least one newest exchange is kept.
@@ -115,7 +115,7 @@ editing the conversation it is in the middle of).
 | Budget | Value |
 |---|---|
 | Memory index in the prompt | ≤ 2 KiB including truncation marker, ≤ 24 pointer lines |
-| Compressed index in the prompt | ≤ 40 lines of bounded excerpts; separate from the history byte budget |
+| Compressed index in the prompt | ≤ 40 lines **and** ≤ 96 KiB of truncated excerpts (older ≤ 2 KiB, newest question ≤ 32 KiB); separate from the history byte budget |
 | Transcript kept verbatim | recent exchanges selected by the token budget, subject to the 2 MiB / 1,024-message backstops and newest-message exception |
 | Saved transcript | ≤ 512 KiB of JSONL including header, newest complete exchanges/call-result pairs; no attachment payloads |
 | Model calls added | none |
