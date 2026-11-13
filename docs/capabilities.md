@@ -142,5 +142,5 @@ authoritative when this table and a firmware disagree.
 | `bus` | raw access for chips without a driver, in eight commands: `i2c_scan`, `i2c_read`, `i2c_write`, `i2c_identify`, `gpio_mode`, `gpio_read`, `gpio_write`, `adc_read` — the command names are exactly the `exec` primitives they wrap; `command: help` lists what each takes |
 | `device_invoke` | one detected device's tool, by id — what `tools_mode: generic` collapses the device tools into |
 
-The `manifest` (five commands) and `board` (nine) families are in [manifest](manifest.md) and here above; `shell`, `read`,
+The `manifest` (five commands) and `board` (seven) families are in [manifest](manifest.md) and here above; `shell`, `read`,
 `write`, `edit` and `script` are in [shell](shell.md) and [scripting](scripting.md).

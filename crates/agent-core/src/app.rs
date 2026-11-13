@@ -764,8 +764,13 @@ impl App {
         self.caps = caps;
 
         let mut tools = ToolRegistry::new();
-        tools.register_all(board_tools::always_tools());
-        tools.register_all(board_tools::manifest_tools());
+        // A name in `DROPPED_ALIASES` is not registered: the family below carries its own
+        // copy of the handler, and `help`/`dispatch` reach the command without a second name.
+        for def in board_tools::always_tools().into_iter().chain(board_tools::manifest_tools()) {
+            if !Self::DROPPED_ALIASES.contains(&def.spec.name.as_str()) {
+                tools.register(def);
+            }
+        }
         tools.register(board_tools::board_family());
         tools.register(board_tools::bus_family());
         // A family is one tool with several commands; the members are still registered under
@@ -918,10 +923,21 @@ impl App {
     /// that is not a rule buried inside one handler.
     const NEVER_OFFERED: &'static [&'static str] = &[];
 
+    /// Aliases that are gone, not hidden.
+    ///
+    /// A family owns these commands and carries its own copy of every handler, so dropping the
+    /// standalone name costs no ability: `board {command: "config_get"}` is the same code the
+    /// name used to run. They are listed here because nothing in this repository named them
+    /// (`git grep` over the code, the tests, `scripts/`, `tools/`, `examples/`, `skills/`, the
+    /// seven translations and `docs/`), which is the bar for removing a published name rather
+    /// than leaving it as a compatibility alias.
+    ///
+    /// Adding a name here is the whole change: `rebuild` skips it and the family keeps it.
+    const DROPPED_ALIASES: &'static [&'static str] =
+        &["board_config_get", "manifest_get", "manifest_validate"];
     pub const ALIASES_ACCEPTED_BUT_NOT_ADVERTISED: &'static [&'static str] = &[
         // the board family's members
         "board_status",
-        "board_config_get",
         "config_set",
         "chip_temp",
         "logs_tail",
@@ -937,9 +953,7 @@ impl App {
         "gpio_write",
         "adc_read",
         // the manifest family's
-        "manifest_get",
         "manifest_describe",
-        "manifest_validate",
         "manifest_apply",
         "manifest_reset",
         // the device families'
@@ -13472,6 +13486,116 @@ mod tests {
     }
 
     /// A tool with arguments that were never named cannot be written down.
+    /// A dropped alias is gone from every list, and the family command it used to be is not.
+    ///
+    /// This is the check `DROPPED_ALIASES` needs to be safe to grow: the name leaves the
+    /// registry, the hidden list and the compatibility column, while the ability it named
+    /// stays reachable through its family. The mapping comes from `family_members`, so a name
+    /// added to the list without a family behind it fails here instead of silently vanishing.
+    #[test]
+    fn a_dropped_alias_is_reachable_only_through_its_family() {
+        assert!(!App::DROPPED_ALIASES.is_empty(), "nothing to check");
+        let mut app = test_app();
+        for alias in App::DROPPED_ALIASES {
+            let reach = app
+                .family_members
+                .get(*alias)
+                .cloned()
+                .unwrap_or_else(|| panic!("`{alias}` dropped, but no family owns it"));
+            let (family, command) = reach.split_once(' ').expect("a family and a command word");
+            let family = family.to_string();
+            let command = command.to_string();
+
+            assert!(app.tools.get(alias).is_none(), "`{alias}` is still a registered tool");
+            assert!(app.why_hidden(alias).is_none(), "`{alias}` is still reported as hidden");
+            assert!(
+                !App::ALIASES_ACCEPTED_BUT_NOT_ADVERTISED.contains(alias),
+                "`{alias}` is still in the compatibility column"
+            );
+            assert!(!tool_names(&mut app).contains(&alias.to_string()), "`{alias}` is still offered");
+            let err = app.call_tool(alias, &json!({})).unwrap_err();
+            assert_eq!(err.code, code::NOT_FOUND, "`{alias}` still answers: {err:?}");
+
+            // The ability itself has to survive: the command answers, and an unknown one does not.
+            match app.call_tool(&family, &json!({ "command": command, "arguments": {} })) {
+                Ok(value) => assert!(value.is_object(), "{family} {command}: {value}"),
+                Err(e) => assert!(
+                    !e.message.contains("no command"),
+                    "`{alias}` was dropped and `{family}` lost `{command}` too: {e:?}"
+                ),
+            }
+        }
+    }
+    /// The published list and the code are the same set, in the reference a person reads.
+    ///
+    /// `a_family_declares_helps_and_dispatches_the_same_commands` pins schema, `help` and
+    /// dispatch. This pins the fourth reader: `docs/capabilities.md`, which is what an owner
+    /// reads before driving the board by hand. Deleting a command without touching the doc
+    /// leaves a name a person will type and the board will refuse, so the four sets are
+    /// checked here as well, and the spelled-out count in the row ("in seven commands") is
+    /// part of the check: a count is the first thing to go stale.
+    #[test]
+    fn the_documented_command_lists_match_the_families() {
+        const DOC: &str = include_str!("../../../docs/capabilities.md");
+        const MANIFEST_DOC: &str = include_str!("../../../docs/manifest.md");
+        let app = test_app();
+        let mut families: std::collections::BTreeMap<String, Vec<String>> = std::collections::BTreeMap::new();
+        for (_, reach) in &app.family_members {
+            let family = reach.split(' ').next().unwrap_or("").to_string();
+            let word = reach.split(' ').nth(1).unwrap_or("").to_string();
+            families.entry(family).or_default().push(word);
+        }
+        assert!(families.len() >= 4, "families did not form: {families:?}");
+
+        for (family, mut words) in families {
+            words.sort();
+            // The row that describes this family, if the reference has one: `| `board` | ...`.
+            let row = DOC.lines().find(|line| {
+                line.starts_with(&format!("| `{family}` |")) || line.starts_with(&format!("| `{family}` | "))
+            });
+            if let Some(row) = row {
+                for word in &words {
+                    assert!(
+                        row.contains(&format!("`{word}`")),
+                        "docs/capabilities.md does not name `{word}` in the `{family}` row"
+                    );
+                }
+                // "in seven commands" must agree with the schema, or the doc is off by one.
+                if let Some(rest) = row.split(" in ").nth(1) {
+                    if let Some((count, _)) = rest.split_once(" command") {
+                        let spelled = match count.trim() {
+                            "one" => 1,
+                            "two" => 2,
+                            "three" => 3,
+                            "four" => 4,
+                            "five" => 5,
+                            "six" => 6,
+                            "seven" => 7,
+                            "eight" => 8,
+                            "nine" => 9,
+                            "ten" => 10,
+                            other => other.parse::<usize>().unwrap_or(usize::MAX),
+                        };
+                        assert_eq!(
+                            spelled,
+                            words.len(),
+                            "the `{family}` row says {count} commands and the schema has {}",
+                            words.len()
+                        );
+                    }
+                }
+            } else {
+                // No row of its own: every command still has to be named somewhere in the
+                // reference, because a driver table is where a person finds it.
+                for word in &words {
+                    assert!(
+                        DOC.contains(&format!("`{word}`")) || MANIFEST_DOC.contains(&format!("`{word}`")),
+                        "neither docs/capabilities.md nor docs/manifest.md names `{word}`, from the `{family}` family"
+                    );
+                }
+            }
+        }
+    }
     #[test]
     fn a_family_declares_helps_and_dispatches_the_same_commands() {
         let mut app = test_app();
@@ -13533,10 +13657,19 @@ mod tests {
             );
 
             // What the model would have been sent for these tools, had they stayed separate.
+            // The definitions are read from the builders rather than from the registry: a name in
+            // `DROPPED_ALIASES` is not registered, and its declaration is exactly what the family
+            // saved, so leaving it out would flatter the family instead of measuring it.
+            let flat: std::collections::BTreeMap<String, ToolDef> = board_tools::always_tools()
+                .into_iter()
+                .chain(board_tools::manifest_tools())
+                .chain(app.devices.tool_defs())
+                .map(|def| (def.spec.name.clone(), def))
+                .collect();
             let replaced: usize = members
                 .iter()
-                .map(|name| {
-                    let def = app.tools.get(name).expect("a member is still registered");
+                .filter_map(|name| flat.get(name))
+                .map(|def| {
                     json!({
                         "type": "function",
                         "function": {
@@ -15095,7 +15228,10 @@ mod tests {
         let mut app = test_app();
 
         let err = app
-            .call_tool("manifest_validate", &json!({ "manifest": [{ "name": "pump_pulse" }] }))
+            .call_tool(
+                "manifest",
+                &json!({ "command": "validate", "arguments": { "manifest": [{ "name": "pump_pulse" }] } }),
+            )
             .unwrap_err();
         let text = err.message;
         for needle in ["must be a JSON object", "devices", "tools", "pump_pulse"] {
@@ -15103,21 +15239,26 @@ mod tests {
         }
 
         let err = app
-            .call_tool("manifest_validate", &json!({ "manifest": { "tools": [{ "name": 7, "exec": {} }] } }))
+            .call_tool("manifest", &json!({ "command": "validate", "arguments": { "manifest": { "tools": [{ "name": 7, "exec": {} }] } } }))
             .unwrap_err();
         assert!(err.message.contains("/tools/0/name"), "no field path: {}", err.message);
         assert!(err.message.contains("devices") && err.message.contains("tools"), "{}", err.message);
 
-        let err = app.call_tool("manifest_validate", &json!({ "manifest": { "tool": [] } })).unwrap_err();
+        let err = app
+            .call_tool(
+                "manifest",
+                &json!({ "command": "validate", "arguments": { "manifest": { "tool": [] } } }),
+            )
+            .unwrap_err();
         assert!(err.message.contains("/tool"), "a typo in a field name must be named: {}", err.message);
 
         // A document of the right shape still validates.
         let ok = app
             .call_tool(
-                "manifest_validate",
-                &json!({ "manifest": { "tools": [{
+                "manifest",
+                &json!({ "command": "validate", "arguments": { "manifest": { "tools": [{
                     "name": "pump_pulse", "params": [],
-                    "exec": { "type": "gpio_write", "pin": 12, "level": 1 } }] } }),
+                    "exec": { "type": "gpio_write", "pin": 12, "level": 1 } }] } } }),
             )
             .unwrap();
         assert_eq!(ok["valid"], true, "{ok}");
