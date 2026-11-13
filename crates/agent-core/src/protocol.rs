@@ -23,9 +23,23 @@ pub struct RpcIn {
     pub is_notification: bool,
 }
 
-/// Parse one JSON-RPC message or a batch array. On a framing error the returned
-/// error carries the null id, because no request id could be recovered.
-pub fn parse(body: &str) -> Result<Vec<RpcIn>, (Option<Value>, i32, String)> {
+pub type RpcError = (Option<Value>, i32, String);
+
+/// Retain the outer framing and each member's validation result. An invalid batch
+/// member must not discard its valid peers or turn an array response into an object.
+#[derive(Debug)]
+pub struct RpcFrame {
+    pub is_batch: bool,
+    pub messages: Vec<Result<RpcIn, RpcError>>,
+}
+
+/// Compatibility seam for callers that need only fully valid requests (including
+/// the single tools/list fast path). Dispatch uses [`parse_frame`] instead.
+pub fn parse(body: &str) -> Result<Vec<RpcIn>, RpcError> {
+    parse_frame(body)?.messages.into_iter().collect()
+}
+
+pub fn parse_frame(body: &str) -> Result<RpcFrame, RpcError> {
     let value: Value =
         serde_json::from_str(body).map_err(|e| (None, code::PARSE_ERROR, format!("invalid JSON: {e}")))?;
     match value {
@@ -33,31 +47,35 @@ pub fn parse(body: &str) -> Result<Vec<RpcIn>, (Option<Value>, i32, String)> {
             if items.is_empty() {
                 return Err((None, code::INVALID_REQUEST, "empty batch".into()));
             }
-            let mut out = Vec::with_capacity(items.len());
-            for item in items {
-                out.push(into_request(item)?);
-            }
-            Ok(out)
+            Ok(RpcFrame { is_batch: true, messages: items.into_iter().map(into_request).collect() })
         }
-        other => Ok(vec![into_request(other)?]),
+        other => Ok(RpcFrame { is_batch: false, messages: vec![into_request(other)] }),
     }
 }
 
-fn into_request(v: Value) -> Result<RpcIn, (Option<Value>, i32, String)> {
-    let id = v.get("id").cloned().filter(|i| !i.is_null());
+fn into_request(v: Value) -> Result<RpcIn, RpcError> {
+    // Null is a legal, if discouraged, id. Only an absent id denotes a notification.
+    // Invalid id shapes cannot be echoed as an id in the error response.
+    let id = v.get("id").filter(|i| i.is_null() || i.is_string() || i.is_number()).cloned();
     let obj = v.as_object().ok_or((id.clone(), code::INVALID_REQUEST, "message is not an object".into()))?;
+    if obj.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
+        return Err((id, code::INVALID_REQUEST, "jsonrpc must be \"2.0\"".into()));
+    }
+    if obj.contains_key("id") && id.is_none() {
+        return Err((None, code::INVALID_REQUEST, "`id` must be a string, number or null".into()));
+    }
     let method = obj
         .get("method")
         .and_then(|m| m.as_str())
         .ok_or((id.clone(), code::INVALID_REQUEST, "missing `method`".into()))?
         .to_string();
-    if let Some(v) = obj.get("jsonrpc") {
-        if v.as_str() != Some("2.0") {
-            return Err((id, code::INVALID_REQUEST, "jsonrpc must be \"2.0\"".into()));
+    if let Some(params) = obj.get("params") {
+        if !params.is_object() && !params.is_array() {
+            return Err((id, code::INVALID_REQUEST, "`params` must be an object or array".into()));
         }
     }
     Ok(RpcIn {
-        is_notification: id.is_none(),
+        is_notification: !obj.contains_key("id"),
         id,
         method,
         params: obj.get("params").cloned().unwrap_or_else(|| json!({})),
@@ -158,6 +176,41 @@ mod tests {
         let e = parse(r#"{"jsonrpc":"1.0","id":1,"method":"ping"}"#).unwrap_err();
         assert_eq!(e.1, code::INVALID_REQUEST);
         assert_eq!(e.0, Some(json!(1)));
+    }
+
+    #[test]
+    fn request_version_id_and_params_are_validated() {
+        for (value, id) in [
+            (json!({"id": 1, "method": "ping"}), Some(json!(1))),
+            (json!({"jsonrpc": "2.0", "id": {}, "method": "ping"}), None),
+            (json!({"jsonrpc": "2.0", "id": [], "method": "ping"}), None),
+            (json!({"jsonrpc": "2.0", "id": true, "method": "ping"}), None),
+            (json!({"jsonrpc": "2.0", "id": "p", "method": "ping", "params": 1}), Some(json!("p"))),
+            (json!({"jsonrpc": "2.0", "id": null, "method": "ping", "params": null}), Some(Value::Null)),
+        ] {
+            let error = parse(&value.to_string()).unwrap_err();
+            assert_eq!(error.0, id, "{value}");
+            assert_eq!(error.1, code::INVALID_REQUEST, "{value}");
+        }
+        assert!(parse(r#"{"jsonrpc":"2.0","id":1,"method":"ping","params":[]}"#).is_ok());
+    }
+
+    #[test]
+    fn null_ids_and_batch_member_errors_retain_their_framing() {
+        let frame = parse_frame(
+            r#"[{"jsonrpc":"2.0","id":null,"method":"ping"},1,{"jsonrpc":"2.0","method":"ping"}]"#,
+        )
+        .unwrap();
+        assert!(frame.is_batch);
+        assert_eq!(frame.messages.len(), 3);
+        let request = frame.messages[0].as_ref().unwrap();
+        assert_eq!(request.id, Some(Value::Null));
+        assert!(!request.is_notification);
+        let error = frame.messages[1].as_ref().unwrap_err();
+        assert_eq!(error.0, None);
+        assert_eq!(error.1, code::INVALID_REQUEST);
+        assert!(frame.messages[2].as_ref().unwrap().is_notification);
+        assert!(!parse_frame(r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#).unwrap().is_batch);
     }
 
     #[test]
