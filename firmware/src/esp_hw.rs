@@ -149,10 +149,8 @@ impl EspHw {
         if let Some(h) = self.devices.get(&(bus, addr)) {
             return Ok(*h);
         }
-        let bus_handle = *self
-            .buses
-            .get(&bus)
-            .ok_or_else(|| McpError::hardware(format!("I2C bus {bus} is not open")))?;
+        let bus_handle =
+            *self.buses.get(&bus).ok_or_else(|| McpError::hardware(format!("I2C bus {bus} is not open")))?;
         let freq = self.bus_pins.get(&bus).map(|b| b.2).unwrap_or(400_000);
         let mut cfg: sys::i2c_device_config_t = unsafe { std::mem::zeroed() };
         cfg.dev_addr_length = sys::i2c_addr_bit_len_t_I2C_ADDR_BIT_LEN_7;
@@ -301,8 +299,7 @@ impl Hardware for EspHw {
         let mut addrs = (host, 0u16)
             .to_socket_addrs()
             .map_err(|e| McpError::hardware(format!("could not resolve `{host}`: {e}")))?;
-        let addr =
-            addrs.next().ok_or_else(|| McpError::hardware(format!("`{host}` resolved to nothing")))?;
+        let addr = addrs.next().ok_or_else(|| McpError::hardware(format!("`{host}` resolved to nothing")))?;
         let ip = match addr.ip() {
             std::net::IpAddr::V4(v4) => v4,
             std::net::IpAddr::V6(_) => return Err(McpError::unsupported("ping supports IPv4 targets only")),
@@ -412,10 +409,8 @@ impl Hardware for EspHw {
     }
 
     fn i2c_scan(&mut self, bus: u8) -> Result<Vec<u8>> {
-        let handle = *self
-            .buses
-            .get(&bus)
-            .ok_or_else(|| McpError::hardware(format!("I2C bus {bus} is not open")))?;
+        let handle =
+            *self.buses.get(&bus).ok_or_else(|| McpError::hardware(format!("I2C bus {bus} is not open")))?;
         let mut found = Vec::new();
         for addr in 0x08u8..=0x77 {
             let first = unsafe { sys::i2c_master_probe(handle, addr as u16, I2C_TIMEOUT_MS) };
@@ -696,10 +691,7 @@ impl Hardware for EspHw {
     }
 
     fn wifi_connect(&mut self, ssid: &str, pw: &str) -> Result<()> {
-        wifi::command(wifi::WifiCmd::Connect {
-            ssid: ssid.to_string(),
-            password: pw.to_string(),
-        })
+        wifi::command(wifi::WifiCmd::Connect { ssid: ssid.to_string(), password: pw.to_string() })
     }
 
     fn reboot(&mut self) {
@@ -726,13 +718,8 @@ impl Hardware for EspHw {
     fn heap_internal(&mut self) -> Option<(u32, u32)> {
         use esp_idf_svc::sys;
         let mut info: sys::multi_heap_info_t = unsafe { std::mem::zeroed() };
-        unsafe {
-            sys::heap_caps_get_info(&mut info, sys::MALLOC_CAP_INTERNAL | sys::MALLOC_CAP_8BIT)
-        };
-        Some((
-            info.total_free_bytes as u32,
-            info.largest_free_block as u32,
-        ))
+        unsafe { sys::heap_caps_get_info(&mut info, sys::MALLOC_CAP_INTERNAL | sys::MALLOC_CAP_8BIT) };
+        Some((info.total_free_bytes as u32, info.largest_free_block as u32))
     }
 
     /// Whether *this* thread can write flash itself: its stack has to be in internal RAM.
@@ -814,8 +801,6 @@ impl Hardware for EspHw {
     }
 }
 
-
-
 // ---------------------------------------------------------------- I2S helpers
 
 /// Create and start one standard-mode I2S channel.
@@ -850,8 +835,7 @@ fn i2s_channel(
         // forever — the amplifier screams until someone sends silence. Clearing the TX
         // buffer after each send makes an interrupted tone decay to silence instead.
         if !rx {
-            chan.__bindgen_anon_1 =
-                sys::i2s_chan_config_t__bindgen_ty_1 { auto_clear_after_cb: true };
+            chan.__bindgen_anon_1 = sys::i2s_chan_config_t__bindgen_ty_1 { auto_clear_after_cb: true };
         }
         let mut handle: sys::i2s_chan_handle_t = std::ptr::null_mut();
         let rc = if rx {
