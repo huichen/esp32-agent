@@ -27,6 +27,8 @@ const S = {
   busy: false,
   sending: false,
   changingConversation: false,
+  /** A cancel is in flight; a second click must not be a second request. */
+  interrupting: false,
   panel: "status",
   afterUnlock: null,
   unlockPromise: null,
@@ -661,7 +663,34 @@ function conversationControls() {
     $(id).disabled = S.changingConversation;
     $(id).setAttribute("aria-busy", String(S.changingConversation));
   }
+  // While a turn runs the field is off and Send becomes Interrupt: typing into a field whose
+  // message would only be queued behind a run reads as if it had been sent.
+  const running = S.busy;
+  $("#input").disabled = running;
+  $("#attach").disabled = running;
   $("#send").disabled = S.changingConversation || S.sending;
+  $("#send").classList.toggle("stop", running);
+  $("#send").setAttribute("aria-label", running ? "Interrupt" : "Send");
+  $("#send").textContent = running ? "\u25a0" : "\u2191";
+  $("#composer").classList.toggle("running", running);
+}
+
+/** Ask the board to stop the turn that is running.
+ *
+ * The stop lands at the next boundary — between model calls or between tool calls — because
+ * a socket already open cannot be withdrawn from here. The page keeps the field disabled
+ * until `run_end`, so a second click is not a second request. */
+async function interruptRun() {
+  if (!S.busy || S.interrupting) return;
+  S.interrupting = true;
+  try {
+    const r = await api("/api/agent/cancel", { method: "POST", body: {} });
+    toast(r && r.cancelling ? "interrupting\u2026" : "nothing to interrupt");
+  } catch (e) {
+    toast(e.message);
+  } finally {
+    S.interrupting = false;
+  }
 }
 
 /** Both the chat-header clear and the Memory controls use this path. A refused POST
@@ -1043,6 +1072,7 @@ function handleEvent(name, data) {
       break;
     case "run_end":
       S.busy = false;
+      conversationControls();
       hideLiveNote();
       liveTrace = null;
       liveBubble = null;
@@ -1570,6 +1600,11 @@ function init() {
 
   $("#composer").onsubmit = (e) => {
     e.preventDefault();
+    // Enter while a turn runs is the interrupt, not a queued message.
+    if (S.busy) {
+      interruptRun();
+      return;
+    }
     send($("#input").value);
   };
 

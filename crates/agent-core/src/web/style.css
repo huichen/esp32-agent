@@ -413,6 +413,19 @@ body {
 .composer .attach:active { transform: scale(0.96); }
 .send:disabled { opacity: 0.45; }
 
+/* Send turns into Interrupt while a turn runs: same button, same place, because the hand is
+   already there and a second control would have to be found first. */
+.send.stop {
+  background: var(--warn);
+  color: #1a1200;
+  font-size: 15px;
+}
+.composer textarea:disabled {
+  color: var(--muted);
+  cursor: not-allowed;
+}
+.composer.running .field { opacity: 0.85; }
+
 /* A message the browser sent but did not get an answer for. The bubble stays where it was
    typed, so the transcript does not silently lose a question, and it says so. */
 .row.user .bubble.failed { border: 1px solid var(--bad); }
