@@ -1,89 +1,51 @@
-# Audio on this board: a WAV, and why not Opus
+# Audio on this board: WAV, scores and streaming playback
 
-The owner asked whether a very small Opus encoder can be written for this board. This
-document answers with arithmetic rather than enthusiasm. The short answer: **no**, and the
-board records WAV while the host encodes. The arithmetic is below, and it says which budget
-is the one that fails, so a future board can be checked against it in a minute.
+The board records short microphone clips as WAV, synthesizes scores, and accepts streaming
+PCM playback. There is **no on-board Opus or ADPCM encoder**. The earlier conclusion that
+Opus could not fit used an obsolete internal-SRAM reading; codec feasibility remains
+unverified, not disproved by that reading.
 
-Nothing here was measured on a fresh build for this document. Every figure is labelled
-`[measured]` (recorded on this bench earlier, with where it came from) or `[estimate]`
-(derived, not built here). The distinction is the point: an `[estimate]` is cheap to
-disagree with, a `[measured]` number is not.
+`[source]` means a configured limit or arithmetic from the implementation. `[measured]`
+numbers are historical bench observations with provenance, not measurements of the audit
+firmware. `[estimate]` means an unbuilt calculation. The final audit source has not been
+flashed or board-tested.
 
 ## 1. What the board has
 
 | Resource | Value | Source |
 |---|---|---|
-| App partition | 3 MiB = 3,145,728 B (`factory`, and the same per `ota_0`/`ota_1`) | `firmware/partitions.csv`, `docs/flashing.md` §3 |
-| Firmware image | 86% of it = ~2,705,000 B, so **~440,000 B free (~430 KiB, 13.6%)** | `[measured]` on this board; `espflash` prints `App size … (86%)` |
-| Internal SRAM free at runtime | **5–6 kB**, and it does not move with the transcript | `[measured]`, `docs/troubleshooting.md`, `README.md` bench numbers |
-| PSRAM free at runtime | ~6.5 MB (6,593 kB at 507 KB of history) | `[measured]`, `docs/troubleshooting.md` |
-| Thread stacks | come from **internal SRAM**, not PSRAM | `docs/troubleshooting.md` ("could not spawn connection thread") |
-| Microphone | 16 kHz, 32-bit slots, left channel, 24 bits used | `[measured]`, `crates/agent-core/src/drivers/audio.rs` |
+| Board | ESP32-S3 N16R8, 16 MiB flash, 8 MiB octal PSRAM, ESP-IDF 5.5.2 | `[source]` `firmware/.cargo/config.toml`, `sdkconfig.defaults` |
+| App partition | `factory`: 4 MiB = 4,194,304 B; no OTA slots or OTA implementation | `[source]` `firmware/partitions.csv`, [flashing](flashing.md#3-partition-table) |
+| Earlier firmware image | ~2,705,000 B, reported as 86% of an older 3 MiB app partition | `[measured]` historical report in `526c8d1` (2026-11-12); not current image size/headroom |
+| Internal SRAM / DMA free | internal 168 kB, DMA 161 kB; largest block 98 kB in each | `[measured]` `93b0579` (2026-11-12), [pool readings](troubleshooting.md#how-much-memory-the-board-has) |
+| PSRAM free | 7901 kB, largest block 7808 kB | `[measured]` same run, not a measurement during maximum audio/history load |
+| Thread stacks | internal for flash/cache-off-sensitive paths; PSRAM allowed for constrained tasks | `[source]` `firmware/src/threads.rs`; DNS uses PSRAM |
+| Microphone | 16 kHz, 32-bit slots, left channel, 24 bits used | `[source]` `crates/agent-core/src/drivers/audio.rs`, `firmware/src/esp_hw.rs` |
 | One tool result | 65,536 B (`agent::MAX_TOOL_RESULT_BYTES`), truncated with a marker past that; `mic_record` sizes its 16,000 samples against it | `crates/agent-core/src/agent.rs` |
 
-The 5–6 kB is not a soft number. TLS already lives close to the edge of it: with ~15 kB free
-the hardware-AES path fails to get a DMA-capable buffer and every record dies with
-`esp-tls-mbedtls: write error :-0x0001` (`docs/troubleshooting.md`, "The portal opens over
-http but not https"). An audio encoder would be competing for the same few kilobytes as the
-thing that talks to the model.
+The earlier 5–6 kB internal-free and 6593 kB PSRAM-at-507-KB-history observations describe
+firmware before allocator fixes (`10b16dd`, 2026-11-11), not current limits. Internal,
+DMA and PSRAM readings answer different questions, and free total is not the largest
+contiguous allocation. Historical TLS allocation failures remain useful diagnoses in
+[troubleshooting](troubleshooting.md#the-portal-opens-over-http-but-not-https).
 
-## 2. What an Opus encoder would cost
+## 2. Codec estimates are not a build result
 
-Opus (RFC 6716) is two codecs in one session: SILK for speech and CELT for everything else,
-plus a hybrid mode. The encoder always runs an internal 48 kHz pipeline; a 16 kHz microphone
-input is resampled up, and a 48 kHz-capable path is part of what "Opus" means. So the cheapest
-honest subset is:
+The original Opus discussion (`526c8d1`, 2026-11-12) estimated code, tables, state, stack
+and CPU without compiling or profiling a codec for this target. It also asserted libopus
+pipeline/subset details without a verified dependency build. Those estimates do not
+establish that an encoder fits, fails to fit, or interoperates with a host decoder.
 
-- **SILK only**, fixed point, mono, and either 8 kHz (narrowband) or 16 kHz (wideband);
-- no CELT, no hybrid, no 48 kHz, no FEC/DTX/VBR knobs.
+Opus and ADPCM remain deferred in [ROADMAP.md](../ROADMAP.md). WAV is the implemented
+microphone format; host encoding avoids introducing an unverified encoder into firmware.
 
-That subset still produces packets a normal `opus_decode` can read — which is exactly why it
-is tempting. The costs:
+## 3. What would establish codec feasibility
 
-| Item | Cost | Basis |
-|---|---|---|
-| Encoder code (SILK encoder, range coder, resampler) | ~30–40 KiB of text | `[estimate]`; libopus is ~70–80 kloc C, `silk/` is ~22 kloc of it |
-| SILK codebooks and tables (NLSF/LSF, pitch lag, LTP, gains, pulse counts) | ~20–30 KiB of rodata | `[estimate]`; these are the tables nobody escapes by writing "a small encoder" |
-| **Flash total** | **~50–70 KiB** | `[estimate]` |
-| Encoder state (`OpusEncoder` + SILK control + resampler) | ~15–30 KiB of heap | `[estimate]`; libopus 1.3 fixed point, not built here |
-| Task stack | ≥ 4 KiB, **internal** | a FreeRTOS task cannot run from PSRAM |
-
-Two further facts about libopus that the table does not show:
-
-1. There is **no supported "SILK-only" build**. `FIXED_POINT` exists, and float can be
-   compiled out, but CELT's state is part of `OpusEncoder` and its tables are linked into the
-   API. A subset means a fork you maintain, not a `-D` flag.
-2. A fork is the maintenance cost this repository's rules are written to avoid: the driver is
-   supposed to stay small enough to read in one sitting (`AGENTS.md` §1, §8).
-
-## 3. Does the subset fit? Flash yes, RAM no
-
-**Flash: it fits, and it is not the blocker.** ~50–70 KiB against ~440,000 B free takes the
-image from 86% to ~88–89% of the partition. Uncomfortable, but inside the partition, and the
-OTA slots are the same 3 MiB so there is no second opinion to consult.
-
-**Internal SRAM: it does not fit, and this is the blocker.**
-
-```
-free internal SRAM           5,000 – 6,000 B
-task stack (internal only)  ≥ 4,096 B          -> at most ~1,900 B left, before any state
-encoder state             15,000 – 30,000 B    -> 3× the total free internal SRAM
-```
-
-The state could live in PSRAM — the transcript already does — but the stack cannot, and the
-5–6 kB that is left is smaller than the stack plus the I2S staging buffers the DMA already
-owns. That is a hard "no", not a "tight": there is no arrangement of the existing allocations
-that finds 15–30 kB of internal RAM on a board that runs the model, TLS, HTTP and the portal
-from the same pool.
-
-CPU is *not* the problem: fixed-point SILK at 16 kHz mono is tens of MHz on a
-Cortex-M4-class core `[estimate, order of magnitude]`, and the ESP32-S3 runs at 240 MHz. The
-problem is that the encode has to be fed by I2S DMA at 32,000 B/s and serviced by a task, and
-there is no task stack to give it.
-
-So: **no encoder was written.** A subset that fits flash cannot be *run* here, and shipping
-half of Opus would be a promise this board cannot keep.
+A codec evaluation needs the exact dependency version/build flags, linked image size
+against the **4 MiB** factory slot, peak heap by capability and largest block, stack
+high-water marks, encode time under concurrent WiFi/TLS/I2S load, and host-decoder checks.
+Cache-off/flash-writing paths must retain internal stacks; enabling PSRAM stacks does not
+make every task safe there. None of these codec measurements has been completed here.
 
 ## 4. What the board does instead: WAV
 
@@ -108,14 +70,16 @@ The header is the canonical 44 bytes (`RIFF`, `WAVE`, one 16-byte `fmt ` chunk f
 16-bit at 16 kHz, `data`), written by `drivers::audio::wav`. The payload it wraps is exactly
 the PCM the tool already produced: the top 16 bits of each 24-bit I2S sample, little-endian.
 
-This replaced the old `pcm_b64` field. One blob, not two: 16,000 samples is 32,000 B of PCM,
-plus the 44-byte header, and base64 turns that into ~42.7 KB of a 64 KB tool result; a second
-copy as raw PCM would add 32 KB and push 75 KB past the cap, cutting the blob mid-base64 —
-the one failure mode that hands a host unreadable bytes. A tool result bigger than the
-history budget it feeds is a cost too: every sample recorded is re-sent with the transcript
-on later turns (~11k tokens for the full second), which is why the schema's *default* is
-still 256 samples and this is a ceiling a caller opts into.
-`the_largest_recording_still_fits_one_tool_result` pins the arithmetic.
+This replaced the old `pcm_b64` field. One blob, not two: 16,000 samples is 32,000 B of PCM
+plus a 44-byte header = **32,044 bytes of WAV / 42,728 bytes of base64**, before JSON
+metadata. A second raw-PCM base64 field would add 42,668 bytes: 85,396 combined bytes
+before metadata, beyond the **65,536-byte** tool-result cap. Truncating that result could
+cut a base64 blob. The accepted maximum fits one result, as checked by
+`the_largest_recording_still_fits_one_tool_result`.
+
+The payload also occupies history and may be re-sent on later turns until trimming or
+compaction. Provider token accounting for audio/base64 is not measured here. The schema's
+*default* remains **256 samples** (16 ms); one second is a ceiling a caller opts into.
 
 Why WAV and not "PCM, figure it out": a host that receives base64 has to guess what it is, and
 the guess that matters is container vs. raw samples. A WAV is unambiguous, needs no codec, and
@@ -123,49 +87,37 @@ every tool that plays audio reads it.
 
 ### What that costs on the wire
 
-| Format | Bytes per second | What one 64 KB tool result carries |
+| Format | Nominal payload bytes per second | Time within a 64 KiB result |
 |---|---|---|
-| WAV, 16 kHz, 16-bit mono | 32,000 | 1 s (16,000 samples; the schema's maximum) |
-| Opus, 16 kbps | 2,000 | 24 s |
-| IMA ADPCM, 4:1 | 8,000 | 6 s |
+| WAV, 16 kHz, 16-bit mono | 32,000 PCM bytes, plus a 44-byte WAV header | implemented maximum 1 s (16,000 samples) |
+| Opus, hypothetical 16 kbps | 2,000, excluding container overhead | about 24 s after base64, before metadata; not implemented |
+| IMA ADPCM, hypothetical 4:1 | 8,000, excluding block/container overhead | about 6 s after base64, before metadata; not implemented |
 
-Raw PCM is 16× bigger than Opus at 16 kbps and 4× bigger than ADPCM — but the binding limit
-here is not bandwidth, it is the 65,536-byte tool result and the kilobytes of internal RAM
-left while TLS is up. A
-compressed stream inside the same cap would carry more *time*, not more audio quality, and it
-would still have to be re-chunked by whoever holds the connection. So the codec is the wrong
-place to spend the budget on this board.
-
-If the pipe ever does bind before the RAM does, the cheap step is **IMA ADPCM** (~40 lines,
-16 bytes of per-channel state, 4:1): it fits in what is left, needs no tables, and is in every
-host. It is **not implemented** — this document proposes it, it does not claim it.
+The compressed rows are `[estimate]` wire arithmetic only, not encoder benchmarks or
+supported `mic_record` modes. Compression could reduce bandwidth and history payload,
+but would still need a verified encoder, framing and host-decoder contract.
 
 ## 5. Recommendation
 
-1. Record on the board as WAV, 16 kHz mono, at most 16,000 samples per call (1 s); encode on
-   the host. That is what `mic_record` does today. Longer audio belongs in `POST /audio/pcm`
-   (§6) or on the host: one second is still a phrase, and the ceiling is the tool result, not
-   the RAM.
-2. Do not attempt an Opus encoder for this board. Flash would fit; internal SRAM would not,
-   by a factor of three, and a forked libopus is a maintenance burden for a chip that cannot
-   run it.
-3. Play a song by streaming PCM into `POST /audio/pcm` (§6), which reads the body as it
-   arrives. Do not grow `speaker_play`: its 2 KB is the tool-result cap, not an oversight.
-4. Play a **tune** as a score (`notes`, §7) when the caller is a model that would otherwise
-   have to produce the samples: a few hundred bytes of `{hz, ms}` against 240 KB of PCM.
-5. Revisit if a board arrives with ~40–50 kB of free internal SRAM *and* a PSRAM-capable task
-   stack (ESP32-P4 class, or DMA that reaches PSRAM): the flash arithmetic above already says
-   the code would fit there.
+1. Record WAV, 16 kHz mono, at most 16,000 samples per call (1 s); encode on the host.
+   Longer microphone-to-file recording is **not implemented**. `POST /audio/pcm` (§6)
+   is playback, not a longer recording route.
+2. Treat on-board Opus/ADPCM as unverified work, not as impossible or already supported.
+3. Play host-held audio through `POST /audio/pcm`, which reads the body as it arrives.
+   `speaker_play.pcm_b64` has a **2048 decoded-byte argument cap**, distinct from the
+   **64 KiB tool-result cap** and **1 MiB buffered HTTP body cap**.
+4. Send a **tune** as `notes` (§7) when the caller would otherwise have to generate samples:
+   a few hundred bytes of score rather than 240,000 bytes of five-second PCM.
+5. Re-evaluate codecs using capability-specific pool/contiguous-block readings and a
+   real target build, not combined free heap or historical allocator failures.
 
 ## 6. Streaming playback: `POST /audio/pcm`
 
-The board could make a tone but not play a song: `speaker_play` carries 2048 bytes, which is
-43 ms at 24 kHz, and every fix along that road runs into the same wall as the encoder — a
-tool result is 2 KB and a request body is 128 KB (`agent::MAX_TOOL_RESULT_BYTES`,
-`http::MAX_BODY_BYTES`), i.e. 1.3 s. Neither is the format's fault; both are the cost of
-holding the bytes somewhere first.
+`speaker_play.pcm_b64` accepts 2048 decoded bytes: 1024 mono samples, about 43 ms at
+24 kHz. This is a tool-argument limit, not the 64 KiB result budget. Ordinary HTTP bodies
+are buffered up to 1 MiB (`http::MAX_BODY_BYTES`); streamed media has separate limits.
 
-So there is one route whose body is not held at all. `POST /audio/pcm` takes raw PCM16LE,
+`POST /audio/pcm` does not materialize the whole body. It takes raw PCM16LE,
 mono, 24 kHz, framed with `Content-Length` or `Transfer-Encoding: chunked`, and hands each
 piece straight to `i2s_out_write` as it arrives:
 
@@ -173,22 +125,20 @@ piece straight to `i2s_out_write` as it arrives:
 |---|---|---|
 | Sample format | PCM16LE, mono, 24000 Hz | `drivers::audio::AMP_RATE_HZ` |
 | One upload | at most **30 s** = 1 440 000 bytes | `AUDIO_STREAM_MAX_BYTES` |
-| Buffer used | two reused `Vec`s, ~3 KB of capacity, no growth per piece | `AudioSink` |
+| Sink buffers | reused byte/sample `Vec`s, initially 1025 + 1024 bytes; socket/stereo/DMA buffers are additional | `[source]` `AudioSink` |
 | New task thread | **none** — the request runs on the accept thread it already owns | `http.rs` |
 | Lock held | one piece at a time (about 1 KB, 21 ms), never for the song | `AudioSink::push` |
 
 The three numbers that matter, in the order they bite:
 
-- **No new stack.** A dedicated audio thread would want the same 6 kB `CONN_STACK` the event
-  streams use, and the boot log already says internal free heap is around 7 kB. The upload
-  therefore runs inline: while one plays, the accept thread is busy and other requests wait
-  in the listen backlog. That is the same trade the sync-melody call makes on the bench
-  firmware, and it is bounded here by the 30 s cap instead of by a task that might not fit.
-- **No body buffer.** 48 KB/s into a `Vec` is not a stream, it is a memory leak with a
-  deadline; the body never becomes one. The socket is throttled by the amplifier, because
-  `i2s_channel_write` blocks until the DMA has taken the piece.
-- **The lock is per piece.** `App` is one mutex, and a handler that held it for a song would
-  stop the portal, `/api/status` and the board's own agent thread for its duration.
+- **No new stack.** The upload runs inline on the accept thread. While it plays, that
+  thread cannot serve a new ordinary request; other sockets wait. Existing event streams
+  have their own threads. Releasing the App mutex does not make the accept loop concurrent.
+- **No whole-body buffer.** PCM arrives at 48,000 bytes/s. The sink reuses piece buffers,
+  and `i2s_channel_write` blocks until DMA accepts them. This is backpressure, not an
+  unbounded song-sized allocation.
+- **The lock is per piece.** The shared `App` mutex is released between I2S writes, so the
+  agent and existing event threads can acquire it between pieces.
 
 Two failures this path has to answer honestly, because both are easy to get wrong:
 
@@ -202,18 +152,22 @@ The amplifier itself needs no new handling: `i2s_out_write` already duplicates m
 slots and clears the TX descriptor afterwards, which is what keeps a finished stream from
 replaying its last DMA buffer forever (the bench bug in `firmware/src/esp_hw.rs`).
 
-What this does **not** do: change the sample rate (the I2S TX clock is the constant
-`AMP_RATE_HZ`, so `?rate=` accepts 24000 only), and hold two uploads at once. Both need a
-`i2s_open_tx(rate)` and a second thread, i.e. RAM this board does not have; they are
-`ROADMAP.md` items, not promises.
+The MIME essence must be exactly `audio/pcm`; parameters are allowed, prefix matches are
+not. Odd final bytes and incomplete HTTP framing return `400` / `ok: false`; a hardware
+write failure returns `500`. Successful responses count samples submitted to the driver,
+not an independently measured acoustic waveform.
+
+What this does **not** do: change the sample rate (`?rate=` accepts 24000 only), capture
+a microphone stream, or serve two uploads concurrently. Those require additional
+implementation/measurement, not a conclusion that no task could ever fit.
 
 ## 7. Playing a melody: send the score, not the samples
 
 §6 streams PCM, and for audio a host already holds that is the right answer. A melody is the
 other case: the bytes do not exist until the *caller* writes them, and here the caller is a
-model. Five seconds at 24 kHz is 240,000 bytes — 320,000 as base64, twice the request body
-and some 80,000 tokens of base64 to get wrong. A tune is therefore something the caller can
-*describe*, not something it can carry.
+model. Five seconds at 24 kHz is 240,000 bytes — 320,000 as base64, far beyond this tool's
+2048 decoded-byte argument cap even though below the buffered HTTP limit. A tune is
+something the caller can *describe* without generating that payload.
 
 | Form | What the caller sends | Audio it plays |
 |---|---|---|
@@ -223,9 +177,8 @@ and some 80,000 tokens of base64 to get wrong. A tune is therefore something the
 
 So the score is not a way around the body cap — §6 already has that — it is a way around
 having to produce the audio at all. `{hz, ms}` is ~25 bytes of JSON, so a fourteen-note tune
-is a few hundred bytes, and the board synthesizes it into **one contiguous buffer** which
-reaches I2S in **one write**. Nothing crosses the network between two notes, so there is
-nothing to be heard there.
+is a few hundred bytes, and the board synthesizes it into **one contiguous mono buffer**
+for back-to-back playback. There is no separate network round trip between notes.
 
 ```json
 {"notes": [{"hz": 523, "ms": 400}, {"hz": 523, "ms": 400}, {"hz": 784, "ms": 400}], "volume": 30}
@@ -235,11 +188,11 @@ nothing to be heard there.
 
 | Limit | Value | Why |
 |---|---|---|
-| Notes per call | 64 | a 64-note score is still under a kilobyte of JSON |
+| Notes per call | 64 | bounded score parsing; exact JSON size depends on formatting |
 | One note | 20–2000 ms, 0–8000 Hz | 20 ms keeps the 2 ms articulation ramp from swallowing the note; 8000 Hz is `speaker_tone`'s ceiling |
 | Whole melody | 12000 ms | 288,000 samples = 576,000 B of mono PCM |
-| Handed to the DMA | 288,000 stereo slots = 1,152,000 B | the driver duplicates each sample into both slots (see §1 of `drivers/audio.rs`) |
-| Peak heap while playing | ~1,728,000 B (~1.65 MiB) | mono buffer + the stereo copy, both in PSRAM — 21% of the 7.9 MB free. `[estimate]`: the arithmetic, not measured |
+| Stereo staging per I2S write | 4 bytes × mono samples in that write | `[source]` `esp_hw.rs::i2s_out_write` duplicates each `i16` into two slots |
+| Chunked-playback arithmetic | a 4096-sample write stages 16,384 bytes; mono + that staging = 592,384 bytes at 12 s | `[estimate]` conditional on the caller's chunk bound; excludes score, request, allocator and DMA overhead, not a measured peak |
 | Arguments on the wire | a few hundred bytes | this is the point |
 | Binary write needed? | **no** | the score is JSON; nothing has to be stored as a file |
 
@@ -252,21 +205,21 @@ samples are inserted or skipped, and the buffer is exactly the sum of the note l
 ### The text workspace
 
 This workspace stores text: `write` writes text files, so a rendered `.wav` cannot be kept
-here, and "render a file, then play the file" is not a path this repository has (a `.wav`
-is also 240,000 bytes for five seconds, twice the `pcm_b64` cap before base64 makes it
-worse). The score form needs no file at all — the melody lives in the tool call and dies
-with it. A host that *does* hold bytes still has `pcm_b64` for the 43 ms it is good for.
+here, and "render a file, then play the file" is not a path this repository has (five
+seconds at the amplifier rate is 240,000 PCM bytes plus a 44-byte WAV header, far beyond
+the `pcm_b64` argument cap before base64). The score form needs no file at all — the
+melody lives in the tool call and dies with it. A host that *does* hold bytes still has `pcm_b64` for the 43 ms it is good for.
 
 ### What it costs elsewhere
 
-The write blocks until every sample is queued, so a tool call occupies the board for the
-length of the melody: `/api/status` and every other tool wait for up to 12 s behind it. §6
-takes the lock once per ~21 ms piece instead of once per tune; this takes it for the whole
-melody, which is the price of the single write and the reason the cap is 12 s rather than
-"as long as you like".
+This tool holds the App lock across synthesis/playback, so `/api/status` and other tools
+wait for it to return. The 12 s limit is score duration, not a wall-clock latency deadline.
+§6 releases the lock between pieces; this tool does not, even if I2S is fed in pieces.
+Chunking a write does not release the tool call's App lock.
 
 The tool result carries `synth_ms` and `write_ms` so the split is measured rather than
-guessed. `[measured]` on this board, repeated runs within a few ms:
+guessed. `[measured]` historical bench timings recorded with `f95bbba` (2026-11-12),
+not re-run on the audit source:
 
 | Melody | Samples | `synth_ms` | `write_ms` | Wall clock of the call |
 |---|---|---|---|---|
@@ -276,28 +229,27 @@ guessed. `[measured]` on this board, repeated runs within a few ms:
 
 Two things are worth reading off that table:
 
-- **`write_ms` is the audio's own length**, to within one DMA ring (16.7 ms). The write
-  therefore never stalls: nothing was dropped for want of room and nothing was inserted
-  waiting for it. That is what "no gap between the notes" means here — not that the gaps
-  are short, but that the stream is never interrupted.
+- `write_ms` was close to the audio duration in those runs. That is evidence of pacing
+  for those clips, not proof of gap-free output for every score or of current maximum-load
+  behavior.
 - The first version of this used `f32::sin` per sample and `synth_ms` was **1,915** for the
   same 14 notes, so the call took 6,779 ms to play 4,800 ms of music: the board spent 40%
   of the tune on float maths and answered nothing while it did. The table oscillator is
   11× cheaper, which is why it is there rather than for elegance. It costs 4 KB of flash
   (1,025 `f32` entries); the app partition went from 87.08% to 87.24% of 3 MiB with it.
-  `[measured]`: `espflash` prints `App/part. size` on every flash.
+  `[measured]` historical percentages of the then-3-MiB partition (`f95bbba`, 2026-11-12),
+  not current factory-slot usage.
 
 ## 8. Sound with a picture: `POST /av`
 
 The bench board played a 30 s clip with its animation on the 128x32 OLED: PCM down one TCP
-port, one frame per MCP `display` call out of the other. That pairing needs two things this
-board does not have at once — a speaker on a task of its own, and an HTTP thread free while
-the song plays — so the same content travels here as **one body**, and the order of the
-records is the synchronisation.
+port, one frame per MCP `display` call out of the other. The current server has no
+background audio task and one ordinary accept thread, so this route carries the content
+as **one body**; record order is the synchronisation.
 
 | Record | Payload | What the board does |
 |---|---|---|
-| `A` | PCM16LE mono at 24 kHz | `i2s_out_write`, which blocks for exactly that much audio |
+| `A` | even-length PCM16LE mono at 24 kHz | blocking `i2s_out_write`; driver submission is the pacing source |
 | `F` | 512 bytes (128x32) or 1024 (128x64), 1-bpp page format | `oled_bitmap`, so a 512-byte frame lands in the top half of a 64-row panel |
 | `E` | nothing | end of the stream |
 
@@ -315,8 +267,18 @@ python tools/av_push.py --audio clip.pcm --frames clip.1bpp --host <ip> --fps 12
 The costs are §6's costs: no new thread (the request runs where requests already run), no
 body buffer (records are parsed as they arrive, into two reused buffers), and the App mutex
 taken once per record rather than for the song. The limits differ in one place — audio is
-still capped at 30 s per body, while the body as a whole may reach 1.9 MB, which is 30 s of
-audio plus 512 KB of frames (30 s of 12 fps at 128x32 is 186 KB).
+still capped at **30 s / 1,440,000 bytes**, while the whole body is capped at
+**1,964,288 bytes**: audio plus a **512 KiB** bitmap/framing allowance. A 12-fps,
+30-second strip of 512-byte frames is 184,320 payload bytes, before record headers.
+
+Use MIME essence `application/x-esp32-av` or `application/octet-stream`. Each record has
+a three-byte `tag | u16le length` header. `E` must have length zero. An incomplete final
+header/payload is `400` / `ok: false` even if HTTP framing completes; a hardware failure
+is `500`. Ending on a complete record boundary without `E` is accepted (`ended: false`);
+bytes following a valid `E` are ignored.
+
+`[measured]` historical bench record in `e7a9623` (2026-11-12): 30.00 s of audio,
+362 frames, 30.19 s wall clock; audio alone 30.03 s. These are not final-audit benchmarks.
 
 Two things this does not do. Frames cannot run *ahead* of the audio: one way, in order, so
 seeking, looping or overlaying means a second body. And the panel's row count is not guessed
@@ -327,7 +289,8 @@ wrong (see `docs/adding-a-device.md`, or set `pins: {"oled.height": 32}`).
 ## 9. How to check these numbers again
 
 - Flash: `espflash flash --partition-table firmware/partitions.csv --target-app-partition
-  factory <elf>` prints `App size … (N%)`; compare N with 86%.
+  factory <elf>` prints `App size … (N%)`; record bytes and percent against the current
+  4 MiB slot, together with the source commit/profile. This command flashes a board.
 - Internal SRAM at runtime: the `mem:` lines the firmware logs at boot, and `/api/status`
   (`docs/troubleshooting.md`).
 - The WAV itself: call `mic_record` over `/mcp`, write `wav_b64` to a file after
@@ -335,13 +298,15 @@ wrong (see `docs/adding-a-device.md`, or set `pins: {"oled.height": 32}`).
   sample count the tool reported.
 - The stream route (§6): `sox` a known 10 s clip to raw PCM16 mono at 24 kHz, `POST` it to
   `/audio/pcm` with `Transfer-Encoding: chunked`, and compare the answer's `ms` with 10000 —
-  then watch `/api/status`'s `free_heap_kb` before and after, which must not have moved. A
-  `samples` count short of `bytes / 2` means a piece was cut; `ok: false` names why.
+  then record internal/DMA/PSRAM free and largest-block readings before, during and after
+  repeated uploads. Combined free heap alone is not the allocation budget. A `samples`
+  count short of `bytes / 2` means a piece was cut; `ok: false` names why.
 - The melody route (§7): call `speaker_play` with `notes` over `/mcp` and time the call. Its
-  `ms` field and the wall clock should agree to within a few tens of milliseconds (the last
-  16.7 ms of audio is still in the DMA ring when the call returns, so the call ends slightly
-  *early*, never late), and `write_ms` should equal `ms` — a write that took longer than the
-  audio means the stream ran dry and was refilled.
+  `ms` field is the score duration; wall clock also includes synthesis, scheduling and
+  request overhead. Record `synth_ms`, `write_ms`, total latency and pool/stack peaks.
+  Check the actual output for completeness/gaps rather than inferring them from timing
+  alone. Verify the largest I2S piece from the current caller before using the staging
+  arithmetic above.
 - The picture: `python tools/av_push.py --audio clip.pcm --frames clip.1bpp --dry-run` prints
   how many records and bytes a clip becomes; a real run answers with `frames` equal to the
   strip's count and `ms` equal to the audio's length. If the OLED snows, its `height` is
