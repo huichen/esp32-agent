@@ -412,6 +412,25 @@ body {
   z-index: 16;
 }
 #pull-hint.show { opacity: 1; transform: translateX(-50%) translateY(0); }
+#pull-hint .spinner { display: none; }
+/* A refresh that takes a second needs a sign of life: the hint stays up, the words change,
+   and the ring turns until the answer arrives (or the request fails and says so). */
+#pull-hint.refreshing .spinner {
+  display: inline-block;
+  width: 11px;
+  height: 11px;
+  margin-right: 7px;
+  vertical-align: -1px;
+  border: 2px solid var(--line);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: pull-spin 0.8s linear infinite;
+}
+@keyframes pull-spin { to { transform: rotate(360deg); } }
+/* Whoever prefers less motion gets the words without the ring. */
+@media (prefers-reduced-motion: reduce) {
+  #pull-hint.refreshing .spinner { animation: none; border-top-color: var(--muted); }
+}
 
 /* ---- sheets (menu, login) ------------------------------------------------ */
 
