@@ -781,7 +781,13 @@ mod tests {
         assert_eq!(read["lines"][1], "LEGACY");
         board.reset();
         let result = app
-            .call_tool("speaker_play", &json!({"notes": [{"hz": 440, "ms": 200}, {"hz": 523, "ms": 200}]}))
+            .call_tool(
+                "audio",
+                &json!({
+                    "command": "speaker_play",
+                    "arguments": {"notes": [{"hz": 440, "ms": 200}, {"hz": 523, "ms": 200}]}
+                }),
+            )
             .unwrap();
         assert_eq!(result["notes"], 2);
         assert_eq!(result["ms"], 400);

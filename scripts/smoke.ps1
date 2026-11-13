@@ -4,7 +4,7 @@
   manifest change, and the board-side range check.
 .DESCRIPTION
   Starts esp32-agent-sim on a free port, waits for /api/status, then walks the flow a
-  model would: tools/list -> manifest_apply -> tools/list -> tool call -> an
+  model would: tools/list -> manifest apply -> tools/list -> tool call -> an
   out-of-range call that must be refused. Exits non-zero if any step fails.
 #>
 param(
@@ -90,7 +90,7 @@ try {
    "exec":{"type":"rgb","pin":48,"color":{"param":"color"}}}
 ]}}
 '@
-  $applied = Rpc ('{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"manifest_apply","arguments":' + $manifest + '}}')
+  $applied = Rpc ('{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"manifest","arguments":{"command":"apply","arguments":' + $manifest + '}}}')
   Write-Host ("apply -> " + $applied.result.structuredContent.applied + ", added: " + ($applied.result.structuredContent.tools_added -join ',')) -ForegroundColor DarkGray
   Check 'manifest applied without a restart' { $applied.result.structuredContent.applied -eq $true }
 
@@ -111,9 +111,9 @@ try {
   $missing = Rpc '{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"lcd_text","arguments":{"text":"hi"}}}'
   Check 'a tool for absent hardware is not callable' { $missing.result.isError -eq $true }
 
-  $schema = Rpc '{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"manifest_describe","arguments":{"section":"schema"}}}'
-  $exec = Rpc '{"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"manifest_describe","arguments":{"section":"exec"}}}'
-  Check 'manifest_describe hands the model a schema and the exec types' {
+  $schema = Rpc '{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"manifest","arguments":{"command":"describe","arguments":{"section":"schema"}}}}'
+  $exec = Rpc '{"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"manifest","arguments":{"command":"describe","arguments":{"section":"exec"}}}}'
+  Check 'manifest describe hands the model a schema and the exec types' {
     $schema.result.structuredContent.manifest_schema.properties.tools -ne $null -and
     $exec.result.structuredContent.primitives.Count -ge 8
   }

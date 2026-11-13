@@ -62,7 +62,7 @@ same order an MCP client sees in `tools/list`.
 
 `every_tool_reaches_the_model_in_one_shape_and_a_predictable_order` and
 `the_tool_list_is_byte_identical_for_the_same_board` pin it. Manifest tools are not kept
-in a block of their own, so a mid-turn `manifest_apply` moves only the entries it
+in a block of their own, so a mid-turn `manifest {command: "apply"}` moves only the entries it
 touches.
 
 ## 3. Whose endpoint and whose key

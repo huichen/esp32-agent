@@ -96,7 +96,11 @@ pub(crate) fn tool_error_with_arguments(
             .map(|entry| crate::tool::argument_names(&entry["function"]["parameters"]))
             .unwrap_or_default()
     };
-    if available.is_empty() {
+    // A family is `command` + `arguments`, and that pair is never what the caller got wrong:
+    // the command's own fields are, and `help` prints those. Offering the family's two fields
+    // as "the available arguments" would send a model looking in the wrong place.
+    let family_shaped = available.contains("command (required)") && available.contains("arguments");
+    if available.is_empty() || family_shaped {
         error.message
     } else {
         format!("{}; available: {available}", error.message)
@@ -1702,23 +1706,35 @@ mod tests {
     fn led_argument_errors_name_the_missing_field_and_available_arguments() {
         let mut app = test_board();
         for (tool, source, available) in [
-            ("led_set", r##"tool("led_set", {rgb: "#00ff00"})"##, "available: color (required)"),
+            (
+                "led_set",
+                r##"tool("indicators", {command: "led_set", arguments: {rgb: "#00ff00"}})"##,
+                "available: color (required)",
+            ),
             (
                 "led_blink",
-                r##"tool("led_blink", {rgb: "#00ff00"})"##,
+                r##"tool("indicators", {command: "led_blink", arguments: {rgb: "#00ff00"}})"##,
                 "available: color (required), ms?, times?",
             ),
         ] {
-            let direct = app.call_tool(tool, &json!({"rgb": "#00ff00"})).unwrap_err();
+            let direct = app
+                .call_tool("indicators", &json!({ "command": tool, "arguments": {"rgb": "#00ff00"} }))
+                .unwrap_err();
             let error = app.call_tool("script", &json!({"source": source})).unwrap_err();
             assert_eq!(direct.code, crate::error::code::INVALID_PARAMS);
             assert_eq!(error.code, direct.code, "the hint must not change the error code");
             assert!(error.message.contains("`color` (colour) is required"), "{tool}: {}", error.message);
-            assert!(error.message.contains(available), "{tool}: {}", error.message);
             assert!(!error.message.contains("rgb?"), "{tool} invented an accepted spelling");
+            // The accepted fields belong to the command, and `help` prints them: a family's
+            // own two fields are not what the caller got wrong.
+            assert!(!error.message.contains("available: command"), "{tool}: {}", error.message);
+            let _ = available;
         }
         let outcome = app
-            .call_tool("script", &json!({"source": r##"tool("led_set", {color: "#00ff00"})"##}))
+            .call_tool(
+                "script",
+                &json!({"source": r##"tool("indicators", {command: "led_set", arguments: {color: "#00ff00"}})"##}),
+            )
             .expect("the named argument succeeds");
         assert_eq!(outcome["result"]["color"], "#00ff00");
     }
@@ -1726,16 +1742,27 @@ mod tests {
     #[test]
     fn oled_argument_errors_name_the_missing_field_and_available_arguments() {
         let mut app = test_board();
-        let direct = app.call_tool("oled_text", &json!({"value": "HI"})).unwrap_err();
-        let error =
-            app.call_tool("script", &json!({"source": r#"tool("oled_text", {value: "HI"})"#})).unwrap_err();
+        let direct = app
+            .call_tool("display", &json!({ "command": "oled_text", "arguments": {"value": "HI"} }))
+            .unwrap_err();
+        let error = app
+            .call_tool(
+                "script",
+                &json!({"source": r#"tool("display", {command: "oled_text", arguments: {value: "HI"}})"#}),
+            )
+            .unwrap_err();
         assert_eq!(direct.code, crate::error::code::INVALID_PARAMS);
         assert_eq!(error.code, direct.code, "the hint must not change the error code");
         assert!(error.message.contains("`text` (string) is required"), "{}", error.message);
-        assert!(error.message.contains("available: text (required), clear?, line?, x?"), "{}", error.message);
         assert!(!error.message.contains("value?"), "oled_text invented an accepted spelling");
+        assert!(!error.message.contains("available: command"), "{}", error.message);
+        let help = app.call_tool("display", &json!({ "command": "help" })).unwrap();
+        assert!(help.to_string().contains("oled_text"), "the fields are one `help` away: {help}");
         let outcome = app
-            .call_tool("script", &json!({"source": r#"tool("oled_text", {text: "HI"})"#}))
+            .call_tool(
+                "script",
+                &json!({"source": r#"tool("display", {command: "oled_text", arguments: {text: "HI"}})"#}),
+            )
             .expect("the named argument succeeds");
         assert_eq!(outcome["result"]["ok"], true);
     }
@@ -1792,7 +1819,10 @@ mod tests {
         let direct = app.call_tool("led_set", &json!({"color": "#00ff00"})).unwrap_err();
         assert_eq!(direct.code, code::FORBIDDEN);
         let error = app
-            .call_tool("script", &json!({"source": r##"tool("led_set", {color: "#00ff00"})"##}))
+            .call_tool(
+                "script",
+                &json!({"source": r##"tool("indicators", {command: "led_set", arguments: {color: "#00ff00"}})"##}),
+            )
             .unwrap_err();
         assert!(error.message.contains("disabled"), "{}", error.message);
         assert!(!error.message.contains("available:"), "{}", error.message);

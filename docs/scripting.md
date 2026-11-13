@@ -141,5 +141,5 @@ its file edits reached flash; check the `store` object in `GET /api/status` for 
 outcomes.
 
 Integers stay integers across the tool boundary (`address: 60`, not `60.0`), so copying a
-number from a tool result into `manifest_apply` does not create a spurious `u8` validation
+number from a tool result into `manifest {command: "apply"}` does not create a spurious `u8` validation
 failure.
