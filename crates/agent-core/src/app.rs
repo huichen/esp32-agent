@@ -12317,6 +12317,14 @@ mod tests {
                     "`indicators` does not say what a colour looks like: {description}"
                 );
             }
+            // A shape buried after a sentence is still a shape (`a melody, played back to back in
+            // one buffer: [{hz, ms}, ...]`) - and clipping before looking for it threw it away.
+            if family == "audio" {
+                assert!(
+                    description.contains("{hz"),
+                    "`audio` does not say what a note looks like: {description}"
+                );
+            }
             assert!(
                 !description.contains("lists what each takes"),
                 "`{family}` still asks the model to spend a call on `help`: {description}"
