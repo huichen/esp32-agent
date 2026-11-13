@@ -13,13 +13,23 @@ const END_OF_CENTRAL: u32 = 0x0605_4b50;
 /// Refuse anything that would not fit through a 2 KB tool result anyway, with room for
 /// the base64 wrapper.
 const MAX_TOTAL: usize = 3 * 1024;
+/// Empty entries and long names consume memory too, independently of payload size.
+const MAX_ENTRIES: usize = 128;
+
+fn valid_name(name: &str) -> bool {
+    !name.is_empty()
+        && !name.starts_with('/')
+        && !name.contains(['\\', ':'])
+        && !name.chars().any(char::is_control)
+        && !name.split('/').any(|part| part == "..")
+}
 
 fn u16_at(data: &[u8], at: usize) -> Option<u16> {
-    Some(u16::from_le_bytes(data.get(at..at + 2)?.try_into().ok()?))
+    Some(u16::from_le_bytes(data.get(at..at.checked_add(2)?)?.try_into().ok()?))
 }
 
 fn u32_at(data: &[u8], at: usize) -> Option<u32> {
-    Some(u32::from_le_bytes(data.get(at..at + 4)?.try_into().ok()?))
+    Some(u32::from_le_bytes(data.get(at..at.checked_add(4)?)?.try_into().ok()?))
 }
 
 /// Build a ZIP from `(name, bytes)` pairs, stored.
@@ -27,15 +37,18 @@ pub fn write(entries: &[(String, Vec<u8>)]) -> Result<Vec<u8>, String> {
     let mut out = Vec::with_capacity(4096);
     let mut central: Vec<(String, u32, u32, u32)> = Vec::new(); // name, crc, size, offset
     for (name, bytes) in entries {
-        if name.is_empty() || name.starts_with('/') || name.contains("..") {
+        if !valid_name(name) {
             return Err(format!("`{name}` is not a relative path inside the archive"));
         }
-        let offset = out.len() as u32;
+        if name.len() > u16::MAX as usize || entries.len() > u16::MAX as usize {
+            return Err("zip: name or entry count exceeds the ZIP32 format".into());
+        }
+        let offset = u32::try_from(out.len()).map_err(|_| "zip: archive exceeds ZIP32")?;
         let crc = zlib::crc32(bytes);
-        let size = bytes.len() as u32;
+        let size = u32::try_from(bytes.len()).map_err(|_| "zip: entry exceeds ZIP32")?;
         out.extend_from_slice(&LOCAL_HEADER.to_le_bytes());
         out.extend_from_slice(&20u16.to_le_bytes()); // version needed
-        out.extend_from_slice(&0u16.to_le_bytes()); // flags
+        out.extend_from_slice(&0x0800u16.to_le_bytes()); // UTF-8 names
         out.extend_from_slice(&0u16.to_le_bytes()); // method: stored
         out.extend_from_slice(&0u16.to_le_bytes()); // time
         out.extend_from_slice(&0u16.to_le_bytes()); // date
@@ -48,12 +61,12 @@ pub fn write(entries: &[(String, Vec<u8>)]) -> Result<Vec<u8>, String> {
         out.extend_from_slice(bytes);
         central.push((name.clone(), crc, size, offset));
     }
-    let central_start = out.len() as u32;
+    let central_start = u32::try_from(out.len()).map_err(|_| "zip: archive exceeds ZIP32")?;
     for (name, crc, size, offset) in &central {
         out.extend_from_slice(&CENTRAL_HEADER.to_le_bytes());
         out.extend_from_slice(&20u16.to_le_bytes()); // version made by
         out.extend_from_slice(&20u16.to_le_bytes()); // version needed
-        out.extend_from_slice(&0u16.to_le_bytes()); // flags
+        out.extend_from_slice(&0x0800u16.to_le_bytes()); // UTF-8 names
         out.extend_from_slice(&0u16.to_le_bytes()); // method
         out.extend_from_slice(&0u16.to_le_bytes()); // time
         out.extend_from_slice(&0u16.to_le_bytes()); // date
@@ -69,7 +82,7 @@ pub fn write(entries: &[(String, Vec<u8>)]) -> Result<Vec<u8>, String> {
         out.extend_from_slice(&offset.to_le_bytes());
         out.extend_from_slice(name.as_bytes());
     }
-    let central_size = out.len() as u32 - central_start;
+    let central_size = u32::try_from(out.len()).map_err(|_| "zip: archive exceeds ZIP32")? - central_start;
     out.extend_from_slice(&END_OF_CENTRAL.to_le_bytes());
     out.extend_from_slice(&0u16.to_le_bytes()); // this disk
     out.extend_from_slice(&0u16.to_le_bytes()); // disk with central
@@ -89,7 +102,11 @@ pub fn read(data: &[u8]) -> Result<Vec<(String, Vec<u8>)>, String> {
     let floor = data.len().saturating_sub(66 * 1024);
     let mut at = data.len().saturating_sub(22);
     loop {
-        if at + 4 <= data.len() && u32_at(data, at) == Some(END_OF_CENTRAL) {
+        if u32_at(data, at) == Some(END_OF_CENTRAL)
+            && u16_at(data, at + 20).is_some_and(|comment| {
+                at.checked_add(22).and_then(|end| end.checked_add(comment as usize)) == Some(data.len())
+            })
+        {
             eocd = Some(at);
             break;
         }
@@ -99,58 +116,101 @@ pub fn read(data: &[u8]) -> Result<Vec<(String, Vec<u8>)>, String> {
         at -= 1;
     }
     let eocd = eocd.ok_or("not a zip archive: no end-of-central-directory record")?;
-    let count = u16_at(data, eocd + 10).ok_or("zip: truncated directory")? as usize;
-    let dir_size = u32_at(data, eocd + 12).ok_or("zip: truncated directory")? as usize;
-    let dir_start = u32_at(data, eocd + 16).ok_or("zip: truncated directory")? as usize;
-    if dir_start + dir_size > data.len() {
+    let end = data.get(eocd..eocd + 22).ok_or("zip: truncated directory")?;
+    let count = u16_at(end, 10).ok_or("zip: truncated directory")? as usize;
+    if u16_at(end, 4) != Some(0) || u16_at(end, 6) != Some(0) || u16_at(end, 8) != Some(count as u16) {
+        return Err("zip: multi-disk archives are not supported".into());
+    }
+    if count > MAX_ENTRIES {
+        return Err(format!("zip: more than {MAX_ENTRIES} entries"));
+    }
+    let dir_size = u32_at(end, 12).ok_or("zip: truncated directory")? as usize;
+    let dir_start = u32_at(end, 16).ok_or("zip: truncated directory")? as usize;
+    let dir_end = dir_start.checked_add(dir_size).ok_or("zip: directory offset overflow")?;
+    if dir_end > eocd {
         return Err("zip: central directory is past the end of the archive".into());
     }
+    let directory = data.get(dir_start..dir_end).ok_or("zip: bad directory range")?;
 
     let mut out = Vec::new();
-    let mut cursor = dir_start;
+    let mut cursor = 0usize;
     let mut total = 0usize;
+    let mut names_total = 0usize;
     for _ in 0..count {
-        if u32_at(data, cursor) != Some(CENTRAL_HEADER) {
+        let entry = directory.get(cursor..).ok_or("zip: truncated entry")?;
+        if u32_at(entry, 0) != Some(CENTRAL_HEADER) {
             return Err("zip: bad central directory entry".into());
         }
-        let method = u16_at(data, cursor + 10).ok_or("zip: truncated entry")?;
-        let crc = u32_at(data, cursor + 16).ok_or("zip: truncated entry")?;
-        let compressed = u32_at(data, cursor + 20).ok_or("zip: truncated entry")? as usize;
-        let name_len = u16_at(data, cursor + 28).ok_or("zip: truncated entry")? as usize;
-        let extra_len = u16_at(data, cursor + 30).ok_or("zip: truncated entry")? as usize;
-        let comment_len = u16_at(data, cursor + 32).ok_or("zip: truncated entry")? as usize;
-        let local = u32_at(data, cursor + 42).ok_or("zip: truncated entry")? as usize;
-        let name = String::from_utf8_lossy(
-            data.get(cursor + 46..cursor + 46 + name_len).ok_or("zip: truncated name")?,
-        )
-        .to_string();
+        let flags = u16_at(entry, 8).ok_or("zip: truncated entry")?;
+        let method = u16_at(entry, 10).ok_or("zip: truncated entry")?;
+        if !matches!(method, 0 | 8) {
+            return Err(format!("zip: compression method {method} is not supported"));
+        }
+        if flags & (1 | 0x40 | 0x2000) != 0 {
+            return Err("zip: encrypted entries are not supported".into());
+        }
+        let crc = u32_at(entry, 16).ok_or("zip: truncated entry")?;
+        let compressed = u32_at(entry, 20).ok_or("zip: truncated entry")? as usize;
+        let uncompressed = u32_at(entry, 24).ok_or("zip: truncated entry")? as usize;
+        let remaining = MAX_TOTAL - total;
+        if uncompressed > remaining || (method == 0 && compressed > remaining) {
+            return Err(format!("zip: entries total more than {MAX_TOTAL} bytes"));
+        }
+        let name_len = u16_at(entry, 28).ok_or("zip: truncated entry")? as usize;
+        let extra_len = u16_at(entry, 30).ok_or("zip: truncated entry")? as usize;
+        let comment_len = u16_at(entry, 32).ok_or("zip: truncated entry")? as usize;
+        if u16_at(entry, 34) != Some(0) {
+            return Err("zip: multi-disk entries are not supported".into());
+        }
+        let local = u32_at(entry, 42).ok_or("zip: truncated entry")? as usize;
+        names_total += name_len;
+        if names_total > MAX_TOTAL {
+            return Err("zip: entry names exceed the memory budget".into());
+        }
+        let name_bytes = entry.get(46..46 + name_len).ok_or("zip: truncated name")?;
+        let name = std::str::from_utf8(name_bytes).map_err(|_| "zip: name is not UTF-8")?;
+        if !valid_name(name) {
+            return Err(format!("`{name}` is not a relative path inside the archive"));
+        }
+        let entry_len = 46 + name_len + extra_len + comment_len;
+        entry.get(..entry_len).ok_or("zip: truncated entry fields")?;
 
-        // The local header repeats the name and extra fields, so the data starts after them.
-        if u32_at(data, local) != Some(LOCAL_HEADER) {
+        // Keep local offsets inside the data area, before doing any arithmetic on them.
+        let local_header = data
+            .get(..dir_start)
+            .and_then(|area| area.get(local..))
+            .ok_or("zip: local header is past the data area")?;
+        if u32_at(local_header, 0) != Some(LOCAL_HEADER) {
             return Err(format!("zip: bad local header for `{name}`"));
         }
-        let local_name = u16_at(data, local + 26).ok_or("zip: truncated local header")? as usize;
-        let local_extra = u16_at(data, local + 28).ok_or("zip: truncated local header")? as usize;
-        let start = local + 30 + local_name + local_extra;
+        if u16_at(local_header, 6) != Some(flags) || u16_at(local_header, 8) != Some(method) {
+            return Err(format!("zip: local flags or method disagree for `{name}`"));
+        }
+        let local_name = u16_at(local_header, 26).ok_or("zip: truncated local header")? as usize;
+        let local_extra = u16_at(local_header, 28).ok_or("zip: truncated local header")? as usize;
+        if local_header.get(30..30 + local_name) != Some(name_bytes) {
+            return Err(format!("zip: local name disagrees for `{name}`"));
+        }
+        let start = 30 + local_name + local_extra;
+        let raw_end = start.checked_add(compressed).ok_or("zip: payload offset overflow")?;
         let raw =
-            data.get(start..start + compressed).ok_or_else(|| format!("zip: `{name}` runs past the end"))?;
-
+            local_header.get(start..raw_end).ok_or_else(|| format!("zip: `{name}` runs past the end"))?;
         let bytes = match method {
             0 => raw.to_vec(),
-            8 => zlib::inflate(raw).map_err(|e| format!("zip: `{name}`: {e}"))?,
-            other => {
-                return Err(format!("zip: `{name}` uses compression method {other}, which is not supported"))
-            }
+            _ => zlib::inflate_limited(raw, remaining).map_err(|e| format!("zip: `{name}`: {e}"))?,
         };
+        if bytes.len() != uncompressed {
+            return Err(format!("zip: `{name}` output length disagrees with its directory entry"));
+        }
         if zlib::crc32(&bytes) != crc {
             return Err(format!("zip: `{name}` failed its CRC check"));
         }
         total += bytes.len();
-        if total > MAX_TOTAL {
-            return Err(format!("zip: entries total more than {MAX_TOTAL} bytes"));
-        }
-        out.push((name, bytes));
-        cursor += 46 + name_len + extra_len + comment_len;
+        out.push((name.to_string(), bytes));
+        cursor += entry_len;
+    }
+    if cursor != directory.len() {
+        return Err("zip: directory size disagrees with its entry count".into());
     }
     Ok(out)
 }
@@ -197,6 +257,8 @@ mod tests {
         let entries = vec![("a.txt".to_string(), b"hello".to_vec())];
         let archive = write(&entries).expect("writes");
         let mut commented = archive.clone();
+        let eocd = commented.len() - 22;
+        commented[eocd + 20..eocd + 22].copy_from_slice(&9u16.to_le_bytes());
         commented.extend_from_slice(b"a comment");
         assert_eq!(read(&commented).expect("a comment is allowed"), entries);
 
@@ -241,6 +303,26 @@ mod tests {
         let archive = write(&entries).expect("writes");
         let err = read(&archive).err().expect("too much to unpack");
         assert!(err.contains("more than"), "{err}");
+
+        let mut archive = write(&[("a.txt".to_string(), b"hello".to_vec())]).unwrap();
+        let central = archive.windows(4).position(|w| w == CENTRAL_HEADER.to_le_bytes()).unwrap();
+        archive[central + 24..central + 28].copy_from_slice(&4u32.to_le_bytes());
+        assert!(read(&archive).is_err(), "a declared output length must agree with the payload");
+
+        // A lying central length cannot let a deflate stream expand beyond the
+        // remaining archive budget. The raw stream is one stored deflate block.
+        let len = (MAX_TOTAL + 1) as u16;
+        let mut raw = vec![1];
+        raw.extend_from_slice(&len.to_le_bytes());
+        raw.extend_from_slice(&(!len).to_le_bytes());
+        raw.extend_from_slice(&vec![b'x'; len as usize]);
+        let mut bomb = write(&[("a.txt".to_string(), raw)]).unwrap();
+        let central = bomb.windows(4).position(|w| w == CENTRAL_HEADER.to_le_bytes()).unwrap();
+        bomb[8..10].copy_from_slice(&8u16.to_le_bytes());
+        bomb[central + 10..central + 12].copy_from_slice(&8u16.to_le_bytes());
+        bomb[central + 24..central + 28].copy_from_slice(&1u32.to_le_bytes());
+        let err = read(&bomb).err().expect("deflate expansion is bounded even with a lying header");
+        assert!(err.contains("output larger than 3072"), "{err}");
     }
 
     /// A path that is absolute, empty or climbs out of the archive is not a name inside it,
@@ -248,7 +330,7 @@ mod tests {
     /// directory it is unpacked into.
     #[test]
     fn a_name_outside_the_archive_is_refused_when_writing() {
-        for bad in ["", "/etc/passwd", "../secret", "a/../../b"] {
+        for bad in ["", "/etc/passwd", "../secret", "a/../../b", "..\\secret", "C:/secret", "x\0y"] {
             let err = write(&[(bad.to_string(), b"x".to_vec())]).err().expect("not a relative name");
             assert!(err.contains("relative path"), "{bad}: {err}");
         }
@@ -281,6 +363,12 @@ mod tests {
         corrupt[30 + name_len] = b'j'; // one byte of the stored payload
         let err = read(&corrupt).err().expect("a corrupted entry is not a file");
         assert!(err.contains("CRC"), "{err}");
+
+        let mut traversal = archive.clone();
+        let central = traversal.windows(4).position(|w| w == CENTRAL_HEADER.to_le_bytes()).unwrap();
+        traversal[30..35].copy_from_slice(b"../xx");
+        traversal[central + 46..central + 51].copy_from_slice(b"../xx");
+        assert!(read(&traversal).is_err(), "reader paths obey the writer's safety contract");
     }
 
     /// The same for a deflated entry: the decompressed bytes are what the CRC covers.
