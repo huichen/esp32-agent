@@ -25,7 +25,7 @@ works towards an objective on its own between turns.
   "skip verification" switch. Inbound traffic — the portal and `/mcp` — is a separate
   listener; port 80 stays open by default and 443 serves the same routes with the
   board's own certificate. See [security](security.md).
-- **Bounded everything.** History ring (at most 256 messages / 512 KB), one user message
+- **Bounded everything.** History ring (at most 1,024 messages / 2 MB), one user message
   32 KB, reasoning 4 KB, tool result 64 KB (cut with `...(truncated)`), model reply 32 KB,
   `agent.max_steps` model calls per turn (`0` = no limit, capped at 200 when set),
   `agent.tick_ms` clamped to 200-5000 (default 1000).
