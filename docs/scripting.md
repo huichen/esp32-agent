@@ -71,7 +71,7 @@ if len(scan.addresses) > 0 { "found" } else { "nothing" }
 | Operators | `+ - * / %`, `== != < <= > >=`, `and or not`, unary `-` |
 | Builtins | `len`, `str`, `num`, `type`, `log`, `print`, `echo`, `sleep(ms)`, `tool(name, args)` |
 | Comments | `#` and `//` |
-| Maps | `{a: 1}` reads like JSON; `{a = 1}` also parses |
+| Maps | `{a: 1}` reads like JSON; `{a = 1}` also parses. A map where a statement starts (`{a: 1}` as the last line) is the map, not a block: a `{` followed by `key:` is always one |
 
 `for` iterates list values, map keys or string characters. `return` exits the current
 function (or the whole script at top level), including from a `while`, `for` or nested
