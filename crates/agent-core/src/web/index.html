@@ -68,12 +68,15 @@
   <!-- Ordered by how often a person needs it, and only five: devices, tools, the agent
        itself, the workspace it reads and writes, and what it is set to. The schedule lives
        inside Agent (it queues turns for the same agent) and the log inside Settings (it is
-       the other thing to look at when the board misbehaves). -->
+       the other thing to look at when the board misbehaves). Terminal sits after Files
+       because it is the same kind of thing — a way to poke the board by hand — and it is
+       the only panel that talks to the board through `/mcp` instead of a REST route. -->
   <nav class="tabs" role="tablist">
     <button role="tab" data-panel="devices" aria-selected="true">Devices</button>
     <button role="tab" data-panel="tools">Tools</button>
     <button role="tab" data-panel="agent">Agent</button>
     <button role="tab" data-panel="files">Files</button>
+    <button role="tab" data-panel="terminal">Terminal</button>
     <button role="tab" data-panel="settings">Settings</button>
   </nav>
   <div class="sheet-body">
@@ -187,6 +190,28 @@
         <h3 id="files-viewer-name">File</h3>
         <pre id="files-viewer" class="log"></pre>
         <div class="buttons"><button id="files-back" class="btn ghost">Close</button></div>
+      </div>
+    </div>
+
+    <div id="panel-terminal" class="panel" hidden>
+      <div class="card term-card">
+        <div class="term-head">
+          <h3>Terminal</h3>
+          <span id="term-state" class="term-state">shell</span>
+          <button id="term-clear" class="btn ghost term-clear" type="button">Clear</button>
+        </div>
+        <!-- One screen, scrolled by itself: the sheet body scrolls too, and a transcript that
+             grows the page makes the prompt a moving target on a phone. -->
+        <div id="term-screen" class="term-screen" tabindex="-1">
+          <div id="term-out" class="term-out" role="log" aria-live="polite" aria-label="Terminal output"></div>
+          <form id="term-form" class="term-line" autocomplete="off">
+            <span class="term-prompt" aria-hidden="true">&#8250;</span>
+            <input id="term-input" class="term-input" type="text" enterkeyhint="go"
+                   aria-label="Command" placeholder="type help"
+                   autocapitalize="off" autocorrect="off" spellcheck="false">
+          </form>
+        </div>
+        <p class="hint">One command line, run on the board through the <code>shell</code> tool: pipes, redirection, no <code>&amp;&amp;</code> or <code>$( )</code>. <code>help</code> explains the rest; <code>!name {json}</code> calls any tool.</p>
       </div>
     </div>
 
