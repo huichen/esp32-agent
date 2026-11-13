@@ -889,7 +889,9 @@ impl App {
             }
         }
         for (family, subs) in families {
-            let summary = format!("{family}: {} commands", subs.len());
+            let summary = board_tools::family_summary(family)
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("{family}: {} commands", subs.len()));
             tools.register(Family::new(family, summary, subs).into_tool().device_tool());
         }
         self.family_members = members;
@@ -1855,7 +1857,7 @@ impl App {
         }
         value["saved"] = json!(false);
         value["queued"] = json!(true);
-        value["persistence_note"] = json!("applied in RAM; queue admission is not storage acknowledgement. This call did not wait for publication; check the store object in GET /api/status for outcomes");
+        value["persistence_note"] = json!("applied in RAM; queue admission is not storage acknowledgement. This call did not wait for publication: `board status` reports the store's `pending`, `failed` and `last_failure`");
         value
     }
 
@@ -1904,6 +1906,13 @@ impl App {
         };
         let elapsed = started.elapsed().as_millis() as u64;
         let result = self.note_tool_overrun(name, result, budget, elapsed);
+        // Counted here, not inside the dispatch: a call that takes a fast path (a file, the
+        // shell, a script, a clip) returns before `call_tool_inner`'s tail, so every one of
+        // those eleven tools was invisible in `counters` and `per_tool` — a board that had
+        // served 100 calls reported 70, and the missing ones were exactly the tools a caller
+        // watches. An overrun counts as a failure, because that is what the caller got.
+        self.runtime.record_tool_call(name, result.is_ok());
+        self.settle();
         // The outer deadline comes back whatever the result was, or a refused call would
         // leave the next one with a budget that has already been spent.
         self.tool_deadline = outer;
@@ -2158,9 +2167,35 @@ impl App {
             };
             (def.handler)(&mut ctx, args)
         };
-        self.runtime.record_tool_call(name, out.is_ok());
-        self.settle();
         out
+    }
+
+    /// Take the store's own counters, without the backend lock.
+    ///
+    /// `pending`, `written`, `failed` and `last_failure` are the queue's own state; `space`
+    /// is left out on purpose, because that one is sampled on the writer's thread
+    /// ([`StoreSpaceSample`]) to keep the lock order one-way (store, then App).
+    fn sample_store(&mut self) {
+        let queue = &self.store_queue;
+        let pending = queue.pending();
+        let written = queue.written();
+        let failed = queue.failed();
+        let last_failure = match queue.last_failure() {
+            Some(refusal) => json!({
+                "key": refusal.key,
+                "op": refusal.op.as_str(),
+                "err": refusal.code,
+                "err_name": refusal.name,
+                "at_ms": refusal.at_ms,
+            }),
+            None => Value::Null,
+        };
+        self.runtime.store_stats = json!({
+            "pending": pending,
+            "written": written,
+            "failed": failed,
+            "last_failure": last_failure,
+        });
     }
 
     /// Queue the config for the store writer.
@@ -2197,6 +2232,11 @@ impl App {
     /// Work owed after a call or a request: persist, rebuild, notice a restart.
     pub fn settle(&mut self) {
         self.invalidate_tool_specs();
+        // A tool that writes (a file, the config, the schedule) answers "queued" and leaves the
+        // outcome to the store writer. Nothing else samples it for the tools, so the reading is
+        // taken here, on the only thread that owns both — `board status` then has an answer to
+        // "did the change reach flash?" that an MCP caller can actually see.
+        self.sample_store();
         let manifest_changed = self.runtime.manifest_dirty;
         if manifest_changed {
             self.runtime.manifest_dirty = false;
@@ -2864,6 +2904,7 @@ impl App {
     /// Returns the sources that were queued, in order.
     pub fn sched_tick(&mut self, at_ms: u64, minute_of_day: u32) -> Vec<String> {
         let mut fired = Vec::new();
+        let mut spent: Vec<String> = Vec::new();
         let mut dirty = false;
         for i in 0..self.tasks.len() {
             if !self.tasks[i].enabled || !crate::sched::due(&self.tasks[i], at_ms, minute_of_day) {
@@ -2872,6 +2913,13 @@ impl App {
             let source = format!("schedule:{}", self.tasks[i].id);
             let prompt = self.tasks[i].prompt.clone();
             let script = self.tasks[i].script.clone();
+            // A one-shot is done the moment it fires: "in ten seconds" is not a task the
+            // caller should have to remember to remove, and a task left behind would fire
+            // again on its next interval. Removed after the loop, because the loop is walking
+            // these indices.
+            if self.tasks[i].after_s > 0 {
+                spent.push(self.tasks[i].id.clone());
+            }
             self.tasks[i].last_run_ms = at_ms;
             dirty = true;
             if source.len() >= 64 {
@@ -2889,6 +2937,12 @@ impl App {
                 self.queue_user(&prompt, &source, at_ms);
                 self.log.info("agent", format!("queued {source}"));
                 fired.push(source);
+            }
+        }
+        if !spent.is_empty() {
+            self.tasks.retain(|t| !spent.contains(&t.id));
+            for id in &spent {
+                self.log.info("agent", format!("schedule: one-shot `{id}` fired and was removed"));
             }
         }
         let mut due_rules: Vec<(usize, String, String)> = Vec::new();
@@ -6607,6 +6661,7 @@ fn task_json(t: &ScheduledTask) -> Value {
         "id": t.id,
         "prompt": t.prompt,
         "script": t.script,
+        "after_s": t.after_s,
         "every_s": t.every_s,
         "at_hhmm": t.at_hhmm,
         "enabled": t.enabled,
@@ -6647,10 +6702,12 @@ fn schedule_string_fields(v: &Value, names: &[&str]) -> Result<()> {
 pub(crate) fn task_from_api(v: &Value, fallback_id: &str) -> Result<ScheduledTask> {
     schedule_string_fields(v, &["id", "prompt", "script", "at_hhmm"])?;
     let every_s = crate::json::optional_ranged_i64(v, "every_s", 0, 86_400)?.unwrap_or(0) as u32;
+    let after_s = crate::json::optional_ranged_i64(v, "after_s", 0, 86_400)?.unwrap_or(0) as u32;
     crate::json::optional_ranged_u64(v, "last_run_ms", 0, u64::MAX)?;
     let mut task = task_from(v, fallback_id)
         .ok_or_else(|| McpError::invalid_params("a task requires `prompt` or `script`"))?;
     task.every_s = every_s;
+    task.after_s = after_s;
     if let Some(why) = task_problem(&task) {
         return Err(McpError::invalid_params(why));
     }
@@ -6688,6 +6745,7 @@ fn task_from(v: &Value, fallback_id: &str) -> Option<ScheduledTask> {
     Some(ScheduledTask {
         id,
         prompt,
+        after_s: v.get("after_s").and_then(|a| a.as_u64()).unwrap_or(0).min(u32::MAX as u64) as u32,
         every_s: v.get("every_s").and_then(|e| e.as_u64()).unwrap_or(0).min(u32::MAX as u64) as u32,
         at_hhmm: v.get("at_hhmm").and_then(|a| a.as_str()).unwrap_or("").trim().to_string(),
         script: v.get("script").and_then(|s| s.as_str()).unwrap_or("").to_string(),
@@ -6706,8 +6764,19 @@ fn task_from(v: &Value, fallback_id: &str) -> Option<ScheduledTask> {
 /// What makes an edited task unusable, if anything. The scheduler needs exactly
 /// one trigger, and `at_hhmm` has to be a time a clock can reach.
 fn task_problem(t: &ScheduledTask) -> Option<String> {
+    if t.after_s > 0 {
+        // "in ten seconds" and "every ten seconds" are different requests; picking one
+        // silently is how a one-shot turns into a task that fires every ten seconds forever.
+        if t.every_s > 0 || !t.at_hhmm.is_empty() {
+            return Some(
+                "a one-shot task takes `after_s` alone: drop `every_s` and `at_hhmm` for a task that fires once"
+                    .to_string(),
+            );
+        }
+        return None;
+    }
     if t.every_s == 0 && t.at_hhmm.is_empty() {
-        return Some("a task needs `every_s` > 0 or `at_hhmm` (\"07:30\")".to_string());
+        return Some("a task needs `after_s` > 0, `every_s` > 0 or `at_hhmm` (\"07:30\")".to_string());
     }
     if !t.at_hhmm.is_empty() && !valid_hhmm(&t.at_hhmm) {
         return Some(format!("`at_hhmm` must be \"HH:MM\" between 00:00 and 23:59, got \"{}\"", t.at_hhmm));
@@ -11623,6 +11692,45 @@ mod tests {
         );
     }
 
+    /// A one-shot task: the caller names it, it fires once on its own clock and then it is gone
+    /// — and a caller that asks for "in ten seconds" and "every ten seconds" at once is told
+    /// to pick one instead of silently getting a task that repeats forever.
+    #[test]
+    fn a_one_shot_task_fires_once_and_removes_itself() {
+        let mut app = test_app();
+        let added = app
+            .call_tool("schedule", &json!({"action":"add","id":"later","prompt":"say hi","after_s":5}))
+            .unwrap();
+        assert_eq!(added["id"], json!("later"), "the caller's id was not kept: {added}");
+        assert_eq!(added["one_shot"], json!(true), "{added}");
+
+        // The tool stamps the task's clock now, so a tick at the current instant must not fire it.
+        let now = crate::app::now_ms();
+        assert!(app.sched_tick(now, 0).is_empty(), "fired in the turn that created it");
+        let fired = app.sched_tick(now + 6_000, 0);
+        assert_eq!(fired, vec!["schedule:later".to_string()]);
+        assert!(
+            app.tasks.iter().all(|t| t.id != "later"),
+            "a one-shot task stayed behind and would fire again: {:?}",
+            app.tasks.iter().map(|t| t.id.clone()).collect::<Vec<_>>()
+        );
+
+        // Refusals: a duplicate id, a one-shot combined with a repeat, and an unaddressable id.
+        app.call_tool("schedule", &json!({"action":"add","id":"taken","prompt":"x","every_s":60})).unwrap();
+        for bad in [
+            json!({"action":"add","id":"taken","prompt":"y","every_s":60}),
+            json!({"action":"add","prompt":"y","after_s":30,"every_s":60}),
+            json!({"action":"add","prompt":"y","after_s":30,"at_hhmm":"07:30"}),
+            json!({"action":"add","prompt":"y","after_s":0}),
+            json!({"action":"add","id":"two words","prompt":"y","every_s":60}),
+        ] {
+            let before = app.tasks.clone();
+            let err = app.call_tool("schedule", &bad).unwrap_err();
+            assert_eq!(err.code, code::INVALID_PARAMS, "{bad}: {err:?}");
+            assert_eq!(app.tasks, before, "{bad} mutated the schedule");
+        }
+    }
+
     #[test]
     fn schedule_replacement_is_atomic_on_invalid_members_duplicates_and_caps() {
         let mut app = test_app();
@@ -13771,6 +13879,40 @@ mod tests {
         }
     }
 
+    /// A refusal has to name the words the schema accepts.
+    ///
+    /// The family keeps its commands under their inner names (`board_status`) and answers to
+    /// the short ones (`status`). The refusal used to list the inner names, so a caller that
+    /// retried with the word it had just been told to use was refused again — measured on the
+    /// board, where `board restart` answered "the commands are board_status, board_config_get, …"
+    /// while the schema offered `status` and `config_get`.
+    #[test]
+    fn a_refused_family_command_names_the_words_the_schema_accepts() {
+        let mut app = test_app();
+        let spec = ToolHost::tool_specs(&app)
+            .as_array()
+            .expect("array")
+            .iter()
+            .find(|t| t["function"]["name"] == "board")
+            .cloned()
+            .expect("the board family");
+        let declared: Vec<String> = spec["function"]["parameters"]["properties"]["command"]["enum"]
+            .as_array()
+            .expect("enum")
+            .iter()
+            .map(|v| v.as_str().unwrap_or_default().to_string())
+            .collect();
+        let err = app.call_tool("board", &json!({ "command": "restart" })).unwrap_err();
+        assert!(err.message.contains("no command `restart`"), "{err:?}");
+        for word in ["status", "chip_temp", "logs_tail"] {
+            assert!(declared.contains(&word.to_string()), "the schema lost `{word}`: {declared:?}");
+            assert!(err.message.contains(word), "the refusal does not name `{word}`: {err:?}");
+        }
+        for inner in ["board_status", "board_config_get"] {
+            assert!(!err.message.contains(inner), "the refusal names `{inner}`: {err:?}");
+        }
+    }
+
     #[test]
     fn tools_list_only_shows_detected_hardware() {
         let mut app = test_app();
@@ -14577,6 +14719,62 @@ mod tests {
     /// Every thread in `/api/status` carries the stack it has left at its deepest point —
     /// the reading that decides whether a stack constant can come down. Without it the
     /// answer is "guess and watch for a reboot".
+    /// Counting has to cover every tool, not only the ones that reach the registry.
+    ///
+    /// `call_tool_inner` returns early for the file, shell, script and clip tools, so those
+    /// eleven returned before the counter was incremented: a board that had served about a
+    /// hundred calls reported 70, and the names missing from `per_tool` were exactly the ones
+    /// an operator watches.
+    #[test]
+    fn every_tool_call_reaches_the_counters() {
+        let mut app = test_app();
+        let calls: [(&str, Value); 5] = [
+            ("write", json!({"path": "/counted.txt", "text": "one"})),
+            ("read", json!({"path": "/counted.txt"})),
+            ("edit", json!({"path": "/counted.txt", "find": "one", "replace": "two"})),
+            ("shell", json!({"command": "echo counted"})),
+            ("script", json!({"source": "1 + 1"})),
+        ];
+        let before = app.runtime.counters_json();
+        for (name, args) in &calls {
+            app.call_tool(name, args).unwrap_or_else(|e| panic!("{name}: {e:?}"));
+        }
+        let after = app.runtime.counters_json();
+        for (name, _) in &calls {
+            assert!(
+                after["per_tool"][name].as_u64().unwrap_or(0)
+                    > before["per_tool"][name].as_u64().unwrap_or(0),
+                "`{name}` was served but is missing from the counters: {}",
+                after["per_tool"]
+            );
+        }
+        assert_eq!(
+            after["tool_calls"].as_u64().unwrap() - before["tool_calls"].as_u64().unwrap(),
+            calls.len() as u64,
+            "the aggregate disagrees with `per_tool`: {after}"
+        );
+    }
+
+    /// The one reading a writing tool leaves open: did the queued change reach flash?
+    ///
+    /// `write` and `edit` answer `saved: false` and point at the store's own counters. Those
+    /// lived on `/api/status` only, which is a portal route — an agent driving the board
+    /// through MCP was told to check something it had no way to read.
+    #[test]
+    fn board_status_reports_what_the_store_owes() {
+        let mut app = test_app();
+        app.call_tool("write", &json!({"path": "/saved.txt", "text": "x"})).unwrap();
+        let status = app.call_tool("board", &json!({"command": "status"})).unwrap();
+        let store = &status["store"];
+        assert!(store["pending"].is_number(), "board_status has no store reading: {status}");
+        assert!(store["failed"].is_number(), "{status}");
+        assert!(store["written"].is_number(), "{status}");
+        assert!(
+            store["pending"].as_u64().unwrap() >= 1,
+            "a write that was only queued has to show as owed work: {store}"
+        );
+    }
+
     #[test]
     fn status_reports_each_threads_stack_headroom() {
         let mut app = test_app();

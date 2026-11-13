@@ -46,6 +46,14 @@ impl Family {
         self.subs.iter().map(|d| d.spec.name.as_str()).collect()
     }
 
+    /// The words a caller types inside the family, in the order `help` lists them.
+    ///
+    /// What an error message has to name: the schema enum, `help` and a refusal all have to
+    /// speak the same language, and the inner names (`board_status`) are not in the schema.
+    pub fn command_words(&self) -> Vec<String> {
+        self.subs.iter().map(|d| Self::command_word(&d.spec.name, self.name)).collect()
+    }
+
     /// The command words inside the family: `manifest apply` answers to `apply`.
     ///
     /// The inner tools keep their full names in the registry, so a script written before
@@ -138,7 +146,7 @@ impl Family {
         if command.is_empty() {
             return Err(McpError::invalid_params(format!(
                 "`command` is required: one of {} (or `help`)",
-                self.commands().join(", ")
+                self.command_words().join(", ")
             )));
         }
         let Some(sub) = self.subs.iter().find(|d| Self::command_word(&d.spec.name, self.name) == command)
@@ -146,7 +154,7 @@ impl Family {
             return Err(McpError::invalid_params(format!(
                 "no command `{command}` in `{}`; the commands are {} (or `help`)",
                 self.name,
-                self.commands().join(", ")
+                self.command_words().join(", ")
             )));
         };
         let inner = match args.get("arguments") {
