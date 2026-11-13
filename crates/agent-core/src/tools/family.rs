@@ -198,18 +198,32 @@ fn argument_hints(schema: &Value) -> String {
     for (name, spec) in props {
         let kind = spec.get("type").and_then(Value::as_str).unwrap_or("any");
         let mark = if required.contains(&name.as_str()) { "" } else { "?" };
-        let note = spec.get("description").and_then(Value::as_str).map(clip_note).unwrap_or_default();
         // Only a note that shows the value's *shape*: `#rrggbb`, `{hz: 523, ms: 400}`, `[r,g,b]`.
         // A sentence about what the field means belongs in `help`; a family that repeats every
         // sentence is bigger than the tools it replaced, which is the one thing grouping exists
-        // to avoid (a test enforces that budget).
-        if note.contains('#') || note.contains('{') || note.contains('[') {
-            parts.push(format!("{name}{mark}: {kind} ({note})"));
-        } else {
-            parts.push(format!("{name}{mark}: {kind}"));
+        // to avoid (a test enforces that budget). The shape is found *before* clipping: a note
+        // like "a melody, played back to back in one buffer: [{hz, ms}, ...]" opens with prose and
+        // ends with the only part worth the bytes.
+        match spec.get("description").and_then(Value::as_str).and_then(shape_of) {
+            Some(shape) => parts.push(format!("{name}{mark}: {kind} ({shape})")),
+            None => parts.push(format!("{name}{mark}: {kind}")),
         }
     }
     parts.join(", ")
+}
+
+/// The part of a note that says what the value looks like, cut short.
+///
+/// `#rrggbb, or an [r,g,b] array` and `a melody, played back to back in one buffer: [{hz, ms}, ...]`
+/// both carry the shape after some prose, and the prose is what does not fit in a family line.
+fn shape_of(note: &str) -> Option<String> {
+    let start = note.find(['#', '[', '{'])?;
+    let shape = clip_note(&note[start..]);
+    if shape.is_empty() {
+        None
+    } else {
+        Some(shape)
+    }
 }
 
 /// An argument's note, cut to the part that says what the value looks like.
