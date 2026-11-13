@@ -882,3 +882,95 @@ pre.log {
 }
 .modal-actions button.ghost { background: var(--bg-soft); color: var(--text); font-weight: 500; }
 .modal-actions button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+/* ---- terminal: the board's shell, on a phone ----------------------------- */
+
+/* A screen, not a card: inset, its own scroll, and a faint wash at the top so the eye knows
+   where the output starts when it is full. The panel's own body scrolls too, and a transcript
+   that grew the page would move the prompt under the thumb. */
+.term-card { display: flex; flex-direction: column; gap: 8px; }
+.term-head { display: flex; align-items: center; gap: 8px; }
+.term-head h3 { margin: 0; flex: 1; }
+
+.term-state {
+  font: 11px/1 ui-monospace, Menlo, Consolas, monospace;
+  letter-spacing: 0.3px;
+  color: var(--muted);
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: 4px 9px;
+  white-space: nowrap;
+}
+.term-state.busy { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 45%, var(--line)); }
+.term-state.bad { color: var(--bad); border-color: color-mix(in srgb, var(--bad) 45%, var(--line)); }
+
+button.btn.term-clear { padding: 6px 11px; font-size: 12px; }
+
+.term-screen {
+  height: min(54vh, 420px);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: 10px 10px 8px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: linear-gradient(color-mix(in srgb, var(--accent) 7%, transparent), transparent 46px), var(--bg);
+  font-family: ui-monospace, Menlo, Consolas, monospace;
+  font-size: 12.5px;
+  line-height: 1.5;
+  color: var(--text);
+  scrollbar-width: thin;
+  scrollbar-color: var(--line) transparent;
+}
+.term-screen::-webkit-scrollbar { width: 8px; }
+.term-screen::-webkit-scrollbar-thumb { background: var(--line); border-radius: 8px; }
+.term-screen:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+.term-out { display: flex; flex-direction: column; gap: 1px; }
+
+/* The command as it was typed, on the line it was typed on. */
+.term-echo { display: flex; gap: 6px; margin-top: 6px; }
+.term-echo:first-child { margin-top: 0; }
+.term-echo .term-cmd { color: var(--text); font-weight: 600; overflow-wrap: anywhere; }
+
+.term-prompt { color: var(--accent); user-select: none; }
+/* The prompt blinks while the field has focus: on a phone the caret is the only thing that
+   moves, and a terminal should look like one. */
+.term-line:focus-within .term-prompt { animation: term-blink 1.15s steps(1, end) infinite; }
+
+.term-text {
+  margin: 0 0 6px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  color: color-mix(in srgb, var(--text) 82%, var(--muted));
+}
+.term-text.term-note { color: var(--muted); }
+.term-text.term-err { color: var(--bad); }
+/* JSON, told apart: a key is the map's name, a string is a value, a number is a reading. */
+.term-text .j-key { color: var(--accent); }
+.term-text .j-str { color: color-mix(in srgb, var(--ok) 78%, var(--muted)); }
+.term-text .j-num { color: var(--warn); }
+.term-text .j-lit { color: color-mix(in srgb, var(--accent) 70%, var(--muted)); }
+
+.term-line { display: flex; align-items: center; gap: 6px; margin-top: 6px; }
+.term-line.running { opacity: 0.55; }
+/* Two classes deep on purpose: the panel's own `input[type="text"]` rule (padding, border,
+   radius, background) outranks a single class, and a terminal whose prompt sits in a rounded
+   box reads as a form field, not as a command line. */
+.term-screen .term-input {
+  flex: 1;
+  min-width: 0;
+  padding: 2px 0;
+  border: 0;
+  outline: 0;
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  caret-color: var(--accent);
+}
+.term-screen .term-input::placeholder { color: var(--muted); opacity: 0.75; }
+.term-screen .term-input:focus-visible { outline: none; }
+
+@keyframes term-blink { 50% { opacity: 0.15; } }
+@media (prefers-reduced-motion: reduce) {
+  .term-line:focus-within .term-prompt { animation: none; }
+}
