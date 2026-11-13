@@ -1412,6 +1412,10 @@ impl App {
                     "name": t["name"],
                     "state": t["state"],
                     "priority": t["priority"],
+                    // Which core the task sits on. Not every platform schedules (the host
+                    // has one, the simulator says 0), which is why it is passed through
+                    // rather than invented here.
+                    "core": t["core"],
                     // One decimal: a 4 KB stack's answer has to be readable as 2.1, not 2.
                     "high_water_kb": t["stack_free_bytes"]
                         .as_u64()
@@ -14575,6 +14579,7 @@ mod tests {
         assert_eq!(threads[0]["high_water_kb"], json!(2.0));
         for t in threads {
             assert!(t["high_water_kb"].as_f64().is_some(), "every thread needs a high-water reading: {t}");
+            assert!(t["core"].as_i64().is_some(), "every thread has to say which core it is on: {t}");
         }
     }
 
