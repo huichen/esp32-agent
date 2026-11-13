@@ -772,6 +772,12 @@ impl KvStore for QueuedStore {
     fn whole_value_bytes(&self) -> Option<usize> {
         self.queue.whole_value_bytes()
     }
+
+    /// Forwarded for the same reason: "how much room is left" is a question about the backend,
+    /// and `StoreQueue`'s copy is the one sampled at the last flush.
+    fn space(&self) -> Option<StoreSpace> {
+        self.queue.space()
+    }
 }
 
 /// In-memory store: used by tests and by a simulator run started without a
