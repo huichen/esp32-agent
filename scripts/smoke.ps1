@@ -118,8 +118,10 @@ try {
     $exec.result.structuredContent.primitives.Count -ge 8
   }
 
-  $sessions = Invoke-RestMethod "http://127.0.0.1:$Port/api/sessions" -TimeoutSec 5
-  Check 'sessions were tracked' { $sessions.sessions.Count -ge 1 }
+  # The count, not a session list: `/api/status` already carries it, and a second route for
+  # the same number was a second thing to keep true.
+  $status = Invoke-RestMethod "http://127.0.0.1:$Port/api/status" -TimeoutSec 5
+  Check 'sessions were tracked' { $status.mcp.sessions -ge 1 }
 
   $tools = Invoke-RestMethod "http://127.0.0.1:$Port/api/tools" -TimeoutSec 5
   Write-Host ("portal sees " + $tools.visible + "/" + $tools.total + " tools visible") -ForegroundColor DarkGray

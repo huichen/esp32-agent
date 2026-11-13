@@ -143,29 +143,6 @@ impl Runtime {
         dropped
     }
 
-    pub fn session_json(&self) -> Value {
-        let items: Vec<Value> = self
-            .sessions
-            .iter()
-            .map(|s| {
-                json!({
-                    "id": s.id,
-                    "age_s": (s.last_seen_ms.saturating_sub(s.created_ms)) / 1000,
-                    "idle_s": (self.last_seen_ms_now().saturating_sub(s.last_seen_ms)) / 1000,
-                    "client": s.client,
-                    "protocol": s.protocol,
-                    "initialized": s.initialized,
-                    "requests": s.requests,
-                })
-            })
-            .collect();
-        json!(items)
-    }
-
-    fn last_seen_ms_now(&self) -> u64 {
-        self.sessions.iter().map(|s| s.last_seen_ms).max().unwrap_or(self.boot_ms)
-    }
-
     pub fn record_tool_call(&mut self, name: &str, ok: bool) {
         self.counters.tool_calls += 1;
         if !ok {

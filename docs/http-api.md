@@ -113,8 +113,6 @@ or cannot: it signs in, it reboots, and it serves its own assets.
 | GET | `/api/logs?n=&since=` | Ring log |
 | GET | `/api/files/tree` | The whole workspace in one answer: every directory (derived from the paths) and file with `size_bytes`, plus `total_bytes` / `total_max` / `file_max`. What the portal's Files tab reads |
 | GET | `/api/files/read?path=<file>` | One file as text |
-| GET | `/api/sessions` | MCP sessions |
-| GET | `/api/clients` | Client configuration, ready to copy |
 | POST | `/audio/pcm` | Play PCM as it arrives: raw PCM16LE mono at 24000 Hz, chunked or with `Content-Length`, at most 30 s, never buffered ([streaming playback](audio.md#6-streaming-playback-post-audiopcm)) |
 | POST | `/av` | Play audio and draw frames from one body: `tag|u16le len|payload` records — `A` audio, `F` a 512-byte 128x32 or 1024-byte 128x64 bitmap, `E` end — in order ([sound with a picture](audio.md#8-sound-with-a-picture-post-av)) |
 | GET | `/api/attachment/<name>` | The file attached to the last message, with its own mime type ([attachments](#5-attachments)) |
@@ -276,4 +274,5 @@ curl -sS -X POST http://<ip>:80/api/agent/message -H 'Content-Type: application/
 - **Claude Desktop / Cursor and anything else that speaks HTTP**:
   `{"mcpServers":{"esp32-agent":{"type":"http","url":"http://<ip>:80/mcp"}}}`
 - **stdio-only clients**: use a bridge such as `mcp-remote` or `mcp2serial`.
-- **Your own script**: see the curl above; `/api/clients` returns a ready-made command.
+- **Your own script**: see the curl above, or the worked example in `/agent.json` under
+  `dynamic.mcp.example`.

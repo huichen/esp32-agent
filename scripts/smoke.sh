@@ -123,7 +123,8 @@ primitives=$(python3 -c 'import json,sys; d=json.load(sys.stdin); print(len(d["r
 check 'manifest_describe hands the model a schema and the exec types' bash -c \
   'grep -q "\"manifest_schema\"" <<<"$1" && grep -q "\"tools\"" <<<"$1" && [ "$2" -ge 8 ]' _ "$schema" "${primitives:-0}"
 
-sessions=$(curl -sS "$base/api/sessions" | python3 -c 'import json,sys; print(len(json.load(sys.stdin)["sessions"]))')
+# The count, not a session list: `/api/status` already carries it.
+sessions=$(curl -sS "$base/api/status" | sed -n 's/.*"sessions":\([0-9][0-9]*\).*/\1/p')
 check 'sessions were tracked' test "${sessions:-0}" -ge 1
 
 tools=$(curl -sS "$base/api/tools")
