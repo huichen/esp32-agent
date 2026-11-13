@@ -20,7 +20,7 @@ disagree with, a `[measured]` number is not.
 | PSRAM free at runtime | ~6.5 MB (6,593 kB at 507 KB of history) | `[measured]`, `docs/troubleshooting.md` |
 | Thread stacks | come from **internal SRAM**, not PSRAM | `docs/troubleshooting.md` ("could not spawn connection thread") |
 | Microphone | 16 kHz, 32-bit slots, left channel, 24 bits used | `[measured]`, `crates/agent-core/src/drivers/audio.rs` |
-| One tool result | 8,192 B (`agent::MAX_TOOL_RESULT_BYTES`), truncated with a marker past that; `mic_record` keeps itself under 2 KB on purpose | `crates/agent-core/src/agent.rs` |
+| One tool result | 65,536 B (`agent::MAX_TOOL_RESULT_BYTES`), truncated with a marker past that; `mic_record` sizes its 16,000 samples against it | `crates/agent-core/src/agent.rs` |
 
 The 5–6 kB is not a soft number. TLS already lives close to the edge of it: with ~15 kB free
 the hardware-AES path fails to get a DMA-capable buffer and every record dies with
@@ -108,10 +108,14 @@ The header is the canonical 44 bytes (`RIFF`, `WAVE`, one 16-byte `fmt ` chunk f
 16-bit at 16 kHz, `data`), written by `drivers::audio::wav`. The payload it wraps is exactly
 the PCM the tool already produced: the top 16 bits of each 24-bit I2S sample, little-endian.
 
-This replaced the old `pcm_b64` field. One blob, not two: 512 samples is 1024 B of PCM, and
-base64 makes that 1424 B; a second copy as raw PCM would be 2792 B and would be cut by the
-2048-byte tool-result cap mid-base64, which is the one failure mode that hands a host
-unreadable bytes. `the_largest_recording_still_fits_one_tool_result` pins that.
+This replaced the old `pcm_b64` field. One blob, not two: 16,000 samples is 32,000 B of PCM,
+plus the 44-byte header, and base64 turns that into ~42.7 KB of a 64 KB tool result; a second
+copy as raw PCM would add 32 KB and push 75 KB past the cap, cutting the blob mid-base64 —
+the one failure mode that hands a host unreadable bytes. A tool result bigger than the
+history budget it feeds is a cost too: every sample recorded is re-sent with the transcript
+on later turns (~11k tokens for the full second), which is why the schema's *default* is
+still 256 samples and this is a ceiling a caller opts into.
+`the_largest_recording_still_fits_one_tool_result` pins the arithmetic.
 
 Why WAV and not "PCM, figure it out": a host that receives base64 has to guess what it is, and
 the guess that matters is container vs. raw samples. A WAV is unambiguous, needs no codec, and
@@ -119,14 +123,15 @@ every tool that plays audio reads it.
 
 ### What that costs on the wire
 
-| Format | Bytes per second | What one 2 KB tool result carries |
+| Format | Bytes per second | What one 64 KB tool result carries |
 |---|---|---|
-| WAV, 16 kHz, 16-bit mono | 32,000 | 32 ms (512 samples; the schema's maximum) |
-| Opus, 16 kbps | 2,000 | 1 s |
-| IMA ADPCM, 4:1 | 8,000 | 250 ms |
+| WAV, 16 kHz, 16-bit mono | 32,000 | 1 s (16,000 samples; the schema's maximum) |
+| Opus, 16 kbps | 2,000 | 24 s |
+| IMA ADPCM, 4:1 | 8,000 | 6 s |
 
 Raw PCM is 16× bigger than Opus at 16 kbps and 4× bigger than ADPCM — but the binding limit
-here is not bandwidth, it is the 2048-byte tool result and the 5–6 kB of internal RAM. A
+here is not bandwidth, it is the 65,536-byte tool result and the kilobytes of internal RAM
+left while TLS is up. A
 compressed stream inside the same cap would carry more *time*, not more audio quality, and it
 would still have to be re-chunked by whoever holds the connection. So the codec is the wrong
 place to spend the budget on this board.
@@ -137,8 +142,10 @@ host. It is **not implemented** — this document proposes it, it does not claim
 
 ## 5. Recommendation
 
-1. Record on the board as WAV, 16 kHz mono, at most 512 samples per call; encode on the host.
-   That is what `mic_record` does today.
+1. Record on the board as WAV, 16 kHz mono, at most 16,000 samples per call (1 s); encode on
+   the host. That is what `mic_record` does today. Longer audio belongs in `POST /audio/pcm`
+   (§6) or on the host: one second is still a phrase, and the ceiling is the tool result, not
+   the RAM.
 2. Do not attempt an Opus encoder for this board. Flash would fit; internal SRAM would not,
    by a factor of three, and a forked libopus is a maintenance burden for a chip that cannot
    run it.
@@ -211,7 +218,7 @@ and some 80,000 tokens of base64 to get wrong. A tune is therefore something the
 | Form | What the caller sends | Audio it plays |
 |---|---|---|
 | `pcm_b64` | 2,732 B of base64 | 2048 B = 1024 samples = **43 ms** |
-| `notes` | ~25 B per note — a few hundred bytes for a tune | as long as the notes add up to, at most **6 s** |
+| `notes` | ~25 B per note — a few hundred bytes for a tune | as long as the notes add up to, at most **12 s** |
 | `POST /audio/pcm` (§6) | 48,000 B for every second of audio | up to **30 s**, but the caller must already have the bytes |
 
 So the score is not a way around the body cap — §6 already has that — it is a way around
@@ -230,9 +237,9 @@ nothing to be heard there.
 |---|---|---|
 | Notes per call | 64 | a 64-note score is still under a kilobyte of JSON |
 | One note | 20–2000 ms, 0–8000 Hz | 20 ms keeps the 2 ms articulation ramp from swallowing the note; 8000 Hz is `speaker_tone`'s ceiling |
-| Whole melody | 6000 ms | 144,000 samples = 288,000 B of mono PCM |
-| Handed to the DMA | 288,000 stereo slots = 576,000 B | the driver duplicates each sample into both slots (see §1 of `drivers/audio.rs`) |
-| Peak heap while playing | ~864,000 B (~844 KiB) | mono buffer + the stereo copy, both in PSRAM. `[estimate]`: the arithmetic, not measured |
+| Whole melody | 12000 ms | 288,000 samples = 576,000 B of mono PCM |
+| Handed to the DMA | 288,000 stereo slots = 1,152,000 B | the driver duplicates each sample into both slots (see §1 of `drivers/audio.rs`) |
+| Peak heap while playing | ~1,728,000 B (~1.65 MiB) | mono buffer + the stereo copy, both in PSRAM — 21% of the 7.9 MB free. `[estimate]`: the arithmetic, not measured |
 | Arguments on the wire | a few hundred bytes | this is the point |
 | Binary write needed? | **no** | the score is JSON; nothing has to be stored as a file |
 
@@ -253,9 +260,9 @@ with it. A host that *does* hold bytes still has `pcm_b64` for the 43 ms it is g
 ### What it costs elsewhere
 
 The write blocks until every sample is queued, so a tool call occupies the board for the
-length of the melody: `/api/status` and every other tool wait for up to 6 s behind it. §6
+length of the melody: `/api/status` and every other tool wait for up to 12 s behind it. §6
 takes the lock once per ~21 ms piece instead of once per tune; this takes it for the whole
-melody, which is the price of the single write and the reason the cap is 6 s rather than
+melody, which is the price of the single write and the reason the cap is 12 s rather than
 "as long as you like".
 
 The tool result carries `synth_ms` and `write_ms` so the split is measured rather than
