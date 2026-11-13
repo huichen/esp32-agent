@@ -93,7 +93,7 @@ fn main() -> anyhow::Result<()> {
     // this fixes showed no panic message, only an immediate RTC_SW_CPU_RST.
     // 20 KB, down from 32: the high-water reading on the board said this thread has never
     // had less than 22.2 kB free (9.8 kB peak use) over a run that included the portal,
-    // `/api/tools`, `/api/status` and `/api/memory`. The rule this size is judged by is
+    // `/api/tools` and `/api/status` (with its heap split). The rule this size is judged by is
     // max(2 x peak, peak + 4 kB) = 19.6 KB, so 20 KB is the floor with the rule applied,
     // and 12 kB of internal RAM is the difference. `/api/status` carries the reading, so
     // the next change is measured, not guessed.

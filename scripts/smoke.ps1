@@ -3,8 +3,8 @@
   End-to-end smoke test against the host simulator: portal, tool list, a live
   manifest change, and the board-side range check.
 .DESCRIPTION
-  Starts esp32-agent-sim on a free port, waits for /healthz, then walks the flow a
-  model would: tools/list -> manifest_apply -> tools/list -> tool call -> an
+  Starts esp32-agent-sim on a free port, waits for /api/status, then walks the flow a
+  model would: tools/list -> manifest apply -> tools/list -> tool call -> an
   out-of-range call that must be refused. Exits non-zero if any step fails.
 #>
 param(
@@ -30,8 +30,8 @@ $proc = Start-Process -FilePath $bin -ArgumentList @('--port', $Port, '--host', 
 function Wait-Ready {
   for ($i = 0; $i -lt 100; $i++) {
     try {
-      $r = Invoke-RestMethod -Uri "http://127.0.0.1:$Port/healthz" -TimeoutSec 2
-      if ($r.ok) { return }
+      $r = Invoke-RestMethod -Uri "http://127.0.0.1:$Port/api/status" -TimeoutSec 2
+      if ($null -ne $r.devices.count) { return }
     } catch { Start-Sleep -Milliseconds 120 }
   }
   throw 'simulator did not become ready'
@@ -66,8 +66,8 @@ try {
     $page.Content -match 'esp32-agent' -and $page.Content -match 'manifest'
   }
 
-  Check 'healthz reports the detected devices' {
-    (Invoke-RestMethod "http://127.0.0.1:$Port/healthz" -TimeoutSec 5).devices -ge 3
+  Check 'status reports the detected devices' {
+    (Invoke-RestMethod "http://127.0.0.1:$Port/api/status" -TimeoutSec 5).devices.count -ge 3
   }
 
   $before = Rpc '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
@@ -90,7 +90,7 @@ try {
    "exec":{"type":"rgb","pin":48,"color":{"param":"color"}}}
 ]}}
 '@
-  $applied = Rpc ('{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"manifest_apply","arguments":' + $manifest + '}}')
+  $applied = Rpc ('{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"manifest","arguments":{"command":"apply","arguments":' + $manifest + '}}}')
   Write-Host ("apply -> " + $applied.result.structuredContent.applied + ", added: " + ($applied.result.structuredContent.tools_added -join ',')) -ForegroundColor DarkGray
   Check 'manifest applied without a restart' { $applied.result.structuredContent.applied -eq $true }
 
@@ -111,15 +111,17 @@ try {
   $missing = Rpc '{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"lcd_text","arguments":{"text":"hi"}}}'
   Check 'a tool for absent hardware is not callable' { $missing.result.isError -eq $true }
 
-  $schema = Rpc '{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"manifest_describe","arguments":{"section":"schema"}}}'
-  $exec = Rpc '{"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"manifest_describe","arguments":{"section":"exec"}}}'
-  Check 'manifest_describe hands the model a schema and the exec types' {
+  $schema = Rpc '{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"manifest","arguments":{"command":"describe","arguments":{"section":"schema"}}}}'
+  $exec = Rpc '{"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"manifest","arguments":{"command":"describe","arguments":{"section":"exec"}}}}'
+  Check 'manifest describe hands the model a schema and the exec types' {
     $schema.result.structuredContent.manifest_schema.properties.tools -ne $null -and
     $exec.result.structuredContent.primitives.Count -ge 8
   }
 
-  $sessions = Invoke-RestMethod "http://127.0.0.1:$Port/api/sessions" -TimeoutSec 5
-  Check 'sessions were tracked' { $sessions.sessions.Count -ge 1 }
+  # The count, not a session list: `/api/status` already carries it, and a second route for
+  # the same number was a second thing to keep true.
+  $status = Invoke-RestMethod "http://127.0.0.1:$Port/api/status" -TimeoutSec 5
+  Check 'sessions were tracked' { $status.mcp.sessions -ge 1 }
 
   $tools = Invoke-RestMethod "http://127.0.0.1:$Port/api/tools" -TimeoutSec 5
   Write-Host ("portal sees " + $tools.visible + "/" + $tools.total + " tools visible") -ForegroundColor DarkGray

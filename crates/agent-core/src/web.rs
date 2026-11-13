@@ -112,6 +112,8 @@ mod tests {
         assert!(APP_JS.contains("await askConfirm(\"Clear conversation\""));
         assert!(APP_JS.contains("Instructions, skills, files and model settings stay."));
         assert!(!APP_JS.contains("/api/factory-reset"), "clearing must not erase the workspace or config");
+        assert!(!APP_JS.contains("/api/reboot"), "no button may restart the board");
+        assert!(!INDEX_HTML.contains("id=\"reboot\""), "the Reboot button is gone");
         assert!(STYLE_CSS.contains(".clear-chat:focus-visible"), "keyboard focus must be visible");
         assert!(INDEX_HTML.contains("<html lang=\"en\">"), "the page declares one language");
     }

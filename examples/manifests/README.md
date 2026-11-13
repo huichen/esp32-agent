@@ -1,7 +1,7 @@
 # Manifest examples
 
 Each file is a **complete argument object** that can be handed straight to
-`manifest_apply` (`mode: merge`), or pasted into the console's manifest tab and applied
+`manifest {command: "apply"}` (`mode: merge`), or pasted into the console's manifest tab and applied
 there.
 
 | File | Hardware it needs | What it shows |

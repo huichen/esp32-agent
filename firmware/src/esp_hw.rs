@@ -718,7 +718,7 @@ impl Hardware for EspHw {
     /// The same flags as the `internal_8bit` pool, deliberately. `esp_get_free_internal_heap_size`
     /// answers a slightly larger number because it counts every internal heap region, including
     /// the IRAM-only bytes that no stack, queue or socket buffer can use. Two numbers for one
-    /// question — 142 kB here and 150 kB in `/api/memory` — is how a reader concludes the report
+    /// question — 142 kB here and 150 kB in the status document's `memory.pools` — is how a reader concludes the report
     /// is broken; this one is the pool a caller can actually allocate from.
     fn heap_internal(&mut self) -> Option<(u32, u32)> {
         use esp_idf_svc::sys;

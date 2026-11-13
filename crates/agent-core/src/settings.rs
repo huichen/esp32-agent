@@ -173,7 +173,7 @@ const MEMORY: &[Field] = &[f("keep", "integer", "0", "exchanges to keep; 0 drops
 
 const TOOLS: &[Field] = &[
     f("tools/call name+arguments", "object", "", "every detected device, the manifest tools, fs_* and net_*"),
-    f("manifest", "object", "", "POST /api/manifest to add devices and tools; live at once"),
+    f("manifest", "object", "", "the `manifest` tool's apply adds devices and tools; live at once"),
     f("files", "string", "", "fs_write / fs_edit / fs_rm on /AGENTS.md and /skills/*"),
 ];
 

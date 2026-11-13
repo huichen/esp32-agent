@@ -124,8 +124,8 @@ impl Drop for EventStreamSlot {
 // overflowed a 6 kB stack with a `***ERROR*** A stack overflow in task pthread` and a
 // reboot, which is why this number was 16 kB + 4 kB for the TLS handshake that also runs
 // here. The measured reading at 20 kB is 13.5 kB free — 6.5 kB peak — over a run that
-// included `/api/tools`, the portal, `/api/status`, `/api/memory`, and an https request
-// (the handshake is the costly part, and it is on this thread). max(2 x 6.5, 6.5 + 4) =
+// included `/api/tools`, the portal, `/api/status` (which carries the heap split), and an
+// https request (the handshake is the costly part, and it is on this thread). max(2 x 6.5, 6.5 + 4) =
 // 13.0 kB, so 16 kB is the floor the rule allows and 4 kB goes back to the heap.
 const ACCEPT_STACK: usize = 16 * 1024;
 #[cfg(not(target_os = "espidf"))]

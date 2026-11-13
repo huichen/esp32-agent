@@ -1751,16 +1751,6 @@ function init() {
     } catch (e) { toast(e.message); }
   };
 
-  $("#reboot").onclick = async () => {
-    if (!(await askConfirm(
-      "Restart the board?",
-      "The agent, its tools and any open stream stop answering until it boots again.",
-      "Restart",
-    ))) return;
-    try { await api("/api/reboot", { method: "POST", body: {} }); toast("restarting"); }
-    catch (e) { toast(e.message); }
-  };
-
   $("#logs-refresh").onclick = loadLogs;
   $("#files-back").onclick = () => {
     $("#files-viewer-card").hidden = true;

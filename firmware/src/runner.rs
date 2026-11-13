@@ -502,11 +502,11 @@ fn tick(
             log.info("agent", format!("model timeout is now {configured} s"));
         }
 
-        // Schedule first: a task that comes due on this tick runs on this tick.
+        // Schedule first: a task that comes due on this tick runs on this tick, and a task
+        // whose work is a script runs it inline — there is no queued job to finish here.
         for source in app.sched_tick(now, minute) {
             log.info("agent", format!("scheduler queued {source}"));
         }
-        app.run_next_script();
 
         // Thread stacks come from internal RAM, and the heap figure the portal shows
         // counts PSRAM. A board that cannot spawn an HTTP connection thread reports

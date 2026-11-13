@@ -22,7 +22,7 @@ misconfiguration costs a URL and not the board. `mcp.plain_http: false` closes i
 | Agent | endpoint, model, key, protocol, thinking level, temperature, context and output size |
 | Schedule | timed prompts and sensor rules |
 | Logs | the ring buffer, newest first |
-| Settings | WiFi with gateway and DNS overrides, the portal PIN, reboot |
+| Settings | WiFi with gateway and DNS overrides, and the portal PIN |
 
 The page keeps a bearer token from `POST /api/auth` and retries once when a write is refused,
 so the PIN is asked for once per session and not per click.

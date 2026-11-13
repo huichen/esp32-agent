@@ -8,7 +8,7 @@ plugged in and reachable.
 | File | What it is | Needs |
 |---|---|---|
 | `bench-agent.ps1` | drives the board's agent loop end to end: point it at `stub_model.py`, send a message, watch a tool call come back, then wait for a scheduled task to fire on its own | a flashed board on the LAN, `powershell` |
-| `stub_model.py` | a stand-in OpenAI-compatible chat endpoint, so the loop is provable with no API key and no provider: the first request answers with a `board_status` tool call, the second quotes the tool result back | `python3` (standard library only) |
+| `stub_model.py` | a stand-in OpenAI-compatible chat endpoint, so the loop is provable with no API key and no provider: the first request answers with a `board {command: "status"}` tool call, the second quotes the tool result back | `python3` (standard library only) |
 
 ```bash
 python tools/stub_model.py --port 8899
