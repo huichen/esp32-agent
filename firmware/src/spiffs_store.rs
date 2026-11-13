@@ -318,6 +318,18 @@ impl KvStore for SpiffsStore {
         self.last_error.clone()
     }
 
+    /// What `esp_spiffs_info()` reports, in bytes.
+    ///
+    /// `total` is SPIFFS' own capacity figure, not the partition size: it is
+    /// `(blocks - 2) * (pages_per_block - lookup_pages) + 1` data pages times the data page size,
+    /// so the 12 517 376-byte partition minus two spare blocks and the object-lookup pages. On
+    /// this board that is 45 811 * 251 = 11 498 561. `used` is the pages it has written. No
+    /// "free" comes from here - `StoreSpace` computes it, because the backend does not report
+    /// one.
+    ///
+    /// Neither number promises that one allocation of that size fits: a 2.1 MB file was refused
+    /// with `ENOSPC` while `free` read 9.38 MB, because SPIFFS needs somewhere to move live pages
+    /// while it writes a new file and reports no figure for that.
     fn space(&self) -> Option<StoreSpace> {
         let (total, used) = capacity();
         if total == 0 {
