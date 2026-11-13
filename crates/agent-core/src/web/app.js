@@ -26,7 +26,6 @@ const S = {
   busy: false,
   panel: "status",
   afterUnlock: null,
-  filesPath: "/",
 };
 
 // ---------------------------------------------------------------- transport
@@ -940,61 +939,75 @@ async function schedOp(id, op) {
   }
 }
 
-/** The workspace, one directory at a time: a file list you can tap into, and a file view.
+/** The workspace as one tree: directories fold, a file opens below.
+ *
+ * It used to be a directory-at-a-time list with breadcrumbs, which cost a request per level
+ * for a workspace that is at most 8 KB. One `/api/files/tree` answers the whole thing, and
+ * the hierarchy is the one the paths already carry.
  *
  * Read-only on purpose. Every write goes through the agent or the `write` tool, where the
- * workspace's 8 KB budget and its one-blob-in-NVS storage are enforced; a portal editor that
- * writes would need the same checks a second time and would be the place they drift apart. */
-async function loadFiles(path) {
-  S.filesPath = path || "/";
+ * 8 KB budget and the one-blob-in-NVS storage are enforced; a portal editor that writes
+ * would need the same checks a second time and would be the place they drift apart. */
+async function loadTree() {
   try {
-    const d = await api("/api/files?path=" + encodeURIComponent(S.filesPath));
+    const d = await api("/api/files/tree");
     if (!d.ok) {
-      toast(d.error || "cannot list that directory");
+      toast(d.error || "cannot read the workspace");
       return;
     }
-    S.filesPath = d.path || "/";
-    renderCrumbs(S.filesPath);
-    const rows = (d.entries || []).map((e) => {
-      const size = e.dir ? "dir" : e.size_bytes + " B";
-      return (
-        '<button class="item file-row" data-path="' + escapeHtml(e.path) + '" data-dir="' +
-        (e.dir ? "1" : "0") + '"><b>' + escapeHtml(e.name) + (e.dir ? "/" : "") +
-        "</b><span class='faint'>" + escapeHtml(size) + "</span></button>"
-      );
-    });
-    $("#files-list").innerHTML = rows.join("") || '<div class="item faint">empty</div>';
+    const root = { dirs: new Map(), files: [] };
+    for (const e of d.entries || []) {
+      const parts = e.path.split("/").filter(Boolean);
+      let node = root;
+      for (let i = 0; i < parts.length - 1; i++) {
+        const key = "/" + parts.slice(0, i + 1).join("/");
+        if (!node.dirs.has(key)) node.dirs.set(key, { name: parts[i], path: key, dirs: new Map(), files: [] });
+        node = node.dirs.get(key);
+      }
+      if (e.dir) {
+        if (!node.dirs.has(e.path)) node.dirs.set(e.path, { name: e.name, path: e.path, dirs: new Map(), files: [] });
+      } else {
+        node.files.push(e);
+      }
+    }
+    const box = $("#files-tree");
+    box.innerHTML = "";
+    renderNode(root, box, 0);
+    if (!box.childElementCount) box.innerHTML = '<div class="item faint">the workspace is empty</div>';
     $("#files-total").textContent =
-      (d.count || 0) + " entries \u00b7 " + d.total_bytes + " of " + d.total_max +
+      d.count + " entries \u00b7 " + d.total_bytes + " of " + d.total_max +
       " bytes used \u00b7 a file may be " + d.file_max + " bytes";
-    $("#files-viewer-card").hidden = true;
-    $$("#files-list .file-row").forEach((row) => {
-      row.onclick = () => {
-        if (row.dataset.dir === "1") loadFiles(row.dataset.path);
-        else openFile(row.dataset.path);
-      };
-    });
   } catch (e) {
     toast(e.message);
   }
 }
 
-/** `/memory/pinout.md` as clickable parents, so a deep path is one tap from the root. */
-function renderCrumbs(path) {
-  const parts = String(path).split("/").filter(Boolean);
-  let built = "";
-  const crumbs = ['<a href="#" data-path="/">/</a>'];
-  for (const part of parts) {
-    built += "/" + part;
-    crumbs.push('<a href="#" data-path="' + escapeHtml(built) + '">' + escapeHtml(part) + "</a>");
+/** One level: directories first, then files, both alphabetical. */
+function renderNode(node, box, depth) {
+  const dirs = Array.from(node.dirs.values()).sort((a, b) => a.name.localeCompare(b.name));
+  const files = node.files.slice().sort((a, b) => a.name.localeCompare(b.name));
+  for (const dir of dirs) {
+    const details = document.createElement("details");
+    details.className = "tree-dir";
+    // The first level is open: a tree that starts fully folded shows one word.
+    details.open = depth === 0;
+    const summary = document.createElement("summary");
+    summary.textContent = dir.name;
+    details.appendChild(summary);
+    const kids = document.createElement("div");
+    kids.className = "tree-kids";
+    details.appendChild(kids);
+    renderNode(dir, kids, depth + 1);
+    box.appendChild(details);
   }
-  $("#files-path").innerHTML = crumbs.join(" / ");
-  $$("#files-path a").forEach((a) => {
-    a.onclick = (ev) => {
-      ev.preventDefault();
-      loadFiles(a.dataset.path);
-    };
-  });
+  for (const file of files) {
+    const row = document.createElement("button");
+    row.className = "tree-file";
+    row.innerHTML = "<b>" + escapeHtml(file.name) + "</b><span class='faint'>" +
+      file.size_bytes + " B</span>";
+    row.onclick = () => openFile(file.path);
+    box.appendChild(row);
+  }
 }
 
 async function openFile(path) {
@@ -1045,7 +1058,7 @@ function showPanel(name) {
   // The schedule queues turns for this agent, so it lives on the Agent panel; the log is
   // the other thing to read when the board misbehaves, so it lives on Settings.
   if (name === "agent") { loadAgent(); loadSched(); }
-  if (name === "files") loadFiles(S.filesPath || "/");
+  if (name === "files") loadTree();
   if (name === "settings") { loadSettings(); loadLogs(); }
 }
 
@@ -1274,7 +1287,6 @@ $("#attach").onclick = () => $("#attach-input").click();
   $("#logs-refresh").onclick = loadLogs;
   $("#files-back").onclick = () => {
     $("#files-viewer-card").hidden = true;
-    loadFiles(S.filesPath);
   };
 
   loadHistory();

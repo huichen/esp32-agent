@@ -439,6 +439,40 @@ button.btn:active { transform: scale(0.98); }
   font-size: 12.5px;
 }
 
+/* The Files tab: a tree, not a list. A directory is a fold, a file is a row that opens. */
+.tree { font-size: 12.5px; }
+.tree details.tree-dir { margin: 2px 0; }
+.tree summary {
+  cursor: pointer;
+  list-style: none;
+  padding: 5px 8px;
+  border-radius: 8px;
+  background: var(--bg-soft);
+  font-weight: 500;
+}
+.tree summary::-webkit-details-marker { display: none; }
+.tree summary::before { content: "\25B8 "; color: var(--muted); }
+.tree details[open] > summary::before { content: "\25BE "; }
+.tree .tree-kids { margin: 2px 0 6px 14px; border-left: 1px solid var(--line); padding-left: 6px; }
+.tree-file {
+  appearance: none;
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+  width: 100%;
+  padding: 5px 8px;
+  margin: 2px 0;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  background: none;
+  color: var(--text);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.tree-file b { font-weight: 400; }
+.tree-file .faint { margin-left: auto; font-size: 11px; color: var(--muted); }
+
 /* The Files tab: a row is a button, so the whole line is the tap target. */
 .list .file-row {
   appearance: none;
