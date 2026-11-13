@@ -518,14 +518,26 @@ def discovery(rec, sim, fake):
     rec.equal("discovered-base-url", doc["dynamic"]["base_url"], sim.url)
     rec.equal("sitemap-alias", sim.get("/sitemap.json")["endpoints"], endpoints)
     rec.check("inventory-descriptions", all(e.get("tag") and e.get("summary") and e.get("returns") and "auth" in e for e in endpoints))
+    for name, expected in [("tool_result_bytes", 65536), ("reply_bytes", 32768),
+                           ("history_bytes", 2097152), ("history_messages", 1024),
+                           ("saved_transcript_bytes", 524288), ("workspace_file_bytes", 262144),
+                           ("workspace_text_bytes", 4194304)]:
+        rec.equal("discovered-limit:" + name, doc["conventions"]["limits"].get(name), expected)
+    job = sim.post("/api/script", {"source": "1 + 2"})
+    sim.call("write", {"path": "/map-fixture.txt", "text": "discovery fixture"})
+    sim.post("/api/agent/message", {"text": "attachment discovery fixture", "attachments": [
+        {"name": "map.bin", "mime": "application/octet-stream", "data_b64": "Zml4dHVyZQ=="}]})
+    concrete = {"/api/script/<id>": "/api/script/" + job["id"],
+                "/api/attachment/<name>": "/api/attachment/map.bin",
+                "/api/files/read": "/api/files/read?path=/map-fixture.txt"}
     skips = {"/api/agent/stream", "/selftest/chat/completions"}
     for e in endpoints:
         if e["method"] != "GET" or e["path"] in skips:
             continue
-        reply = sim.request("GET", e["path"])
+        reply = sim.request("GET", concrete.get(e["path"], e["path"]))
         rec.equal("advertised-GET:" + e["path"], reply.status, 200)
         rec.check("body:" + e["path"], bool(reply.body) and bool(reply.headers.get("content-type")))
-    # The self-test contract is POST, whereas the current table advertises GET.
+    # Contract regressions: the old map advertised GET selftest and omitted live routes.
     rec.check("selftest-advertises-POST", ("POST", "/selftest/chat/completions") in inventory, short(sorted(inventory)))
     for method, path in [("POST", "/api/tools"), ("GET", "/api/files"), ("GET", "/api/files/tree"),
                          ("GET", "/api/files/read"), ("POST", "/api/sched/run")]:
@@ -535,6 +547,7 @@ def discovery(rec, sim, fake):
         "/api/agent/prompt": {"action": "set", "text": "audit standing order"},
         "/api/config": {"device_name": "interface-audit"},
         "/api/manifest": {"manifest": {"version": 1, "tools": []}},
+        "/api/tools": {"disabled": []},
         "/api/devices/probe": {}, "/api/wifi/connect": {"ssid": "fixture-network", "password": ""},
         "/api/wifi/forget": {}, "/api/agent/message": {"text": "no provider is configured"},
         "/api/agent/reset": {}, "/api/agent/forget": {"keep": 0}, "/api/agent/config": {"model": ""},

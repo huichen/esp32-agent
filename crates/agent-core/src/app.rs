@@ -1175,6 +1175,7 @@ impl App {
                 &self.cfg.mcp.path,
                 tool_count,
                 !self.cfg.auth.mcp_token.is_empty(),
+                !self.cfg.auth.portal_pin.is_empty(),
             ),
             "security": {
                 "portal_pin_set": !self.cfg.auth.portal_pin.is_empty(),
@@ -3006,8 +3007,8 @@ impl App {
     /// the run appends the real one.
     /// `GET /api/files/tree`: the whole workspace in one answer.
     ///
-    /// The workspace is at most 8 KB of text, so a directory-at-a-time view costs a round
-    /// trip per level for a tree that fits in one response. Every file brings its path, and
+    /// This returns names and sizes, never the file bodies; the file-count and path
+    /// budgets bound its metadata even with a multi-MiB workspace. Every file brings its path, and
     /// the directories are the prefixes of those paths — the same rule `list` uses, so the
     /// tree and `ls` cannot disagree about what a directory is.
     fn files_tree_json(&self) -> Value {
@@ -3053,7 +3054,7 @@ impl App {
     /// `GET /api/files?path=/dir`: one directory of the workspace, directories first.
     ///
     /// Shaped like the `ls` tool on purpose — one workspace, one meaning of `size_bytes` —
-    /// plus the two totals. The workspace is a single 8 KB blob stored in NVS chunks, so
+    /// plus the two totals. File bodies and the index are stored separately, so
     /// "how much of it is used" is the question a person asks when a write is refused, and
     /// a per-file number cannot answer it.
     fn files_json(&self, path: &str) -> Value {
@@ -3892,7 +3893,7 @@ impl App {
                 self.apply_manifest_http(req)
             }
             ("GET", "/api/manifest/schema") => {
-                // An HTTP response has no 2 KB cap, so this route hands over the part of
+                // An HTTP response has no tool-result cap, so this route hands over the part of
                 // the reference needed to write a manifest in one go; the model asks for
                 // the same content one section at a time (`manifest_describe`).
                 let mut out = json!({});
@@ -4189,7 +4190,7 @@ impl App {
                 Response::json(&v)
             }
             ("GET", "/api/catalog") => Response::json(&drivers::catalog_json()),
-            // The portal's Files tab: read-only, so it needs no PIN like every other read.
+            // The portal's Files tab is read-only but exposes private workspace contents.
             // Both answers carry the same numbers the `ls` and `read` tools return, because
             // there is one workspace and one meaning of "how big is it".
             ("GET", "/api/files") => {
@@ -4279,6 +4280,9 @@ impl App {
             // on the board itself. It only ever returns a canned reply, so it cannot
             // be mistaken for a model, and nothing else depends on it.
             ("POST", "/selftest/chat/completions") => Response::json(&selftest_completion(req)),
+            ("GET", "/selftest/ping") => Response::json(&json!({
+                "ok": true, "service": "selftest-net", "purpose": "lock-free target for net_get",
+            })),
             // `/audio/pcm` is consumed before the handler whenever the server was built with
             // `make_routes`, because its body must not be buffered. Reaching this arm means
             // that composition root was not used (a unit test, say); 501 says so, where the
@@ -6968,8 +6972,8 @@ fn selftest_completion(req: &Request) -> Value {
         ("fs_edit", r#"{"path":"/bench/hello.txt","find":"self-test","replace":"edited"}"#);
     const GREP: (&str, &str) = ("fs_grep", r#"{"pattern":"written","path":"/bench"}"#);
     // The workflow the device exists for: discover what is wired, learn the manifest
-    // schema, add a tool that was not there before, then call it. Six rounds, so the
-    // bench has to raise agent.max_steps to run it.
+    // schema, add a tool that was not there before, then call it. Six rounds also
+    // verify that the next request receives the freshly published tool declaration.
     const INVENTORY: (&str, &str) = ("inventory", "{}");
     const I2C_SCAN: (&str, &str) = ("i2c_scan", "{}");
     const DESCRIBE: (&str, &str) = ("manifest_describe", "{}");
@@ -6978,6 +6982,10 @@ fn selftest_completion(req: &Request) -> Value {
         r#"{"mode":"merge","manifest":{"tools":[{"name":"bench_mcp_probe","description":"Read the boot button on GPIO0 as a level, 1 released and 0 pressed","params":[],"exec":{"type":"gpio_read","pin":0}}]}}"#,
     );
     const CALL_NEW: (&str, &str) = ("bench_mcp_probe", "{}");
+    // Keep the scripted network case local too: it should not depend on public DNS
+    // or Internet access merely to exercise the transport and tool result path.
+    let local_url = format!("{}://{}/selftest/ping", req.scheme, req.header("host").unwrap_or("127.0.0.1"));
+    let net_args = json!({"url": local_url}).to_string();
     let steps: &[(&str, &str)] = if has_word(&ask, "edit") || ask.contains("改") {
         &[WRITE, EDIT, READ]
     } else if has_word(&ask, "file") || ask.contains("文件") {
@@ -6985,14 +6993,49 @@ fn selftest_completion(req: &Request) -> Value {
     } else if has_word(&ask, "mcp") {
         &[INVENTORY, I2C_SCAN, DESCRIBE, APPLY, CALL_NEW, ("board_status", "{}")]
     } else if has_word(&ask, "net") || has_word(&ask, "http") {
-        &[("net_get", r#"{"url":"http://example.com/"}"#)]
+        &[("net_get", &net_args)]
     } else {
         &[("board_status", "{}")]
     };
-    let next_tool = steps.get(tool_rounds).copied();
+    let desired = steps.get(tool_rounds).copied();
+    // The default profile advertises families and read/write/edit/shell, not the
+    // old aliases. Choose only a name in the actual request; legacy-only fixtures
+    // still work, and a disabled family is not bypassed via an unadvertised alias.
+    let next_tool = desired.and_then(|(name, args)| {
+        if has_tool(name) {
+            return Some((name.to_string(), args.to_string()));
+        }
+        let (family, command) = match name {
+            "board_status" => ("board", "status"),
+            "inventory" => ("board", "inventory"),
+            "i2c_scan" => ("bus", "i2c_scan"),
+            "manifest_describe" => ("manifest", "describe"),
+            "manifest_apply" => ("manifest", "apply"),
+            "fs_write" | "fs_read" | "fs_edit" => {
+                let current = match name {
+                    "fs_write" => "write",
+                    "fs_read" => "read",
+                    _ => "edit",
+                };
+                return has_tool(current).then(|| (current.to_string(), args.to_string()));
+            }
+            "fs_grep" | "net_get" if has_tool("shell") => {
+                let command = if name == "fs_grep" {
+                    "grep written /bench".to_string()
+                } else {
+                    format!("curl {local_url}")
+                };
+                return Some(("shell".to_string(), json!({"command": command}).to_string()));
+            }
+            _ => return None,
+        };
+        let arguments = serde_json::from_str::<Value>(args).unwrap_or_else(|_| json!({}));
+        has_tool(family)
+            .then(|| (family.to_string(), json!({"command": command, "arguments": arguments}).to_string()))
+    });
 
-    let message = match (next_tool, tool_result) {
-        (Some((name, args)), _) if has_tool(name) => json!({
+    let message = match (next_tool.as_ref(), desired, tool_result) {
+        (Some((name, args)), _, _) => json!({
             "role": "assistant",
             "content": null,
             "tool_calls": [{
@@ -7001,15 +7044,15 @@ fn selftest_completion(req: &Request) -> Value {
                 "function": { "name": name, "arguments": args }
             }]
         }),
-        (Some((name, _)), _) => json!({
+        (None, Some((name, _)), _) => json!({
             "role": "assistant",
             "content": format!("selftest: `{name}` is not on the tool list, so there is nothing to demonstrate"),
         }),
-        (None, Some(text)) => json!({
+        (None, None, Some(text)) => json!({
             "role": "assistant",
             "content": format!("selftest: the board answered with {}", body_prefix(&text, 160)),
         }),
-        (None, None) => json!({ "role": "assistant", "content": "selftest: nothing to do" }),
+        (None, None, None) => json!({ "role": "assistant", "content": "selftest: nothing to do" }),
     };
     let answered = next_tool.is_none();
     // A scripted turn still carries reasoning and usage: the point of this endpoint is
@@ -8726,6 +8769,24 @@ mod tests {
         let mut missing = Vec::new();
         for route in crate::sitemap::ROUTES {
             let mut req = post(route.path, "{}");
+            if route.path == "/api/script/<id>" {
+                let job = app.submit_script("1 + 2", true);
+                req.path = format!("/api/script/{}", job.id);
+            } else if route.path == "/api/attachment/<name>" {
+                app.attachments = vec![crate::agent::Attachment {
+                    name: "fixture.txt".into(),
+                    mime: "text/plain".into(),
+                    data_b64: "Zml4dHVyZQ==".into(),
+                }];
+                req.path = "/api/attachment/fixture.txt".into();
+            } else if route.path == "/api/sched/run" {
+                app.tasks.push(ScheduledTask {
+                    id: "map-run".into(),
+                    script: "1".into(),
+                    ..ScheduledTask::default()
+                });
+                req.body = br#"{"id":"map-run"}"#.to_vec();
+            }
             req.method = route.method.into();
             req.headers.insert("host".into(), "board.test:8080".into());
             let resp = app.route(&req);
@@ -8749,6 +8810,24 @@ mod tests {
         assert_eq!(doc["dynamic"]["mcp"]["path"], "/mcp");
         let endpoints = doc["endpoints"].as_array().expect("endpoints");
         assert!(endpoints.iter().any(|e| e["path"] == "/agent.json"));
+        for path in [
+            "/api/config",
+            "/api/agent/history",
+            "/api/agent/prompt",
+            "/api/agent/events",
+            "/api/agent/stream",
+            "/api/logs",
+            "/api/files",
+            "/api/script/<id>",
+        ] {
+            assert!(
+                endpoints.iter().any(|e| e["method"] == "GET" && e["path"] == path && e["auth"] != "none"),
+                "discovery incorrectly advertises a private read as open: {path}"
+            );
+        }
+        app.cfg.auth.portal_pin = "1234".into();
+        let doc = body_json(&app.route(&req));
+        assert!(doc["dynamic"]["mcp"]["auth"].as_str().unwrap().contains("portal credential"));
     }
 
     /// The map is a promise about where to send the next request. Over TLS it has to
@@ -11040,6 +11119,53 @@ mod tests {
         assert!(!has_word("board_profile", "file"));
         assert!(!has_word("netmask 255.255.255.0", "net"));
         assert!(has_word("fetch it over http", "http"));
+
+        // Exercise the whole canned chain against the default advertised profile.
+        // The original alias-only fixture above remains a compatibility check.
+        for ask in ["status", "write a file", "edit a file", "mcp"] {
+            let mut app = test_app();
+            let mut messages = vec![json!({"role": "user", "content": ask})];
+            let mut calls = 0;
+            loop {
+                let request = json!({"model": "selftest", "messages": messages, "tools": app.tool_specs()});
+                let reply = selftest_completion(&post("/selftest/chat/completions", &request.to_string()));
+                let message = &reply["choices"][0]["message"];
+                let Some(call) = message["tool_calls"].as_array().and_then(|calls| calls.first()) else {
+                    assert_eq!(reply["choices"][0]["finish_reason"], "stop");
+                    assert!(
+                        !message["content"].as_str().unwrap_or("").contains("not on the tool list"),
+                        "{ask}: {reply}"
+                    );
+                    break;
+                };
+                let name = call["function"]["name"].as_str().unwrap();
+                assert!(app
+                    .tool_specs()
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|tool| tool["function"]["name"] == name));
+                let args: Value =
+                    serde_json::from_str(call["function"]["arguments"].as_str().unwrap()).unwrap();
+                let result = app
+                    .call_tool(name, &args)
+                    .unwrap_or_else(|error| panic!("{ask}: {name} {args}: {error}"));
+                messages.push(message.clone());
+                messages
+                    .push(json!({"role": "tool", "tool_call_id": call["id"], "content": result.to_string()}));
+                calls += 1;
+                assert!(calls <= 6, "the canned script must finish");
+            }
+            assert_eq!(
+                calls,
+                match ask {
+                    "status" => 1,
+                    "mcp" => 6,
+                    _ => 3,
+                },
+                "{ask}"
+            );
+        }
     }
 
     /// A turn in flight must not own the app while the model is thinking.

@@ -19,7 +19,7 @@ use std::time::Duration;
 
 pub const MAX_HEADER_BYTES: usize = 8 * 1024;
 pub const MAX_BODY_BYTES: usize = 1024 * 1024;
-const MAX_CONNECTIONS: usize = 6;
+pub const MAX_CONNECTIONS: usize = 6;
 const IDLE_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// Sockets accepted but not yet sending. A browser warming connections can hold several,
