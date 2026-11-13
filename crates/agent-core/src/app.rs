@@ -3147,23 +3147,11 @@ impl App {
     }
 
     fn next_task_id(&self) -> String {
-        for n in 1..=MAX_TASKS * 4 {
-            let id = format!("t{n}");
-            if !self.tasks.iter().any(|t| t.id == id) {
-                return id;
-            }
-        }
-        format!("t{}", self.tasks.len() + 1)
+        next_schedule_task_id(&self.tasks)
     }
 
     fn next_rule_id(&self) -> String {
-        for n in 1..=MAX_RULES * 4 {
-            let id = format!("r{n}");
-            if !self.rules.iter().any(|r| r.id == id) {
-                return id;
-            }
-        }
-        format!("r{}", self.rules.len() + 1)
+        next_schedule_id("r", self.rules.iter().map(|r| r.id.as_str()))
     }
 
     /// Add, update, enable/disable or delete one task or rule by id.
@@ -3205,6 +3193,19 @@ impl App {
             Ok(v) => v,
             Err(e) => return Response::error_json(400, &format!("invalid JSON: {e}")),
         };
+        if body.get("tasks").is_some() || body.get("rules").is_some() {
+            match self.sched_replacement(&body) {
+                Ok((tasks, rules)) => {
+                    self.tasks = tasks;
+                    self.rules = rules;
+                    self.persist_sched();
+                    let mut v = self.sched_json();
+                    v["ok"] = json!(true);
+                    return Response::json(&v);
+                }
+                Err(e) => return Response::error_json(400, &e.message),
+            }
+        }
         let kind = body.get("kind").and_then(|k| k.as_str()).unwrap_or("");
         let op = body.get("op").and_then(|o| o.as_str()).unwrap_or("upsert");
         let id = body.get("id").and_then(|i| i.as_str()).unwrap_or("").trim().to_string();
@@ -3234,13 +3235,10 @@ impl App {
             ("task", "add") | ("task", "update") | ("task", "upsert") => {
                 let src = body.get("task").unwrap_or(&body);
                 let fallback = self.next_task_id();
-                let task = match task_from(src, &fallback) {
-                    Some(t) => t,
-                    None => return Response::json_status(400, &json!({ "error": "`prompt` is required" })),
+                let task = match task_from_api(src, &fallback) {
+                    Ok(t) => t,
+                    Err(e) => return Response::error_json(400, &e.message),
                 };
-                if let Some(why) = task_problem(&task) {
-                    return Response::json_status(400, &json!({ "error": why }));
-                }
                 match self.tasks.iter().position(|t| t.id == task.id) {
                     Some(i) => {
                         // A patch that does not mention the clock keeps the old one.
@@ -3283,13 +3281,10 @@ impl App {
             ("rule", "add") | ("rule", "update") | ("rule", "upsert") => {
                 let src = body.get("rule").unwrap_or(&body);
                 let fallback = self.next_rule_id();
-                let rule = match rule_from_id(src, &fallback) {
-                    Some(r) => r,
-                    None => return Response::json_status(400, &json!({ "error": "`tool` is required" })),
+                let rule = match rule_from_api(src, &fallback) {
+                    Ok(r) => r,
+                    Err(e) => return Response::error_json(400, &e.message),
                 };
-                if let Some(why) = rule_problem(&rule) {
-                    return Response::json_status(400, &json!({ "error": why }));
-                }
                 match self.rules.iter().position(|r| r.id == rule.id) {
                     Some(i) => {
                         let mut rule = rule;
@@ -3320,6 +3315,70 @@ impl App {
         let mut v = self.sched_json();
         v["ok"] = json!(true);
         Response::json(&v)
+    }
+
+    /// Validate the advertised full replacement in temporary lists. A bad member
+    /// must not erase a previously valid schedule or reset any existing clocks.
+    fn sched_replacement(&self, body: &Value) -> Result<(Vec<ScheduledTask>, Vec<SensorRule>)> {
+        if body.get("kind").is_some() || body.get("op").is_some() {
+            return Err(McpError::invalid_params("do not mix schedule replacement with `kind`/`op`"));
+        }
+        let task_sources = body
+            .get("tasks")
+            .and_then(Value::as_array)
+            .ok_or_else(|| McpError::invalid_params("replacement requires a `tasks` array"))?;
+        let rule_sources = body
+            .get("rules")
+            .and_then(Value::as_array)
+            .ok_or_else(|| McpError::invalid_params("replacement requires a `rules` array"))?;
+        if task_sources.len() > MAX_TASKS || rule_sources.len() > MAX_RULES {
+            return Err(McpError::invalid_params(format!(
+                "at most {MAX_TASKS} scheduled tasks and {MAX_RULES} sensor rules"
+            )));
+        }
+        let mut tasks: Vec<ScheduledTask> = Vec::with_capacity(task_sources.len());
+        for src in task_sources {
+            let fallback = next_schedule_id(
+                "t",
+                task_sources
+                    .iter()
+                    .filter_map(|v| v.get("id").and_then(Value::as_str))
+                    .map(str::trim)
+                    .chain(tasks.iter().map(|t| t.id.as_str())),
+            );
+            let mut task = task_from_api(src, &fallback)?;
+            if tasks.iter().any(|t| t.id == task.id) {
+                return Err(McpError::invalid_params(format!("duplicate task id `{}`", task.id)));
+            }
+            if src.get("last_run_ms").is_none() {
+                if let Some(old) = self.tasks.iter().find(|t| t.id == task.id) {
+                    task.last_run_ms = old.last_run_ms;
+                }
+            }
+            tasks.push(task);
+        }
+        let mut rules: Vec<SensorRule> = Vec::with_capacity(rule_sources.len());
+        for src in rule_sources {
+            let fallback = next_schedule_id(
+                "r",
+                rule_sources
+                    .iter()
+                    .filter_map(|v| v.get("id").and_then(Value::as_str))
+                    .map(str::trim)
+                    .chain(rules.iter().map(|r| r.id.as_str())),
+            );
+            let mut rule = rule_from_api(src, &fallback)?;
+            if rules.iter().any(|r| r.id == rule.id) {
+                return Err(McpError::invalid_params(format!("duplicate rule id `{}`", rule.id)));
+            }
+            if src.get("last_fire_ms").is_none() {
+                if let Some(old) = self.rules.iter().find(|r| r.id == rule.id) {
+                    rule.last_fire_ms = old.last_fire_ms;
+                }
+            }
+            rules.push(rule);
+        }
+        Ok((tasks, rules))
     }
 
     /// Run the queued message, if there is one, and keep the transcript.
@@ -6256,6 +6315,60 @@ fn task_json(t: &ScheduledTask) -> Value {
     })
 }
 
+fn next_schedule_id<'a>(prefix: &str, ids: impl Iterator<Item = &'a str>) -> String {
+    let ids: std::collections::BTreeSet<_> = ids.collect();
+    // There are at most N occupied names, so one of N+1 candidates must be free.
+    (1..=ids.len() + 1)
+        .map(|n| format!("{prefix}{n}"))
+        .find(|id| !ids.contains(id.as_str()))
+        .expect("one more candidate than occupied names")
+}
+
+pub(crate) fn next_schedule_task_id(tasks: &[ScheduledTask]) -> String {
+    next_schedule_id("t", tasks.iter().map(|t| t.id.as_str()))
+}
+
+fn schedule_string_fields(v: &Value, names: &[&str]) -> Result<()> {
+    if !v.is_object() {
+        return Err(McpError::invalid_params("schedule entries must be objects"));
+    }
+    for name in names {
+        if v.get(*name).is_some_and(|raw| !raw.is_string()) {
+            return Err(McpError::invalid_params(format!("`{name}` must be a string")));
+        }
+    }
+    if v.get("enabled").is_some_and(|raw| !raw.is_boolean()) {
+        return Err(McpError::invalid_params("`enabled` must be a boolean"));
+    }
+    Ok(())
+}
+
+/// Strict edge validation shared by REST and the schedule tool. Stored schedule
+/// blobs keep the lenient reader below, so this does not change recovery semantics.
+pub(crate) fn task_from_api(v: &Value, fallback_id: &str) -> Result<ScheduledTask> {
+    schedule_string_fields(v, &["id", "prompt", "script", "at_hhmm"])?;
+    let every_s = crate::json::optional_ranged_i64(v, "every_s", 0, 86_400)?.unwrap_or(0) as u32;
+    crate::json::optional_ranged_u64(v, "last_run_ms", 0, u64::MAX)?;
+    let mut task = task_from(v, fallback_id)
+        .ok_or_else(|| McpError::invalid_params("a task requires `prompt` or `script`"))?;
+    task.every_s = every_s;
+    if let Some(why) = task_problem(&task) {
+        return Err(McpError::invalid_params(why));
+    }
+    Ok(task)
+}
+
+fn rule_from_api(v: &Value, fallback_id: &str) -> Result<SensorRule> {
+    schedule_string_fields(v, &["id", "tool", "path", "op", "prompt"])?;
+    crate::json::optional_ranged_u64(v, "min_interval_s", 0, u32::MAX as u64)?;
+    crate::json::optional_ranged_u64(v, "last_fire_ms", 0, u64::MAX)?;
+    let rule = rule_from_id(v, fallback_id).ok_or_else(|| McpError::invalid_params("`tool` is required"))?;
+    if let Some(why) = rule_problem(&rule) {
+        return Err(McpError::invalid_params(why));
+    }
+    Ok(rule)
+}
+
 /// A task from a JSON object. Lenient on purpose: this also reads the NVS blob,
 /// which was validated when it was written. `fallback_id` names a new one.
 fn task_from(v: &Value, fallback_id: &str) -> Option<ScheduledTask> {
@@ -6307,7 +6420,11 @@ fn valid_hhmm(s: &str) -> bool {
     let Some((h, m)) = s.split_once(':') else {
         return false;
     };
-    if h.len() != 2 || m.len() != 2 {
+    if h.len() != 2
+        || m.len() != 2
+        || !h.bytes().all(|c| c.is_ascii_digit())
+        || !m.bytes().all(|c| c.is_ascii_digit())
+    {
         return false;
     }
     match (h.parse::<u32>(), m.parse::<u32>()) {
@@ -8649,8 +8766,6 @@ mod tests {
         assert!(web::STYLE_CSS.contains("100dvh"), "mobile height, not a guessed one");
     }
 
-    /// The board's own agent can put work on the board's schedule: a task, on an interval
-    /// or at a daily time, into the same queue a user message uses.
     #[test]
     fn raw_board_arguments_refuse_before_hardware_access() {
         use crate::hardware::{BoardInfo, PinMode};
@@ -8810,6 +8925,8 @@ mod tests {
         assert_eq!(app.tasks.len(), 1, "invalid notifications must not execute");
     }
 
+    /// The board's own agent can put work on the board's schedule: a task, on an interval
+    /// or at a daily time, into the same queue a user message uses.
     #[test]
     fn the_agent_can_schedule_its_own_work() {
         let mut app = test_app();
@@ -10437,6 +10554,113 @@ mod tests {
         );
         // The edit is persisted, so a reboot keeps the schedule.
         assert!(app.store.get(NVS_KEY_SCHED).is_some(), "the schedule was never saved");
+    }
+
+    #[test]
+    fn schedule_tool_and_rest_share_validation_limits_and_unique_ids() {
+        let mut app = test_app();
+        let first = app.call_tool("schedule", &json!({"action":"add","prompt":"one","every_s":60})).unwrap();
+        let second = app.call_tool("schedule", &json!({"action":"add","prompt":"two","every_s":60})).unwrap();
+        app.call_tool("schedule", &json!({"action":"remove","id":first["id"]})).unwrap();
+        let third =
+            app.call_tool("schedule", &json!({"action":"add","prompt":"three","every_s":60})).unwrap();
+        assert_ne!(second["id"], third["id"]);
+        for task in [
+            json!({"prompt":"x"}),
+            json!({"prompt":"x","at_hhmm":"25:00"}),
+            json!({"prompt":"x","at_hhmm":"+1:00"}),
+            json!({"prompt":"x","every_s":1.5}),
+            json!({"prompt":"x","every_s":true}),
+            json!({"prompt":"x","every_s":-1}),
+            json!({"prompt":"x","every_s":86401}),
+            json!({"prompt":"x","every_s":60,"enabled":"yes"}),
+        ] {
+            let before = app.tasks.clone();
+            let mut tool = task.clone();
+            tool["action"] = json!("add");
+            assert_eq!(app.call_tool("schedule", &tool).unwrap_err().code, code::INVALID_PARAMS);
+            let body = json!({"kind":"task","op":"add","task":task});
+            assert_eq!(app.route(&post("/api/sched", &body.to_string())).status, 400);
+            assert_eq!(app.tasks, before, "refusal must not mutate tasks");
+        }
+        while app.tasks.len() < MAX_TASKS {
+            app.call_tool("schedule", &json!({"action":"add","prompt":"slot","every_s":60})).unwrap();
+        }
+        let before = app.tasks.clone();
+        assert!(app.call_tool("schedule", &json!({"action":"add","prompt":"ninth","every_s":60})).is_err());
+        assert_eq!(
+            app.route(&post(
+                "/api/sched",
+                r#"{"kind":"task","task":{"id":"ninth","prompt":"x","every_s":60}}"#
+            ))
+            .status,
+            400
+        );
+        assert_eq!(app.tasks, before);
+        assert_eq!(
+            app.tasks.iter().map(|t| &t.id).collect::<std::collections::BTreeSet<_>>().len(),
+            MAX_TASKS
+        );
+    }
+
+    #[test]
+    fn schedule_replacement_is_atomic_on_invalid_members_duplicates_and_caps() {
+        let mut app = test_app();
+        let task = json!({"id":"t1","prompt":"keep task","every_s":60});
+        let rule = json!({"id":"r1","tool":"bme280_read","prompt":"keep rule"});
+        let body = json!({"tasks":[task.clone()],"rules":[rule.clone()]});
+        assert_eq!(app.route(&post("/api/sched", &body.to_string())).status, 200);
+        let before = (app.tasks.clone(), app.rules.clone(), app.store.get(NVS_KEY_SCHED));
+        for invalid in [
+            json!({"tasks":[],"rules":[{"tool":"bme280_read"}]}),
+            json!({"tasks":[task.clone(),task.clone()],"rules":[]}),
+            json!({"tasks":[],"rules":[rule.clone(),rule.clone()]}),
+            json!({"tasks":[{"prompt":"bad","at_hhmm":"24:00"}],"rules":[]}),
+            json!({"tasks":[{"prompt":"bad","every_s":true}],"rules":[]}),
+            json!({"tasks":[{"prompt":"bad","every_s":60,"last_run_ms":"0"}],"rules":[]}),
+            json!({"tasks":[],"rules":[{"tool":"bme280_read","prompt":"bad","op":"approx"}]}),
+            json!({"tasks":[],"rules":[{"tool":"bme280_read","prompt":"bad","min_interval_s":-1}]}),
+            json!({"tasks":vec![task.clone();MAX_TASKS+1],"rules":[]}),
+            json!({"tasks":[],"rules":vec![rule.clone();MAX_RULES+1]}),
+            json!({"tasks":{},"rules":[]}),
+            json!({"tasks":[]}),
+            json!({"tasks":[],"rules":[],"kind":"task"}),
+            json!({"tasks":[17],"rules":[]}),
+        ] {
+            assert_eq!(app.route(&post("/api/sched", &invalid.to_string())).status, 400, "{invalid}");
+            assert_eq!((app.tasks.clone(), app.rules.clone(), app.store.get(NVS_KEY_SCHED)), before);
+        }
+    }
+
+    #[test]
+    fn schedule_replacement_preserves_clocks_defaults_and_existing_mutations() {
+        let mut app = test_app();
+        let body = json!({"tasks":[{"id":"t1","prompt":"first","every_s":60,"last_run_ms":123}],
+            "rules":[{"id":"r1","tool":"bme280_read","prompt":"rule","last_fire_ms":456}]});
+        assert_eq!(app.route(&post("/api/sched", &body.to_string())).status, 200);
+        let replacement = json!({"tasks":[{"prompt":"generated","at_hhmm":"07:30"},
+            {"id":"t1","script":"1","every_s":"60"}],
+            "rules":[{"id":"r1","tool":"bme280_read","prompt":"new rule"}]});
+        assert_eq!(app.route(&post("/api/sched", &replacement.to_string())).status, 200);
+        assert_ne!(app.tasks[0].id, "t1", "generated ids reserve later explicit ids");
+        assert!(app.tasks[0].last_run_ms > 1_000_000_000_000);
+        assert_eq!(app.tasks[1].last_run_ms, 123);
+        assert_eq!(app.rules[0].last_fire_ms, 456);
+        assert!(app.tasks.iter().all(|t| t.enabled));
+        assert!(app.rules[0].enabled);
+        assert_eq!(app.rules[0].min_interval_s, 60);
+        assert_eq!(app.rules[0].op, "true");
+        assert_eq!(app.route(&post("/api/sched", r#"{"kind":"task","op":"disable","id":"t1"}"#)).status, 200);
+        assert!(!app.tasks[1].enabled);
+        let body = json!({"tasks":[{"id":"t1","prompt":"changed","every_s":60,"last_run_ms":789}],
+            "rules":[{"id":"r1","tool":"bme280_read","prompt":"changed","last_fire_ms":987}]});
+        assert_eq!(app.route(&post("/api/sched", &body.to_string())).status, 200);
+        assert_eq!(app.tasks[0].last_run_ms, 789);
+        assert_eq!(app.rules[0].last_fire_ms, 987);
+        let stored: Value = serde_json::from_str(&app.store.get(NVS_KEY_SCHED).unwrap()).unwrap();
+        assert_eq!(stored["tasks"][0]["last_run_ms"], 789);
+        assert_eq!(app.route(&post("/api/sched", r#"{"tasks":[],"rules":[]}"#)).status, 200);
+        assert!(app.tasks.is_empty() && app.rules.is_empty());
     }
 
     #[test]

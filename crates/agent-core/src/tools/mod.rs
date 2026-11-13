@@ -418,33 +418,18 @@ pub fn system_tools() -> Vec<ToolDef> {
                     "count": ctx.tasks.len(),
                 })),
                 "add" => {
-                    let prompt = j::opt_str(args, "prompt").unwrap_or_default();
-                    if prompt.trim().is_empty() {
-                        return Err(McpError::invalid_params("`prompt` is required to add a task"));
+                    if ctx.tasks.len() >= crate::app::MAX_TASKS {
+                        return Err(McpError::invalid_params(format!("at most {} scheduled tasks", crate::app::MAX_TASKS)));
                     }
-                    let every_s = j::opt_i64(args, "every_s").unwrap_or(0).clamp(0, 86_400) as u32;
-                    let at_hhmm = j::opt_str(args, "at_hhmm").unwrap_or_default();
-                    if every_s == 0 && at_hhmm.is_empty() {
-                        return Err(McpError::invalid_params(
-                            "give `every_s` or `at_hhmm`; a task with neither never fires",
-                        ));
-                    }
-                    // The id is derived, not asked for: a model inventing one twice would
-                    // silently replace its own task.
-                    let id = format!("t{}", ctx.tasks.len() + 1);
-                    ctx.tasks.push(crate::sched::ScheduledTask {
-                        id: id.clone(),
-                        prompt,
-                        script: j::opt_str(args, "script").unwrap_or_default(),
-                        every_s,
-                        at_hhmm,
-                        enabled: j::opt_bool(args, "enabled").unwrap_or(true),
-                        // The clock starts now. `due()` compares this with the wall clock in
-                        // milliseconds, so a fresh task carrying 0 is 1970 - `since_last` is
-                        // 1.79e12 and it fires during the very turn that created it (measured:
-                        // `schedule add {every_s:120}`, then the LED changed before the answer).
-                        last_run_ms: crate::app::now_ms(),
-                    });
+                    // The id is derived, not asked for, and remains unique after removals.
+                    let id = crate::app::next_schedule_task_id(ctx.tasks);
+                    let mut input = args.clone();
+                    input["id"] = json!(id);
+                    // The tool creates a new task, so its clock always starts now. An
+                    // existing REST edit/replacement may instead preserve its old clock.
+                    input["last_run_ms"] = json!(crate::app::now_ms());
+                    let task = crate::app::task_from_api(&input, &id)?;
+                    ctx.tasks.push(task);
                     ctx.runtime.sched_dirty = true;
                     ctx.log.info("agent", format!("schedule: task `{id}` added from a tool call"));
                     Ok(json!({ "ok": true, "id": id, "count": ctx.tasks.len() }))
