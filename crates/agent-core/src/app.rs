@@ -5454,39 +5454,52 @@ impl App {
         })
     }
 
-    /// Pack `{name: text}` entries into an archive and return it as base64.
+    /// Pack `{name: text}` entries into a compact inline archive and return base64.
     ///
-    /// Base64 rather than a file in the workspace: the workspace holds text and totals 8 kB,
-    /// and a tool result is capped at 2 KB anyway. An external agent can decode the string
-    /// and write a real `.zip`; the board itself only needs to hand it over.
+    /// The 1,400-byte archive policy is separate from the workspace and tool-result limits.
+    /// Check stored ZIP overhead before cloning any file; a large workspace export must
+    /// be refused without first allocating an equally large archive and input copy.
     fn shell_zip(&mut self, args: &Value) -> std::result::Result<String, String> {
+        const INLINE_MAX: usize = 1400;
         let name = args.get("name").and_then(|v| v.as_str()).unwrap_or("archive.zip");
         let mut entries: Vec<(String, Vec<u8>)> = Vec::new();
+        let mut encoded_bytes = 22usize;
+        let mut append = |path: &str, text: &str| -> std::result::Result<(), String> {
+            let next = encoded_bytes
+                .saturating_add(76)
+                .saturating_add(path.len().saturating_mul(2))
+                .saturating_add(text.len());
+            if next > INLINE_MAX {
+                return Err(format!("the archive would be {next} bytes; zip's inline archive limit is {INLINE_MAX} bytes before base64"));
+            }
+            entries.push((path.to_string(), text.as_bytes().to_vec()));
+            encoded_bytes = next;
+            Ok(())
+        };
         if let Some(files) = args.get("files").and_then(|v| v.as_object()) {
             for (path, text) in files {
-                entries.push((path.clone(), text.as_str().unwrap_or("").as_bytes().to_vec()));
+                append(path, text.as_str().unwrap_or(""))?;
             }
         }
-        // `paths` packs files that are already in the workspace.
+        // Borrow the existing text until admission succeeds; Workspace::read would
+        // clone the entire file even when its first entry already exceeds INLINE_MAX.
         if let Some(paths) = args.get("paths").and_then(|v| v.as_array()) {
             for path in paths.iter().filter_map(|p| p.as_str()) {
                 self.ensure_enabled("fs_read").map_err(|e| e.message)?;
-                match fs_tools::Workspace::read(&self.workspace, path) {
-                    Ok(text) => entries.push((path.trim_start_matches('/').to_string(), text.into_bytes())),
-                    Err(_) => return Err(format!("`{path}` is not in the workspace")),
-                }
+                let canonical = AppWorkspace::file_path(path)?;
+                let text = self
+                    .workspace
+                    .files
+                    .get(&canonical)
+                    .ok_or_else(|| format!("`{path}` is not in the workspace"))?;
+                append(canonical.trim_start_matches('/'), text)?;
             }
         }
         if entries.is_empty() {
             return Err("nothing to pack: give `files` {name: text} or `paths` [..]".into());
         }
         let archive = crate::zip::write(&entries)?;
-        if archive.len() > 1400 {
-            return Err(format!(
-                "the archive would be {} bytes; a tool result is limited to about 1.4 kB of base64",
-                archive.len()
-            ));
-        }
+        debug_assert_eq!(archive.len(), encoded_bytes);
         // No `stored`: nothing is written anywhere. `zip` hands the archive back as base64 and
         // the field said otherwise, which is a claim a caller could act on and be wrong.
         Ok(json!({
