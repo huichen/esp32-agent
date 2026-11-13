@@ -706,7 +706,11 @@ fn normalize_path(p: &str) -> String {
     }
     s.push_str(p.trim_end_matches('/'));
     if s.len() > 32 {
-        s.truncate(32);
+        let mut end = 32;
+        while !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        s.truncate(end);
     }
     s
 }
@@ -754,6 +758,16 @@ mod tests {
         let mut c = Config::default();
         c.apply_patch(&json!({ "mcp": { "path": "api/mcp/" } })).unwrap();
         assert_eq!(c.mcp.path, "/api/mcp");
+
+        // The 32-byte path ceiling may fall inside a UTF-8 character. Both a live
+        // patch and a stored config must shorten it without panicking.
+        let path = format!("{}é/", "a".repeat(30));
+        c.apply_patch(&json!({ "mcp": { "path": path } })).unwrap();
+        assert_eq!(c.mcp.path, format!("/{}", "a".repeat(30)));
+        let stored = Config::from_json_str(&json!({ "mcp": { "path": "界".repeat(20) } }).to_string())
+            .expect("a long Unicode path still loads");
+        assert_eq!(stored.mcp.path, format!("/{}", "界".repeat(10)));
+        assert!(stored.mcp.path.len() <= 32);
     }
 
     #[test]
