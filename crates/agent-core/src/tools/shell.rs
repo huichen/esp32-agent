@@ -510,6 +510,11 @@ fn takes_value(op: &str, key: &str) -> bool {
         "p" => matches!(op, "nslookup" | "nc"),
         "w" => matches!(op, "hexdump" | "xd" | "od"),
         "n" => matches!(op, "head" | "tail" | "strings"),
+        // In the usage lines and not in this table, so the value was read as a positional
+        // argument and the flag as `true`: `nc host -t 2500` timed out after the default 3 s,
+        // and `awk '...' --sep ,` never saw its separator.
+        "t" => op == "nc",
+        "sep" => op == "awk",
         "i" => op == "tee",
         _ => false,
     }
@@ -712,6 +717,12 @@ fn arguments_inner(parsed: &Parsed, piped: bool) -> Result<serde_json::Value, St
         }
     };
     let flag = |long: &str, short: &str| parsed.flags.get(long).or_else(|| parsed.flags.get(short)).cloned();
+    // A flag whose value is a number must arrive as one. Measured on the board: `nc host -p 443`
+    // answered `"port": 80`, because the handler reads `as_u64()` and the flag carried the string
+    // `"443"`, so the default won - and `-p 22` reported an open port that was never contacted.
+    let num = |long: &str, short: &str| -> Option<Value> {
+        flag(long, short).and_then(|v| v.trim().parse::<i64>().ok()).map(|n| json!(n))
+    };
     let flag_bool = |long: &str, short: &str| flag(long, short).map(|v| v == "true").unwrap_or(false);
 
     Ok(match parsed.name.as_str() {
@@ -731,17 +742,16 @@ fn arguments_inner(parsed: &Parsed, piped: bool) -> Result<serde_json::Value, St
             "regex": flag_bool("extended", "e"),
         }),
         "zip" => {
-            let name = need(0, "<archive>")?;
-            let mut files = serde_json::Map::new();
-            for path in parsed.args.iter().skip(1) {
-                files.insert(path.trim_start_matches('/').to_string(), json!(""));
-            }
-            json!({ "name": name, "paths": parsed.args.iter().skip(1).collect::<Vec<_>>(), "files": files })
+            // `paths` only. Filling `files` as well (with empty text) put every name in the
+            // archive twice - once empty, once with its content - because `shell_zip` packs both
+            // arguments: measured, `zip a.zip x.txt y.txt` listed four entries for two files.
+            let name = need(0, "<name>")?;
+            json!({ "name": name, "paths": parsed.args.iter().skip(1).collect::<Vec<_>>() })
         }
         "unzip" => json!({ "archive_b64": need(0, "<archive_b64>")? }),
         "hexdump" | "xd" | "od" => json!({
             "path": path_arg(0)?,
-            "width": flag("width", "w"),
+            "width": num("width", "w"),
             "octal": parsed.name == "od",
         }),
         "base64" | "base64enc" | "base64dec" => json!({
@@ -766,11 +776,11 @@ fn arguments_inner(parsed: &Parsed, piped: bool) -> Result<serde_json::Value, St
             "format": flag("format", "f"),
         }),
         "wget" => json!({ "url": need(0, "<url>")?, "path": flag("output", "o") }),
-        "nslookup" => json!({ "host": need(0, "<host>")?, "port": flag("port", "p") }),
+        "nslookup" => json!({ "host": need(0, "<host>")?, "port": num("port", "p") }),
         "nc" => {
-            json!({ "host": need(0, "<host>")?, "port": flag("port", "p"), "timeout_ms": flag("timeout", "t") })
+            json!({ "host": need(0, "<host>")?, "port": num("port", "p"), "timeout_ms": num("timeout", "t") })
         }
-        "ping" => json!({ "host": need(0, "<host>")?, "count": flag("count", "c") }),
+        "ping" => json!({ "host": need(0, "<host>")?, "count": num("count", "c") }),
         "ifconfig" | "df" | "free" | "uptime" | "date" | "uname" | "ps" | "help" | "du" | "whoami" | "id"
         | "netstat" | "route" | "arp" => json!({}),
         "env" => json!({ "action": "list" }),
@@ -787,13 +797,13 @@ fn arguments_inner(parsed: &Parsed, piped: bool) -> Result<serde_json::Value, St
         }
         "head" | "tail" => json!({
             "path": path_arg(0)?,
-            "lines": parsed.flags.get("n").cloned(),
+            "lines": num("n", "n"),
             "tail": parsed.name == "tail",
         }),
         "cut" => json!({
             "path": path_arg(0)?,
             "delimiter": parsed.flags.get("d").cloned(),
-            "field": parsed.flags.get("f").cloned(),
+            "field": num("field", "f"),
         }),
         "sort" => json!({
             "path": path_arg(0)?,
@@ -813,7 +823,7 @@ fn arguments_inner(parsed: &Parsed, piped: bool) -> Result<serde_json::Value, St
             json!({ "program": need(0, "<{print $1}> ")?, "sep": flag("sep", "f"), "path": path_arg(1)? })
         }
         "tee" => json!({ "path": need(0, "<path>")?, "input": parsed.flags.get("i").cloned() }),
-        "strings" => json!({ "path": path_arg(0)?, "min": parsed.flags.get("n").cloned() }),
+        "strings" => json!({ "path": path_arg(0)?, "min": num("n", "n") }),
         "sleep" => json!({ "unit": "s", "value": need(0, "<seconds>")? }),
         "usleep" => json!({ "unit": "ms", "value": need(0, "<milliseconds>")? }),
         "jot" => json!({ "count": need(0, "<count>")?, "start": arg(1), "step": arg(2) }),
@@ -854,9 +864,9 @@ pub fn usage(op: &str) -> Option<&'static str> {
         "grep" => {
             "grep [-E] <pattern> [path]  (literal by default; -E = regex: . ^ $ * + ? [...] \\d \\w \\s)"
         }
-        "zip" => "zip <archive> <path...>",
+        "zip" => "zip <name> <path...>  (the archive comes back as base64; nothing is written)",
         "unzip" => "unzip <archive_b64>",
-        "df" => "df",
+        "df" => "df  (free_bytes is the workspace budget; store_* is the filesystem)",
         "free" => "free",
         "uptime" => "uptime",
         "date" => "date",
@@ -1158,11 +1168,47 @@ mod tests {
     /// A filter has to name its file, and the flags that take a value have to survive the
     /// shared flag table: `-c` is ping's count and `-w` is hexdump's width, so `wc -c /f`
     /// reaches the handler as `c=/f`.
+    /// A flag that carries a number has to arrive as one.
+    ///
+    /// Measured on the board: `nc future-os.cn -p 443` answered `"port": 80` and `-p 22` reported
+    /// an open port that was never contacted. The flag reached the handler as the string `"443"`,
+    /// the handler reads `as_u64()`, and the default won - a monitor that lies is worse than one
+    /// that refuses.
+    #[test]
+    fn a_numeric_flag_arrives_as_a_number() {
+        let nc = arguments(&parse("nc example.com -p 443 -t 2500").unwrap()).unwrap();
+        assert_eq!(nc["port"], json!(443));
+        assert_eq!(nc["timeout_ms"], json!(2500));
+        let dns = arguments(&parse("nslookup example.com -p 5353").unwrap()).unwrap();
+        assert_eq!(dns["port"], json!(5353));
+        let ping = arguments(&parse("ping 10.0.0.1 -c 3").unwrap()).unwrap();
+        assert_eq!(ping["count"], json!(3));
+        let hex = arguments(&parse("hexdump /f -w 16").unwrap()).unwrap();
+        assert_eq!(hex["width"], json!(16));
+        let awk = arguments(&parse("awk '{print $1}' /f --sep ,").unwrap()).unwrap();
+        assert_eq!(awk["sep"], json!(","), "the usage line documents --sep");
+        let strings = arguments(&parse("strings /f -n 6").unwrap()).unwrap();
+        assert_eq!(strings["min"], json!(6));
+        // And a flag that is not a number stays a string: `cut -d ,` is a delimiter.
+        let cut = arguments(&parse("cut -d , -f 2 /f").unwrap()).unwrap();
+        assert_eq!(cut["delimiter"], json!(","));
+    }
+
+    /// `zip` packs each path once. It used to pack every file twice - once from an empty `files`
+    /// map, once from `paths` - so a two-file archive listed four entries.
+    #[test]
+    fn zip_packs_each_path_once() {
+        let zip = arguments(&parse("zip out.zip /a.txt /b.txt").unwrap()).unwrap();
+        assert!(zip.get("files").is_none(), "the shell must not hand `zip` an empty files map: {zip}");
+        assert_eq!(zip["paths"].as_array().map(|a| a.len()), Some(2));
+        assert_eq!(zip["name"], json!("out.zip"));
+    }
+
     #[test]
     fn the_new_commands_parse_the_way_a_shell_writes_them() {
         let cut = arguments(&parse("cut -d , -f 2 /notes.csv").unwrap()).unwrap();
         assert_eq!(cut["delimiter"], json!(","));
-        assert_eq!(cut["field"], json!("2"));
+        assert_eq!(cut["field"], json!(2), "a field number is a number");
         assert_eq!(cut["path"], json!("/notes.csv"));
 
         let wc = arguments(&parse("wc -c /f").unwrap()).unwrap();
@@ -1173,7 +1219,7 @@ mod tests {
         assert_eq!(wc["path"], json!("/f"));
 
         let head = arguments(&parse("head -n 2 /f").unwrap()).unwrap();
-        assert_eq!(head["lines"], json!("2"));
+        assert_eq!(head["lines"], json!(2));
         assert_eq!(head["tail"], json!(false));
         let tail = arguments(&parse("tail /f").unwrap()).unwrap();
         assert_eq!(tail["tail"], json!(true));
