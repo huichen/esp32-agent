@@ -58,7 +58,8 @@ defaults, and the limits. An agent that can fetch a URL needs nothing else.
 ## Give it a model
 
 Open `http://<board>/`, choose **Agent**, and fill in the endpoint, the model id and the key,
-then save. The key is write-only: it goes to NVS and reads back as `__set__`. The same panel
+then save. The key is write-only: it goes to NVS, and reads report `api_key_set`, not the key.
+The same panel
 holds `protocol` (`chat`, `responses` or `anthropic`), `reasoning`, `context_tokens` and
 `max_output_tokens`.
 
@@ -76,10 +77,10 @@ works for every board it can reach. Without a key at all, `base_url` set to
 ## Safety notes
 
 - **Credentials stay on the board.** WiFi goes to NVS through `provision`, never into the
-  image; `api_key` is write-only and reads back as `__set__`.
+  image; `api_key` is write-only and reads report only `api_key_set`.
 - **Set both credentials before the board leaves your desk.** `auth.portal_pin` guards REST
-  writes and config, transcript, prompt, workspace and attachment reads. Logs and the run
-  journal are currently open. MCP uses its own `auth.mcp_token`, not the portal PIN.
+  writes and config, schedule, transcript, prompt, workspace, attachment, log, run-journal and
+  script-result reads. MCP uses `auth.mcp_token`; when that is unset, it falls back to the portal credential.
 - **Compare the certificate.** The board's TLS certificate is self-signed; its fingerprint is at
   `GET /api/tls`. Port 80 stays open by default so a bad certificate costs a URL and not the
   board; `mcp.plain_http: false` closes it, and the USB cable is then the way back in.

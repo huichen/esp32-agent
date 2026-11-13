@@ -62,7 +62,8 @@ valores por defecto, y los límites. Un agente que sepa pedir una URL no necesit
 ## Dale un modelo
 
 Abre `http://<board>/`, panel **Agent**, escribe el endpoint, el id del modelo y la clave, y
-guarda. La clave es de solo escritura: va a NVS y se relee como `__set__`. El mismo panel tiene
+guarda. La clave es de solo escritura: va a NVS y las lecturas muestran `api_key_set`, no la clave.
+El mismo panel tiene
 `protocol` (`chat`, `responses` o `anthropic`), `reasoning`, `context_tokens` y
 `max_output_tokens`.
 
@@ -80,11 +81,11 @@ instrucción sirve para cada placa que pueda alcanzar. Sin ninguna clave, `base_
 ## Notas de seguridad
 
 - **Las credenciales se quedan en la placa.** El WiFi va a NVS por `provision`, nunca a la
-  imagen; `api_key` es de solo escritura y se relee como `__set__`.
+  imagen; `api_key` es de solo escritura y las lecturas solo muestran `api_key_set`.
 - **Configura ambas credenciales antes de que la placa salga de tu mesa.** `auth.portal_pin`
-  protege las escrituras REST y las lecturas de configuración, transcripción, prompt, espacio
-  de trabajo y adjuntos. Los registros y el diario de ejecución están abiertos actualmente.
-  MCP usa su propio `auth.mcp_token`, no el PIN de la consola.
+  protege las escrituras REST y las lecturas de configuración, programación, transcripción, prompt, espacio
+  de trabajo, adjuntos, registros, diario de ejecución y resultados de scripts. MCP usa
+  `auth.mcp_token`; si no está configurado, recurre a la credencial de la consola.
 - **Compara el certificado.** El de la placa es autofirmado; su huella está en `GET /api/tls`.
   El puerto 80 sigue abierto por defecto: un certificado malo cuesta una URL, no la placa; `mcp.plain_http: false` lo cierra, y entonces el cable USB es la única vuelta atrás.
 - **`shell`, `script` y las herramientas del manifiesto mueven pines.** Ese es el objetivo de la
