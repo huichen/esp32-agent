@@ -17,12 +17,13 @@ const CMD: u8 = 0x00;
 const DATA: u8 = 0x40;
 
 /// Internal batched draw, deliberately not a published OLED tool. `media_play` checks
-/// the public rectangle/text switches before using it; a frame needs one flush, not an
-/// intermediate picture for every rectangle. Generic device dispatch cannot expose it.
+/// the public bitmap/rectangle/text switches before using it; a frame needs one flush,
+/// not an intermediate picture for every rectangle. Generic dispatch cannot expose it.
 pub(crate) const MEDIA_FRAME_TOOL: &str = "__media_frame";
 pub(crate) const MAX_FRAME_RECTS: usize = 64;
 
 pub(crate) struct MediaFrame {
+    bitmap: Option<Vec<u8>>,
     rects: Vec<MediaRect>,
     text: Option<String>,
     line: i32,
@@ -42,6 +43,34 @@ impl MediaFrame {
     pub(crate) fn parse(args: &Value, width: u8, height: u8) -> Result<Self> {
         if !args.is_object() {
             return Err(McpError::invalid_params("must be an object"));
+        }
+        if let Some(raw) = args.get("bitmap_b64") {
+            if ["rects", "text", "line"].iter().any(|field| args.get(field).is_some()) {
+                return Err(McpError::invalid_params(
+                    "`bitmap_b64` cannot be combined with `rects`, `text` or `line`",
+                ));
+            }
+            let b64 =
+                raw.as_str().ok_or_else(|| McpError::invalid_params("`bitmap_b64` must be a string"))?;
+            let expected = usize::from(width).div_ceil(8) * usize::from(height);
+            let length_error = |actual| {
+                McpError::invalid_params(format!(
+                    "`bitmap_b64` is {actual} decoded bytes; expected {expected} for {width}x{height}",
+                ))
+            };
+            let mut bitmap = Vec::new();
+            // Count and validate before allocating: even a single oversized blob must
+            // fail with its actual length, not reserve an unbounded temporary buffer.
+            crate::util::b64_decode_limit(b64, &mut bitmap, expected).map_err(|error| {
+                match error.data.as_ref().and_then(|data| data["decoded_bytes"].as_u64()) {
+                    Some(actual) => length_error(actual),
+                    None => McpError::invalid_params(format!("`bitmap_b64` {}", error.message)),
+                }
+            })?;
+            if bitmap.len() != expected {
+                return Err(length_error(bitmap.len() as u64));
+            }
+            return Ok(Self { bitmap: Some(bitmap), rects: Vec::new(), text: None, line: 0 });
         }
         let mut rects = Vec::new();
         if let Some(raw) = args.get("rects") {
@@ -83,9 +112,15 @@ impl MediaFrame {
         };
         let line = j::optional_ranged_i64(args, "line", 0, i64::from(height / 8) - 1)?.unwrap_or(0) as i32;
         if rects.is_empty() && text.is_none() {
-            return Err(McpError::invalid_params("needs drawable content: non-empty `rects` or `text`"));
+            return Err(McpError::invalid_params(
+                "needs drawable content: `bitmap_b64`, non-empty `rects` or `text`",
+            ));
         }
-        Ok(Self { rects, text, line })
+        Ok(Self { bitmap: None, rects, text, line })
+    }
+
+    pub(crate) fn bitmap_bytes(&self) -> Option<usize> {
+        self.bitmap.as_ref().map(Vec::len)
     }
 
     pub(crate) fn has_rects(&self) -> bool {
@@ -97,6 +132,9 @@ impl MediaFrame {
     }
 
     pub(crate) fn arguments(&self) -> Value {
+        if let Some(bitmap) = &self.bitmap {
+            return json!({"bitmap_b64": crate::util::b64_encode(bitmap)});
+        }
         let mut args = json!({
             "rects": self.rects.iter().map(|r| json!({
                 "x": r.x, "y": r.y, "w": r.w, "h": r.h, "fill": r.fill,
@@ -578,12 +616,18 @@ impl Device for Ssd1306 {
                 // already validated the whole call. No raw caller can create a partial
                 // parameter failure inside a frame.
                 let frame = MediaFrame::parse(args, self.width, self.height)?;
-                self.clear();
-                for rect in frame.rects {
-                    self.draw_rect(rect.x, rect.y, rect.w, rect.h, rect.fill, true);
-                }
-                if let Some(text) = frame.text {
-                    self.text(0, frame.line * 8, &text, true);
+                if let Some(bitmap) = frame.bitmap {
+                    // The same page-format bytes as oled_bitmap and POST /av, but
+                    // media frames must replace the entire detected panel.
+                    self.fb.copy_from_slice(&bitmap);
+                } else {
+                    self.clear();
+                    for rect in frame.rects {
+                        self.draw_rect(rect.x, rect.y, rect.w, rect.h, rect.fill, true);
+                    }
+                    if let Some(text) = frame.text {
+                        self.text(0, frame.line * 8, &text, true);
+                    }
                 }
                 self.flush(hw)?;
                 Ok(json!({ "ok": true }))
@@ -961,6 +1005,28 @@ mod tests {
             .call("oled_rect", &json!({ "x": 0, "y": 0, "w": 200, "h": 4 }), &mut bus)
             .expect_err("wider than the panel");
         assert_eq!(err.code, crate::error::code::INVALID_PARAMS);
+    }
+
+    #[test]
+    fn invalid_media_bitmaps_do_not_clear_or_flush_the_panel() {
+        let mut bus = Bus::default();
+        let mut p = bare_panel();
+        p.text_line(1, "KEEP");
+        let before = p.framebuffer().to_vec();
+        let bitmap = crate::util::b64_encode(&[0xAA; 512]);
+        for args in [
+            json!({"bitmap_b64": bitmap, "rects": []}),
+            json!({"bitmap_b64": bitmap, "text": ""}),
+            json!({"bitmap_b64": bitmap, "line": 0}),
+            json!({"bitmap_b64": crate::util::b64_encode(&[0xAA; 513])}),
+            json!({"bitmap_b64": "!!!!"}),
+            json!({"bitmap_b64": null}),
+        ] {
+            let error = p.call(MEDIA_FRAME_TOOL, &args, &mut bus).unwrap_err();
+            assert_eq!(error.code, crate::error::code::INVALID_PARAMS);
+            assert_eq!(p.framebuffer(), before, "the internal draw also validates before clearing");
+            assert!(bus.log.is_empty(), "no display write on invalid frame arguments");
+        }
     }
 
     #[test]

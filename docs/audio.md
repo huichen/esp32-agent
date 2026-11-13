@@ -244,21 +244,58 @@ Two things are worth reading off that table:
 
 Give `notes`, `frames`, or both. Notes use exactly `speaker_play`'s **64-note / 12,000 ms**
 budget and 24 kHz mono synthesis; `hz: 0` is a rest. `volume` is 0–100, default 30. A frame
-is `{at_ms, rects?, text?, line?}`; its slot is **0–12,000 ms** after playback starts,
-excluding synthesis. At most **360 frames / 64 rectangles per frame** are accepted;
-excess lists are refused with their counts. No `confirm` is needed.
+is `{at_ms, bitmap_b64?}` or `{at_ms, rects?, text?, line?}`; its slot is **0–12,000 ms**
+after playback starts, excluding synthesis. At most **360 frames / 64 rectangles per
+vector frame** are accepted; excess lists are refused with their counts. No `confirm`
+is needed.
+
+| Frame field | Meaning |
+|---|---|
+| `at_ms` | Required playback offset, 0–12,000 ms; input order need not be chronological |
+| `bitmap_b64` | Optional base64 of a packed 1-bpp, full-panel bitmap; the entire frame, not an overlay |
+| `rects` | Optional list of `{x, y, w, h, fill?}` rectangles; at most 64, `fill` defaults to true |
+| `text` | Optional non-empty ASCII text using `oled_text`'s 6×8 font and wrapping |
+| `line` | Optional text row, default 0; must fit the detected panel |
+
+A frame chooses **one content form**: `bitmap_b64` alone, or rectangles/text. A bitmap
+cannot carry any `rects`, `text` or `line` field, even if empty, null or the default;
+mixing forms is a parameter error naming the frame index. Bitmap and vector frames may
+coexist in the same call and are drawn in `at_ms` order.
+
+`bitmap_b64` uses the **same page-format bytes as `oled_bitmap.data_b64` and the `F`
+records in [`POST /av`](#8-sound-with-a-picture-post-av)**. For pixel `(x, y)`, byte
+`(y / 8) × width + x` holds its bit `y % 8`: eight vertical pixels per byte, bit 0 at
+the top, columns left-to-right within each eight-row page. This is the panel's own
+framebuffer layout, **not row-major/MSB-first packed scanlines**. Existing page-format
+frame generators (including `tools/av_push.py`) need only base64-encode a full-panel
+frame; no pixel conversion is needed. The `oled_bitmap` tool retains its existing
+encoding and half-height behavior.
 
 ```json
 {"notes":[{"hz":523,"ms":400},{"hz":784,"ms":400}],"frames":[{"at_ms":0,"text":"START"},{"at_ms":400,"rects":[{"x":8,"y":8,"w":16,"h":8,"fill":true}],"text":"NEXT","line":0},{"at_ms":1000,"text":"END"}],"volume":30}
 ```
 
-Each frame clears the framebuffer, draws rectangles using `oled_rect`'s filled/outlined
-pixels (`fill` defaults to true), overlays `oled_text`'s 6×8 text and wrapping (`line`
-defaults to 0), then flushes **once**. Origins, dimensions and text rows are checked
-against the detected panel; legal rectangles crossing an edge are clipped. Every frame
-needs non-empty rectangles or text. All parameters are validated before any audio/display
-write; an invalid later frame names its index and field and plays nothing. Action/family
-disables are respected; manifest-policy-wrapped actions are refused, not bypassed.
+Each frame replaces the framebuffer and flushes **once**. A vector frame draws
+rectangles using `oled_rect`'s filled/outlined pixels, then overlays the text. Origins,
+dimensions and text rows are checked against the detected panel; legal rectangles
+crossing an edge are clipped. A vector frame needs non-empty rectangles or text.
+
+Decoded bitmap lengths must match the detected panel exactly:
+`height × ceil(width / 8)` bytes, **512 for 128×32 or 1024 for 128×64**. A short or long
+bitmap is refused with the frame index and expected/actual byte counts. Unlike
+`oled_bitmap` and `/av`, a media frame cannot use a half-height bitmap on a 64-row panel.
+The sum of decoded bitmap bytes in one call is capped at **32 KiB = 32,768 bytes**:
+64 full 128×32 bitmap frames or 32 full 128×64 bitmap frames. Vector frames do not use
+that byte budget, but still consume the 360-entry frame limit. The first frame exceeding
+the byte budget names its index, cumulative count and limit, and refuses the **whole
+call**. This is a **tool-argument/request budget**, not the separate **64 KiB tool-result
+ceiling**; base64/JSON wire bytes are not the decoded count.
+
+All parameters, bitmap encodings/lengths and the per-call bitmap budget are validated
+**before playback, synthesis or any audio/display write**. An invalid later frame plays
+nothing and draws nothing, even if earlier frames were valid. Action/family disables
+(including `oled_bitmap`) are respected; manifest-policy-wrapped actions are refused,
+not bypassed.
 
 The melody is synthesized **once**, then played in **4096-sample chunks**. One monotonic
 clock checks frame deadlines before the first write and between writes. Frames are
