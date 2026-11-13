@@ -322,6 +322,28 @@ inbound buffer this board was configured with, which mbedTLS rejects. It is fixe
 `firmware/sdkconfig.defaults` (16 KB inbound, the protocol maximum) — raising `timeout_s`
 never had anything to do with it.
 
+## What the store reports
+
+`GET /api/status.store.space` is the block a person reads when a write was refused, and every
+number in it has one source:
+
+| Field | Where it comes from |
+|---|---|
+| `total_bytes`, `used_bytes` (filesystem) | `esp_spiffs_info()`, i.e. `SPIFFS_info()`. Its `total` is SPIFFS' own capacity figure, **not** the partition size: `(blocks - 2) * (pages_per_block - lookup_pages) + 1` data pages times the data page size. On this board that is the 12 517 376-byte partition minus two spare blocks and the lookup pages: 45 811 x 251 = **11 498 561**. |
+| `free_bytes` | **Computed** as `total - used`. No backend reports a "free" number. |
+| `used_entries`, `free_entries`, `total_entries` (NVS) | `nvs_get_stats()`'s `nvs_stats_t`, counted in 32-byte entries. |
+| `used_bytes`, `total_bytes` (NVS) | **Computed** as entries x 32; NVS reports no bytes. |
+
+A filesystem reports no entries at all, so its JSON has none - `free_entries: 0` read as "full" on
+a partition with megabytes left, which is why the key is absent rather than zero.
+
+**What `free_bytes` is not:** a promise that one allocation of that size will succeed. Measured on
+this board: creating a 2.1 MB file returned `ENOSPC` while `free` read 9.38 MB, because SPIFFS
+needs somewhere to move live pages while it writes a new file, and reports no figure for that. A
+workspace save needs a second copy of the whole document, so the practical ceiling is roughly half
+of `free_bytes` - about 4.6 MB on an empty partition, less once the filesystem has been rewritten
+many times. At 2.1 MB the save was refused outright.
+
 ## A store write was refused
 
 `/api/status.store.failed` counts operations the backing store refused after a caller was
