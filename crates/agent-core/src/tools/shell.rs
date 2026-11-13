@@ -320,8 +320,21 @@ pub fn split_sequence(line: &str) -> Result<Option<Vec<String>>, String> {
     let mut parts: Vec<String> = Vec::new();
     let mut current = String::new();
     let mut quote: Option<char> = None;
+    let mut escaped = false;
     for (at, ch) in line.char_indices() {
         let rest_after: &str = &line[at + ch.len_utf8()..];
+        // Keep escapes for the tokenizer, but do not interpret the escaped
+        // character as a quote or separator here.
+        if escaped {
+            current.push(ch);
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' {
+            current.push(ch);
+            escaped = true;
+            continue;
+        }
         if let Some(q) = quote {
             current.push(ch);
             if ch == q {
@@ -1370,6 +1383,18 @@ mod tests {
             parse_pipeline("echo $HOME").unwrap().stages[0].parsed.args,
             vec!["$HOME"],
             "no expansion"
+        );
+
+        // Sequencing must use the same escape rules as tokenization. An escaped
+        // separator or quote must never turn literal text into a second command.
+        for line in [r"echo keep\; rm /important", r#"echo "keep\"; rm /important""#] {
+            assert_eq!(split_sequence(line).unwrap(), None, "unexpected command split: {line}");
+            assert_eq!(parse_pipeline(line).unwrap().stages.len(), 1);
+        }
+        let line = r"echo first\; literal; echo second";
+        assert_eq!(
+            split_sequence(line).unwrap(),
+            Some(vec![r"echo first\; literal".into(), "echo second".into()])
         );
     }
 
