@@ -92,6 +92,26 @@ window.__esp32Measure = function () {
       wrap: wrap ? r(wrap) : null,
       bubble: r(bubble),
     };
+    var links = document.createElement("div");
+    links.innerHTML = markdown([
+      '[safe HTTPS](https://example.test/a?q=1&b=2)',
+      '[safe HTTP](http://example.test/)',
+      '[safe mail](mailto:user@example.test)',
+      '[safe relative](/api/files?path=/hello)',
+      '[safe anchor](#memory)',
+      '[bad js](javascript:alert(1))',
+      '[bad case](JaVaScRiPt:alert(1))',
+      '[bad tab](java\tscript:alert(1))',
+      '[bad data](data:text/html,hello)',
+      '[bad file](file:///etc/passwd)',
+      '[bad vb](vbscript:msgbox(1))',
+      '<img src=x onerror="alert(1)">',
+      '[attribute text](https://example.test/&quot;)',
+    ].join("\n\n"));
+    out.links = Array.prototype.map.call(links.querySelectorAll("a"), function (a) {
+      return { label: a.textContent, href: a.getAttribute("href"), protocol: a.protocol, onclick: a.getAttribute("onclick") };
+    });
+    out.rawImage = !!links.querySelector("img");
     host.remove();
     return out;
   };
@@ -109,6 +129,16 @@ window.__esp32Measure = function () {
   out.prettyJson = pretty('{"a":1,"b":2}');
   out.prettyBlock = pretty('{"text":"line one\\nline two","bytes":3}');
   out.prettyPlain = pretty("not json at all");
+  // Several private reads can get 401 together at startup. They must wait for the
+  // same login, rather than overwrite the first unresolved callback.
+  var firstUnlock = unlock();
+  var secondUnlock = unlock();
+  out.sharedUnlock = firstUnlock === secondUnlock;
+  var finishUnlock = S.afterUnlock;
+  S.afterUnlock = null;
+  S.unlockPromise = null;
+  q("#login").hidden = true;
+  if (finishUnlock) finishUnlock(true);
   // A restored transcript must read like the live one: `renderTrace` lays out what came back
   // through the same `pretty()`, so a JSON result whose payload holds newlines is a block,
   // not one line with literal `\n` in it.
@@ -535,6 +565,22 @@ fn a_markdown_table_renders_as_a_table_on_a_phone() {
         assert!(
             md["cells"].as_array().into_iter().flatten().any(|c| c == "a | b"),
             "{at}: `\\|` is a pipe in the text, not a separator: {md}"
+        );
+        let links = md["links"].as_array().expect("the rendered link fixtures");
+        assert_eq!(links.len(), 6, "{at}: active-content URLs became links: {links:?}");
+        assert!(
+            links.iter().all(|link| {
+                ["http:", "https:", "mailto:"].contains(&link["protocol"].as_str().unwrap_or(""))
+                    && link["onclick"].is_null()
+                    && !link["label"].as_str().unwrap_or("").starts_with("bad")
+            }),
+            "{at}: unsafe Markdown links: {links:?}"
+        );
+        assert_eq!(links[0]["href"], "https://example.test/a?q=1&b=2", "queries stay intact");
+        assert_eq!(md["rawImage"], false, "raw HTML must stay text");
+        assert_eq!(
+            measured[width]["sharedUnlock"], true,
+            "{at}: concurrent PIN reads stranded a login waiter"
         );
         assert_eq!(
             md["pipeOnly"],

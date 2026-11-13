@@ -36,6 +36,10 @@ pub const ARGS_ERROR_KEY: &str = "__llm_arguments_error";
 /// must return non-2xx responses as `Err` built with [`http_error`], so the
 /// status and the body prefix survive to the log without a second channel.
 pub trait ChatTransport {
+    /// Apply the current model call's timeout before any socket work. Stub transports
+    /// may ignore it; real transports must not keep a stale boot-time setting.
+    fn set_timeout(&mut self, _timeout: std::time::Duration) {}
+
     /// POST `body` to `url` with `headers`; return the response body.
     ///
     /// `url` is `http://` or `https://`; the scheme is the implementation's business
@@ -115,7 +119,7 @@ pub struct LlmConfig {
     /// Ceiling on the reply, in tokens; sent as `max_tokens` on all three protocols.
     /// Also part of the compaction reserve.
     ///
-    /// The board still truncates a reply at [`MAX_REPLY_BYTES`] (8 KB) to keep it out of
+    /// The board still truncates a reply at [`MAX_REPLY_BYTES`] (32 KiB) to keep it out of
     /// the portal's way, so a 32K ceiling is a provider-side limit rather than a promise
     /// of a longer answer here.
     pub max_output_tokens: u32,
@@ -372,6 +376,7 @@ fn send_once(
     tools: &Value,
     url: &str,
 ) -> Result<ModelReply, String> {
+    transport.set_timeout(std::time::Duration::from_secs(u64::from(cfg.timeout_s.clamp(5, 180))));
     match Protocol::parse(&cfg.protocol) {
         Protocol::Chat => chat_completions(transport, cfg, messages, tools, url),
         Protocol::Responses => responses(transport, cfg, messages, tools, url),
@@ -559,11 +564,37 @@ fn responses_input(messages: &Value) -> Value {
                     }));
                 }
             }
-            "system" => out.push(json!({ "role": "system", "content": message["content"] })),
-            _ => out.push(json!({ "role": "user", "content": message["content"] })),
+            "system" => {
+                out.push(json!({ "role": "system", "content": responses_content(&message["content"]) }))
+            }
+            _ => out.push(json!({ "role": "user", "content": responses_content(&message["content"]) })),
         }
     }
     Value::Array(out)
+}
+
+/// Chat multimodal parts use a different vocabulary and nesting from Responses.
+fn responses_content(content: &Value) -> Value {
+    match content {
+        Value::Array(parts) => Value::Array(
+            parts
+                .iter()
+                .map(|part| match part["type"].as_str().unwrap_or_default() {
+                    "text" => json!({ "type": "input_text", "text": part["text"] }),
+                    "image_url" => {
+                        let mut image =
+                            json!({ "type": "input_image", "image_url": part["image_url"]["url"] });
+                        if let Some(detail) = part["image_url"].get("detail") {
+                            image["detail"] = detail.clone();
+                        }
+                        image
+                    }
+                    _ => part.clone(),
+                })
+                .collect(),
+        ),
+        _ => content.clone(),
+    }
 }
 
 fn responses_tools(tools: &Value) -> Vec<Value> {
@@ -603,11 +634,10 @@ fn parse_responses_reply(body: &str) -> Result<ModelReply, String> {
                 }
             }
             "function_call" => {
-                let arguments = item["arguments"].as_str().unwrap_or("{}");
                 calls.push(ToolCall {
                     id: item["call_id"].as_str().unwrap_or_default().to_string(),
                     name: item["name"].as_str().unwrap_or_default().to_string(),
-                    arguments: serde_json::from_str(arguments).unwrap_or_else(|_| json!({})),
+                    arguments: tool_arguments(item.get("arguments")),
                 });
             }
             _ => {}
@@ -789,7 +819,7 @@ fn parse_anthropic_reply(body: &str) -> Result<ModelReply, String> {
             "tool_use" => calls.push(ToolCall {
                 id: block["id"].as_str().unwrap_or_default().to_string(),
                 name: block["name"].as_str().unwrap_or_default().to_string(),
-                arguments: block["input"].clone(),
+                arguments: tool_arguments(block.get("input")),
             }),
             _ => {}
         }
@@ -845,32 +875,33 @@ fn parse_reply(body: &str) -> Result<ModelReply, String> {
             let function = call.get("function");
             let name =
                 function.and_then(|f| f.get("name")).and_then(Value::as_str).unwrap_or_default().to_string();
-            let arguments = match function.and_then(|f| f.get("arguments")) {
-                // The documented wire format: a JSON *string*.
-                Some(Value::String(raw)) => match serde_json::from_str::<Value>(raw) {
-                    Ok(Value::Object(map)) => Value::Object(map),
-                    Ok(other) => {
-                        return Err(format!(
-                            "llm: tool call {name}: arguments parsed to {}, expected an object",
-                            json_kind(&other)
-                        ))
-                    }
-                    Err(e) => {
-                        json!({ ARGS_ERROR_KEY: format!("arguments are not JSON ({e}): {}", body_prefix(raw, 120)) })
-                    }
-                },
-                // Tolerated: a server that already decoded the object for us.
-                Some(value @ Value::Object(_)) => value.clone(),
-                Some(other) => {
-                    json!({ ARGS_ERROR_KEY: format!("arguments have type {}, expected a JSON string", json_kind(other)) })
-                }
-                None => json!({}),
-            };
+            let arguments = tool_arguments(function.and_then(|f| f.get("arguments")));
             tool_calls.push(ToolCall { id, name, arguments });
         }
     }
 
     Ok(ModelReply { content, reasoning, tool_calls, usage, retry_note: String::new() })
+}
+
+/// Decode tool input consistently across all adapters. A malformed or non-object
+/// value keeps the call id for its error result, but can never reach the tool host.
+fn tool_arguments(value: Option<&Value>) -> Value {
+    match value {
+        Some(Value::String(raw)) => match serde_json::from_str::<Value>(raw) {
+            Ok(value @ Value::Object(_)) => value,
+            Ok(other) => json!({ ARGS_ERROR_KEY: format!(
+                "arguments parsed to {}, expected an object", json_kind(&other)
+            ) }),
+            Err(e) => json!({ ARGS_ERROR_KEY: format!(
+                "arguments are not JSON ({e}): {}", body_prefix(raw, 120)
+            ) }),
+        },
+        Some(value @ Value::Object(_)) => value.clone(),
+        Some(other) => json!({ ARGS_ERROR_KEY: format!(
+            "arguments have type {}, expected an object", json_kind(other)
+        ) }),
+        None => json!({}),
+    }
 }
 
 /// The argument-parse error of `tc`, if `chat` degraded its arguments.
@@ -1070,6 +1101,21 @@ mod tests {
         assert_eq!(input[2]["type"], "function_call");
         assert_eq!(input[3]["type"], "function_call_output");
         assert_eq!(body["tools"][0]["name"], "oled_read", "flat tool objects, not nested");
+
+        // Chat's text/image_url content parts are not Responses input parts.
+        let image_messages = json!([{ "role": "user", "content": [
+            { "type": "text", "text": "what is this?" },
+            { "type": "image_url", "image_url": { "url": "data:image/png;base64,aGVsbG8=" } }
+        ] }]);
+        chat(&mut stub, &proto_cfg("responses"), &image_messages, &wire_tools()).expect("image reply");
+        let body: Value = serde_json::from_str(&stub.seen.borrow()[1].1).expect("json");
+        assert_eq!(body["input"][0]["content"][0], json!({ "type": "input_text", "text": "what is this?" }));
+        assert_eq!(
+            body["input"][0]["content"][1],
+            json!({
+                "type": "input_image", "image_url": "data:image/png;base64,aGVsbG8="
+            })
+        );
     }
 
     #[test]
@@ -1098,16 +1144,27 @@ mod tests {
         urls: Vec<String>,
         headers: Vec<Vec<(String, String)>>,
         bodies: Vec<String>,
+        timeouts: Vec<std::time::Duration>,
         reply: Result<String, String>,
     }
 
     impl Default for StubTransport {
         fn default() -> Self {
-            Self { urls: Vec::new(), headers: Vec::new(), bodies: Vec::new(), reply: Ok(String::new()) }
+            Self {
+                urls: Vec::new(),
+                headers: Vec::new(),
+                bodies: Vec::new(),
+                timeouts: Vec::new(),
+                reply: Ok(String::new()),
+            }
         }
     }
 
     impl ChatTransport for StubTransport {
+        fn set_timeout(&mut self, timeout: std::time::Duration) {
+            self.timeouts.push(timeout);
+        }
+
         fn post_json(&mut self, url: &str, headers: &[(&str, &str)], body: &str) -> Result<String, String> {
             self.urls.push(url.to_string());
             self.headers.push(headers.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect());
@@ -1179,6 +1236,15 @@ mod tests {
         assert!((temperature - 1.0).abs() < 1e-6, "temperature is {temperature}");
         assert_eq!(body["messages"], messages());
         assert_eq!(body["tools"], tools());
+        assert_eq!(t.timeouts, vec![std::time::Duration::from_secs(45)]);
+        // A live config change must reach the next socket, not just the portal.
+        for (configured, expected) in [(7, 7), (0, 5), (u32::MAX, 180)] {
+            let mut updated = cfg();
+            updated.timeout_s = configured;
+            chat(&mut t, &updated, &messages(), &tools()).expect("reply after timeout change");
+            assert_eq!(t.timeouts.last(), Some(&std::time::Duration::from_secs(expected)));
+            assert_eq!(t.timeouts.len(), t.bodies.len(), "set before every request");
+        }
     }
 
     #[test]
@@ -1228,6 +1294,29 @@ mod tests {
         assert!(err.contains("not JSON"), "unexpected error text: {err}");
         // Echoed back to the model as `{}`, never as our private error key.
         assert_eq!(arguments_request_json(call), "{}");
+
+        // Every adapter must preserve the failure instead of turning malformed or
+        // non-object input into a runnable call with guessed/default arguments.
+        for raw in ["{\"path\": \"/a.txt\"", "[]", "null", "42", "\"text\""] {
+            let responses = parse_responses_reply(&json!({
+                "output": [{ "type": "function_call", "call_id": "bad", "name": "fs_write", "arguments": raw }]
+            }).to_string()).expect("the call survives as an error result");
+            let call = &responses.tool_calls[0];
+            assert!(arguments_error(call).is_some(), "Responses accepted {raw}: {call:?}");
+            assert_eq!(arguments_request_json(call), "{}");
+        }
+        for input in [Value::Null, json!([]), json!(42), json!("text")] {
+            let anthropic = parse_anthropic_reply(
+                &json!({
+                    "content": [{ "type": "tool_use", "id": "bad", "name": "fs_write", "input": input }]
+                })
+                .to_string(),
+            )
+            .expect("the call survives as an error result");
+            let call = &anthropic.tool_calls[0];
+            assert!(arguments_error(call).is_some(), "Anthropic accepted {input}: {call:?}");
+            assert_eq!(arguments_request_json(call), "{}");
+        }
     }
 
     #[test]

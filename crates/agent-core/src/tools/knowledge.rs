@@ -180,6 +180,10 @@ pub fn memory(ws: &dyn Workspace) -> Option<String> {
     let text = ws.read(MEMORY_MD).ok()?;
     let mut out = String::new();
     let mut lines = 0;
+    let truncated = format!("- (truncated; the rest is in {MEMORY_MD}, read it with fs_read)\n");
+    let full = format!("- (index full: {MEMORY_INDEX_MAX} lines; replace an entry)\n");
+    // Include the marker in the budget, and check before appending an untrusted line.
+    let content_budget = MEMORY_BUDGET.saturating_sub(truncated.len().max(full.len()));
     for line in text.lines() {
         let line = line.trim_end();
         if line.trim().is_empty() {
@@ -191,16 +195,24 @@ pub fn memory(ws: &dyn Workspace) -> Option<String> {
             continue;
         }
         if lines >= MEMORY_INDEX_MAX {
-            out.push_str(&format!("- (index full: {MEMORY_INDEX_MAX} lines; replace an entry)\n"));
+            out.push_str(&full);
+            break;
+        }
+        if line.len().saturating_add(1) > content_budget.saturating_sub(out.len()) {
+            let mut end = content_budget.saturating_sub(out.len()).saturating_sub(1).min(line.len());
+            while !line.is_char_boundary(end) {
+                end -= 1;
+            }
+            if end > 0 {
+                out.push_str(&line[..end]);
+                out.push('\n');
+            }
+            out.push_str(&truncated);
             break;
         }
         out.push_str(line);
         out.push('\n');
         lines += 1;
-        if out.len() >= MEMORY_BUDGET {
-            out.push_str(&format!("- (truncated; the rest is in {MEMORY_MD}, read it with fs_read)\n"));
-            break;
-        }
     }
     if out.trim().is_empty() {
         None
@@ -364,5 +376,13 @@ mod tests {
         let injected = memory(&ws).expect("index");
         assert_eq!(injected.matches("/memory/t").count(), MEMORY_INDEX_MAX, "{injected}");
         assert!(injected.contains("index full"), "{injected}");
+
+        // One pointer may itself be a whole workspace file. The byte budget is a
+        // limit, not a trigger that fires only after that file has entered the prompt.
+        let huge = format!("- [huge](/memory/huge.md) {}", "界".repeat(MEMORY_BUDGET));
+        let ws = ws_with(&[(MEMORY_MD, &huge)]);
+        let injected = memory(&ws).expect("bounded pointer");
+        assert!(injected.len() <= MEMORY_BUDGET, "{} bytes", injected.len());
+        assert!(injected.contains("truncated"), "{injected}");
     }
 }

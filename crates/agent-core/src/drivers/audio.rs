@@ -650,9 +650,13 @@ mod tests {
     fn a_tone_is_bounded_and_shaped() {
         let t = tone(440.0, 100, 0.5);
         assert_eq!(t.len(), 2400, "24 kHz for 100 ms");
-        assert!(t.iter().any(|s| s.abs() > 1000), "a half-volume tone must move");
-        assert!(t.iter().all(|s| s.abs() <= 32767), "no wrap-around");
-        assert!(t[0].abs() < 200 && t[t.len() - 1].abs() < 200, "the ends click");
+        let magnitude = |s: &i16| i32::from(*s).abs();
+        assert!(t.iter().any(|s| magnitude(s) > 1000), "a half-volume tone must move");
+        assert!(
+            t.iter().all(|s| magnitude(s) <= 16_384),
+            "the half-volume amplitude must not wrap or exceed its envelope"
+        );
+        assert!(magnitude(&t[0]) < 200 && magnitude(&t[t.len() - 1]) < 200, "the ends click");
     }
 
     #[test]

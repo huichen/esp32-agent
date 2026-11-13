@@ -13,7 +13,7 @@
 
 | 要点 | 细节 |
 |---|---|
-| 模型跑在板上 | 循环、工具、记忆与会话记录都是固件；模型可以是任何 OpenAI 兼容或 Anthropic 端点。[给它一个模型](docs/model.md) |
+| 智能体跑在板上 | 循环、工具、记忆与会话记录都是固件；模型可以是任何 OpenAI 兼容或 Anthropic 端点。[给它一个模型](docs/model.md) |
 | 工具集就是一份文档 | `manifest` (`command: apply`) 校验 JSON 清单，把它编译成工具，同一轮内即生效。[清单](docs/manifest.md) |
 | 自己发现硬件 | 启动时探测 I2C、1-Wire 与已声明的引脚；只有应答的才得到工具。[能力](docs/capabilities.md) |
 | 一套工具，两个调用方 | MCP 端点与板载智能体看到同一批工具，来自同一份描述。[HTTP 与 MCP API](docs/http-api.md) |
@@ -22,14 +22,20 @@
 | 一个 shell 和一门脚本语言 | `shell` 有 57 个按 NuttX 命名的命令，还有一个对工具调用做循环的解释器。[Shell](docs/shell.md) · [脚本](docs/scripting.md) |
 | 它会记住告诉过它的事 | 常驻指令、`/AGENTS.md`、`/MEMORY.md` 索引与技能，每轮组装进提示词。[模型每轮都能看到什么](docs/context.md) |
 | 自带技能 | 固件里只带一个流程 `create-skill`，用标准的 `---` 头部书写，而它教的就是剩下的部分：技能是什么、怎么写。首次启动落在 `/skills`，你改过的那份会一直是你的。[技能](docs/agent-skills.md) |
-| 板子自己就是服务器 | 由板子提供 HTTPS，证书由它生成，三类调用方一个 PIN。[认证](docs/security.md) |
+| 板子自己就是服务器 | 由板子提供 HTTPS，证书由它生成，控制台 PIN 与独立的 MCP token 分别鉴权。[认证](docs/security.md) |
 | 无需硬件即可测试 | 模拟器把同一份 `agent-core` 跑在虚拟板上。[模拟器](docs/simulator.md) |
 
 ## 烧录与连接
 
+从源码构建；目前没有发布预编译的镜像。默认目标是 ESP32-S3 N16R8，带 16 MiB flash 和
+8 MiB 八线 PSRAM。按[烧录](docs/flashing.md)安装工具链，然后运行：
+
 ```bash
-espflash write-bin --chip esp32s3 --flash-size 16mb 0x0 esp32-agent-vX.Y.Z.bin
+bash scripts/build-firmware.sh --flash --port /dev/ttyACM0
 ```
+
+Windows 上使用 `powershell -File scripts/build-firmware.ps1 -Flash -Port COM3`。脚本先构建再烧录，
+并显式传入分区表和 `factory` 应用分区。
 
 板子里没有 WiFi 凭据，所以它开一个叫 `esp32-agent-setup` 的热点。连上它，打开
 `http://192.168.4.1/`，填网络名和密码，保存。凭据进 NVS，板子重连。在这一步完成之前，
@@ -49,7 +55,7 @@ espflash write-bin --chip esp32s3 --flash-size 16mb 0x0 esp32-agent-vX.Y.Z.bin
 ## 给它一个模型
 
 打开 `http://<board>/`，进 **Agent** 面板，填端点、模型 id 和密钥，保存。密钥只写：进 NVS，
-读回来是 `__set__`。同一个面板里有 `protocol`（`chat`、`responses` 或 `anthropic`）、
+读操作返回 `api_key_set`，不返回密钥。同一个面板里有 `protocol`（`chat`、`responses` 或 `anthropic`）、
 `reasoning`、`context_tokens` 和 `max_output_tokens`。
 
 **或者交给 agent 去做。** agent 取过 `agent.json` 之后就知道这些设置项、它们的类型和默认值，
@@ -64,11 +70,12 @@ agent 用 `POST /api/agent/config` 写进去——和面板发的是同一个调
 
 ## 安全须知
 
-- **凭据只留在板上。** WiFi 通过 `provision` 写进 NVS，不烧进镜像；`api_key` 只写，读回来是 `__set__`。
-- **板子离开你的桌子之前先设 PIN。** `auth.portal_pin` 守住所有写操作，以及会暴露会话记录、提示词、
-  配置与日志的读操作。
+- **凭据只留在板上。** WiFi 通过 `provision` 写进 NVS，不烧进镜像；`api_key` 只写，读操作只报告 `api_key_set`。
+- **板子离开你的桌子之前设好两种凭据。** `auth.portal_pin` 守住 REST 写操作，以及配置、调度、会话记录、
+  提示词、工作区、附件、日志、运行事件和脚本结果的读操作。MCP 使用 `auth.mcp_token`；未设置时，
+  回退到控制台凭据。
 - **核对证书。** 板子的 TLS 证书是自签的，指纹在 `GET /api/tls`。80 端口默认保持开着，证书坏了只损失一个 URL，不是整块板；把 `mcp.plain_http` 设为 false 就关掉它，那时唯一的退路是 USB 线。
-- **`shell`、`script` 与清单工具会动引脚。** 这正是这块板的意义；PIN 是“agent 在干活”和“路人顺手”之间的界线。
+- **`shell`、`script` 与清单工具会动引脚。** 这正是这块板的意义；为每种接口配置对应的凭据，才能区分授权调用方与路人。
 
 [Security](docs/security.md) 写了哪些东西是故意不设防的。
 
@@ -76,13 +83,15 @@ agent 用 `POST /api/agent/config` 写进去——和面板发的是同一个调
 
 | 部分 | 状态 |
 |---|---|
-| `agent-core` | 763 个单元测试与 5 个集成测试通过；`scripts/smoke.ps1` 端到端通过 |
+| `agent-core` | 831 个单元测试与 5 个集成测试通过；`scripts/smoke.ps1` 端到端通过 |
 | 模拟器 | 控制台、MCP 与智能体循环端到端运行 |
-| 固件 | 在 ESP32-S3-DevKitC-1 N16R8（IDF v5.5.2）上烧录：42 个工具、OLED 128×32、I²S 麦克风与功放、WS2812、TLS 控制台、通过 HTTPS 的模型轮次 |
-| 未实现 | OTA、SD 卡、DHT11/22、摄像头。见 `ROADMAP.md` |
+| 固件 | 历史台架固件在 ESP32-S3-DevKitC-1 N16R8（IDF v5.5.2）上运行：42 个工具、OLED 128×32、I²S 麦克风与功放、WS2812、TLS 控制台、通过 HTTPS 的模型轮次；审计变更尚未通过实板验证 |
+| 未实现 / 未验证 | OTA 与固件 DVP 摄像头采集尚未实现。SD 原始扇区与 DHT11/22 驱动有主机测试，尚无实板验证。见 `ROADMAP.md` |
 
-台架数字：一次用到四个工具的轮次 13.7 s；经 TLS 的控制台 0.55 s；I²C 扫描在 8 次运行中
-稳定；加载一次 TLS 页面后内部 SRAM 空闲 5–6 kB，这是这里最紧的约束。
+历史台架数字：一次用到四个工具的轮次 13.7 s；经 TLS 的控制台 0.55 s；I²C 扫描在 8 次运行中
+稳定。早期加载 TLS 页面后内部 SRAM 空闲 5–6 kB 的读数，早于分配器修复（`10b16dd`），不是当前上限。
+后续分池测量与来源见[故障排查](docs/troubleshooting.md#how-much-memory-the-board-has)。本次审计固件
+尚未烧录或在实板上测试。
 
 ## 文档
 
@@ -90,7 +99,7 @@ agent 用 `POST /api/agent/config` 写进去——和面板发的是同一个调
 [HTTP 与 MCP](docs/http-api.md) · [添加设备](docs/adding-a-device.md) · [烧录](docs/flashing.md) ·
 [故障排查](docs/troubleshooting.md) · [智能体循环](docs/agent-loop.md) · [流](docs/agent-stream.md) ·
 [技能](docs/agent-skills.md) · [记忆](docs/agent-memory.md) · [脚本](docs/scripting.md) ·
-[Model](docs/model.md) · [Web console](docs/web-console.md) · [Scheduling](docs/scheduling.md) · [Shell](docs/shell.md) · [Context layers](docs/context.md) · [Security](docs/security.md) · [Simulator](docs/simulator.md) · [Audio](docs/audio.md)
+[Model](docs/model.md) · [Web console](docs/web-console.md) · [Scheduling](docs/scheduling.md) · [Shell](docs/shell.md) · [Context layers](docs/context.md) · [Security](docs/security.md) · [Simulator](docs/simulator.md) · [Audio](docs/audio.md) · [审计报告](docs/audit-2026-11.md)
 
 ## 贡献
 

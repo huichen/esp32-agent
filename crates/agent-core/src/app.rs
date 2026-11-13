@@ -73,46 +73,31 @@ pub const NVS_KEY_RUN_IN_FLIGHT: &str = crate::keys::RUN_IN_FLIGHT;
 /// asked for.
 pub const RESUME_SOURCE: &str = "resume";
 
-/// The file tools write into a RAM map that is persisted as one JSON blob, so the whole
-/// workspace has to be small enough to serialise next to everything else.
-///
-/// Both numbers used to be 2 KB and 8 KB because the blob was spread over five NVS values.
-/// It is a file on `storage` now, so the ceiling is the partition rather than a value: a
-/// single file may be 256 KB and the workspace 4 MB, which is what makes `write` a real
-/// editor instead of a note pad. The map still lives in RAM between writes, so this is also
-/// a heap budget; 4 MB of text is PSRAM the board has.
-pub const WORKSPACE_FILE_MAX: usize = 256 * 1024;
+/// The file tools write into a RAM map with a filesystem value per published file and a
+/// separate index. Per-file admission shares the file tools' limit; the aggregate cap is
+/// a text-payload budget, not a measurement of the RAM needed by the map and request copies.
+pub const WORKSPACE_FILE_MAX: usize = crate::tools::fs::MAX_FILE_BYTES;
 pub const WORKSPACE_TOTAL_MAX: usize = 4 * 1024 * 1024;
-/// How the workspace blob is spread over the store.
+/// Legacy `ws1` workspace chunk plan, retained for reading/migration.
 ///
-/// Not one value under `ws`: ESP-IDF refuses a string above about 4000 bytes, and a
-/// workspace with a few files in it is already past that. The board then logged
-/// `nvs write 'ws': ESP_ERR_NVS_VALUE_TOO_LONG` while `write` answered `ok: true` and
-/// `read` served the file out of RAM until the next boot - a write that looked fine and
-/// silently was not. The blob is now `ws` (header: count, total length, one checksum per
-/// chunk) plus `ws.1`, `ws.2`, ... as the transcript is stored, with one difference: the
-/// header carries a checksum per chunk, so a rejected blob can name the value that
-/// disagrees.
-///
-/// Five values of 3500 bytes is 17,500 bytes of serialised JSON, against
-/// [`WORKSPACE_TOTAL_MAX`] of *text*: JSON escapes a newline to two bytes, so the same
-/// 8 KB of Markdown weighs about 10 KB stored. The ceiling is stated here rather than left
-/// to arithmetic in a log line; [`store::write_blob`] refuses the blob and says so when it
-/// is passed.
+/// This was five values of 3500 bytes (17,500 encoded JSON bytes), with checksums in
+/// the `ws` header and payloads in `ws.1`, `ws.2`, ... . It replaced a single NVS
+/// string that exceeded ESP-IDF's value limit. It is not the current workspace budget:
+/// new saves publish an index and one filesystem value per path, and cleanup of these
+/// historical chunks follows a confirmed publication.
 pub const WORKSPACE_PLAN: store::Plan =
     store::Plan { tag: "ws1", chunk_bytes: store::CHUNK_BYTES, chunks_max: 5 };
 
 /// The longest `sleep` / `usleep` waits this board will actually wait.
 ///
-/// One loop serves the MCP endpoint, the portal and the agent, so a sleeping command
-/// blocks everything else — a `sleep 30` would look like a hung device. The cap is what
-/// keeps the command useful without letting it become an outage.
+/// Tool calls hold the shared App lock, so a sleeping command delays other callers
+/// needing that lock. The cap is an execution policy, independent of heap capacity.
 pub const MAX_SHELL_SLEEP_MS: u64 = 10_000;
 
 /// How much of a pipeline's last stage reaches the answer.
 ///
-/// The same reason `hexdump` and `unzip` have budgets: a tool result is about 2 KB, and a
-/// pipeline can multiply what a single command would have returned.
+/// A pipeline can multiply intermediate output. Its 8 KiB stdout policy is deliberately
+/// separate from the agent's 64 KiB tool-text ceiling and the workspace's file budgets.
 pub const PIPE_RESULT_MAX: usize = 8192;
 
 /// How many scheduled prompts and sensor rules the board keeps. The scheduler
@@ -294,6 +279,9 @@ pub struct App {
     /// Files attached to the most recent message. Replaced, never accumulated: an
     /// attachment belongs to one turn, and the heap is the scarcest thing here.
     pub attachments: Vec<crate::agent::Attachment>,
+    /// The running turn's image inputs. A newer queued message may replace the
+    /// download list while the current model call is in flight.
+    active_attachments: Option<Vec<crate::agent::Attachment>>,
     /// The board's own certificate, when it serves https on a second port. The
     /// fingerprint is what a person compares against the browser's warning page —
     /// it is the only proof that this board, and not something on the path, answered.
@@ -353,6 +341,15 @@ pub struct App {
     store_queue: store::StoreQueue,
     /// What the platform says about the task that drains the queue.
     store_writer: StoreWriter,
+    /// Only the latest admitted workspace generation. Its receipt, not queue admission,
+    /// decides when hashes can suppress a later write.
+    workspace_pending: Option<WorkspaceSave>,
+    /// Monotonic admissions let nested tool routers describe their own file effects without
+    /// waiting for a flash writer while the caller holds the App mutex.
+    workspace_admissions: u64,
+    /// Values potentially left by a refused publication/cleanup, retained for a later
+    /// successful index publication. Bounded with the queue's key budget before admission.
+    workspace_stale_keys: std::collections::BTreeSet<String>,
 }
 
 /// Whether the thread that runs the agent loop is up.
@@ -415,6 +412,13 @@ impl StoreWriter {
     }
 }
 
+struct WorkspaceSave {
+    receipt: store::PublicationReceipt,
+    hashes: std::collections::BTreeMap<String, u64>,
+    changed: Vec<String>,
+    cleanup: Vec<String>,
+}
+
 impl App {
     pub fn new(hw: Box<dyn Hardware>, store: Box<dyn KvStore>, log: Arc<LogBuf>, firmware: FwMeta) -> Self {
         let now = now_ms();
@@ -473,6 +477,7 @@ impl App {
             firmware,
             lan_url: String::new(),
             attachments: Vec::new(),
+            active_attachments: None,
             tls: TlsInfo::default(),
             agent: Agent::new(),
             llm: LlmConfig::default(),
@@ -491,6 +496,9 @@ impl App {
             agent_thread: AgentThread::NotStarted,
             store_queue: queue,
             store_writer: StoreWriter::default(),
+            workspace_pending: None,
+            workspace_admissions: 0,
+            workspace_stale_keys: Default::default(),
         };
         app.log.info(
             "boot",
@@ -548,9 +556,9 @@ impl App {
 
     /// The queue handle a platform's writer task drains.
     ///
-    /// Handing it out is the whole mechanism: the writer keeps this and calls
-    /// [`App::flush_store`] under the app lock, and nothing else in the firmware touches
-    /// NVS after boot.
+    /// Platforms use [`App::flush_shared_store`] to drain outside the app mutex and then
+    /// acknowledge completed workspace generations under it. A reboot path may deliberately
+    /// use [`App::flush_store`] while holding that mutex for its final batch.
     pub fn store_queue(&self) -> store::StoreQueue {
         self.store_queue.clone()
     }
@@ -592,8 +600,28 @@ impl App {
     /// firmware checks the calling task's stack before every call
     /// (`firmware/src/nvs_writer.rs`); the host tests call this directly, where there is
     /// no such thing as a flash window.
-    pub fn flush_store(&self, who: &str) -> store::FlushReport {
+    pub fn flush_store(&mut self, who: &str) -> store::FlushReport {
         let report = self.store_queue.flush();
+        self.acknowledge_store_flush(who, &report);
+        report
+    }
+
+    /// Drain outside the app mutex, then settle receipts and log under a short app lock.
+    /// Queue/backend access can still block during I/O; this is not a lock-free store.
+    /// The same internal-stack-only precondition as `flush_store` applies, and the platform
+    /// must check the calling task before using this helper.
+    pub fn flush_shared_store(shared: &Shared, who: &str) -> store::FlushReport {
+        let queue = app_lock(shared).store_queue();
+        let report = queue.flush();
+        app_lock(shared).acknowledge_store_flush(who, &report);
+        report
+    }
+
+    /// Complete app bookkeeping after the queue was drained, including generation-specific
+    /// workspace receipts. This method does no backend writes; platforms may drain outside
+    /// the app lock and then call it under a short mutable app lock.
+    pub fn acknowledge_store_flush(&mut self, who: &str, report: &store::FlushReport) {
+        self.acknowledge_workspace();
         // One line per refusal, not one line for all of them: a count says something is
         // wrong, and only the key says *what* is. `report.failed` is still the count, and
         // `/api/status.store.last_failure` carries the newest one off the wire.
@@ -616,7 +644,6 @@ impl App {
                 format!("wrote {} store value(s) from `{who}`: {}", report.written, report.keys.join(", ")),
             );
         }
-        report
     }
 
     /// Re-run board resolution, manifest device instantiation, detection and the
@@ -965,7 +992,7 @@ impl App {
     /// before they were all built from this predicate.
     pub fn why_hidden(&self, name: &str) -> Option<String> {
         let def = self.tools.get(name)?;
-        if self.cfg.mcp.disabled_tools.iter().any(|d| d == name) {
+        if self.ensure_enabled(name).is_err() {
             return Some("switched off in `mcp.disabled_tools`".to_string());
         }
         // A family took this name over. The handler still answers, so the sentence says
@@ -1002,14 +1029,19 @@ impl App {
     ///
     /// Same shape as [`why_hidden`](Self::why_hidden): `None` means "offered".
     fn extra_why_hidden(&self, name: &str) -> Option<String> {
-        if self.cfg.mcp.disabled_tools.iter().any(|d| d == name) {
+        if self.ensure_enabled(name).is_err() {
             return Some("switched off in `mcp.disabled_tools`".to_string());
         }
         match name {
-            // A camera is a driver and a DVP bus. Without them `image_read` can only answer
-            // "a camera is not available on this board", so it is not a tool the model can
-            // use - it is a tool that teaches the model to waste a turn.
-            "image_read" if !self.caps.contains("camera") => Some("no camera on this board".to_string()),
+            "image_read" if !self.llm.vision => {
+                Some("vision is disabled for the configured model".to_string())
+            }
+            "image_read"
+                if !self.caps.contains("camera")
+                    && !self.tool_attachments().iter().any(|a| a.mime.starts_with("image/")) =>
+            {
+                Some("no camera or image attachment on this board".to_string())
+            }
             _ => None,
         }
     }
@@ -1132,6 +1164,7 @@ impl App {
                 &self.cfg.mcp.path,
                 tool_count,
                 !self.cfg.auth.mcp_token.is_empty(),
+                !self.cfg.auth.portal_pin.is_empty(),
             ),
             "security": {
                 "portal_pin_set": !self.cfg.auth.portal_pin.is_empty(),
@@ -1539,9 +1572,8 @@ impl App {
         let mut source = crate::json::opt_str(args, "source").unwrap_or_default();
         let path = crate::json::opt_str(args, "path").unwrap_or_default();
         if source.trim().is_empty() && !path.trim().is_empty() {
-            let read = fs_tools::call(&mut self.workspace, "fs_read", &json!({ "path": path }))
-                .ok_or_else(|| McpError::invalid_params(format!("no script at `{path}`")))?
-                .map_err(McpError::invalid_params)?;
+            let read =
+                self.fs_or_net_call("fs_read", &json!({ "path": path })).map_err(McpError::invalid_params)?;
             // `fs_read` answers with a JSON object (`{path, text, …}`), so the script is its
             // `text` field — feeding the whole object to the parser is what made a one-line
             // script fail with "unexpected token Colon".
@@ -1609,35 +1641,50 @@ impl App {
         }
     }
 
+    fn tool_attachments(&self) -> &[crate::agent::Attachment] {
+        self.active_attachments.as_deref().unwrap_or(&self.attachments)
+    }
+
     /// Ask the configured model about an attached image.
     ///
-    /// This is a **second** model call, made inside a tool: the board has no OCR engine and
-    /// no image pipeline, so the only reader it has is the model the user configured. That
-    /// costs a round trip and tokens, which is why the tool description says so.
-    ///
-    /// It always uses the chat-completions shape: image parts are OpenAI's
-    /// `image_url` blocks there, Anthropic's `image` blocks in the Messages API, and the
-    /// Responses API wants input items — three shapes for one question, and this tool
-    /// answers only the shape it can be sure of.
+    /// This is a **second** model call, made inside a tool, with the configured
+    /// Chat, Responses or Anthropic adapter. It costs a round trip and tokens;
+    /// an uploaded image needs neither a camera driver nor an on-board OCR engine.
     fn image_read(&mut self, args: &Value) -> Result<Value> {
         let prompt = args
             .get("prompt")
             .and_then(|v| v.as_str())
-            .unwrap_or("Transcribe every piece of text in this image exactly, then describe what it shows.")
-            .to_string();
+            .unwrap_or("Transcribe every piece of text in this image exactly, then describe what it shows.");
         let wanted = args.get("name").and_then(|v| v.as_str()).unwrap_or("");
 
-        let attachment = match self.attachments.iter().find(|a| wanted.is_empty() || a.name == wanted) {
+        if prompt.len() > AGENT_TEXT_MAX {
+            return Err(McpError::invalid_params(format!("image prompt exceeds {AGENT_TEXT_MAX} bytes")));
+        }
+        if !self.llm.vision {
+            return Err(McpError::unsupported("the configured model has vision disabled"));
+        }
+        let images = self.tool_attachments();
+        let attachment = match images
+            .iter()
+            .find(|a| a.mime.starts_with("image/") && (wanted.is_empty() || a.name == wanted))
+        {
             Some(a) => a.clone(),
             None => {
-                return Err(McpError::invalid_params(if self.attachments.is_empty() {
-                    "no image attached to the last message; attach one in the portal first".to_string()
-                } else {
-                    format!(
-                        "no attachment named `{wanted}`; the last message carried: {}",
-                        self.attachments.iter().map(|a| a.name.clone()).collect::<Vec<_>>().join(", ")
-                    )
-                }))
+                return Err(McpError::invalid_params(
+                    if !images.iter().any(|a| a.mime.starts_with("image/")) {
+                        "no image attached to the last message; attach one in the portal first".to_string()
+                    } else {
+                        format!(
+                            "no attachment named `{wanted}`; the last message carried: {}",
+                            images
+                                .iter()
+                                .filter(|a| a.mime.starts_with("image/"))
+                                .map(|a| a.name.clone())
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        )
+                    },
+                ))
             }
         };
         if self.llm.base_url.trim().is_empty() || self.llm.model.trim().is_empty() {
@@ -1649,9 +1696,7 @@ impl App {
             return Err(McpError::unsupported("no HTTP transport attached"));
         };
 
-        let mut cfg = self.llm.clone();
-        cfg.protocol = "chat".into();
-        cfg.vision = true;
+        let cfg = self.llm.clone();
         let messages = json!([{
             "role": "user",
             "content": [
@@ -1741,7 +1786,64 @@ impl App {
         .to_string())
     }
 
+    /// An explicit disable applies to aliases, family members and underlying file
+    /// operations too; a listing profile only changes how a tool is advertised.
+    fn ensure_enabled(&self, name: &str) -> Result<()> {
+        crate::tool::ensure_tool_enabled_in(&self.cfg, &self.family_members, name)?;
+        let dependencies: &[&str] = match name {
+            "edit" | "fs_edit" | "fs_cp" => &["fs_read", "fs_write"],
+            "fs_mv" => &["fs_read", "fs_write", "fs_rm"],
+            "fs_grep" => &["fs_read"],
+            _ => &[],
+        };
+        for dependency in dependencies {
+            crate::tool::ensure_tool_enabled(&self.cfg, dependency)?;
+        }
+        Ok(())
+    }
+
+    fn workspace_admission_reply(mut value: Value) -> Value {
+        if !value.is_object() {
+            value = json!({ "result": value });
+        }
+        value["saved"] = json!(false);
+        value["queued"] = json!(true);
+        value["persistence_note"] = json!("applied in RAM; queue admission is not storage acknowledgement. This call did not wait for publication; check the store object in GET /api/status for outcomes");
+        value
+    }
+
     pub fn call_tool(&mut self, name: &str, args: &Value) -> Result<Value> {
+        let before = self.workspace_admissions;
+        let result = self.call_tool_inner(name, args);
+        if self.workspace_admissions == before {
+            return result;
+        }
+        match result {
+            Ok(value) => Ok(Self::workspace_admission_reply(value)),
+            Err(mut error) => {
+                // A later command failing does not roll back an earlier admitted write.
+                // Preserve the original error/data and make that partial effect observable.
+                let data = error.data.get_or_insert_with(|| json!({}));
+                if !data.is_object() {
+                    *data = json!({ "original_data": data.take() });
+                }
+                data["workspace_admission"] = Self::workspace_admission_reply(json!({}));
+                Err(error)
+            }
+        }
+    }
+
+    fn call_tool_inner(&mut self, name: &str, args: &Value) -> Result<Value> {
+        self.ensure_enabled(name)?;
+        if !args.is_object() {
+            return Err(McpError::invalid_params("tool arguments must be an object"));
+        }
+        if name.starts_with("fs_") || name.starts_with("net_") {
+            let text = self.fs_or_net_call(name, args).map_err(McpError::invalid_params)?;
+            return Ok(serde_json::from_str(&text).unwrap_or_else(|_| json!({ "text": text })));
+        }
+        // Generic device dispatch resolves the instance's public name before checking
+        // its switch, so a stored raw alias cannot bypass a suffixed tool's disable.
         // The script tool is the one tool that needs the dispatcher itself: `tool()` inside
         // a script calls any other tool, so it cannot live in the registry where handlers
         // only see a `ToolCtx`.
@@ -1790,10 +1892,10 @@ impl App {
         if name == "image_read" {
             return self.image_read(args);
         }
-        // A name a family took over still answers. It is hidden from the listing, not
-        // removed from the board, so a script or a person who learned `manifest_apply`
-        // before the family existed keeps working — and the listing says where it went.
-        if !self.is_visible(name) && !self.family_members.contains_key(name) {
+        // Family aliases and generic/minimal folding change the listing, not whether
+        // a previously learned tool can execute. Only explicit disables and missing
+        // hardware are execution refusals (the former was checked before every fast path).
+        if Self::NEVER_OFFERED.contains(&name) || self.tools.get(name).is_none() {
             // A tool a person has and a model does not: the refusal has to be a sentence, not a
             // bare "no such tool". A stored script that calls `reboot` was written by somebody
             // who believed the model could restart the board; that person needs to be told
@@ -1817,6 +1919,18 @@ impl App {
             ))
             .with_data(json!({ "missing_capabilities": missing })));
         }
+        if let Some(def) = self.tools.get(name) {
+            if !def.spec.core && self.cfg.mcp.tools_mode != "all" {
+                let missing = self.caps.missing(&def.spec.requires);
+                if !missing.is_empty() {
+                    return Err(McpError::unsupported(format!(
+                        "tool `{name}` needs hardware that was not detected: {}",
+                        missing.join(", ")
+                    ))
+                    .with_data(json!({ "missing_capabilities": missing })));
+                }
+            }
+        }
         let out = {
             let App {
                 hw,
@@ -1831,6 +1945,7 @@ impl App {
                 manifest,
                 tasks,
                 rules,
+                family_members,
                 ..
             } = self;
             let def = match tools.get(name) {
@@ -1856,6 +1971,7 @@ impl App {
                 taken: &taken,
                 tasks,
                 rules,
+                families: family_members,
             };
             (def.handler)(&mut ctx, args)
         };
@@ -1872,21 +1988,24 @@ impl App {
     /// the writer (`/api/status.store.failed` and the `store` log line), because the caller
     /// here is very often the agent thread, which cannot touch flash at all — see
     /// [`App::flush_store`].
-    fn persist_config(&mut self) {
+    fn persist_config(&mut self) -> bool {
         let json = self.cfg.to_json_string();
-        if self.store.set(crate::config::NVS_KEY_CONFIG, &json) {
-            self.log.info("config", "saved");
+        let queued = self.store.set(crate::config::NVS_KEY_CONFIG, &json);
+        if queued {
+            self.log.info("config", "queued for saving");
         } else {
             self.log.error("config", "the config could not even be queued for saving");
         }
         self.runtime.config_dirty = false;
+        queued
     }
 
     fn persist_manifest(&mut self) {
         let json = self.manifest.to_json_string();
         if self.store.set(NVS_KEY_MANIFEST, &json) {
             self.runtime.manifest_rev += 1;
-            self.log.info("manifest", format!("saved, revision {}", self.runtime.manifest_rev));
+            self.log
+                .info("manifest", format!("queued for saving, live revision {}", self.runtime.manifest_rev));
         } else {
             self.log.error("manifest", "the manifest could not even be queued for saving");
         }
@@ -1970,33 +2089,56 @@ impl App {
         if self.load_workspace_files() {
             return;
         }
-        // Older layouts: one document (current shape) or the chunked one, each of which is
-        // migrated to one-value-per-file below, so a board that upgrades mid-life keeps its
-        // files. Two layouts live under this key. `ws1 ...` is the chunked one written while
-        // the store could only take values; a document that starts with `{` is the current one.
-        let mut peek = [0u8; 4];
-        let head = match self.store.read_at(NVS_KEY_WORKSPACE, 0, &mut peek) {
-            Some(n) if n > 0 => n,
-            _ => return,
-        };
-        if head >= 4 && &peek == b"ws1 " {
+        // Peek through the streaming reader, not `get`/the queue's default `read_at`,
+        // which would materialize the complete legacy document before its limits apply.
+        let mut chunked = false;
+        let loaded = (|| -> std::result::Result<Option<AppWorkspace>, serde_json::Error> {
+            use std::io::Read as _;
+            let Some(mut reader) = self.store.reader(NVS_KEY_WORKSPACE).or_else(|| {
+                self.store
+                    .get(NVS_KEY_WORKSPACE)
+                    .map(|text| Box::new(std::io::Cursor::new(text.into_bytes())) as Box<dyn std::io::Read>)
+            }) else {
+                return Ok(None);
+            };
+            let mut peek = [0u8; 4];
+            let mut head = 0;
+            while head < peek.len() {
+                match reader.read(&mut peek[head..]) {
+                    Ok(0) => break,
+                    Ok(n) => head += n,
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(e) => return Err(serde_json::Error::io(e)),
+                }
+            }
+            if head == 4 && &peek == b"ws1 " {
+                chunked = true;
+                return Ok(None);
+            }
+            AppWorkspace::from_reader(std::io::Cursor::new(&peek[..head]).chain(reader)).map(Some)
+        })();
+        if chunked {
             self.load_workspace_chunked();
             return;
         }
-        let Some(reader) = self.store.reader(NVS_KEY_WORKSPACE) else { return };
-        match AppWorkspace::from_reader(reader) {
-            Ok(ws) => {
+        match loaded {
+            Ok(Some(ws)) => {
                 self.workspace = ws;
                 self.migrate_workspace("one document");
             }
-            Err(e) => {
-                // The value cannot be read by this build or any other, so leaving it in
-                // flash only costs the space and hides the fact from the next boot.
-                self.log.error(
-                    "agent",
-                    format!("the stored workspace is unreadable ({e}); starting with an empty one"),
-                );
-                store::clear_blob(self.store.as_mut(), NVS_KEY_WORKSPACE, WORKSPACE_PLAN);
+            other => {
+                // A reader cannot distinguish absent from unreadable on every backend.
+                // Look up names only on this failure path; never discard orphaned values.
+                let has_workspace =
+                    self.store.keys().iter().any(|key| key == NVS_KEY_WORKSPACE || key.starts_with("ws."));
+                if has_workspace {
+                    let error =
+                        other.err().map_or_else(|| "missing workspace header".to_string(), |e| e.to_string());
+                    let why =
+                        format!("the stored workspace is unreadable ({error}); stored data was preserved");
+                    self.log.error("agent", why.clone());
+                    self.workspace.refuse_load(why);
+                }
             }
         }
     }
@@ -2008,7 +2150,7 @@ impl App {
             Ok(()) => self.log.info(
                 "agent",
                 format!(
-                    "migrated the stored workspace from {from} to one value per file: {files} file(s), {bytes} bytes"
+                    "queued workspace migration from {from} to one value per file: {files} file(s), {bytes} bytes; the old layout stays until publication succeeds"
                 ),
             ),
             // Not fatal: the old value is untouched until the new index lands, so the next boot
@@ -2023,70 +2165,114 @@ impl App {
     /// Read the workspace from its index and one value per file. `false` when there is no
     /// index, which means this board still holds an older layout.
     fn load_workspace_files(&mut self) -> bool {
-        let Some(doc) = self.store.get(crate::keys::WORKSPACE_INDEX) else { return false };
-        let index: std::collections::BTreeMap<String, String> = match serde_json::from_str(&doc) {
-            Ok(index) => index,
+        let loaded = (|| -> std::result::Result<AppWorkspace, serde_json::Error> {
+            let reader = self
+                .store
+                .reader(crate::keys::WORKSPACE_INDEX)
+                .or_else(|| {
+                    self.store.get(crate::keys::WORKSPACE_INDEX).map(|text| {
+                        Box::new(std::io::Cursor::new(text.into_bytes())) as Box<dyn std::io::Read>
+                    })
+                })
+                .ok_or_else(|| {
+                    serde_json::Error::io(std::io::Error::other("workspace index is absent or unreadable"))
+                })?;
+            // Validate the complete index, including each derived key, before accessing
+            // any file content. An invalid suffix must not authorize reads from other keys.
+            let index = workspace_json::index(reader)?;
+            let mut ws = AppWorkspace::default();
+            for (path, key) in index {
+                let reader = self
+                    .store
+                    .reader(&key)
+                    .or_else(|| {
+                        self.store.get(&key).map(|text| {
+                            Box::new(std::io::Cursor::new(text.into_bytes())) as Box<dyn std::io::Read>
+                        })
+                    })
+                    .ok_or_else(|| {
+                        serde_json::Error::io(std::io::Error::other(
+                            "indexed workspace file is absent or unreadable",
+                        ))
+                    })?;
+                let allowance = WORKSPACE_FILE_MAX.min(WORKSPACE_TOTAL_MAX - ws.bytes());
+                let text = workspace_json::text(reader, allowance)?;
+                ws.insert_checked(&path, std::borrow::Cow::Owned(text), false)
+                    .map_err(<serde_json::Error as serde::de::Error>::custom)?;
+            }
+            ws.saved = ws.files.iter().map(|(path, text)| (path.clone(), crate::keys::fnv1a(text))).collect();
+            Ok(ws)
+        })();
+        match loaded {
+            Ok(ws) => {
+                self.log.info(
+                    "agent",
+                    format!("workspace: {} file(s), {} bytes from the index", ws.len(), ws.bytes()),
+                );
+                self.workspace = ws;
+                true
+            }
             Err(e) => {
-                self.log
-                    .error("agent", format!("the workspace index is unreadable ({e}); no files were loaded"));
-                return true;
-            }
-        };
-        let mut ws = AppWorkspace::default();
-        let mut missing = 0usize;
-        let mut bytes = 0usize;
-        for (path, key) in &index {
-            match self.store.get(key) {
-                Some(text) => {
-                    bytes += text.len();
-                    ws.files.insert(path.clone(), text);
+                if !self.store.keys().iter().any(|key| key == crate::keys::WORKSPACE_INDEX) {
+                    return false;
                 }
-                None => missing += 1,
+                let why = format!("the workspace index is unreadable ({e}); no files were loaded; stored data was preserved");
+                self.log.error("agent", why.clone());
+                self.workspace.refuse_load(why);
+                true
             }
         }
-        if missing > 0 {
-            self.log.error(
-                "agent",
-                format!("{} workspace file(s) named by the index are missing from the store", missing),
-            );
-        }
-        self.log
-            .info("agent", format!("workspace: {} file(s), {bytes} bytes from the index", ws.files.len()));
-        ws.saved = ws.files.iter().map(|(path, text)| (path.clone(), crate::keys::fnv1a(text))).collect();
-        self.workspace = ws;
-        true
     }
 
     /// The chunked layout: a `ws1` header under `ws` and the document in `ws.1`, `ws.2`, ...
     fn load_workspace_chunked(&mut self) {
-        let (text, legacy) = match store::read_blob(self.store.as_ref(), NVS_KEY_WORKSPACE, WORKSPACE_PLAN) {
-            store::BlobState::Missing => return,
-            store::BlobState::Stored(text) => (text, false),
-            store::BlobState::Legacy(text) => (text, true),
-            store::BlobState::Corrupt(why) => {
-                self.log.error(
-                    "agent",
-                    format!("the stored workspace does not check out ({why}); starting with an empty one"),
-                );
-                store::clear_blob(self.store.as_mut(), NVS_KEY_WORKSPACE, WORKSPACE_PLAN);
-                return;
+        let loaded = (|| -> std::result::Result<(AppWorkspace, bool), String> {
+            // The historical header/chunks each fit an NVS value. Stage only that bounded
+            // snapshot before reusing the shared checksum validation, never an unbounded `get`.
+            let mut snapshot = store::MemoryStore::new();
+            let reader = self.store.reader(NVS_KEY_WORKSPACE).ok_or("workspace header is unreadable")?;
+            let header = workspace_json::text(reader, store::VALUE_MAX).map_err(|e| e.to_string())?;
+            let count = if header.starts_with("ws1 ") {
+                let count = header
+                    .split_whitespace()
+                    .nth(1)
+                    .and_then(|n| n.parse::<usize>().ok())
+                    .ok_or("invalid workspace chunk count")?;
+                if count > WORKSPACE_PLAN.chunks_max {
+                    return Err("workspace chunk count exceeds its limit".to_string());
+                }
+                count
+            } else {
+                0
+            };
+            snapshot.set(NVS_KEY_WORKSPACE, &header);
+            for chunk in 1..=count {
+                let key = crate::keys::workspace_chunk(chunk);
+                let reader = self.store.reader(&key).ok_or("workspace chunk is unreadable")?;
+                let text = workspace_json::text(reader, store::CHUNK_BYTES).map_err(|e| e.to_string())?;
+                snapshot.set(&key, &text);
             }
-        };
-        match serde_json::from_str::<Value>(&text) {
-            Ok(v) => self.workspace = AppWorkspace::from_json(&v),
+            let (text, legacy) = match store::read_blob(&snapshot, NVS_KEY_WORKSPACE, WORKSPACE_PLAN) {
+                store::BlobState::Stored(text) => (text, false),
+                store::BlobState::Legacy(text) => (text, true),
+                store::BlobState::Corrupt(why) => return Err(why),
+                store::BlobState::Missing => return Err("workspace header is missing".to_string()),
+            };
+            let ws = AppWorkspace::from_reader(text.as_bytes()).map_err(|e| e.to_string())?;
+            Ok((ws, legacy))
+        })();
+        match loaded {
+            Ok((ws, legacy)) => {
+                self.workspace = ws;
+                if legacy {
+                    self.migrate_workspace("one value");
+                }
+            }
             Err(e) => {
-                // The value cannot be read by this build or any other, so leaving it in
-                // flash only costs the space and hides the fact from the next boot.
-                self.log.error(
-                    "agent",
-                    format!("the stored workspace is unreadable ({e}); starting with an empty one"),
-                );
-                store::clear_blob(self.store.as_mut(), NVS_KEY_WORKSPACE, WORKSPACE_PLAN);
-                return;
+                let why = format!("the stored workspace is unreadable ({e}); stored data was preserved");
+                self.log.error("agent", why.clone());
+                self.workspace.refuse_load(why);
             }
-        }
-        if legacy {
-            self.migrate_workspace("one value");
         }
     }
 
@@ -2335,6 +2521,7 @@ impl App {
     pub fn agent_begin(&mut self) -> Option<AgentStep> {
         // Nothing queued is not an error, it is "no work": an idle tick calls this.
         let source = self.agent.pending.as_ref().map(|pending| pending.source.clone())?;
+        self.active_attachments = self.agent.pending.as_ref().map(|pending| pending.attachments.clone());
         let max_steps = self.llm.max_steps;
         let (context_tokens, max_output_tokens) = (self.llm.context_tokens, self.llm.max_output_tokens);
         // Before the run, not after: the marker is what tells the next boot that this turn
@@ -2356,6 +2543,7 @@ impl App {
     pub fn agent_reply(&mut self, reply: std::result::Result<llm::ModelReply, String>) -> AgentStep {
         let step = self.with_agent(move |agent, host| agent.apply(host, reply, now_ms));
         if matches!(&step, AgentStep::Done(_)) {
+            self.active_attachments = None;
             // The turn is over, so a reboot from here must not ask it again. Clearing the
             // marker before the final save means the worst case is a lost reply, never a
             // reply the board repeats.
@@ -2484,115 +2672,150 @@ impl App {
         v
     }
 
-    fn persist_agent_cfg(&mut self) {
+    fn persist_agent_cfg(&mut self) -> bool {
         let text = llm_json(&self.llm, true).to_string();
-        if !self.store.set(NVS_KEY_AGENT_CFG, &text) {
-            self.log.error("agent", "could not save the model config");
+        let queued = self.store.set(NVS_KEY_AGENT_CFG, &text);
+        if !queued {
+            self.log.error("agent", "could not queue the model config for saving");
         }
+        queued
     }
 
     fn persist_sched(&mut self) {
         let text = self.sched_json().to_string();
         if !self.store.set(NVS_KEY_SCHED, &text) {
-            self.log.error("agent", "could not save the schedule");
+            self.log.error("agent", "could not queue the schedule for saving");
         }
     }
 
-    /// Queue the workspace, or say why it cannot be stored at all.
-    ///
-    /// The return value is the point: a blob that cannot fit the storage plan has to reach
-    /// the caller as an error, because the caller is the one about to answer `ok: true` to
-    /// a model or a person, and [`App::workspace_edit`] undoes the change on `Err`. What is
-    /// checked here is therefore everything that is knowable before flash is touched —
-    /// the chunk count, the per-value ceiling, the UTF-8 boundaries; NVS refusing a write
-    /// it has room for is left to the writer task, which counts it in
-    /// `/api/status.store.failed` and logs the keys.
-    ///
-    /// The write itself is a request (see [`App::flush_store`]): this runs on whatever
-    /// thread made the change, and on this board only the store writer may touch flash.
-    /// Write the workspace: one value per file, plus an index that names them.
-    ///
-    /// This used to write the whole document on every save. Two measurements made that
-    /// untenable: the time grew with the workspace (14 s at 0.25 MB, 277 s at 2 MB, because a
-    /// save rewrote all of it), and the save needed a second copy of the document on flash at
-    /// the same time, which SPIFFS refused at about 2 MB with `ENOSPC` while reporting 9 MB
-    /// free. Per file, a save costs one file, and nothing is ever duplicated on flash.
-    ///
-    /// The index goes last: a value written without an index entry is garbage the next save
-    /// overwrites, while an index entry whose value is missing loses one file, not the board.
+    /// Admit one incremental workspace publication, not a synchronous durability promise.
+    /// Files precede the index; obsolete values and legacy data are removed only after
+    /// every required file and the index actually succeeds. Path-derived physical keys
+    /// still mean replacements are not an all-files transaction.
     fn persist_workspace(&mut self) -> std::result::Result<(), String> {
-        let mut index: std::collections::BTreeMap<String, String> = Default::default();
-        let mut written: std::collections::BTreeMap<String, u64> = Default::default();
-        let mut failed: Vec<String> = Vec::new();
-
+        self.acknowledge_workspace();
+        self.workspace.writable()?;
+        let mut index = std::collections::BTreeMap::new();
+        let mut hashes = std::collections::BTreeMap::new();
+        let mut writes = Vec::new();
+        let mut changed = Vec::new();
         for (path, text) in &self.workspace.files {
             let key = crate::keys::workspace_file(path);
-            index.insert(path.clone(), key.clone());
             let hash = crate::keys::fnv1a(text);
-            if self.workspace.saved.get(path) == Some(&hash) {
-                written.insert(path.clone(), hash);
-                continue;
+            // A queued/in-flight newer value may differ even when this edit returns to the
+            // last durable hash. Such a revert must replace that pending write too.
+            let pending_matches =
+                self.workspace_pending.as_ref().map_or(true, |save| save.hashes.get(path) == Some(&hash));
+            if self.workspace.saved.get(path) != Some(&hash) || !pending_matches {
+                writes.push((key.clone(), text.as_str()));
+                changed.push(path.clone());
             }
-            if self.store.set(&key, text) {
-                written.insert(path.clone(), hash);
-            } else {
-                // The old bytes stay: the key is derived from the path, not from the content,
-                // and `publish` renames only once the new value is complete.
-                failed.push(path.clone());
-            }
+            index.insert(path, key);
+            hashes.insert(path.clone(), hash);
         }
 
-        // Values whose file is gone. Only the paths we wrote before, so a stale key from an
-        // interrupted session is left to the save that follows it.
-        for path in self.workspace.saved.keys() {
+        let mut cleanup = self.workspace_stale_keys.clone();
+        cleanup.extend(self.workspace_pending.iter().flat_map(|save| save.cleanup.iter()).cloned());
+        for path in self
+            .workspace
+            .saved
+            .keys()
+            .chain(self.workspace_pending.iter().flat_map(|save| save.hashes.keys()))
+        {
             if !self.workspace.files.contains_key(path) {
-                self.store.remove(&crate::keys::workspace_file(path));
+                cleanup.insert(crate::keys::workspace_file(path));
             }
         }
-
+        // Enumerating names avoids materializing a possibly megabyte legacy document just
+        // to decide whether it needs cleanup. Check every historical chunk, including gaps.
+        let legacy: std::collections::BTreeSet<String> = (1..=WORKSPACE_PLAN.chunks_max)
+            .map(crate::keys::workspace_chunk)
+            .chain(std::iter::once(NVS_KEY_WORKSPACE.to_string()))
+            .collect();
+        for key in self.store.keys() {
+            if legacy.contains(&key) {
+                cleanup.insert(key);
+            }
+        }
+        // A new path may reuse an old path's physical hash; cleanup cannot unlink a key
+        // named by the new index, even across such a collision between generations.
+        for key in index.values() {
+            cleanup.remove(key);
+        }
+        let prospective_stale = cleanup.len().saturating_add(writes.len()).saturating_add(
+            self.workspace_stale_keys
+                .iter()
+                .filter(|key| !cleanup.contains(*key) && !writes.iter().any(|(write, _)| write == *key))
+                .count(),
+        );
+        if prospective_stale > store::PENDING_KEYS_MAX {
+            return Err(format!("the workspace was not saved: {prospective_stale} cleanup/dependency keys exceed the {}-key persistence budget; previous queue unchanged", store::PENDING_KEYS_MAX));
+        }
         let doc = serde_json::to_string(&index)
             .map_err(|e| format!("the workspace index could not be written: {e}"))?;
-        let committed = self.store.set(crate::keys::WORKSPACE_INDEX, &doc);
-        if committed {
-            // The layouts this one replaced, under keys nothing reads any more: the whole
-            // document (`ws`, or `ws1 ...` in its header) and its chunks. Asked for before
-            // removing, so the usual save leaves them alone entirely.
-            if self.store.get(NVS_KEY_WORKSPACE).is_some() {
-                self.store.remove(NVS_KEY_WORKSPACE);
-            }
-            for chunk in 1..=WORKSPACE_PLAN.chunks_max {
-                let key = crate::keys::workspace_chunk(chunk);
-                if self.store.get(&key).is_none() {
-                    break;
-                }
-                self.store.remove(&key);
-            }
-            self.workspace.saved = written;
-        }
-
-        if !failed.is_empty() {
+        let writes_ref: Vec<(&str, &str)> = writes.iter().map(|(key, text)| (key.as_str(), *text)).collect();
+        let cleanup: Vec<String> = cleanup.into_iter().collect();
+        let cleanup_ref: Vec<&str> = cleanup.iter().map(String::as_str).collect();
+        let receipt = self.store.publish(crate::keys::WORKSPACE_INDEX, &doc, &writes_ref, &cleanup_ref);
+        let Some(receipt) = receipt else {
+            let detail = self
+                .store
+                .last_error()
+                .map_or_else(|| "the store refused a file or index request".to_string(), |error| error.name);
             let why = format!(
-                "{} workspace file(s) were not saved ({}); the rest are",
-                failed.len(),
-                failed.join(", ")
+                "the workspace was not saved ({}): {detail}; see /api/status.store",
+                changed.join(", ")
             );
             self.log.error("agent", why.clone());
             return Err(why);
+        };
+        self.workspace_admissions = self.workspace_admissions.wrapping_add(1);
+        let previous = self.workspace_pending.replace(WorkspaceSave { receipt, hashes, changed, cleanup });
+        // Admission waited for any in-flight drain. Its older receipt is now completed or
+        // confirmed superseded; settle that generation without acknowledging the new one.
+        if let Some(previous) = previous {
+            if let Some(outcome) = previous.receipt.outcome() {
+                self.apply_workspace_outcome(previous, outcome);
+            }
         }
-        if !committed {
-            let why = "the workspace index was refused by the store, see /api/status.store";
-            self.log.error("agent", why);
-            return Err(why.to_string());
-        }
+        self.acknowledge_workspace(); // Also supports a genuinely synchronous KvStore.
         Ok(())
     }
 
-    /// One change to the workspace, durable or undone.
-    ///
-    /// Every caller that changes a file goes through here, so that "the write failed" and
-    /// "the file is there" cannot both be true. Without the rollback a failed save left the
-    /// new text in RAM: `write` answered ok, `read` served the file, and the next boot came
-    /// back without it - the failure was only visible in a log line nobody was reading.
+    fn acknowledge_workspace(&mut self) {
+        let Some(outcome) = self.workspace_pending.as_ref().and_then(|save| save.receipt.outcome()) else {
+            return;
+        };
+        let save = self.workspace_pending.take().expect("the receipt belongs to this generation");
+        self.apply_workspace_outcome(save, outcome);
+    }
+
+    fn apply_workspace_outcome(&mut self, save: WorkspaceSave, outcome: store::PublicationOutcome) {
+        match outcome {
+            store::PublicationOutcome::Superseded => {}
+            store::PublicationOutcome::Finished { published: true, cleanup_failed } => {
+                self.workspace.saved = save.hashes;
+                for path in self.workspace.saved.keys() {
+                    self.workspace_stale_keys.remove(&crate::keys::workspace_file(path));
+                }
+                for key in save.cleanup {
+                    self.workspace_stale_keys.remove(&key);
+                }
+                self.workspace_stale_keys.extend(cleanup_failed);
+            }
+            store::PublicationOutcome::Finished { published: false, .. } => {
+                // Some path-addressed values may have changed even though the index did not
+                // publish. Their old hashes cannot safely suppress a retry or a revert.
+                for path in save.changed {
+                    self.workspace.saved.remove(&path);
+                    self.workspace_stale_keys.insert(crate::keys::workspace_file(&path));
+                }
+                self.workspace_stale_keys.extend(save.cleanup);
+                self.log.error("agent", "the workspace publication failed; the RAM edit is not confirmed durable, obsolete/legacy cleanup was skipped, and a later save can retry");
+            }
+        }
+    }
+
     /// PSRAM free right now, in bytes, when the platform can say.
     ///
     /// Asked before a change that needs a copy of the workspace, so that running out is a
@@ -2601,23 +2824,49 @@ impl App {
         self.hw.heap_pools().into_iter().find(|p| p.pool == "spiram").map(|p| p.free_kb as usize * 1024)
     }
 
+    /// One change admitted for persistence, or fully undone on a closure/admission error.
+    /// A later backend refusal is asynchronous: RAM retains the edit, diagnostics report
+    /// the failure, and a subsequent explicit save can retry it.
     fn workspace_edit<T>(
         &mut self,
         change: impl FnOnce(&mut AppWorkspace) -> std::result::Result<T, String>,
     ) -> std::result::Result<T, String> {
+        // Settle an earlier completed publication before estimating or cloning the rollback;
+        // otherwise a refused new admission could restore stale persistence hashes.
+        self.acknowledge_workspace();
         // The rollback below needs a copy of the whole map, so this is the moment the board can
         // run out of PSRAM. Ask first: a refused write is a sentence the caller can act on, and
         // an allocation that fails is `memory allocation of N bytes failed` followed by
         // `abort()` - a reboot, measured on this board.
         if let Some(free) = self.psram_free_bytes() {
-            workspace_fits(self.workspace.bytes(), Some(free))?;
+            workspace_fits(&self.workspace, Some(free))?;
         }
-        let before = self.workspace.clone();
-        let outcome = change(&mut self.workspace)?;
+        let prior_receipt = self.workspace_pending.as_ref().map(|save| save.receipt.clone());
+        let mut before = self.workspace.clone();
+        let outcome = match change(&mut self.workspace) {
+            Ok(outcome) => outcome,
+            Err(e) => {
+                self.workspace = before;
+                self.acknowledge_workspace();
+                return Err(e);
+            }
+        };
         match self.persist_workspace() {
             Ok(()) => Ok(outcome),
             Err(e) => {
+                // The old writer may have completed after the rollback clone, and
+                // persist_workspace may already have settled that receipt before refusing
+                // this new admission. Undo file edits, not that durability acknowledgement
+                // (or hash invalidation): otherwise a later revert can skip a required write.
+                if self.workspace_pending.is_none()
+                    && prior_receipt.as_ref().is_some_and(|receipt| {
+                        matches!(receipt.outcome(), Some(store::PublicationOutcome::Finished { .. }))
+                    })
+                {
+                    before.saved = std::mem::take(&mut self.workspace.saved);
+                }
                 self.workspace = before;
+                self.acknowledge_workspace();
                 Err(format!(
                     "{e}. The change was dropped, so `read` shows the file as it was before this call"
                 ))
@@ -2646,11 +2895,9 @@ impl App {
                     crate::tools::knowledge::SKILLS_DIR
                 ),
             );
-            // The workspace is one persisted blob; a skill that exists only in RAM would be
-            // installed again next boot, and would be missing from what the portal and an
-            // MCP client read today. Seeding is best effort - there is nothing to roll back
-            // to, since this is the boot that had no workspace - so a failure is a log line
-            // rather than an error nobody could act on.
+            // Seeded files use the same incremental workspace publication. A RAM-only
+            // skill would be seeded again after reboot. Seeding is best effort, so an
+            // admission/backend refusal is a log/store diagnostic, not a startup error.
             if let Err(e) = self.persist_workspace() {
                 self.log.error("boot", format!("the seeded skills are in RAM only: {e}"));
             }
@@ -2667,52 +2914,83 @@ impl App {
         };
         let mut text = body.get("text").and_then(|t| t.as_str()).unwrap_or("").to_string();
 
-        // Attachments: a name, a mime type and base64 bytes. The board cannot show an
-        // image and the model here is text-only, so what the model gets is a line naming
-        // the file; the bytes are served back at `/api/attachment/<name>` for whoever can
-        // use them. Refusing quietly would be worse than this: the user would attach a
-        // screenshot and never learn it went nowhere.
+        // Admit the whole candidate before replacing the download list or queued
+        // message. Otherwise a rejected second attachment loses the previous image.
+        let mut attachments: Vec<crate::agent::Attachment> = Vec::new();
         let mut notes: Vec<String> = Vec::new();
-        if let Some(list) = body.get("attachments").and_then(|v| v.as_array()) {
+        if let Some(given) = body.get("attachments") {
+            let Some(list) = given.as_array() else {
+                return Response::error_json(400, "`attachments` must be an array");
+            };
             if list.len() > MAX_ATTACHMENTS {
                 return Response::json_status(
                     413,
                     &json!({ "error": format!("{} attachments; the limit is {MAX_ATTACHMENTS}", list.len()) }),
                 );
             }
-            self.attachments.clear();
             for item in list {
-                let name = item.get("name").and_then(|v| v.as_str()).unwrap_or("attachment").to_string();
-                let mime = item
-                    .get("mime")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("application/octet-stream")
-                    .to_string();
-                let mut bytes = Vec::new();
-                let encoded = item.get("data_b64").and_then(|v| v.as_str()).unwrap_or("");
-                if let Err(e) = crate::util::b64_decode(encoded, &mut bytes) {
-                    return Response::json_status(
+                if !item.is_object() {
+                    return Response::error_json(400, "each attachment must be an object");
+                }
+                for field in ["name", "mime", "data_b64"] {
+                    if item.get(field).is_some_and(|v| !v.is_string()) {
+                        return Response::error_json(400, &format!("attachment `{field}` must be a string"));
+                    }
+                }
+                let name = item.get("name").and_then(Value::as_str).unwrap_or("attachment");
+                if name.is_empty() || name.len() > 128 || name.chars().any(char::is_control) {
+                    return Response::error_json(
                         400,
-                        &json!({ "error": format!("`{name}`: base64: {}", e.message) }),
+                        "attachment name must be 1..=128 bytes without control characters",
                     );
                 }
-                if bytes.len() > MAX_ATTACHMENT_BYTES {
-                    return Response::json_status(
-                        413,
-                        &json!({
-                            "error": format!(
-                                "`{name}` is {} bytes; an attachment is limited to {MAX_ATTACHMENT_BYTES}",
-                                bytes.len()
-                            )
-                        }),
+                if attachments.iter().any(|a| a.name == name) {
+                    return Response::error_json(400, "attachment names must be unique");
+                }
+                let mime = item.get("mime").and_then(Value::as_str).unwrap_or("application/octet-stream");
+                let token = |part: &str| {
+                    !part.is_empty()
+                        && part.bytes().all(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b))
+                };
+                if mime.len() > 128
+                    || !mime.split_once('/').is_some_and(|(kind, subtype)| token(kind) && token(subtype))
+                {
+                    return Response::error_json(
+                        400,
+                        "attachment mime must be a bare type/subtype of at most 128 bytes",
                     );
+                }
+                let mut bytes = Vec::new();
+                let encoded = item.get("data_b64").and_then(Value::as_str).unwrap_or("");
+                if let Err(e) = crate::util::b64_decode_limit(encoded, &mut bytes, MAX_ATTACHMENT_BYTES) {
+                    let status = if e.data.as_ref().is_some_and(|data| data.get("decoded_bytes").is_some()) {
+                        413
+                    } else {
+                        400
+                    };
+                    return Response::json_status(
+                        status,
+                        &json!({ "error": format!("`{name}`: {}", e.message) }),
+                    );
+                }
+                let mut path = String::new();
+                for byte in name.bytes() {
+                    if byte.is_ascii_alphanumeric() || b"-._~".contains(&byte) {
+                        path.push(byte as char);
+                    } else {
+                        use std::fmt::Write as _;
+                        let _ = write!(path, "%{byte:02X}");
+                    }
                 }
                 notes.push(format!(
-                    "[attached: {name}, {mime}, {} kB — fetch with GET /api/attachment/{name}]",
+                    "[attached: {name}, {mime}, {} kB — fetch with GET /api/attachment/{path}]",
                     bytes.len().div_ceil(1024)
                 ));
-                let data_b64 = crate::util::b64_encode(&bytes);
-                self.attachments.push(crate::agent::Attachment { name, mime, data_b64 });
+                attachments.push(crate::agent::Attachment {
+                    name: name.to_string(),
+                    mime: mime.to_ascii_lowercase(),
+                    data_b64: crate::util::b64_encode(&bytes),
+                });
             }
             if !notes.is_empty() {
                 text.push_str("\n\n");
@@ -2728,18 +3006,16 @@ impl App {
                 &json!({ "error": format!("`text` is {} bytes; the limit is {AGENT_TEXT_MAX}", text.len()) }),
             );
         }
-        // Kept twice on purpose: the app serves the bytes back, the message sends them.
-        // Vecs over 512 bytes live in PSRAM and an attachment is capped at 24 kB.
-        let attachments = self.attachments.clone();
         self.agent.vision = self.llm.vision;
         if !self.agent.push_user(&text, "http", now_ms()) {
             return Response::json_status(400, &json!({ "error": "`text` is required" }));
         }
-        // Attachments belong to the message, not to the app: the request that carries
-        // them and the transcript that reports them must not be able to disagree.
+        // A text-only message intentionally replaces the list with an empty one.
+        // The running turn keeps its own snapshot if another message is queued.
         if let Some(message) = self.agent.pending.as_mut() {
-            message.attachments = attachments;
+            message.attachments = attachments.clone();
         }
+        self.attachments = attachments;
         // The index this message will occupy once the run appends it: the queue is
         // depth 1, so a second trigger coalesces into the same slot.
         let seq = self.agent.history.len() + usize::from(self.agent.pending.is_some());
@@ -2755,8 +3031,8 @@ impl App {
     /// the run appends the real one.
     /// `GET /api/files/tree`: the whole workspace in one answer.
     ///
-    /// The workspace is at most 8 KB of text, so a directory-at-a-time view costs a round
-    /// trip per level for a tree that fits in one response. Every file brings its path, and
+    /// This returns names and sizes, never the file bodies; the file-count and path
+    /// budgets bound its metadata even with a multi-MiB workspace. Every file brings its path, and
     /// the directories are the prefixes of those paths — the same rule `list` uses, so the
     /// tree and `ls` cannot disagree about what a directory is.
     fn files_tree_json(&self) -> Value {
@@ -2802,7 +3078,7 @@ impl App {
     /// `GET /api/files?path=/dir`: one directory of the workspace, directories first.
     ///
     /// Shaped like the `ls` tool on purpose — one workspace, one meaning of `size_bytes` —
-    /// plus the two totals. The workspace is a single 8 KB blob stored in NVS chunks, so
+    /// plus the two totals. File bodies and the index are stored separately, so
     /// "how much of it is used" is the question a person asks when a write is refused, and
     /// a per-file number cannot answer it.
     fn files_json(&self, path: &str) -> Value {
@@ -2896,6 +3172,9 @@ impl App {
     /// connection outlives this call. The app lock is taken per poll, never for the
     /// life of the stream - that is the property the whole design is for.
     fn agent_stream(&mut self, req: &Request) -> Response {
+        if let Err(r) = self.require_read(req) {
+            return r;
+        }
         let after = req.query_get("after").and_then(|v| v.trim().parse().ok()).unwrap_or(0u64);
         let resp = self.agent_stream_from(after, StreamLimits::default());
         if resp.is_stream() {
@@ -2961,7 +3240,7 @@ impl App {
             self.runtime.config_dirty = true;
             self.log.info("agent", format!("scheduler tick is now {clamped} ms"));
         }
-        self.persist_agent_cfg();
+        let queued = self.persist_agent_cfg();
         self.log.info(
             "agent",
             format!(
@@ -2972,8 +3251,15 @@ impl App {
             ),
         );
         let mut v = self.agent_config_json();
-        v["saved"] = json!(true);
-        Response::json(&v)
+        v["saved"] = json!(false);
+        v["queued"] = json!(queued);
+        v["note"] = json!("applied in RAM; queue admission is not flash acknowledgement. Check /api/status.store for pending writes and failures");
+        if queued {
+            Response::json(&v)
+        } else {
+            v["error"] = json!("model config was applied in RAM but could not be queued for saving");
+            Response::json_status(503, &v)
+        }
     }
 
     fn sched_json(&self) -> Value {
@@ -2985,23 +3271,11 @@ impl App {
     }
 
     fn next_task_id(&self) -> String {
-        for n in 1..=MAX_TASKS * 4 {
-            let id = format!("t{n}");
-            if !self.tasks.iter().any(|t| t.id == id) {
-                return id;
-            }
-        }
-        format!("t{}", self.tasks.len() + 1)
+        next_schedule_task_id(&self.tasks)
     }
 
     fn next_rule_id(&self) -> String {
-        for n in 1..=MAX_RULES * 4 {
-            let id = format!("r{n}");
-            if !self.rules.iter().any(|r| r.id == id) {
-                return id;
-            }
-        }
-        format!("r{}", self.rules.len() + 1)
+        next_schedule_id("r", self.rules.iter().map(|r| r.id.as_str()))
     }
 
     /// Add, update, enable/disable or delete one task or rule by id.
@@ -3043,6 +3317,19 @@ impl App {
             Ok(v) => v,
             Err(e) => return Response::error_json(400, &format!("invalid JSON: {e}")),
         };
+        if body.get("tasks").is_some() || body.get("rules").is_some() {
+            match self.sched_replacement(&body) {
+                Ok((tasks, rules)) => {
+                    self.tasks = tasks;
+                    self.rules = rules;
+                    self.persist_sched();
+                    let mut v = self.sched_json();
+                    v["ok"] = json!(true);
+                    return Response::json(&v);
+                }
+                Err(e) => return Response::error_json(400, &e.message),
+            }
+        }
         let kind = body.get("kind").and_then(|k| k.as_str()).unwrap_or("");
         let op = body.get("op").and_then(|o| o.as_str()).unwrap_or("upsert");
         let id = body.get("id").and_then(|i| i.as_str()).unwrap_or("").trim().to_string();
@@ -3072,13 +3359,10 @@ impl App {
             ("task", "add") | ("task", "update") | ("task", "upsert") => {
                 let src = body.get("task").unwrap_or(&body);
                 let fallback = self.next_task_id();
-                let task = match task_from(src, &fallback) {
-                    Some(t) => t,
-                    None => return Response::json_status(400, &json!({ "error": "`prompt` is required" })),
+                let task = match task_from_api(src, &fallback) {
+                    Ok(t) => t,
+                    Err(e) => return Response::error_json(400, &e.message),
                 };
-                if let Some(why) = task_problem(&task) {
-                    return Response::json_status(400, &json!({ "error": why }));
-                }
                 match self.tasks.iter().position(|t| t.id == task.id) {
                     Some(i) => {
                         // A patch that does not mention the clock keeps the old one.
@@ -3121,13 +3405,10 @@ impl App {
             ("rule", "add") | ("rule", "update") | ("rule", "upsert") => {
                 let src = body.get("rule").unwrap_or(&body);
                 let fallback = self.next_rule_id();
-                let rule = match rule_from_id(src, &fallback) {
-                    Some(r) => r,
-                    None => return Response::json_status(400, &json!({ "error": "`tool` is required" })),
+                let rule = match rule_from_api(src, &fallback) {
+                    Ok(r) => r,
+                    Err(e) => return Response::error_json(400, &e.message),
                 };
-                if let Some(why) = rule_problem(&rule) {
-                    return Response::json_status(400, &json!({ "error": why }));
-                }
                 match self.rules.iter().position(|r| r.id == rule.id) {
                     Some(i) => {
                         let mut rule = rule;
@@ -3160,6 +3441,70 @@ impl App {
         Response::json(&v)
     }
 
+    /// Validate the advertised full replacement in temporary lists. A bad member
+    /// must not erase a previously valid schedule or reset any existing clocks.
+    fn sched_replacement(&self, body: &Value) -> Result<(Vec<ScheduledTask>, Vec<SensorRule>)> {
+        if body.get("kind").is_some() || body.get("op").is_some() {
+            return Err(McpError::invalid_params("do not mix schedule replacement with `kind`/`op`"));
+        }
+        let task_sources = body
+            .get("tasks")
+            .and_then(Value::as_array)
+            .ok_or_else(|| McpError::invalid_params("replacement requires a `tasks` array"))?;
+        let rule_sources = body
+            .get("rules")
+            .and_then(Value::as_array)
+            .ok_or_else(|| McpError::invalid_params("replacement requires a `rules` array"))?;
+        if task_sources.len() > MAX_TASKS || rule_sources.len() > MAX_RULES {
+            return Err(McpError::invalid_params(format!(
+                "at most {MAX_TASKS} scheduled tasks and {MAX_RULES} sensor rules"
+            )));
+        }
+        let mut tasks: Vec<ScheduledTask> = Vec::with_capacity(task_sources.len());
+        for src in task_sources {
+            let fallback = next_schedule_id(
+                "t",
+                task_sources
+                    .iter()
+                    .filter_map(|v| v.get("id").and_then(Value::as_str))
+                    .map(str::trim)
+                    .chain(tasks.iter().map(|t| t.id.as_str())),
+            );
+            let mut task = task_from_api(src, &fallback)?;
+            if tasks.iter().any(|t| t.id == task.id) {
+                return Err(McpError::invalid_params(format!("duplicate task id `{}`", task.id)));
+            }
+            if src.get("last_run_ms").is_none() {
+                if let Some(old) = self.tasks.iter().find(|t| t.id == task.id) {
+                    task.last_run_ms = old.last_run_ms;
+                }
+            }
+            tasks.push(task);
+        }
+        let mut rules: Vec<SensorRule> = Vec::with_capacity(rule_sources.len());
+        for src in rule_sources {
+            let fallback = next_schedule_id(
+                "r",
+                rule_sources
+                    .iter()
+                    .filter_map(|v| v.get("id").and_then(Value::as_str))
+                    .map(str::trim)
+                    .chain(rules.iter().map(|r| r.id.as_str())),
+            );
+            let mut rule = rule_from_api(src, &fallback)?;
+            if rules.iter().any(|r| r.id == rule.id) {
+                return Err(McpError::invalid_params(format!("duplicate rule id `{}`", rule.id)));
+            }
+            if src.get("last_fire_ms").is_none() {
+                if let Some(old) = self.rules.iter().find(|r| r.id == rule.id) {
+                    rule.last_fire_ms = old.last_fire_ms;
+                }
+            }
+            rules.push(rule);
+        }
+        Ok((tasks, rules))
+    }
+
     /// Run the queued message, if there is one, and keep the transcript.
     ///
     /// The HTTP routes only enqueue; the agent thread in the platform layer (and
@@ -3170,6 +3515,7 @@ impl App {
             return Ok(String::new());
         }
         let cfg = self.llm.clone();
+        self.active_attachments = self.agent.pending.as_ref().map(|pending| pending.attachments.clone());
         // The source of the queued message, which the journal and the transcript record.
         let source = self.agent.pending.as_ref().map(|p| p.source.clone()).unwrap_or_default();
         // This runner takes the whole turn in one call (`run_pending`), so its transcript
@@ -3193,6 +3539,7 @@ impl App {
         };
         self.model_transport = transport;
         self.agent = agent;
+        self.active_attachments = None;
         // Only a turn that actually ran ends here: a missing transport leaves the
         // message queued for a later attempt and keeps the run-in-flight marker, so the
         // next boot resumes it instead of forgetting it.
@@ -3217,27 +3564,34 @@ impl App {
     /// As [`Self::handle_rpc`], but knowing which listener answered. `initialize` quotes
     /// an endpoint, and quoting the wrong scheme sends the next agent to a dead port.
     pub fn handle_rpc_with(&mut self, body: &str, session: Option<&str>, scheme: &str) -> Option<Value> {
-        let messages = match protocol::parse(body) {
+        let frame = match protocol::parse_frame(body) {
             Ok(m) => m,
             Err((id, code_n, message)) => {
                 self.runtime.counters.bad_requests += 1;
                 return Some(protocol::err(id, code_n, &message, None));
             }
         };
-        let single = messages.len() == 1;
         let mut out = Vec::new();
-        for msg in messages {
-            if let Some(v) = self.handle_one(msg, session, scheme) {
-                out.push(v);
+        for message in frame.messages {
+            match message {
+                Ok(msg) => {
+                    if let Some(v) = self.handle_one(msg, session, scheme) {
+                        out.push(v);
+                    }
+                }
+                Err((id, code_n, message)) => {
+                    self.runtime.counters.bad_requests += 1;
+                    out.push(protocol::err(id, code_n, &message, None));
+                }
             }
         }
         self.settle();
         if out.is_empty() {
             None
-        } else if single {
-            out.pop()
-        } else {
+        } else if frame.is_batch {
             Some(Value::Array(out))
+        } else {
+            out.pop()
         }
     }
 
@@ -3251,10 +3605,11 @@ impl App {
                         entry.initialized = true;
                     }
                 }
+                return None;
             }
-            return None;
+        } else {
+            self.runtime.counters.requests += 1;
         }
-        self.runtime.counters.requests += 1;
         let result = match msg.method.as_str() {
             "initialize" => Ok(self.on_initialize(&msg.params, session, scheme)),
             "ping" => Ok(json!({})),
@@ -3277,10 +3632,10 @@ impl App {
             )),
         };
         match result {
-            Ok(v) => Some(protocol::ok(id, v)),
+            Ok(v) => (!msg.is_notification).then(|| protocol::ok(id, v)),
             Err(e) => {
                 self.log.warn("rpc", format!("{}: {}", msg.method, e.message));
-                Some(protocol::err(id, e.code, &e.message, e.data))
+                (!msg.is_notification).then(|| protocol::err(id, e.code, &e.message, e.data))
             }
         }
     }
@@ -3315,18 +3670,7 @@ impl App {
         let started = std::time::Instant::now();
         // The tools outside the registry go through `ToolHost`, which is the path the
         // board's own agent uses, so an MCP caller and the agent share one behaviour.
-        let result = if name.starts_with("fs_") || name.starts_with("net_") {
-            if self.cfg.mcp.disabled_tools.iter().any(|d| d == &name) {
-                Err(McpError::not_found(format!("tool `{name}` is disabled")))
-            } else {
-                match ToolHost::call_tool(self, &name, &args) {
-                    Ok(text) => Ok(text_result(&text)),
-                    Err(message) => Err(McpError::invalid_params(message)),
-                }
-            }
-        } else {
-            self.call_tool(&name, &args)
-        };
+        let result = self.call_tool(&name, &args);
         let ms = started.elapsed().as_millis();
         match result {
             Ok(v) => {
@@ -3514,6 +3858,9 @@ impl App {
                     "this endpoint uses the POST-only Streamable HTTP transport; open / for the config page",
                 ),
                 "DELETE" => {
+                    if let Err(r) = self.require_mcp(req) {
+                        return self.with_cors(r);
+                    }
                     let sid = req.header("mcp-session-id").unwrap_or("");
                     self.runtime.sessions.retain(|s| s.id != sid);
                     Response::empty(204)
@@ -3577,7 +3924,7 @@ impl App {
                 self.apply_manifest_http(req)
             }
             ("GET", "/api/manifest/schema") => {
-                // An HTTP response has no 2 KB cap, so this route hands over the part of
+                // An HTTP response has no tool-result cap, so this route hands over the part of
                 // the reference needed to write a manifest in one go; the model asks for
                 // the same content one section at a time (`manifest_describe`).
                 let mut out = json!({});
@@ -3636,6 +3983,9 @@ impl App {
             // The run journal, with the host agent's event names. A client polls it
             // with `?after=<seq>` exactly like the transcript.
             ("GET", "/api/agent/events") => {
+                if let Err(r) = self.require_read(req) {
+                    return r;
+                }
                 let after = req.query_get("after").and_then(|v| v.parse().ok()).unwrap_or(0u64);
                 Response::json(&self.agent.events_json(after))
             }
@@ -3653,6 +4003,8 @@ impl App {
                     return r;
                 }
                 let (removed, kept) = self.agent.forget(0);
+                self.attachments.clear();
+                self.active_attachments = None;
                 self.persist_transcript();
                 self.log.info("agent", "transcript cleared from the portal");
                 Response::json(&json!({ "reset": true, "removed": removed, "kept": kept }))
@@ -3666,6 +4018,10 @@ impl App {
                 let body: Value = serde_json::from_str(&req.body_str()).unwrap_or(Value::Null);
                 let keep = body.get("keep").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
                 let (removed, kept) = self.agent.forget(keep);
+                if keep == 0 {
+                    self.attachments.clear();
+                    self.active_attachments = None;
+                }
                 // Forgetting has to reach flash, or the conversation comes back after a
                 // reboot - the one outcome nobody asking for `forget` would accept.
                 self.persist_transcript();
@@ -3794,6 +4150,9 @@ impl App {
                 Response::json(&out)
             }
             ("GET", path) if path.starts_with("/api/script/") => {
+                if let Err(r) = self.require_read(req) {
+                    return r;
+                }
                 let id = &path["/api/script/".len()..];
                 match self.script_job(id) {
                     Some(job) => Response::json(&json!({
@@ -3852,6 +4211,9 @@ impl App {
                 Response::json(&json!({ "ok": true, "note": "credentials cleared" }))
             }
             ("GET", "/api/logs") => {
+                if let Err(r) = self.require_read(req) {
+                    return r;
+                }
                 let n = req.query_get("n").and_then(|v| v.parse().ok()).unwrap_or(80usize);
                 let since = req.query_get("since").and_then(|v| v.parse().ok()).unwrap_or(0u64);
                 let mut v = self.log.to_json(n.min(400), since);
@@ -3859,7 +4221,7 @@ impl App {
                 Response::json(&v)
             }
             ("GET", "/api/catalog") => Response::json(&drivers::catalog_json()),
-            // The portal's Files tab: read-only, so it needs no PIN like every other read.
+            // The portal's Files tab is read-only but exposes private workspace contents.
             // Both answers carry the same numbers the `ls` and `read` tools return, because
             // there is one workspace and one meaning of "how big is it".
             ("GET", "/api/files") => {
@@ -3949,6 +4311,9 @@ impl App {
             // on the board itself. It only ever returns a canned reply, so it cannot
             // be mistaken for a model, and nothing else depends on it.
             ("POST", "/selftest/chat/completions") => Response::json(&selftest_completion(req)),
+            ("GET", "/selftest/ping") => Response::json(&json!({
+                "ok": true, "service": "selftest-net", "purpose": "lock-free target for net_get",
+            })),
             // `/audio/pcm` is consumed before the handler whenever the server was built with
             // `make_routes`, because its body must not be buffered. Reaching this arm means
             // that composition root was not used (a unit test, say); 501 says so, where the
@@ -4015,7 +4380,10 @@ impl App {
             .map(|v| v.trim().to_string())
             .unwrap_or_default();
         if bearer.is_empty() {
-            return false;
+            // EventSource cannot set Authorization. Only a minted short-lived portal
+            // token is accepted in the URL, and only for a non-mutating read.
+            return matches!(req.method.as_str(), "GET" | "HEAD")
+                && req.query_get("token").is_some_and(|token| self.runtime.token_valid(token, now_ms()));
         }
         if bearer == pin {
             return true;
@@ -4038,25 +4406,31 @@ impl App {
         Err(Response::json_status(401, &json!({ "error": "PIN required", "pin_required": true })))
     }
 
-    fn handle_mcp_post(&mut self, req: &Request) -> Response {
+    /// POST and DELETE share both the service switch and the bearer requirement.
+    fn require_mcp(&mut self, req: &Request) -> std::result::Result<(), Response> {
         if !self.cfg.mcp.enabled {
-            return Response::error_json(503, "MCP service is disabled in the configuration");
+            return Err(Response::error_json(503, "MCP service is disabled in the configuration"));
         }
-        if !self.cfg.auth.mcp_token.is_empty() {
-            let ok = req
-                .header("authorization")
-                .map(|a| {
-                    a.trim_start_matches("Bearer ").trim_start_matches("bearer ").trim()
-                        == self.cfg.auth.mcp_token
-                })
-                .unwrap_or(false);
-            if !ok {
-                self.runtime.counters.auth_failures += 1;
-                return Response::json_status(401, &json!({ "error": "missing or wrong bearer token" }))
-                    .with_header("WWW-Authenticate", "Bearer");
-            }
+        if self.cfg.auth.mcp_token.is_empty() {
+            return self.require_pin(req);
         }
+        let ok = req.header("authorization").and_then(|a| a.trim().split_once(' ')).is_some_and(
+            |(scheme, token)| {
+                scheme.eq_ignore_ascii_case("Bearer") && token.trim() == self.cfg.auth.mcp_token
+            },
+        );
+        if ok {
+            return Ok(());
+        }
+        self.runtime.counters.auth_failures += 1;
+        Err(Response::json_status(401, &json!({ "error": "missing or wrong bearer token" }))
+            .with_header("WWW-Authenticate", "Bearer"))
+    }
 
+    fn handle_mcp_post(&mut self, req: &Request) -> Response {
+        if let Err(r) = self.require_mcp(req) {
+            return r;
+        }
         let body = req.body_str();
         if body.trim().is_empty() {
             return Response::error_json(400, "empty body: send a JSON-RPC request");
@@ -4169,20 +4543,43 @@ impl App {
             Ok(v) => v,
             Err(e) => return Response::error_json(400, &format!("invalid JSON: {e}")),
         };
-        if let Some(mode) = body.get("mode").and_then(|m| m.as_str()) {
-            if matches!(mode, "auto" | "all" | "generic") {
-                self.cfg.mcp.tools_mode = mode.to_string();
-            }
+        if !body.is_object() {
+            return Response::error_json(400, "tool selection must be an object");
         }
-        if let Some(disabled) = body.get("disabled").and_then(|d| d.as_array()) {
-            self.cfg.mcp.disabled_tools =
-                disabled.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect();
+        let mode = match body.get("mode") {
+            None => None,
+            Some(Value::String(mode)) if matches!(mode.as_str(), "auto" | "all" | "generic") => {
+                Some(mode.clone())
+            }
+            Some(_) => return Response::error_json(400, "mode must be auto, generic or all"),
+        };
+        let disabled = match body.get("disabled") {
+            None => None,
+            Some(Value::Array(names)) if names.iter().all(Value::is_string) => {
+                Some(names.iter().filter_map(Value::as_str).map(str::to_string).collect())
+            }
+            Some(_) => return Response::error_json(400, "disabled must be an array of tool-name strings"),
+        };
+        // Validate the complete selection before changing either field.
+        if let Some(mode) = mode {
+            self.cfg.mcp.tools_mode = mode;
+        }
+        if let Some(disabled) = disabled {
+            self.cfg.mcp.disabled_tools = disabled;
         }
         self.runtime.config_dirty = true;
-        self.persist_config();
+        let queued = self.persist_config();
         let mut v = self.tools_portal_json();
-        v["ok"] = json!(true);
-        Response::json(&v)
+        v["ok"] = json!(queued);
+        v["applied"] = json!(true);
+        v["queued"] = json!(queued);
+        v["saved"] = json!(false);
+        if queued {
+            Response::json(&v)
+        } else {
+            v["error"] = json!("tool selection was applied in RAM but could not be queued for saving");
+            Response::json_status(503, &v)
+        }
     }
 
     fn wifi_connect(&mut self, req: &Request) -> Response {
@@ -4294,6 +4691,8 @@ impl App {
         let mut h = std::collections::hash_map::DefaultHasher::new();
         self.cfg.mcp.profile.hash(&mut h);
         self.cfg.mcp.tools_mode.hash(&mut h);
+        self.llm.vision.hash(&mut h);
+        self.tool_attachments().iter().any(|a| a.mime.starts_with("image/")).hash(&mut h);
         for name in &self.cfg.mcp.disabled_tools {
             name.hash(&mut h);
         }
@@ -4350,15 +4749,40 @@ impl App {
 
     /// The `fs_*` and `net_*` handlers by name, shared by the tool host and `shell`.
     fn fs_or_net_call(&mut self, name: &str, arguments: &Value) -> std::result::Result<String, String> {
+        let before = self.workspace_admissions;
+        let result = self.fs_or_net_call_inner(name, arguments);
+        if self.workspace_admissions == before {
+            return result;
+        }
+        match result {
+            Ok(text) => {
+                let value = serde_json::from_str(&text).unwrap_or_else(|_| json!({ "text": text }));
+                Ok(Self::workspace_admission_reply(value).to_string())
+            }
+            Err(mut error) => {
+                const NOTE: &str = "Earlier workspace edits remain in RAM and were queued; queue admission is not storage acknowledgement. Check the store object in GET /api/status for outcomes.";
+                if !error.contains(NOTE) {
+                    error.push('\n');
+                    error.push_str(NOTE);
+                }
+                Err(error)
+            }
+        }
+    }
+
+    fn fs_or_net_call_inner(&mut self, name: &str, arguments: &Value) -> std::result::Result<String, String> {
+        self.ensure_enabled(name).map_err(|e| e.message)?;
+        if !arguments.is_object() {
+            return Err("tool arguments must be an object".to_string());
+        }
         if name.starts_with("fs_") {
             let call = |ws: &mut AppWorkspace| {
                 fs_tools::call(ws, name, arguments)
                     .ok_or_else(|| format!("`{name}` starts with fs_ but no such file tool exists"))?
             };
             let text = if matches!(name, "fs_write" | "fs_edit" | "fs_rm" | "fs_cp" | "fs_mv") {
-                // A tool that changes a file answers only once the change is stored, or not at
-                // all: a `write` that said ok and lost the file at the next boot is the failure
-                // this branch is here to prevent.
+                // Refused RAM edits/queue admission roll back here. A successful call must
+                // report queued=true/saved=false, not imply that the writer has completed.
                 self.workspace_edit(call)?
             } else {
                 call(&mut self.workspace)?
@@ -4458,6 +4882,7 @@ impl App {
         args: &Value,
     ) -> std::result::Result<String, String> {
         let op = parsed.name.clone();
+        self.ensure_enabled(&op).map_err(|e| e.message)?;
         // A missing argument is a wrong command line like any other, so it answers with the
         // usage line too: `cp` with one word should not be the one error that stays silent
         // about how the command is written.
@@ -4487,6 +4912,7 @@ impl App {
     /// pipeline, because a pipeline must not be a second way round anything (the PIN, the
     /// workspace limit, the refusals).
     fn shell_dispatch(&mut self, tool: &str, inner: &Value) -> std::result::Result<String, String> {
+        self.ensure_enabled(tool).map_err(|e| e.message)?;
         match tool {
             "shell_zip" => self.shell_zip(inner),
             "shell_unzip" => self.shell_unzip(inner),
@@ -4568,6 +4994,7 @@ impl App {
                         crate::tools::shell::PIPE_USAGE
                     ));
                 }
+                self.ensure_enabled("fs_read").map_err(|e| e.message)?;
                 stdin = Some(fs_tools::Workspace::read(&self.workspace, path)?);
             }
             if index > 0 && stdio == crate::tools::shell::Stdio::Produces {
@@ -4632,6 +5059,10 @@ impl App {
     /// with no file copies its input, `grep` with no file filters what the pipe left, and
     /// `echo` is the producer a redirect is usually written for.
     fn pipe_stage(&mut self, op: &str, inner: &Value) -> std::result::Result<String, String> {
+        self.ensure_enabled(op).map_err(|e| e.message)?;
+        if let Some(tool) = crate::tools::shell::route(op) {
+            crate::tool::ensure_tool_enabled(&self.cfg, tool).map_err(|e| e.message)?;
+        }
         if op == "cat" {
             match inner.get("path").and_then(|v| v.as_str()) {
                 Some(path) if !path.is_empty() => {
@@ -4661,7 +5092,9 @@ impl App {
         target: &crate::tools::shell::Redirect,
         text: &str,
     ) -> std::result::Result<Value, String> {
+        self.ensure_enabled("fs_write").map_err(|e| e.message)?;
         let existing = if target.append {
+            self.ensure_enabled("fs_read").map_err(|e| e.message)?;
             fs_tools::Workspace::read(&self.workspace, &target.path).unwrap_or_default()
         } else {
             String::new()
@@ -4714,6 +5147,10 @@ impl App {
     /// `curl`: GET (with HTML reduced to text) or POST when `data` is given.
     /// `wget`: the same fetch, saved into the workspace under `path`.
     fn run_curl(&mut self, name: &str, args: &Value) -> std::result::Result<String, String> {
+        self.ensure_enabled(name).map_err(|e| e.message)?;
+        if name == "wget" {
+            self.ensure_enabled("fs_write").map_err(|e| e.message)?;
+        }
         let url = args.get("url").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
         if url.is_empty() {
             return Err("`url` is required".into());
@@ -4927,8 +5364,8 @@ impl App {
         let octal = args.get("octal").and_then(|v| v.as_bool()).unwrap_or(false);
         let (path, text) = self.shell_input(args, if octal { "od" } else { "hexdump" })?;
         let data = text.into_bytes();
-        // A tool result is 2 KB; a column per byte eats 4 (octal) or 5 (hex) bytes, so dump
-        // as much as arrives whole and say what was left out.
+        // Keep a compact roughly 1.8 KiB dump, independent of the global tool-text cap.
+        // Octal/hex columns expand each input byte; report what this local policy omits.
         let lines_that_fit = 1800 / (width * if octal { 4 } else { 5 } + 12);
         let mut out = String::new();
         for (row, chunk) in data.chunks(width).enumerate() {
@@ -4972,11 +5409,13 @@ impl App {
             let Some(target) = target else {
                 return Ok(serde_json::json!({ "text": decoded, "bytes": bytes.len() }).to_string());
             };
+            self.ensure_enabled("fs_write").map_err(|e| e.message)?;
             self.workspace_edit(|ws| fs_tools::Workspace::write(ws, &target, &decoded))?;
             return Ok(serde_json::json!({ "path": target, "bytes": bytes.len() }).to_string());
         }
         let encoded = crate::util::b64_encode(text.as_bytes());
         if let Some(target) = out_path {
+            self.ensure_enabled("fs_write").map_err(|e| e.message)?;
             self.workspace_edit(|ws| fs_tools::Workspace::write(ws, &target, &encoded))?;
             return Ok(serde_json::json!({ "path": target, "bytes": encoded.len() }).to_string());
         }
@@ -5003,38 +5442,52 @@ impl App {
         })
     }
 
-    /// Pack `{name: text}` entries into an archive and return it as base64.
+    /// Pack `{name: text}` entries into a compact inline archive and return base64.
     ///
-    /// Base64 rather than a file in the workspace: the workspace holds text and totals 8 kB,
-    /// and a tool result is capped at 2 KB anyway. An external agent can decode the string
-    /// and write a real `.zip`; the board itself only needs to hand it over.
+    /// The 1,400-byte archive policy is separate from the workspace and tool-result limits.
+    /// Check stored ZIP overhead before cloning any file; a large workspace export must
+    /// be refused without first allocating an equally large archive and input copy.
     fn shell_zip(&mut self, args: &Value) -> std::result::Result<String, String> {
+        const INLINE_MAX: usize = 1400;
         let name = args.get("name").and_then(|v| v.as_str()).unwrap_or("archive.zip");
         let mut entries: Vec<(String, Vec<u8>)> = Vec::new();
+        let mut encoded_bytes = 22usize;
+        let mut append = |path: &str, text: &str| -> std::result::Result<(), String> {
+            let next = encoded_bytes
+                .saturating_add(76)
+                .saturating_add(path.len().saturating_mul(2))
+                .saturating_add(text.len());
+            if next > INLINE_MAX {
+                return Err(format!("the archive would be {next} bytes; zip's inline archive limit is {INLINE_MAX} bytes before base64"));
+            }
+            entries.push((path.to_string(), text.as_bytes().to_vec()));
+            encoded_bytes = next;
+            Ok(())
+        };
         if let Some(files) = args.get("files").and_then(|v| v.as_object()) {
             for (path, text) in files {
-                entries.push((path.clone(), text.as_str().unwrap_or("").as_bytes().to_vec()));
+                append(path, text.as_str().unwrap_or(""))?;
             }
         }
-        // `paths` packs files that are already in the workspace.
+        // Borrow the existing text until admission succeeds; Workspace::read would
+        // clone the entire file even when its first entry already exceeds INLINE_MAX.
         if let Some(paths) = args.get("paths").and_then(|v| v.as_array()) {
             for path in paths.iter().filter_map(|p| p.as_str()) {
-                match fs_tools::Workspace::read(&self.workspace, path) {
-                    Ok(text) => entries.push((path.trim_start_matches('/').to_string(), text.into_bytes())),
-                    Err(_) => return Err(format!("`{path}` is not in the workspace")),
-                }
+                self.ensure_enabled("fs_read").map_err(|e| e.message)?;
+                let canonical = AppWorkspace::file_path(path)?;
+                let text = self
+                    .workspace
+                    .files
+                    .get(&canonical)
+                    .ok_or_else(|| format!("`{path}` is not in the workspace"))?;
+                append(canonical.trim_start_matches('/'), text)?;
             }
         }
         if entries.is_empty() {
             return Err("nothing to pack: give `files` {name: text} or `paths` [..]".into());
         }
         let archive = crate::zip::write(&entries)?;
-        if archive.len() > 1400 {
-            return Err(format!(
-                "the archive would be {} bytes; a tool result is limited to about 1.4 kB of base64",
-                archive.len()
-            ));
-        }
+        debug_assert_eq!(archive.len(), encoded_bytes);
         // No `stored`: nothing is written anywhere. `zip` hands the archive back as base64 and
         // the field said otherwise, which is a claim a caller could act on and be wrong.
         Ok(json!({
@@ -5094,6 +5547,7 @@ impl App {
     fn shell_input(&self, args: &Value, op: &str) -> std::result::Result<(Value, String), String> {
         let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
         if !path.is_empty() {
+            self.ensure_enabled("fs_read").map_err(|e| e.message)?;
             let text = fs_tools::Workspace::read(&self.workspace, &path)?;
             return Ok((json!(path), text));
         }
@@ -5364,6 +5818,7 @@ impl App {
     /// `tee <path> [-i <text>]`: write the text and echo it. In a pipeline the text arrives
     /// on stdin; on its own it arrives as `-i`, because that is what a pipe would have been.
     fn shell_tee(&mut self, args: &Value) -> std::result::Result<String, String> {
+        self.ensure_enabled("fs_write").map_err(|e| e.message)?;
         let path = App::shell_path(args, "tee")?;
         let flag = args.get("input").and_then(|v| v.as_str()).unwrap_or("");
         let piped = args.get("stdin").and_then(|v| v.as_str());
@@ -5390,6 +5845,7 @@ impl App {
 
     /// `touch <path>`: create an empty file. There is no mtime to move, and it says so.
     fn shell_touch(&mut self, args: &Value) -> std::result::Result<String, String> {
+        self.ensure_enabled("fs_write").map_err(|e| e.message)?;
         let path = App::shell_path(args, "touch")?;
         let exists = fs_tools::Workspace::read(&self.workspace, &path).is_ok();
         if !exists {
@@ -5526,6 +5982,7 @@ impl App {
     /// `crc32 <path>`: the same CRC-32 the zip writer already uses, so there is one of it.
     fn shell_crc32(&mut self, args: &Value) -> std::result::Result<String, String> {
         let path = App::shell_path(args, "crc32")?;
+        self.ensure_enabled("fs_read").map_err(|e| e.message)?;
         let bytes = fs_tools::Workspace::read(&self.workspace, &path)?.into_bytes();
         let crc = crate::zlib::crc32(&bytes);
         Ok(json!({
@@ -5550,12 +6007,16 @@ impl App {
                 }
                 let previous = self.cfg.wifi.hostname.clone();
                 self.cfg.wifi.hostname = name.clone();
-                self.persist_config();
+                if !self.persist_config() {
+                    self.cfg.wifi.hostname = previous;
+                    return Err("hostname: config could not be queued for saving; name unchanged".into());
+                }
                 Ok(json!({
                     "hostname": name,
                     "previous": previous,
-                    "saved": true,
-                    "note": "saved to the config; the DHCP lease carries the new name after the next reconnect",
+                    "saved": false,
+                    "queued": true,
+                    "note": "applied in RAM and queued, not acknowledged on flash; DHCP carries the new name after reconnect. Check /api/status.store for failures",
                 })
                 .to_string())
             }
@@ -5912,18 +6373,6 @@ fn tool_text(v: &Value) -> String {
     serde_json::to_string(v).unwrap_or_else(|_| "{}".to_string())
 }
 
-/// The reverse of [`tool_text`]: a tool that answers with JSON text, shaped as an MCP
-/// result so an external client sees the same envelope as the registry tools.
-fn text_result(text: &str) -> Value {
-    match serde_json::from_str::<Value>(text) {
-        Ok(value) => protocol::tool_json(&value),
-        Err(_) => json!({
-            "content": [{ "type": "text", "text": text }],
-            "isError": false,
-        }),
-    }
-}
-
 /// Accept either an OpenAI tool or an MCP tool definition from an extra tool group
 /// and return the OpenAI shape the model call needs.
 fn openai_tools(list: &Value) -> Vec<Value> {
@@ -6054,6 +6503,60 @@ fn task_json(t: &ScheduledTask) -> Value {
     })
 }
 
+fn next_schedule_id<'a>(prefix: &str, ids: impl Iterator<Item = &'a str>) -> String {
+    let ids: std::collections::BTreeSet<_> = ids.collect();
+    // There are at most N occupied names, so one of N+1 candidates must be free.
+    (1..=ids.len() + 1)
+        .map(|n| format!("{prefix}{n}"))
+        .find(|id| !ids.contains(id.as_str()))
+        .expect("one more candidate than occupied names")
+}
+
+pub(crate) fn next_schedule_task_id(tasks: &[ScheduledTask]) -> String {
+    next_schedule_id("t", tasks.iter().map(|t| t.id.as_str()))
+}
+
+fn schedule_string_fields(v: &Value, names: &[&str]) -> Result<()> {
+    if !v.is_object() {
+        return Err(McpError::invalid_params("schedule entries must be objects"));
+    }
+    for name in names {
+        if v.get(*name).is_some_and(|raw| !raw.is_string()) {
+            return Err(McpError::invalid_params(format!("`{name}` must be a string")));
+        }
+    }
+    if v.get("enabled").is_some_and(|raw| !raw.is_boolean()) {
+        return Err(McpError::invalid_params("`enabled` must be a boolean"));
+    }
+    Ok(())
+}
+
+/// Strict edge validation shared by REST and the schedule tool. Stored schedule
+/// blobs keep the lenient reader below, so this does not change recovery semantics.
+pub(crate) fn task_from_api(v: &Value, fallback_id: &str) -> Result<ScheduledTask> {
+    schedule_string_fields(v, &["id", "prompt", "script", "at_hhmm"])?;
+    let every_s = crate::json::optional_ranged_i64(v, "every_s", 0, 86_400)?.unwrap_or(0) as u32;
+    crate::json::optional_ranged_u64(v, "last_run_ms", 0, u64::MAX)?;
+    let mut task = task_from(v, fallback_id)
+        .ok_or_else(|| McpError::invalid_params("a task requires `prompt` or `script`"))?;
+    task.every_s = every_s;
+    if let Some(why) = task_problem(&task) {
+        return Err(McpError::invalid_params(why));
+    }
+    Ok(task)
+}
+
+fn rule_from_api(v: &Value, fallback_id: &str) -> Result<SensorRule> {
+    schedule_string_fields(v, &["id", "tool", "path", "op", "prompt"])?;
+    crate::json::optional_ranged_u64(v, "min_interval_s", 0, u32::MAX as u64)?;
+    crate::json::optional_ranged_u64(v, "last_fire_ms", 0, u64::MAX)?;
+    let rule = rule_from_id(v, fallback_id).ok_or_else(|| McpError::invalid_params("`tool` is required"))?;
+    if let Some(why) = rule_problem(&rule) {
+        return Err(McpError::invalid_params(why));
+    }
+    Ok(rule)
+}
+
 /// A task from a JSON object. Lenient on purpose: this also reads the NVS blob,
 /// which was validated when it was written. `fallback_id` names a new one.
 fn task_from(v: &Value, fallback_id: &str) -> Option<ScheduledTask> {
@@ -6105,7 +6608,11 @@ fn valid_hhmm(s: &str) -> bool {
     let Some((h, m)) = s.split_once(':') else {
         return false;
     };
-    if h.len() != 2 || m.len() != 2 {
+    if h.len() != 2
+        || m.len() != 2
+        || !h.bytes().all(|c| c.is_ascii_digit())
+        || !m.bytes().all(|c| c.is_ascii_digit())
+    {
         return false;
     }
     match (h.parse::<u32>(), m.parse::<u32>()) {
@@ -6179,37 +6686,51 @@ fn rule_problem(r: &SensorRule) -> Option<String> {
 
 // ---------------------------------------------------------------- workspace
 
-/// The agent's file workspace: an in-RAM map persisted as one JSON blob in NVS.
+#[path = "workspace_json.rs"]
+mod workspace_json;
+
+/// Metadata has its own limits: empty files and long names still occupy RAM.
+pub const WORKSPACE_FILES_MAX: usize = 1024;
+pub const WORKSPACE_PATH_MAX: usize = 256;
+pub const WORKSPACE_NAMES_MAX: usize = 128 * 1024;
+/// Permit a little redundant path syntax without accepting an unbounded raw name.
+const WORKSPACE_RAW_PATH_MAX: usize = 4 * WORKSPACE_PATH_MAX;
+/// Conservative per-map-entry allowance for tree-node slack and allocator bookkeeping.
+const WORKSPACE_ENTRY_RAM: usize = 192;
+
+/// The agent's bounded in-RAM file map, persisted as an index and one value per file.
 ///
-/// Deliberately small (a file is <= 2 KB, the whole workspace <= 8 KB) because it
-/// shares the chip's heap with the model transcript; SPIFFS can replace it later
-/// behind the same [`crate::tools::fs::Workspace`] trait.
+/// Text limits remain 256 KiB per file and 4 MiB in total. Logical path and entry
+/// budgets are separate from the short physical keys; see `docs/storage.md`.
 #[derive(Default, Debug, Clone)]
 pub struct AppWorkspace {
     files: std::collections::BTreeMap<String, String>,
-    /// What was last written for each path, so a save rewrites only what changed.
-    ///
-    /// The hash is content-only: the key for a path never changes, so a failed write leaves the
-    /// previous bytes in place and the hash stays wrong until the next attempt, which retries.
+    /// Per-path content hashes maintained by App's incremental persistence path.
+    /// This map alone does not establish that a queued write reached storage.
     saved: std::collections::BTreeMap<String, u64>,
+    /// A refused restore must not be replaced by boot-time seeding or a partial edit.
+    /// Repairing storage (or an explicit reset) makes the next load writable again.
+    load_refused: Option<String>,
 }
 
-/// Whether a change of `bytes` can be made with `free` bytes of PSRAM.
+/// Whether a change of `workspace` can be made with `free` bytes of PSRAM.
 ///
 /// Two copies: the rollback keeps the map as it was, and the change builds the new text. The
 /// margin is the allocator's overhead and whatever else a turn is holding. The point of asking
 /// is that the failure has two shapes and only one of them is usable: a refusal here says
 /// "nothing was changed", while an allocation that fails prints `memory allocation of N bytes
 /// failed` and calls `abort()` - measured on this board, at a 1.25 MB workspace.
-pub fn workspace_fits(bytes: usize, free: Option<usize>) -> std::result::Result<(), String> {
+pub fn workspace_fits(workspace: &AppWorkspace, free: Option<usize>) -> std::result::Result<(), String> {
+    workspace.writable()?;
     let Some(free) = free else { return Ok(()) };
+    let bytes = workspace.ram_bytes();
     let need = bytes.saturating_mul(2).saturating_add(64 * 1024);
     if free >= need {
         return Ok(());
     }
     Err(format!(
-        "the file workspace is {bytes} bytes and a change needs about {need} bytes of PSRAM \
-         (a rollback copy plus the new text); {free} is free, so nothing was changed"
+        "the file workspace uses an estimated {bytes} bytes of RAM and a change needs about {need} bytes of PSRAM \
+         (a rollback copy, file text, names and entry overhead); {free} is free, so nothing was changed"
     ))
 }
 
@@ -6238,23 +6759,13 @@ impl AppWorkspace {
         out.write_all(b"}}")
     }
 
-    /// Parse the document [`AppWorkspace::write_json`] writes, straight into the map.
+    /// Parse version-1 JSON incrementally, with bounded encoded input and decoded strings.
     ///
-    /// `from_json(&Value)` needed the whole document as a `String`, then a `Value` of it, then
-    /// the map - three copies on every boot. serde deserialises into the map directly, so the
-    /// peak is the map plus the parser's own buffer.
-    /// Incremental, and buffered: serde_json's reader pulls one byte at a time while it parses a
-    /// string, so handing it the store's reader directly meant a file open and seek per byte.
-    /// 8 KB of buffer turns that into one pull per 8 KB of document.
+    /// No intermediate `Value`, full-document `String`, or unbounded parser string buffer:
+    /// each path is checked before its content, and each decoded byte before allocation.
+    /// Legacy documents that omit `version` or `files` retain their version-1 meaning.
     pub fn from_reader(reader: impl std::io::Read) -> std::result::Result<Self, serde_json::Error> {
-        #[derive(serde::Deserialize)]
-        struct Doc {
-            #[serde(default)]
-            files: std::collections::BTreeMap<String, String>,
-        }
-        let mut buffered = std::io::BufReader::with_capacity(8192, reader);
-        let doc: Doc = serde_json::from_reader(&mut buffered)?;
-        Ok(Self { files: doc.files, saved: Default::default() })
+        workspace_json::document(reader)
     }
 
     pub fn to_json(&self) -> Value {
@@ -6265,16 +6776,108 @@ impl AppWorkspace {
         json!({ "version": 1, "files": files })
     }
 
-    pub fn from_json(v: &Value) -> Self {
+    /// The already-materialized legacy form. Validate before copying any entry.
+    /// The caller's `Value` allocation is not owned by this function.
+    pub fn from_json(v: &Value) -> std::result::Result<Self, String> {
+        let doc = v.as_object().ok_or("workspace document must be an object")?;
+        if doc.keys().any(|field| field != "version" && field != "files") {
+            return Err("unknown workspace field".to_string());
+        }
+        if doc.get("version").is_some_and(|version| version.as_u64() != Some(1)) {
+            return Err("workspace version must be the integer 1".to_string());
+        }
         let mut ws = Self::default();
-        if let Some(map) = v.get("files").and_then(|f| f.as_object()) {
+        if let Some(files) = doc.get("files") {
+            let map = files.as_object().ok_or("workspace files must be an object")?;
             for (path, text) in map {
-                if let Some(text) = text.as_str() {
-                    ws.files.insert(path.clone(), text.to_string());
-                }
+                let text = text.as_str().ok_or("workspace file content must be a string")?;
+                ws.insert_checked(path, std::borrow::Cow::Borrowed(text), false)?;
             }
         }
-        ws
+        Ok(ws)
+    }
+
+    fn file_path(path: &str) -> std::result::Result<String, String> {
+        let path = normalize_path(path)?;
+        if path == "/" {
+            return Err("the workspace root is a directory, not a file".to_string());
+        }
+        Ok(path)
+    }
+
+    /// Shared admission for normal writes and both restoration formats.
+    /// A restore cannot silently overwrite a canonical-name collision.
+    fn check_insert(&self, path: &str, bytes: usize, overwrite: bool) -> std::result::Result<String, String> {
+        self.writable()?;
+        let key = Self::file_path(path)?;
+        let previous = self.files.get(&key);
+        if !overwrite && previous.is_some() {
+            return Err(format!("duplicate canonical workspace path `{key}`"));
+        }
+        if previous.is_none() {
+            let physical = crate::keys::workspace_file(&key);
+            if self.files.keys().any(|existing| {
+                Self::path_conflicts(existing, &key) || crate::keys::workspace_file(existing) == physical
+            }) {
+                return Err(format!("workspace path `{key}` collides with an existing file or directory"));
+            }
+            if self.files.len() >= WORKSPACE_FILES_MAX {
+                return Err(format!("the workspace holds at most {WORKSPACE_FILES_MAX} files"));
+            }
+            let names = self.files.keys().map(|path| path.len()).sum::<usize>();
+            if !matches!(names.checked_add(key.len()), Some(n) if n <= WORKSPACE_NAMES_MAX) {
+                return Err(format!("workspace filenames hold at most {WORKSPACE_NAMES_MAX} bytes"));
+            }
+        }
+        if bytes > WORKSPACE_FILE_MAX {
+            return Err(format!(
+                "`{key}` is {bytes} bytes; the limit is {WORKSPACE_FILE_MAX} bytes per file"
+            ));
+        }
+        let others = self.bytes().saturating_sub(previous.map_or(0, String::len));
+        if !matches!(others.checked_add(bytes), Some(n) if n <= WORKSPACE_TOTAL_MAX) {
+            return Err(format!(
+                "the workspace holds at most {WORKSPACE_TOTAL_MAX} bytes; remove a file first"
+            ));
+        }
+        Ok(key)
+    }
+
+    fn path_conflicts(left: &str, right: &str) -> bool {
+        left == right
+            || left.strip_prefix(right).is_some_and(|rest| rest.starts_with('/'))
+            || right.strip_prefix(left).is_some_and(|rest| rest.starts_with('/'))
+    }
+
+    fn insert_checked(
+        &mut self,
+        path: &str,
+        text: std::borrow::Cow<'_, str>,
+        overwrite: bool,
+    ) -> std::result::Result<(), String> {
+        let key = self.check_insert(path, text.len(), overwrite)?;
+        let text = match text {
+            std::borrow::Cow::Owned(text) => text,
+            std::borrow::Cow::Borrowed(text) => {
+                let mut copy = String::new();
+                copy.try_reserve_exact(text.len()).map_err(|_| "workspace text allocation was refused")?;
+                copy.push_str(text);
+                copy
+            }
+        };
+        self.files.insert(key, text);
+        Ok(())
+    }
+
+    fn writable(&self) -> std::result::Result<(), String> {
+        match &self.load_refused {
+            Some(why) => Err(format!("the stored workspace was not loaded ({why}); writes are blocked to preserve it; repair or explicitly reset storage")),
+            None => Ok(()),
+        }
+    }
+
+    fn refuse_load(&mut self, why: impl Into<String>) {
+        self.load_refused = Some(why.into());
     }
 
     pub fn len(&self) -> usize {
@@ -6288,7 +6891,22 @@ impl AppWorkspace {
 
     /// Total text bytes across every file: the number [`WORKSPACE_TOTAL_MAX`] is about.
     pub fn bytes(&self) -> usize {
-        self.files.values().map(|text| text.len()).sum()
+        self.files.values().fold(0usize, |total, text| total.saturating_add(text.len()))
+    }
+
+    /// Allocation-capacity estimate, not a measured heap size. Include both maps'
+    /// strings and a generous allowance per tree entry; text-only `bytes()` stays unchanged.
+    pub fn ram_bytes(&self) -> usize {
+        let files = self.files.iter().fold(0usize, |total, (path, text)| {
+            total
+                .saturating_add(path.capacity())
+                .saturating_add(text.capacity())
+                .saturating_add(WORKSPACE_ENTRY_RAM)
+        });
+        let saved = self.saved.keys().fold(0usize, |total, path| {
+            total.saturating_add(path.capacity()).saturating_add(WORKSPACE_ENTRY_RAM)
+        });
+        files.saturating_add(saved).saturating_add(self.load_refused.as_ref().map_or(0, String::capacity))
     }
 
     pub fn is_empty(&self) -> bool {
@@ -6299,20 +6917,15 @@ impl AppWorkspace {
 /// `/a/b` from `a//b/`, `/a/./b`; `..` is refused rather than resolved, so a tool
 /// call can never climb out of the workspace.
 fn normalize_path(path: &str) -> std::result::Result<String, String> {
-    let mut out = String::from("/");
-    for part in path.split('/') {
-        match part {
-            "" | "." => {}
-            ".." => return Err(format!("`{path}` leaves the workspace root")),
-            p => {
-                if !out.ends_with('/') {
-                    out.push('/');
-                }
-                out.push_str(p);
-            }
-        }
+    // Check before normalization allocates a vector or a canonical path.
+    if path.len() > WORKSPACE_RAW_PATH_MAX {
+        return Err(format!("a raw workspace path holds at most {WORKSPACE_RAW_PATH_MAX} bytes"));
     }
-    Ok(out)
+    let path = fs_tools::normalize(path)?;
+    if path.len() > WORKSPACE_PATH_MAX {
+        return Err(format!("a canonical workspace path holds at most {WORKSPACE_PATH_MAX} bytes"));
+    }
+    Ok(path)
 }
 
 impl fs_tools::Workspace for AppWorkspace {
@@ -6342,30 +6955,17 @@ impl fs_tools::Workspace for AppWorkspace {
     }
 
     fn read(&self, path: &str) -> std::result::Result<String, String> {
-        let key = normalize_path(path)?;
+        let key = Self::file_path(path)?;
         self.files.get(&key).cloned().ok_or_else(|| format!("no file `{key}`"))
     }
 
     fn write(&mut self, path: &str, text: &str) -> std::result::Result<(), String> {
-        let key = normalize_path(path)?;
-        if text.len() > WORKSPACE_FILE_MAX {
-            return Err(format!(
-                "`{key}` is {} bytes; the limit is {WORKSPACE_FILE_MAX} bytes per file",
-                text.len()
-            ));
-        }
-        let others: usize = self.files.iter().filter(|(k, _)| **k != key).map(|(_, v)| v.len()).sum();
-        if others + text.len() > WORKSPACE_TOTAL_MAX {
-            return Err(format!(
-                "the workspace holds at most {WORKSPACE_TOTAL_MAX} bytes; remove a file first"
-            ));
-        }
-        self.files.insert(key, text.to_string());
-        Ok(())
+        self.insert_checked(path, std::borrow::Cow::Borrowed(text), true)
     }
 
     fn remove(&mut self, path: &str) -> std::result::Result<(), String> {
-        let key = normalize_path(path)?;
+        self.writable()?;
+        let key = Self::file_path(path)?;
         match self.files.remove(&key) {
             Some(_) => Ok(()),
             None => Err(format!("no file `{key}`")),
@@ -6464,8 +7064,8 @@ fn selftest_completion(req: &Request) -> Value {
         ("fs_edit", r#"{"path":"/bench/hello.txt","find":"self-test","replace":"edited"}"#);
     const GREP: (&str, &str) = ("fs_grep", r#"{"pattern":"written","path":"/bench"}"#);
     // The workflow the device exists for: discover what is wired, learn the manifest
-    // schema, add a tool that was not there before, then call it. Six rounds, so the
-    // bench has to raise agent.max_steps to run it.
+    // schema, add a tool that was not there before, then call it. Six rounds also
+    // verify that the next request receives the freshly published tool declaration.
     const INVENTORY: (&str, &str) = ("inventory", "{}");
     const I2C_SCAN: (&str, &str) = ("i2c_scan", "{}");
     const DESCRIBE: (&str, &str) = ("manifest_describe", "{}");
@@ -6474,6 +7074,10 @@ fn selftest_completion(req: &Request) -> Value {
         r#"{"mode":"merge","manifest":{"tools":[{"name":"bench_mcp_probe","description":"Read the boot button on GPIO0 as a level, 1 released and 0 pressed","params":[],"exec":{"type":"gpio_read","pin":0}}]}}"#,
     );
     const CALL_NEW: (&str, &str) = ("bench_mcp_probe", "{}");
+    // Keep the scripted network case local too: it should not depend on public DNS
+    // or Internet access merely to exercise the transport and tool result path.
+    let local_url = format!("{}://{}/selftest/ping", req.scheme, req.header("host").unwrap_or("127.0.0.1"));
+    let net_args = json!({"url": local_url}).to_string();
     let steps: &[(&str, &str)] = if has_word(&ask, "edit") || ask.contains("改") {
         &[WRITE, EDIT, READ]
     } else if has_word(&ask, "file") || ask.contains("文件") {
@@ -6481,14 +7085,49 @@ fn selftest_completion(req: &Request) -> Value {
     } else if has_word(&ask, "mcp") {
         &[INVENTORY, I2C_SCAN, DESCRIBE, APPLY, CALL_NEW, ("board_status", "{}")]
     } else if has_word(&ask, "net") || has_word(&ask, "http") {
-        &[("net_get", r#"{"url":"http://example.com/"}"#)]
+        &[("net_get", &net_args)]
     } else {
         &[("board_status", "{}")]
     };
-    let next_tool = steps.get(tool_rounds).copied();
+    let desired = steps.get(tool_rounds).copied();
+    // The default profile advertises families and read/write/edit/shell, not the
+    // old aliases. Choose only a name in the actual request; legacy-only fixtures
+    // still work, and a disabled family is not bypassed via an unadvertised alias.
+    let next_tool = desired.and_then(|(name, args)| {
+        if has_tool(name) {
+            return Some((name.to_string(), args.to_string()));
+        }
+        let (family, command) = match name {
+            "board_status" => ("board", "status"),
+            "inventory" => ("board", "inventory"),
+            "i2c_scan" => ("bus", "i2c_scan"),
+            "manifest_describe" => ("manifest", "describe"),
+            "manifest_apply" => ("manifest", "apply"),
+            "fs_write" | "fs_read" | "fs_edit" => {
+                let current = match name {
+                    "fs_write" => "write",
+                    "fs_read" => "read",
+                    _ => "edit",
+                };
+                return has_tool(current).then(|| (current.to_string(), args.to_string()));
+            }
+            "fs_grep" | "net_get" if has_tool("shell") => {
+                let command = if name == "fs_grep" {
+                    "grep written /bench".to_string()
+                } else {
+                    format!("curl {local_url}")
+                };
+                return Some(("shell".to_string(), json!({"command": command}).to_string()));
+            }
+            _ => return None,
+        };
+        let arguments = serde_json::from_str::<Value>(args).unwrap_or_else(|_| json!({}));
+        has_tool(family)
+            .then(|| (family.to_string(), json!({"command": command, "arguments": arguments}).to_string()))
+    });
 
-    let message = match (next_tool, tool_result) {
-        (Some((name, args)), _) if has_tool(name) => json!({
+    let message = match (next_tool.as_ref(), desired, tool_result) {
+        (Some((name, args)), _, _) => json!({
             "role": "assistant",
             "content": null,
             "tool_calls": [{
@@ -6497,15 +7136,15 @@ fn selftest_completion(req: &Request) -> Value {
                 "function": { "name": name, "arguments": args }
             }]
         }),
-        (Some((name, _)), _) => json!({
+        (None, Some((name, _)), _) => json!({
             "role": "assistant",
             "content": format!("selftest: `{name}` is not on the tool list, so there is nothing to demonstrate"),
         }),
-        (None, Some(text)) => json!({
+        (None, None, Some(text)) => json!({
             "role": "assistant",
             "content": format!("selftest: the board answered with {}", body_prefix(&text, 160)),
         }),
-        (None, None) => json!({ "role": "assistant", "content": "selftest: nothing to do" }),
+        (None, None, None) => json!({ "role": "assistant", "content": "selftest: nothing to do" }),
     };
     let answered = next_tool.is_none();
     // A scripted turn still carries reasoning and usage: the point of this endpoint is
@@ -6674,16 +7313,16 @@ pub fn make_handler(app: Shared) -> Handler {
 
 /// Where a host streams PCM into the speaker: `POST /audio/pcm` (docs/audio.md §6).
 ///
-/// The alternative the board had was a tool argument, and a tool result is capped at 2 KB,
-/// so `speaker_play` carries 43 ms — a note, never a song. A request body has no such cap
-/// and, with [`crate::http::BodySink`], no buffer either: the bytes go to the amplifier as
-/// they arrive, and the speaker's own pacing is what throttles the socket.
+/// Unlike `speaker_play`, which synthesizes the whole bounded score, this route accepts
+/// PCM without retaining the complete clip or putting its samples into a tool envelope.
+/// [`crate::http::BodySink`] reuses small chunk buffers; the upload has its own 30 s/byte
+/// limits, and the speaker's pacing throttles the socket.
 pub const AUDIO_STREAM_PATH: &str = "/audio/pcm";
 
 /// How much audio one upload may carry: 30 s at 24 kHz, 16-bit mono.
 ///
-/// Not a memory budget — nothing is held — but a bound on how long one request may hold
-/// the speaker, and on how long a client that never stops sending can keep it. Longer audio
+/// Not a full-clip memory budget — only chunk buffers are held — but a bound on how long
+/// one request may hold the speaker and how long a sending client can keep it. Longer audio
 /// is a second request, which is also the honest shape for a retry.
 pub const AUDIO_STREAM_MAX_SECONDS: u32 = 30;
 pub const AUDIO_STREAM_MAX_BYTES: usize = 24_000 * 2 * AUDIO_STREAM_MAX_SECONDS as usize;
@@ -6806,7 +7445,7 @@ fn audio_route(app: &Shared, req: &Request) -> crate::http::BodyRoute {
     // The bytes are played at the amplitude they carry, so the content type has to say what
     // they are: a misdirected JSON POST would otherwise be screamed into the speaker.
     let content_type = req.header("content-type").unwrap_or("").to_ascii_lowercase();
-    if !content_type.starts_with("audio/pcm") {
+    if content_type.split(';').next().unwrap_or("").trim() != "audio/pcm" {
         return BodyRoute::Answer(Response::error_json(
             415,
             "Content-Type must be audio/pcm; the body is raw PCM16LE mono at 24000 Hz (docs/audio.md)",
@@ -6923,6 +7562,12 @@ impl AvReader {
                         format!("unknown record tag 0x{:02x}", self.tag),
                     ));
                 }
+                if self.tag == b'E' && self.need != 0 {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "an end record must have length 0",
+                    ));
+                }
                 if self.need == 0 {
                     if self.tag != b'E' {
                         // An empty audio or frame record is a host bug, not a pause.
@@ -6960,6 +7605,7 @@ struct AvSink {
     frames: usize,
     received: usize,
     failed: Option<String>,
+    invalid: Option<String>,
 }
 
 impl AvSink {
@@ -6974,6 +7620,7 @@ impl AvSink {
             frames: 0,
             received: 0,
             failed: None,
+            invalid: None,
         }
     }
 }
@@ -6981,16 +7628,15 @@ impl AvSink {
 impl crate::http::BodySink for AvSink {
     fn push(&mut self, bytes: &[u8]) -> std::io::Result<()> {
         if self.received + bytes.len() > AV_MAX_BODY_BYTES {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("more than {AV_MAX_BODY_BYTES} bytes in one body"),
-            ));
+            let message = format!("more than {AV_MAX_BODY_BYTES} bytes in one body");
+            self.invalid = Some(message.clone());
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, message));
         }
         self.received += bytes.len();
         // Split the borrow: the reader needs `&mut self.reader` while the callback writes
         // to the other fields.
         let shared = Arc::clone(&self.app);
-        let AvSink { reader, audio, audio_bytes, samples, frames, failed, .. } = self;
+        let AvSink { reader, audio, audio_bytes, samples, frames, failed, invalid, .. } = self;
         let mut on = |tag: u8, payload: &[u8]| -> std::io::Result<()> {
             match tag {
                 b'E' => Ok(()),
@@ -7052,7 +7698,13 @@ impl crate::http::BodySink for AvSink {
                 )),
             }
         };
-        reader.feed(bytes, &mut on)
+        let result = reader.feed(bytes, &mut on);
+        if let Err(err) = &result {
+            if failed.is_none() {
+                *invalid = Some(err.to_string());
+            }
+        }
+        result
     }
 
     fn finish(self: Box<Self>, complete: bool) -> Response {
@@ -7077,9 +7729,14 @@ impl crate::http::BodySink for AvSink {
             body["error"] = json!(e);
             return Response::json_status(500, &body);
         }
-        if !complete {
+        if let Some(error) = self.invalid {
             body["ok"] = json!(false);
-            body["error"] = json!("the upload ended before its body did: the rest was not played");
+            body["error"] = json!(error);
+            return Response::json_status(400, &body);
+        }
+        if !complete || !self.reader.head.is_empty() || self.reader.need != 0 {
+            body["ok"] = json!(false);
+            body["error"] = json!("the upload or its final AV record ended early: the rest was not played");
             return Response::json_status(400, &body);
         }
         Response::json(&body)
@@ -7100,9 +7757,10 @@ fn av_route(app: &Shared, req: &Request) -> crate::http::BodyRoute {
         ));
     }
     let content_type = req.header("content-type").unwrap_or("").to_ascii_lowercase();
-    if !(content_type.starts_with("application/x-esp32-av")
-        || content_type.starts_with("application/octet-stream"))
-    {
+    if !matches!(
+        content_type.split(';').next().unwrap_or("").trim(),
+        "application/x-esp32-av" | "application/octet-stream"
+    ) {
         return BodyRoute::Answer(Response::error_json(
             415,
             "Content-Type must be application/x-esp32-av (or application/octet-stream); the body is `tag|u16le len|payload` records (docs/audio.md)",
@@ -8155,6 +8813,23 @@ mod tests {
         // A frame that is neither 128x32 nor 128x64 is not a frame.
         let err = sink.push(b"F\x10\x00aaaaaaaaaaaaaaaa").expect_err("wrong frame size");
         assert!(err.to_string().contains("512"), "{err}");
+
+        for body in [b"A\x04".as_slice(), b"A\x04\x00\x01", b"E\x01\x00\x00"] {
+            let mut sink = match router(&req) {
+                BodyRoute::Sink(s) => s,
+                _ => panic!("a fresh sink"),
+            };
+            // HTTP completed, but the inner record did not (or E carried a payload).
+            let _ = sink.push(body);
+            let resp = sink.finish(true);
+            assert_eq!(resp.status, 400, "accepted malformed AV body {body:?}");
+            assert_eq!(body_json(&resp)["ok"], false);
+        }
+        let sink = match router(&req) {
+            BodyRoute::Sink(s) => s,
+            _ => panic!("a fresh sink"),
+        };
+        assert_eq!(sink.finish(true).status, 200, "an empty complete body has no torn record");
     }
 
     /// A board whose own agent loop is dead looked exactly like a quiet board: the only
@@ -8186,6 +8861,24 @@ mod tests {
         let mut missing = Vec::new();
         for route in crate::sitemap::ROUTES {
             let mut req = post(route.path, "{}");
+            if route.path == "/api/script/<id>" {
+                let job = app.submit_script("1 + 2", true);
+                req.path = format!("/api/script/{}", job.id);
+            } else if route.path == "/api/attachment/<name>" {
+                app.attachments = vec![crate::agent::Attachment {
+                    name: "fixture.txt".into(),
+                    mime: "text/plain".into(),
+                    data_b64: "Zml4dHVyZQ==".into(),
+                }];
+                req.path = "/api/attachment/fixture.txt".into();
+            } else if route.path == "/api/sched/run" {
+                app.tasks.push(ScheduledTask {
+                    id: "map-run".into(),
+                    script: "1".into(),
+                    ..ScheduledTask::default()
+                });
+                req.body = br#"{"id":"map-run"}"#.to_vec();
+            }
             req.method = route.method.into();
             req.headers.insert("host".into(), "board.test:8080".into());
             let resp = app.route(&req);
@@ -8209,6 +8902,24 @@ mod tests {
         assert_eq!(doc["dynamic"]["mcp"]["path"], "/mcp");
         let endpoints = doc["endpoints"].as_array().expect("endpoints");
         assert!(endpoints.iter().any(|e| e["path"] == "/agent.json"));
+        for path in [
+            "/api/config",
+            "/api/agent/history",
+            "/api/agent/prompt",
+            "/api/agent/events",
+            "/api/agent/stream",
+            "/api/logs",
+            "/api/files",
+            "/api/script/<id>",
+        ] {
+            assert!(
+                endpoints.iter().any(|e| e["method"] == "GET" && e["path"] == path && e["auth"] != "none"),
+                "discovery incorrectly advertises a private read as open: {path}"
+            );
+        }
+        app.cfg.auth.portal_pin = "1234".into();
+        let doc = body_json(&app.route(&req));
+        assert!(doc["dynamic"]["mcp"]["auth"].as_str().unwrap().contains("portal credential"));
     }
 
     /// The map is a promise about where to send the next request. Over TLS it has to
@@ -8318,6 +9029,165 @@ mod tests {
         assert!(web::STYLE_CSS.contains("100dvh"), "mobile height, not a guessed one");
     }
 
+    #[test]
+    fn raw_board_arguments_refuse_before_hardware_access() {
+        use crate::hardware::{BoardInfo, PinMode};
+        struct NoRawAccess;
+        impl Hardware for NoRawAccess {
+            fn board_info(&mut self) -> BoardInfo {
+                BoardInfo::default()
+            }
+            fn gpio_config(&mut self, _: i32, _: PinMode) -> Result<()> {
+                panic!("GPIO configured before validation")
+            }
+            fn gpio_read(&mut self, _: i32) -> Result<bool> {
+                panic!("GPIO read before validation")
+            }
+            fn gpio_write(&mut self, _: i32, _: bool) -> Result<()> {
+                panic!("GPIO written before validation")
+            }
+            fn adc_mv(&mut self, _: i32) -> Result<u32> {
+                panic!("ADC read before validation")
+            }
+            fn i2c_scan(&mut self, _: u8) -> Result<Vec<u8>> {
+                panic!("I2C scanned before validation")
+            }
+            fn i2c_read(&mut self, _: u8, _: u8, _: Option<u8>, _: &mut [u8]) -> Result<()> {
+                panic!("I2C read before validation")
+            }
+            fn i2c_write(&mut self, _: u8, _: u8, _: Option<u8>, _: &[u8]) -> Result<()> {
+                panic!("I2C written before validation")
+            }
+        }
+        let mut app = test_app();
+        app.hw = Box::new(NoRawAccess);
+        let refused = |app: &mut App, name: &str, args: Value| {
+            let error = app.call_tool(name, &args).unwrap_err();
+            assert_eq!(error.code, code::INVALID_PARAMS, "{name} {args}: {}", error.message);
+        };
+        for name in ["gpio_read", "gpio_write", "gpio_mode", "adc_read"] {
+            let mut args = json!({"level":1,"mode":"output"});
+            refused(&mut app, name, args.clone());
+            for pin in [
+                json!(null),
+                json!(true),
+                json!(1.5),
+                json!(1.0),
+                json!("1.2"),
+                json!("bad"),
+                json!([]),
+                json!({}),
+                json!(-1),
+                json!(49),
+                json!(u64::MAX),
+            ] {
+                args["pin"] = pin;
+                refused(&mut app, name, args.clone());
+            }
+        }
+        refused(&mut app, "gpio_write", json!({"pin":12}));
+        for level in [json!(null), json!(false), json!(0.5), json!("bad"), json!({}), json!(-1), json!(2)] {
+            refused(&mut app, "gpio_write", json!({"pin":12,"level":level}));
+        }
+        refused(&mut app, "gpio_mode", json!({"pin":12}));
+        for name in ["i2c_read", "i2c_write"] {
+            refused(&mut app, name, json!({"data":[0]}));
+            for addr in [json!(null), json!(true), json!(1.5), json!("bad"), json!({}), json!(0), json!(128)]
+            {
+                refused(&mut app, name, json!({"addr":addr,"data":[0]}));
+            }
+            for field in ["bus", "reg"] {
+                for raw in [json!(null), json!(true), json!(1.5), json!("bad"), json!(-1), json!(256)] {
+                    let mut args = json!({"addr":60,"data":[0]});
+                    args[field] = raw;
+                    refused(&mut app, name, args);
+                }
+            }
+        }
+        for raw in [json!(null), json!(true), json!(1.5), json!("1"), json!("bad"), json!(0), json!(65)] {
+            refused(&mut app, "i2c_read", json!({"addr":60,"length":raw}));
+        }
+        for raw in [json!(null), json!(true), json!(1.5), json!("2"), json!(-1), json!(256)] {
+            refused(&mut app, "i2c_write", json!({"addr":60,"data":[0,raw]}));
+        }
+        refused(&mut app, "i2c_write", json!({"addr":60}));
+        refused(&mut app, "i2c_write", json!({"addr":60,"data":"bytes"}));
+        for bus in [json!(null), json!(true), json!(1.5), json!("bad"), json!(-1), json!(4)] {
+            refused(&mut app, "i2c_scan", json!({"bus":bus}));
+        }
+        // Numeric strings remain supported; absent optional fields keep the configured
+        // bus, one-byte read length and command-only register default.
+        app.hw = Box::new(VirtualBoard::new());
+        app.cfg.bus.i2c[0].bus = 2;
+        assert_eq!(app.call_tool("gpio_write", &json!({"pin":"12","level":"1"})).unwrap()["pin"], 12);
+        let read = app.call_tool("i2c_read", &json!({"addr":"118"})).unwrap();
+        assert_eq!(read["bus"], 2);
+        assert_eq!(read["bytes"].as_array().unwrap().len(), 1);
+        assert_eq!(read["reg"], Value::Null);
+        let read =
+            app.call_tool("i2c_read", &json!({"addr":"118","reg":"208","length":1,"bus":"0"})).unwrap();
+        assert_eq!(read["bytes"][0], 0x60);
+        assert!(app.call_tool("i2c_write", &json!({"addr":"60","data":[0,255]})).is_ok());
+    }
+
+    #[test]
+    fn rpc_batches_keep_valid_peers_errors_and_array_responses() {
+        let mut app = test_app();
+        let reply = app.handle_rpc(r#"[{"jsonrpc":"2.0","id":1,"method":"ping"}]"#, None).unwrap();
+        assert_eq!(reply.as_array().unwrap().len(), 1);
+        assert_eq!(reply[0]["id"], 1);
+        let reply = app
+            .handle_rpc(
+                r#"[
+            {"jsonrpc":"2.0","id":"first","method":"ping"},
+            17,
+            {"jsonrpc":"2.0","method":"ping"},
+            {"jsonrpc":"2.0","id":{},"method":"tools/call","params":{"name":"reboot"}},
+            {"jsonrpc":"2.0","id":null,"method":"ping"},
+            {"id":"bad-version","method":"tools/call","params":{"name":"reboot"}}
+        ]"#,
+                None,
+            )
+            .unwrap();
+        assert_eq!(reply.as_array().unwrap().len(), 5);
+        assert_eq!(reply[0]["id"], "first");
+        assert!(reply[0].get("result").is_some());
+        assert_eq!(reply[1]["error"]["code"], code::INVALID_REQUEST);
+        assert_eq!(reply[1]["id"], Value::Null);
+        assert_eq!(reply[2]["error"]["code"], code::INVALID_REQUEST);
+        assert_eq!(reply[2]["id"], Value::Null);
+        assert_eq!(reply[3]["id"], Value::Null);
+        assert!(reply[3].get("result").is_some());
+        assert_eq!(reply[4]["id"], "bad-version");
+        assert_eq!(reply[4]["error"]["code"], code::INVALID_REQUEST);
+        assert_eq!(app.runtime.counters.bad_requests, 3);
+        assert_eq!(app.runtime.counters.notifications, 1);
+        assert!(!app.runtime.restart_requested, "invalid requests must not execute");
+        assert!(app.handle_rpc(r#"[{"jsonrpc":"2.0","method":"ping"}]"#, None).is_none());
+        let error = app.handle_rpc("[", None).unwrap();
+        assert_eq!(error["error"]["code"], code::PARSE_ERROR);
+        let error = app.handle_rpc("[]", None).unwrap();
+        assert_eq!(error["error"]["code"], code::INVALID_REQUEST);
+        assert!(error.is_object());
+    }
+
+    #[test]
+    fn valid_rpc_notifications_execute_without_a_response() {
+        let mut app = test_app();
+        let notification = json!({"jsonrpc":"2.0","method":"tools/call","params":{
+            "name":"schedule","arguments":{"action":"add","prompt":"notification task","every_s":86400}
+        }});
+        assert!(app.handle_rpc(&notification.to_string(), None).is_none());
+        assert_eq!(app.tasks.len(), 1);
+        assert_eq!(app.tasks[0].prompt, "notification task");
+        let mut invalid = notification;
+        invalid["jsonrpc"] = json!("1.0");
+        invalid["params"]["arguments"]["prompt"] = json!("invalid task");
+        let error = app.handle_rpc(&invalid.to_string(), None).unwrap();
+        assert_eq!(error["error"]["code"], code::INVALID_REQUEST);
+        assert_eq!(app.tasks.len(), 1, "invalid notifications must not execute");
+    }
+
     /// The board's own agent can put work on the board's schedule: a task, on an interval
     /// or at a daily time, into the same queue a user message uses.
     #[test]
@@ -8403,7 +9273,10 @@ mod tests {
         for section in ["overview", "builtins", "examples"] {
             let doc = app.call_tool("script", &json!({"section": section})).expect("section");
             let bytes = doc["text"].as_str().unwrap().len();
-            assert!(bytes < 2048, "{section} is {bytes} bytes; a tool result is capped at 2 KB");
+            assert!(
+                bytes < 2048,
+                "{section} is {bytes} bytes; the reference section's compact policy is 2 KiB"
+            );
         }
         assert!(app.call_tool("script", &json!({"section": "nope"})).is_err());
         // An empty call is a help request too, not a confusing "source required".
@@ -8966,7 +9839,7 @@ mod tests {
     /// assertion fail, and so does putting a deprecated alias back in backticks.
     #[test]
     fn the_prompt_names_only_tools_the_model_is_offered() {
-        let mut app = test_app();
+        let app = test_app();
         let prompt = app.agent.prompt_text(&app).clone();
         let offered: Vec<String> = ToolHost::tool_specs(&app)
             .as_array()
@@ -8986,6 +9859,17 @@ mod tests {
                 "`{token}` is a deprecated alias and must not be advertised in the prompt"
             );
         }
+
+        let specs = ToolHost::tool_specs(&app);
+        let write_spec = specs.as_array().unwrap().iter().find(|t| t["function"]["name"] == "write").unwrap();
+        let description = write_spec["function"]["description"].as_str().unwrap();
+        for limit in [WORKSPACE_FILE_MAX, WORKSPACE_TOTAL_MAX] {
+            assert!(
+                description.contains(&format!("{limit} bytes")),
+                "the model gets the live budget: {description}"
+            );
+        }
+        assert!(!description.contains("2048 bytes"), "the obsolete file budget must not be advertised");
 
         // Reverse proof, without touching the build: one invented name is caught.
         let mut injected = prompt.clone();
@@ -9176,7 +10060,8 @@ mod tests {
         let mut app = test_app();
         let set = sh(&mut app, "hostname bench-1");
         assert_eq!(set["hostname"], json!("bench-1"));
-        assert_eq!(set["saved"], json!(true));
+        assert_eq!(set["saved"], json!(false), "queue admission is not a durable acknowledgement");
+        assert_eq!(set["queued"], json!(true));
         assert_eq!(app.cfg.wifi.hostname, "bench-1");
         assert_eq!(sh(&mut app, "hostname")["hostname"], json!("bench-1"));
         let err =
@@ -9474,8 +10359,8 @@ mod tests {
         assert_eq!(sh(&mut app, "cat /second.txt")["text"], json!("hello\n"));
     }
 
-    /// The 8 KB workspace is the same limit a redirect has to respect, and a refusal says
-    /// how many bytes it wanted.
+    /// A redirect shares the file/aggregate workspace limits and reports the requested
+    /// size when it cannot fit.
     #[test]
     fn a_redirect_that_would_not_fit_says_how_much_it_needed() {
         let mut app = empty_workspace_app();
@@ -9570,7 +10455,7 @@ mod tests {
     fn the_stream_route_answers_text_event_stream_without_a_pin() {
         let shared = shared_app();
         let resp = shared.lock().unwrap().route(&get("/api/agent/stream?after=0"));
-        assert_eq!(resp.status, 200, "no pin gate, like the transcript");
+        assert_eq!(resp.status, 200, "a board without a PIN keeps the stream open");
         assert!(resp.is_stream(), "the body is written after the headers");
         let header = |name: &str| {
             resp.headers.iter().find(|(k, _)| k == name).map(|(_, v)| v.clone()).unwrap_or_default()
@@ -9581,6 +10466,19 @@ mod tests {
         // Dropping the response without running the body still frees the slot.
         drop(resp);
         assert_eq!(shared.lock().unwrap().active_event_streams(), 0);
+        let mut app = shared.lock().unwrap();
+        app.cfg.auth.portal_pin = "1234".into();
+        assert_eq!(app.route(&get("/api/agent/stream")).status, 401);
+        assert_eq!(app.active_event_streams(), 0, "a refusal must not acquire a stream slot");
+        let token = body_json(&app.route(&post("/api/auth", r#"{"pin":"1234"}"#)))["token"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let mut req = get("/api/agent/stream");
+        req.query.insert("token".into(), token);
+        assert_eq!(app.route(&req).status, 200, "EventSource can use a minted portal token");
+        req.query.insert("token".into(), "1234".into());
+        assert_eq!(app.route(&req).status, 401, "the token parameter must not accept a raw PIN");
     }
 
     #[test]
@@ -9792,6 +10690,8 @@ mod tests {
         )));
         assert!(saved.get("api_key").is_none(), "the POST response echoed the key: {saved}");
         assert_eq!(saved["api_key_set"], true);
+        assert_eq!(saved["saved"], false, "a queued request cannot acknowledge durable storage");
+        assert_eq!(saved["queued"], true);
         let got = body_json(&app.route(&get("/api/agent/config")));
         assert!(got.get("api_key").is_none(), "GET echoed the key: {got}");
         assert_eq!(got["api_key_set"], true);
@@ -9837,6 +10737,14 @@ mod tests {
         assert_eq!(app.route(&get("/api/agent/history")).status, 401);
         assert_eq!(app.route(&get("/api/config")).status, 401);
         assert_eq!(app.route(&get("/api/agent/prompt")).status, 401);
+        for path in ["/api/agent/events", "/api/agent/stream", "/api/logs", "/api/script/missing"] {
+            assert_eq!(app.route(&get(path)).status, 401, "{path} exposes conversation or script output");
+        }
+        assert_eq!(
+            app.route(&post("/mcp", r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#)).status,
+            401,
+            "an unset MCP token must not bypass the configured portal PIN"
+        );
         assert_eq!(app.route(&get("/api/sched")).status, 200);
         assert!(app.tasks.is_empty(), "an unauthorised write got through");
         assert!(app.agent.history.is_empty());
@@ -9864,6 +10772,23 @@ mod tests {
         let mut read = get("/api/config");
         read.headers.insert("authorization".into(), format!("Bearer {token}"));
         assert_eq!(app.route(&read).status, 200, "and a read that needs the credential");
+        for path in ["/api/agent/events", "/api/logs"] {
+            read.path = path.into();
+            assert_eq!(app.route(&read).status, 200, "{path}");
+        }
+        let mut mcp = post("/mcp", r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#);
+        mcp.headers.insert("authorization".into(), format!("Bearer {token}"));
+        assert_eq!(
+            app.route(&mcp).status,
+            200,
+            "a portal credential works when no dedicated MCP token is set"
+        );
+        read = get("/api/config");
+        read.query.insert("token".into(), token.clone());
+        assert_eq!(app.route(&read).status, 200);
+        let mut query_write = post("/api/agent/reset", "{}");
+        query_write.query.insert("token".into(), token);
+        assert_eq!(app.route(&query_write).status, 401, "URL tokens authorize reads only");
 
         let mut forged = get("/api/config");
         forged.headers.insert("authorization".into(), "Bearer 0000000000000000".into());
@@ -9909,6 +10834,113 @@ mod tests {
         );
         // The edit is persisted, so a reboot keeps the schedule.
         assert!(app.store.get(NVS_KEY_SCHED).is_some(), "the schedule was never saved");
+    }
+
+    #[test]
+    fn schedule_tool_and_rest_share_validation_limits_and_unique_ids() {
+        let mut app = test_app();
+        let first = app.call_tool("schedule", &json!({"action":"add","prompt":"one","every_s":60})).unwrap();
+        let second = app.call_tool("schedule", &json!({"action":"add","prompt":"two","every_s":60})).unwrap();
+        app.call_tool("schedule", &json!({"action":"remove","id":first["id"]})).unwrap();
+        let third =
+            app.call_tool("schedule", &json!({"action":"add","prompt":"three","every_s":60})).unwrap();
+        assert_ne!(second["id"], third["id"]);
+        for task in [
+            json!({"prompt":"x"}),
+            json!({"prompt":"x","at_hhmm":"25:00"}),
+            json!({"prompt":"x","at_hhmm":"+1:00"}),
+            json!({"prompt":"x","every_s":1.5}),
+            json!({"prompt":"x","every_s":true}),
+            json!({"prompt":"x","every_s":-1}),
+            json!({"prompt":"x","every_s":86401}),
+            json!({"prompt":"x","every_s":60,"enabled":"yes"}),
+        ] {
+            let before = app.tasks.clone();
+            let mut tool = task.clone();
+            tool["action"] = json!("add");
+            assert_eq!(app.call_tool("schedule", &tool).unwrap_err().code, code::INVALID_PARAMS);
+            let body = json!({"kind":"task","op":"add","task":task});
+            assert_eq!(app.route(&post("/api/sched", &body.to_string())).status, 400);
+            assert_eq!(app.tasks, before, "refusal must not mutate tasks");
+        }
+        while app.tasks.len() < MAX_TASKS {
+            app.call_tool("schedule", &json!({"action":"add","prompt":"slot","every_s":60})).unwrap();
+        }
+        let before = app.tasks.clone();
+        assert!(app.call_tool("schedule", &json!({"action":"add","prompt":"ninth","every_s":60})).is_err());
+        assert_eq!(
+            app.route(&post(
+                "/api/sched",
+                r#"{"kind":"task","task":{"id":"ninth","prompt":"x","every_s":60}}"#
+            ))
+            .status,
+            400
+        );
+        assert_eq!(app.tasks, before);
+        assert_eq!(
+            app.tasks.iter().map(|t| &t.id).collect::<std::collections::BTreeSet<_>>().len(),
+            MAX_TASKS
+        );
+    }
+
+    #[test]
+    fn schedule_replacement_is_atomic_on_invalid_members_duplicates_and_caps() {
+        let mut app = test_app();
+        let task = json!({"id":"t1","prompt":"keep task","every_s":60});
+        let rule = json!({"id":"r1","tool":"bme280_read","prompt":"keep rule"});
+        let body = json!({"tasks":[task.clone()],"rules":[rule.clone()]});
+        assert_eq!(app.route(&post("/api/sched", &body.to_string())).status, 200);
+        let before = (app.tasks.clone(), app.rules.clone(), app.store.get(NVS_KEY_SCHED));
+        for invalid in [
+            json!({"tasks":[],"rules":[{"tool":"bme280_read"}]}),
+            json!({"tasks":[task.clone(),task.clone()],"rules":[]}),
+            json!({"tasks":[],"rules":[rule.clone(),rule.clone()]}),
+            json!({"tasks":[{"prompt":"bad","at_hhmm":"24:00"}],"rules":[]}),
+            json!({"tasks":[{"prompt":"bad","every_s":true}],"rules":[]}),
+            json!({"tasks":[{"prompt":"bad","every_s":60,"last_run_ms":"0"}],"rules":[]}),
+            json!({"tasks":[],"rules":[{"tool":"bme280_read","prompt":"bad","op":"approx"}]}),
+            json!({"tasks":[],"rules":[{"tool":"bme280_read","prompt":"bad","min_interval_s":-1}]}),
+            json!({"tasks":vec![task.clone();MAX_TASKS+1],"rules":[]}),
+            json!({"tasks":[],"rules":vec![rule.clone();MAX_RULES+1]}),
+            json!({"tasks":{},"rules":[]}),
+            json!({"tasks":[]}),
+            json!({"tasks":[],"rules":[],"kind":"task"}),
+            json!({"tasks":[17],"rules":[]}),
+        ] {
+            assert_eq!(app.route(&post("/api/sched", &invalid.to_string())).status, 400, "{invalid}");
+            assert_eq!((app.tasks.clone(), app.rules.clone(), app.store.get(NVS_KEY_SCHED)), before);
+        }
+    }
+
+    #[test]
+    fn schedule_replacement_preserves_clocks_defaults_and_existing_mutations() {
+        let mut app = test_app();
+        let body = json!({"tasks":[{"id":"t1","prompt":"first","every_s":60,"last_run_ms":123}],
+            "rules":[{"id":"r1","tool":"bme280_read","prompt":"rule","last_fire_ms":456}]});
+        assert_eq!(app.route(&post("/api/sched", &body.to_string())).status, 200);
+        let replacement = json!({"tasks":[{"prompt":"generated","at_hhmm":"07:30"},
+            {"id":"t1","script":"1","every_s":"60"}],
+            "rules":[{"id":"r1","tool":"bme280_read","prompt":"new rule"}]});
+        assert_eq!(app.route(&post("/api/sched", &replacement.to_string())).status, 200);
+        assert_ne!(app.tasks[0].id, "t1", "generated ids reserve later explicit ids");
+        assert!(app.tasks[0].last_run_ms > 1_000_000_000_000);
+        assert_eq!(app.tasks[1].last_run_ms, 123);
+        assert_eq!(app.rules[0].last_fire_ms, 456);
+        assert!(app.tasks.iter().all(|t| t.enabled));
+        assert!(app.rules[0].enabled);
+        assert_eq!(app.rules[0].min_interval_s, 60);
+        assert_eq!(app.rules[0].op, "true");
+        assert_eq!(app.route(&post("/api/sched", r#"{"kind":"task","op":"disable","id":"t1"}"#)).status, 200);
+        assert!(!app.tasks[1].enabled);
+        let body = json!({"tasks":[{"id":"t1","prompt":"changed","every_s":60,"last_run_ms":789}],
+            "rules":[{"id":"r1","tool":"bme280_read","prompt":"changed","last_fire_ms":987}]});
+        assert_eq!(app.route(&post("/api/sched", &body.to_string())).status, 200);
+        assert_eq!(app.tasks[0].last_run_ms, 789);
+        assert_eq!(app.rules[0].last_fire_ms, 987);
+        let stored: Value = serde_json::from_str(&app.store.get(NVS_KEY_SCHED).unwrap()).unwrap();
+        assert_eq!(stored["tasks"][0]["last_run_ms"], 789);
+        assert_eq!(app.route(&post("/api/sched", r#"{"tasks":[],"rules":[]}"#)).status, 200);
+        assert!(app.tasks.is_empty() && app.rules.is_empty());
     }
 
     #[test]
@@ -10196,6 +11228,53 @@ mod tests {
         assert!(!has_word("board_profile", "file"));
         assert!(!has_word("netmask 255.255.255.0", "net"));
         assert!(has_word("fetch it over http", "http"));
+
+        // Exercise the whole canned chain against the default advertised profile.
+        // The original alias-only fixture above remains a compatibility check.
+        for ask in ["status", "write a file", "edit a file", "mcp"] {
+            let mut app = test_app();
+            let mut messages = vec![json!({"role": "user", "content": ask})];
+            let mut calls = 0;
+            loop {
+                let request = json!({"model": "selftest", "messages": messages, "tools": app.tool_specs()});
+                let reply = selftest_completion(&post("/selftest/chat/completions", &request.to_string()));
+                let message = &reply["choices"][0]["message"];
+                let Some(call) = message["tool_calls"].as_array().and_then(|calls| calls.first()) else {
+                    assert_eq!(reply["choices"][0]["finish_reason"], "stop");
+                    assert!(
+                        !message["content"].as_str().unwrap_or("").contains("not on the tool list"),
+                        "{ask}: {reply}"
+                    );
+                    break;
+                };
+                let name = call["function"]["name"].as_str().unwrap();
+                assert!(app
+                    .tool_specs()
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|tool| tool["function"]["name"] == name));
+                let args: Value =
+                    serde_json::from_str(call["function"]["arguments"].as_str().unwrap()).unwrap();
+                let result = app
+                    .call_tool(name, &args)
+                    .unwrap_or_else(|error| panic!("{ask}: {name} {args}: {error}"));
+                messages.push(message.clone());
+                messages
+                    .push(json!({"role": "tool", "tool_call_id": call["id"], "content": result.to_string()}));
+                calls += 1;
+                assert!(calls <= 6, "the canned script must finish");
+            }
+            assert_eq!(
+                calls,
+                match ask {
+                    "status" => 1,
+                    "mcp" => 6,
+                    _ => 3,
+                },
+                "{ask}"
+            );
+        }
     }
 
     /// A turn in flight must not own the app while the model is thinking.
@@ -10368,6 +11447,400 @@ mod tests {
 
     // ------------------------------------------------- the workspace across a reboot
 
+    fn workspace_document_refused(doc: &Value) {
+        assert!(AppWorkspace::from_json(doc).is_err(), "Value loader accepted an invalid workspace");
+        let encoded = serde_json::to_vec(doc).unwrap();
+        assert!(
+            AppWorkspace::from_reader(encoded.as_slice()).is_err(),
+            "stream loader accepted an invalid workspace"
+        );
+    }
+
+    fn workspace_snapshot(store: &SharedStore) -> std::collections::BTreeMap<String, String> {
+        store
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(key, _)| *key == "ws" || key.starts_with("ws."))
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect()
+    }
+
+    struct WorkspaceCountedRead<R> {
+        inner: R,
+        bytes: std::rc::Rc<std::cell::Cell<usize>>,
+        pull: usize,
+    }
+
+    impl<R: std::io::Read> std::io::Read for WorkspaceCountedRead<R> {
+        fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+            let want = out.len().min(self.pull);
+            let count = self.inner.read(&mut out[..want])?;
+            self.bytes.set(self.bytes.get() + count);
+            Ok(count)
+        }
+    }
+
+    /// Reads without cloning values, and can refuse a key after a partial successful read.
+    struct WorkspaceReadStore {
+        inner: SharedStore,
+        reads: Arc<Mutex<Vec<String>>>,
+        failure: Option<(String, usize)>,
+    }
+
+    impl KvStore for WorkspaceReadStore {
+        fn get(&self, key: &str) -> Option<String> {
+            self.reads.lock().unwrap().push(key.to_string());
+            self.inner.get(key)
+        }
+        fn set(&mut self, key: &str, value: &str) -> bool {
+            self.inner.set(key, value)
+        }
+        fn remove(&mut self, key: &str) -> bool {
+            self.inner.remove(key)
+        }
+        fn keys(&self) -> Vec<String> {
+            self.inner.keys()
+        }
+        fn whole_value_bytes(&self) -> Option<usize> {
+            self.inner.whole_value_bytes()
+        }
+        fn read_at(&self, key: &str, offset: usize, out: &mut [u8]) -> Option<usize> {
+            self.reads.lock().unwrap().push(key.to_string());
+            let until = self
+                .failure
+                .as_ref()
+                .filter(|(failed, _)| failed == key)
+                .map_or(usize::MAX, |(_, after)| *after);
+            if offset >= until {
+                return None;
+            }
+            let values = self.inner.0.lock().unwrap();
+            let bytes = values.get(key)?.as_bytes();
+            if offset >= bytes.len() {
+                return Some(0);
+            }
+            let count = out.len().min(bytes.len() - offset).min(until - offset);
+            out[..count].copy_from_slice(&bytes[offset..offset + count]);
+            Some(count)
+        }
+    }
+
+    #[test]
+    fn workspace_restore_enforces_the_existing_text_budgets() {
+        workspace_document_refused(
+            &json!({"version": 1, "files": {"/big": "x".repeat(WORKSPACE_FILE_MAX + 1)}}),
+        );
+        let mut files = serde_json::Map::new();
+        for n in 0..16 {
+            files.insert(format!("/f{n}"), json!("x".repeat(WORKSPACE_FILE_MAX)));
+        }
+        let full = json!({"version": 1, "files": files});
+        assert_eq!(AppWorkspace::from_json(&full).unwrap().bytes(), WORKSPACE_TOTAL_MAX);
+        let encoded = serde_json::to_vec(&full).unwrap();
+        assert_eq!(AppWorkspace::from_reader(encoded.as_slice()).unwrap().bytes(), WORKSPACE_TOTAL_MAX);
+        let mut over = full;
+        over["files"]["/one-more-byte"] = json!("x");
+        workspace_document_refused(&over);
+    }
+
+    #[test]
+    fn workspace_restore_and_writes_bound_names_and_file_count() {
+        let mut files = serde_json::Map::new();
+        for n in 0..10_000 {
+            files.insert(format!("/empty-{n}"), json!(""));
+        }
+        workspace_document_refused(&json!({"version": 1, "files": files}));
+
+        let mut ws = AppWorkspace::default();
+        for n in 0..WORKSPACE_FILES_MAX {
+            fs_tools::Workspace::write(&mut ws, &format!("/e{n:04}"), "").unwrap();
+        }
+        assert_eq!(ws.bytes(), 0);
+        assert!(fs_tools::Workspace::write(&mut ws, "/extra", "").is_err());
+        fs_tools::Workspace::write(&mut ws, "/e0000", "replacement").unwrap();
+        assert_eq!(ws.len(), WORKSPACE_FILES_MAX);
+        fs_tools::Workspace::remove(&mut ws, "/e0000").unwrap();
+        fs_tools::Workspace::write(&mut ws, "/extra", "").unwrap();
+
+        let mut names = AppWorkspace::default();
+        for n in 0..(WORKSPACE_NAMES_MAX / WORKSPACE_PATH_MAX) {
+            let path = format!("/n{n:04}{}", "p".repeat(WORKSPACE_PATH_MAX - 6));
+            fs_tools::Workspace::write(&mut names, &path, "").unwrap();
+        }
+        assert_eq!(names.files.keys().map(String::len).sum::<usize>(), WORKSPACE_NAMES_MAX);
+        assert!(fs_tools::Workspace::write(&mut names, "/extra", "").is_err());
+        let mut over = names.to_json();
+        over["files"]["/extra"] = json!("");
+        workspace_document_refused(&over);
+    }
+
+    #[test]
+    fn workspace_paths_share_normalization_and_directory_rules() {
+        let mut ws = AppWorkspace::default();
+        fs_tools::Workspace::write(&mut ws, " notes//./a/ ", "hello").unwrap();
+        assert_eq!(fs_tools::Workspace::read(&ws, "/notes/a").unwrap(), "hello");
+        assert_eq!(fs_tools::Workspace::read(&ws, "notes/a").unwrap(), "hello");
+        for path in ["/", " ", "/a/../b", "/a\\b", "/a\0b"] {
+            assert!(fs_tools::Workspace::write(&mut ws, path, "").is_err(), "accepted {path:?}");
+            assert!(fs_tools::Workspace::read(&ws, path).is_err(), "read {path:?}");
+            assert!(fs_tools::Workspace::remove(&mut ws, path).is_err(), "removed {path:?}");
+        }
+        assert!(fs_tools::Workspace::list(&ws, "/").is_ok());
+        assert!(fs_tools::Workspace::write(&mut ws, "/notes", "file over directory").is_err());
+        assert!(fs_tools::Workspace::write(&mut ws, "/notes/a/b", "directory under file").is_err());
+        let enormous = format!("/{}", "p".repeat(WORKSPACE_TOTAL_MAX));
+        assert!(fs_tools::Workspace::write(&mut ws, &enormous, "").is_err());
+        let exact = format!("/{}", "p".repeat(WORKSPACE_PATH_MAX - 1));
+        fs_tools::Workspace::write(&mut ws, &exact, "").unwrap();
+        assert!(fs_tools::Workspace::write(&mut ws, &(exact + "p"), "").is_err());
+        let relative = json!({"files": {"relative": "readable"}});
+        assert_eq!(
+            fs_tools::Workspace::read(&AppWorkspace::from_json(&relative).unwrap(), "/relative").unwrap(),
+            "readable"
+        );
+    }
+
+    #[test]
+    fn workspace_restore_rejects_bad_shapes_and_canonical_collisions() {
+        for bad in [
+            json!(null),
+            json!([]),
+            json!({"files": null}),
+            json!({"files": []}),
+            json!({"files": {"/x": 7}}),
+            json!({"version": "1"}),
+            json!({"version": 1.0}),
+            json!({"version": 2}),
+            json!({"version": true}),
+            json!({"unknown": {}}),
+            json!({"files": {"/": "root"}}),
+            json!({"files": {"relative": "hidden", "/a/../b": "hidden"}}),
+            json!({"files": {"/a": "one", "a": "two"}}),
+            json!({"files": {"/a/b": "one", "/a//b": "two"}}),
+            json!({"files": {"/a": "file", "/a/b": "child"}}),
+        ] {
+            workspace_document_refused(&bad);
+        }
+        for raw in [
+            r#"{"version":1,"version":1}"#,
+            r#"{"files":{},"files":{}}"#,
+            r#"{"files":{"/a":"one","/a":"two"}}"#,
+            r#"{"files":{},}"#,
+            r#"{"files":{"/a":"x",}}"#,
+            r#"{"files":{}} {}"#,
+        ] {
+            assert!(AppWorkspace::from_reader(raw.as_bytes()).is_err(), "accepted {raw}");
+        }
+        for valid in [json!({}), json!({"version": 1}), json!({"files": {}})] {
+            assert!(AppWorkspace::from_json(&valid).unwrap().is_empty());
+            assert!(AppWorkspace::from_reader(valid.to_string().as_bytes()).unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn workspace_stream_parser_agrees_with_json_string_decoding() {
+        let raw = br#"{"files":{"/\u754c":"ASCII \" \\ \/ \b \f \n \r \t \u0000 \uD83D\uDE00"},"version":1}"#;
+        let expected: Value = serde_json::from_slice(raw).unwrap();
+        let counter = std::rc::Rc::new(std::cell::Cell::new(0));
+        let reader = WorkspaceCountedRead { inner: &raw[..], bytes: counter, pull: 1 };
+        let ws = AppWorkspace::from_reader(reader).unwrap();
+        assert_eq!(
+            fs_tools::Workspace::read(&ws, "/界").unwrap(),
+            expected["files"]["/界"].as_str().unwrap()
+        );
+        let unicode = json!({"version": 1, "files": {"/日本語.md": "界 한글 😀"}});
+        assert_eq!(AppWorkspace::from_reader(unicode.to_string().as_bytes()).unwrap().to_json(), unicode);
+        for invalid in [
+            &br#"{"files":{"/a":"\q"}}"#[..],
+            &br#"{"files":{"/a":"\uD800"}}"#[..],
+            &br#"{"files":{"/a":"\uDC00"}}"#[..],
+            &br#"{"files":{"/a":"\uD800\u0041"}}"#[..],
+            &br#"{"files":{"/a":"\uZZZZ"}}"#[..],
+            &b"{\"files\":{\"/a\":\"\xff\"}}"[..],
+            &b"{\"files\":{\"/a\":\"unescaped\nnewline\"}}"[..],
+        ] {
+            assert!(AppWorkspace::from_reader(invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn workspace_stream_parser_stops_before_unbounded_strings_are_materialized() {
+        use std::io::Read as _;
+        for (prefix, limit) in [
+            (br#"{"files":{"/a":""#.as_slice(), WORKSPACE_FILE_MAX),
+            (br#"{"files":{""#.as_slice(), WORKSPACE_RAW_PATH_MAX),
+        ] {
+            let count = std::rc::Rc::new(std::cell::Cell::new(0));
+            let reader = WorkspaceCountedRead {
+                inner: std::io::Cursor::new(prefix).chain(std::io::repeat(b'x')),
+                bytes: count.clone(),
+                pull: usize::MAX,
+            };
+            let error = AppWorkspace::from_reader(reader).unwrap_err();
+            assert!(error.to_string().contains("limit"), "{error}");
+            println!(
+                "decoded string limit={limit}: stopped after {} input bytes including read-ahead",
+                count.get()
+            );
+            assert!(count.get() <= prefix.len() + limit + 1 + 8192, "drained {} bytes", count.get());
+        }
+        let prefix = br#"{"files":{"/a":""#;
+        let count = std::rc::Rc::new(std::cell::Cell::new(0));
+        let escapes = std::io::Cursor::new(br#"\u0061"#.repeat(WORKSPACE_FILE_MAX + 10_000));
+        let reader = WorkspaceCountedRead {
+            inner: std::io::Cursor::new(prefix).chain(escapes),
+            bytes: count.clone(),
+            pull: usize::MAX,
+        };
+        assert!(AppWorkspace::from_reader(reader).is_err());
+        assert!(count.get() <= prefix.len() + 6 * (WORKSPACE_FILE_MAX + 1) + 8192);
+    }
+
+    #[test]
+    fn workspace_ram_estimate_counts_empty_files_and_saved_paths() {
+        let mut ws = AppWorkspace::default();
+        for n in 0..WORKSPACE_FILES_MAX {
+            fs_tools::Workspace::write(&mut ws, &format!("/empty-{n}"), "").unwrap();
+        }
+        assert_eq!(ws.bytes(), 0);
+        assert!(ws.ram_bytes() >= WORKSPACE_FILES_MAX * WORKSPACE_ENTRY_RAM);
+        assert!(workspace_fits(&ws, Some(64 * 1024)).is_err());
+        let before = ws.ram_bytes();
+        ws.saved = ws.files.keys().map(|path| (path.clone(), 0)).collect();
+        assert!(ws.ram_bytes() >= before + WORKSPACE_FILES_MAX * WORKSPACE_ENTRY_RAM);
+        assert!(workspace_fits(&ws, Some(2 * ws.ram_bytes() + 64 * 1024)).is_ok());
+    }
+
+    #[test]
+    fn workspace_rejected_documents_survive_boot_seeding_and_later_edits() {
+        for doc in [
+            "{torn".to_string(),
+            json!({"version": 2, "files": {}}).to_string(),
+            json!({"version": 1, "files": {"/big": "x".repeat(WORKSPACE_FILE_MAX + 1)}}).to_string(),
+        ] {
+            let store = SharedStore::new();
+            store.clone().set("ws", &doc);
+            let before = workspace_snapshot(&store);
+            let mut app = app_with(&store);
+            assert!(app.workspace.is_empty());
+            assert!(fs_tools::Workspace::write(&mut app.workspace, "/new", "no overwrite").is_err());
+            assert!(fs_tools::Workspace::remove(&mut app.workspace, "/new").is_err());
+            drain_store(&mut app);
+            assert_eq!(workspace_snapshot(&store), before);
+        }
+    }
+
+    #[test]
+    fn workspace_rejected_chunked_snapshots_are_preserved() {
+        let mut memory = MemoryStore::new();
+        store::write_blob(&mut memory, "ws", r#"{"version":2,"files":{}}"#, WORKSPACE_PLAN).unwrap();
+        for corrupt in [false, true] {
+            let store = SharedStore::new();
+            for key in memory.keys() {
+                store.clone().set(&key, &memory.get(&key).unwrap());
+            }
+            if corrupt {
+                store.clone().set("ws.1", "different bytes");
+            }
+            let before = workspace_snapshot(&store);
+            let mut app = app_with(&store);
+            assert!(app.workspace.load_refused.is_some());
+            drain_store(&mut app);
+            assert_eq!(workspace_snapshot(&store), before);
+        }
+    }
+
+    #[test]
+    fn workspace_index_validates_every_name_and_key_before_content_reads() {
+        let good = crate::keys::workspace_file("/good");
+        let cases = [
+            json!({"/good": good, "/wrong": "other"}),
+            json!({"/a": crate::keys::workspace_file("/a"), "a": crate::keys::workspace_file("/a")}),
+            json!({"/a": crate::keys::workspace_file("/a"), "/a/b": crate::keys::workspace_file("/a/b")}),
+            json!({"/a/../b": "other"}),
+            json!({"/": "other"}),
+        ];
+        for index in cases {
+            let store = SharedStore::new();
+            store.clone().set(crate::keys::WORKSPACE_INDEX, &index.to_string());
+            store.clone().set(&good, "must not be read before the index is valid");
+            store.clone().set("other", "must never be fetched as workspace data");
+            let before = workspace_snapshot(&store);
+            let reads = Arc::new(Mutex::new(Vec::new()));
+            let backend = WorkspaceReadStore { inner: store.clone(), reads: reads.clone(), failure: None };
+            let mut app = App::new(
+                Box::new(VirtualBoard::new()),
+                Box::new(backend),
+                LogBuf::new(64),
+                FwMeta::default(),
+            );
+            assert!(app.workspace.load_refused.is_some());
+            assert!(!reads.lock().unwrap().iter().any(|key| key == "other" || key == &good));
+            drain_store(&mut app);
+            assert_eq!(workspace_snapshot(&store), before);
+        }
+    }
+
+    #[test]
+    fn workspace_index_content_errors_preserve_the_complete_previous_index() {
+        let key = crate::keys::workspace_file("/bad");
+        for failure in [false, true] {
+            let store = SharedStore::new();
+            store.clone().set(crate::keys::WORKSPACE_INDEX, &json!({"/bad": key}).to_string());
+            store.clone().set(&key, &"x".repeat(WORKSPACE_FILE_MAX + 1));
+            let before = workspace_snapshot(&store);
+            let backend = WorkspaceReadStore {
+                inner: store.clone(),
+                reads: Arc::new(Mutex::new(Vec::new())),
+                failure: failure.then(|| (key.clone(), 7)),
+            };
+            let mut app = App::new(
+                Box::new(VirtualBoard::new()),
+                Box::new(backend),
+                LogBuf::new(64),
+                FwMeta::default(),
+            );
+            assert!(app.workspace.is_empty());
+            assert!(app.workspace.load_refused.is_some());
+            drain_store(&mut app);
+            assert_eq!(workspace_snapshot(&store), before);
+        }
+        let store = SharedStore::new();
+        let mut index = serde_json::Map::new();
+        for n in 0..17 {
+            let path = format!("/f{n:02}");
+            let key = crate::keys::workspace_file(&path);
+            index.insert(path, json!(key));
+            store.clone().set(&key, &"x".repeat(if n == 16 { 1 } else { WORKSPACE_FILE_MAX }));
+        }
+        store.clone().set(crate::keys::WORKSPACE_INDEX, &Value::Object(index).to_string());
+        let before = workspace_snapshot(&store);
+        let mut app = app_with(&store);
+        assert!(app.workspace.is_empty(), "must not adopt a partial over-budget index");
+        assert!(app.workspace.load_refused.is_some());
+        drain_store(&mut app);
+        assert_eq!(workspace_snapshot(&store), before);
+    }
+
+    #[test]
+    fn workspace_transient_read_refusal_preserves_the_legacy_document() {
+        let store = SharedStore::new();
+        store.clone().set("ws", r#"{"version":1,"files":{"/a":"keep me"}}"#);
+        let before = workspace_snapshot(&store);
+        let backend = WorkspaceReadStore {
+            inner: store.clone(),
+            reads: Arc::new(Mutex::new(Vec::new())),
+            failure: Some(("ws".to_string(), 4)),
+        };
+        let mut app =
+            App::new(Box::new(VirtualBoard::new()), Box::new(backend), LogBuf::new(64), FwMeta::default());
+        assert!(app.workspace.load_refused.is_some());
+        drain_store(&mut app);
+        assert_eq!(workspace_snapshot(&store), before);
+    }
+
     /// The document is written as it is generated and parsed as it is read, so the two halves
     /// of the streaming path have to agree - and the result has to still be the JSON every
     /// other reader expects.
@@ -10399,14 +11872,18 @@ mod tests {
     /// (the rollback and the change) plus a margin, against what is actually free.
     #[test]
     fn a_workspace_change_is_refused_before_psram_runs_out() {
-        // 1 MB of workspace needs ~2.06 MB free; a board with 7.9 MB says yes.
-        assert!(super::workspace_fits(1_000_000, Some(7_900_000)).is_ok());
+        let mut ws = AppWorkspace::default();
+        for file in 0..4 {
+            fs_tools::Workspace::write(&mut ws, &format!("/f{file}"), &"x".repeat(250_000)).unwrap();
+        }
+        // 1 MB of text plus metadata needs slightly over 2.06 MB free.
+        assert!(super::workspace_fits(&ws, Some(7_900_000)).is_ok());
         // The same board with 1 MB left says no, and says why.
-        let err = super::workspace_fits(1_000_000, Some(1_000_000)).unwrap_err();
+        let err = super::workspace_fits(&ws, Some(1_000_000)).unwrap_err();
         assert!(err.contains("nothing was changed"), "{err}");
         assert!(err.contains("PSRAM"), "{err}");
         // A platform that cannot answer is not blocked: no measurement is not a refusal.
-        assert!(super::workspace_fits(1_000_000, None).is_ok());
+        assert!(super::workspace_fits(&ws, None).is_ok());
     }
 
     /// The space a backend reports has to say what that backend has, or the field lies.
@@ -10449,6 +11926,529 @@ mod tests {
             Some(nvs["total_bytes"].as_u64().unwrap() - nvs["used_bytes"].as_u64().unwrap()),
             "{nvs}"
         );
+    }
+
+    /// A controllable write refusal, after queue admission and before publication.
+    #[derive(Clone)]
+    struct WorkspaceWriteStore {
+        inner: SharedStore,
+        refuse: Arc<Mutex<Option<String>>>,
+        refuse_remove: Arc<Mutex<Option<String>>>,
+        last_error: Option<store::StoreError>,
+    }
+
+    impl WorkspaceWriteStore {
+        fn new() -> Self {
+            let inner = SharedStore::new();
+            let mut cfg = Config::default();
+            cfg.skills.seed_defaults = false;
+            inner.clone().set(crate::config::NVS_KEY_CONFIG, &cfg.to_json_string());
+            Self {
+                inner,
+                refuse: Arc::new(Mutex::new(None)),
+                refuse_remove: Arc::new(Mutex::new(None)),
+                last_error: None,
+            }
+        }
+
+        fn app(&self) -> App {
+            App::new(
+                Box::new(VirtualBoard::new()),
+                Box::new(self.clone()),
+                LogBuf::new(128),
+                FwMeta::default(),
+            )
+        }
+    }
+
+    impl KvStore for WorkspaceWriteStore {
+        fn get(&self, key: &str) -> Option<String> {
+            self.inner.get(key)
+        }
+        fn set(&mut self, key: &str, value: &str) -> bool {
+            self.last_error = None;
+            if self.refuse.lock().unwrap().as_deref() == Some(key) {
+                self.last_error = Some(store::StoreError { code: 42, name: "TEST_WRITE_REFUSAL".into() });
+                return false;
+            }
+            self.inner.set(key, value)
+        }
+        fn remove(&mut self, key: &str) -> bool {
+            self.last_error = None;
+            if self.refuse_remove.lock().unwrap().as_deref() == Some(key) {
+                self.last_error = Some(store::StoreError { code: 43, name: "TEST_REMOVE_REFUSAL".into() });
+                return false;
+            }
+            self.inner.remove(key)
+        }
+        fn keys(&self) -> Vec<String> {
+            self.inner.keys()
+        }
+        fn whole_value_bytes(&self) -> Option<usize> {
+            self.inner.whole_value_bytes()
+        }
+        fn last_error(&self) -> Option<store::StoreError> {
+            self.last_error.clone()
+        }
+    }
+
+    #[test]
+    fn a_shared_store_flush_releases_the_app_lock_and_acknowledges_only_finished_generations() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::mpsc;
+        use std::time::{Duration, Instant};
+
+        struct SlowStore {
+            inner: WorkspaceWriteStore,
+            key: String,
+            pause: Arc<AtomicBool>,
+            entered: mpsc::Sender<()>,
+            resume: mpsc::Receiver<()>,
+        }
+        impl KvStore for SlowStore {
+            fn get(&self, key: &str) -> Option<String> {
+                self.inner.get(key)
+            }
+            fn set(&mut self, key: &str, value: &str) -> bool {
+                if key == self.key && self.pause.swap(false, Ordering::AcqRel) {
+                    self.entered.send(()).unwrap();
+                    self.resume.recv_timeout(Duration::from_secs(10)).expect("release blocked store");
+                }
+                self.inner.set(key, value)
+            }
+            fn remove(&mut self, key: &str) -> bool {
+                self.inner.remove(key)
+            }
+            fn keys(&self) -> Vec<String> {
+                self.inner.keys()
+            }
+            fn whole_value_bytes(&self) -> Option<usize> {
+                self.inner.whole_value_bytes()
+            }
+            fn last_error(&self) -> Option<store::StoreError> {
+                self.inner.last_error()
+            }
+        }
+
+        for (refused, admission_refused) in [(false, false), (true, false), (false, true), (true, true)] {
+            let backend = WorkspaceWriteStore::new();
+            let pause = Arc::new(AtomicBool::new(false));
+            let (entered_tx, entered_rx) = mpsc::channel();
+            let (resume_tx, resume_rx) = mpsc::channel();
+            let key = crate::keys::workspace_file("/a");
+            let slow = SlowStore {
+                inner: backend.clone(),
+                key: key.clone(),
+                pause: pause.clone(),
+                entered: entered_tx,
+                resume: resume_rx,
+            };
+            let mut app =
+                App::new(Box::new(VirtualBoard::new()), Box::new(slow), LogBuf::new(128), FwMeta::default());
+            app.workspace_edit(|ws| fs_tools::Workspace::write(ws, "/a", "durable")).unwrap();
+            drain_store(&mut app);
+            app.workspace_edit(|ws| fs_tools::Workspace::write(ws, "/a", "first generation")).unwrap();
+            let first = app.workspace_pending.as_ref().unwrap().receipt.clone();
+            if refused {
+                *backend.refuse.lock().unwrap() = Some(if admission_refused {
+                    crate::keys::WORKSPACE_INDEX.to_string()
+                } else {
+                    key.clone()
+                });
+            }
+            pause.store(true, Ordering::Release);
+            let shared: Shared = Arc::new(Mutex::new(app));
+            let writer = std::thread::spawn({
+                let shared = shared.clone();
+                move || App::flush_shared_store(&shared, "slow-test-writer")
+            });
+            if let Err(error) = entered_rx.recv_timeout(Duration::from_secs(10)) {
+                let _ = resume_tx.send(());
+                let _ = writer.join();
+                panic!("the writer never entered the blocked store: {error}");
+            }
+            let mut guard = match shared.try_lock() {
+                Ok(guard) => guard,
+                Err(error) => {
+                    let _ = resume_tx.send(());
+                    let _ = writer.join();
+                    panic!("the writer held the app lock during blocked backend I/O: {error}");
+                }
+            };
+            assert_eq!(guard.workspace.saved.get("/a"), Some(&crate::keys::fnv1a("durable")));
+            assert_eq!(fs_tools::Workspace::read(&guard.workspace, "/a").unwrap(), "first generation");
+            assert!(first.outcome().is_none(), "the blocked save is not durable yet");
+            // RAM-only work can proceed while flash is blocked, including error rollback.
+            let error = guard
+                .workspace_edit::<()>(|ws| {
+                    fs_tools::Workspace::write(ws, "/a", "partial")?;
+                    fs_tools::Workspace::write(ws, "/scratch", "partial")?;
+                    Err("partial edit refused".to_string())
+                })
+                .unwrap_err();
+            assert_eq!(error, "partial edit refused");
+            assert_eq!(fs_tools::Workspace::read(&guard.workspace, "/a").unwrap(), "first generation");
+            assert!(fs_tools::Workspace::read(&guard.workspace, "/scratch").is_err());
+
+            // Keep the app lock so the older writer cannot do app bookkeeping yet. Wait on
+            // the generation's receipt, not elapsed time, for the backend drain to finish.
+            let finish_first = || {
+                resume_tx.send(()).unwrap();
+                let deadline = Instant::now() + Duration::from_secs(10);
+                while first.outcome().is_none() {
+                    assert!(Instant::now() < deadline, "the released backend did not finish its publication");
+                    std::thread::yield_now();
+                }
+                assert_eq!(
+                    first.outcome(),
+                    Some(store::PublicationOutcome::Finished {
+                        published: !refused,
+                        cleanup_failed: Vec::new()
+                    })
+                );
+            };
+            let first_saved = (!refused).then(|| crate::keys::fnv1a("first generation"));
+            let next = if admission_refused {
+                let mut budget = store::QueuedStore::new(guard.store_queue());
+                let error = guard
+                    .workspace_edit(|ws| {
+                        fs_tools::Workspace::write(ws, "/a", "second generation")?;
+                        // Complete the old publication after the rollback clone, then refuse
+                        // the new admission. Restoring RAM must retain that completed outcome.
+                        finish_first();
+                        assert!(budget.set("budget", &"x".repeat(store::PENDING_BYTES_MAX - 256)));
+                        Ok(())
+                    })
+                    .unwrap_err();
+                assert!(error.contains("STORE_QUEUE_FULL"), "{error}");
+                assert_eq!(fs_tools::Workspace::read(&guard.workspace, "/a").unwrap(), "first generation");
+                assert_eq!(
+                    guard.workspace.saved.get("/a").copied(),
+                    first_saved,
+                    "rollback lost a completed publication outcome"
+                );
+                assert!(budget.remove("budget"));
+                "durable" // A revert must rewrite any value replaced before the failed index.
+            } else {
+                finish_first();
+                "second generation"
+            };
+            *backend.refuse.lock().unwrap() = None;
+            guard.workspace_edit(|ws| fs_tools::Workspace::write(ws, "/a", next)).unwrap();
+            let second = guard.workspace_pending.as_ref().unwrap().receipt.clone();
+            assert_eq!(guard.workspace.saved.get("/a").copied(), first_saved);
+            assert!(second.outcome().is_none());
+            drop(guard);
+
+            let report = writer.join().expect("writer completes after the app lock is released");
+            assert_eq!(
+                report.failed,
+                if refused {
+                    if admission_refused {
+                        1
+                    } else {
+                        2
+                    }
+                } else {
+                    0
+                }
+            );
+            let guard = app_lock(&shared);
+            assert_eq!(guard.workspace.saved.get("/a").copied(), first_saved);
+            assert!(second.outcome().is_none(), "the old report cannot acknowledge a newer queued save");
+            assert_eq!(
+                backend.inner.get(&key).as_deref(),
+                Some(if refused && !admission_refused { "durable" } else { "first generation" })
+            );
+            drop(guard);
+            assert_eq!(App::flush_shared_store(&shared, "next-test-writer").failed, 0);
+            assert_eq!(backend.inner.get(&key).as_deref(), Some(next));
+            assert_eq!(app_lock(&shared).workspace.saved.get("/a"), Some(&crate::keys::fnv1a(next)));
+        }
+    }
+
+    #[test]
+    fn workspace_tools_acknowledge_admission_without_waiting_for_the_writer() {
+        let backend = WorkspaceWriteStore::new();
+        let mut app = backend.app();
+        let key = crate::keys::workspace_file("/admission.txt");
+        *backend.refuse.lock().unwrap() = Some(key.clone());
+        let write = app.call_tool("write", &json!({ "path": "/admission.txt", "text": "one" })).unwrap();
+        assert_eq!(write["queued"], true, "{write}");
+        assert_eq!(write["saved"], false, "{write}");
+        assert!(write["persistence_note"].as_str().unwrap().contains("not storage acknowledgement"));
+        assert!(backend.inner.get(&key).is_none(), "an acknowledgement must not imply a backend write");
+        assert!(app.flush_store("refusing-test-writer").failed > 0);
+        assert_eq!(fs_tools::Workspace::read(&app.workspace, "/admission.txt").unwrap(), "one");
+        assert!(backend.inner.get(&key).is_none());
+        *backend.refuse.lock().unwrap() = None;
+
+        for (tool, arguments) in [
+            ("fs_edit", json!({ "path": "/admission.txt", "find": "one", "replace": "two" })),
+            ("shell", json!({ "command": "echo three > /redirect.txt" })),
+            ("shell", json!({ "command": "touch /touch.txt" })),
+            ("shell", json!({ "command": "echo four | tee /tee.txt" })),
+            ("shell", json!({ "command": "base64enc /admission.txt -o /encoded.txt" })),
+            ("script", json!({ "source": "tool(\"write\", {path: \"/script.txt\", text: \"five\"}); 42" })),
+        ] {
+            let text = ToolHost::call_tool(&mut app, tool, &arguments).unwrap();
+            let result: Value = serde_json::from_str(&text).unwrap();
+            assert_eq!(result["queued"], true, "{tool}: {result}");
+            assert_eq!(result["saved"], false, "{tool}: {result}");
+        }
+        let read = app.call_tool("read", &json!({ "path": "/admission.txt" })).unwrap();
+        assert!(read.get("queued").is_none() && read.get("saved").is_none(), "reads are not save requests");
+        let error = app
+            .call_tool("shell", &json!({ "command": "echo six > /partial.txt; cat /missing-after-write" }))
+            .unwrap_err();
+        assert_eq!(error.data.as_ref().unwrap()["workspace_admission"]["queued"], true);
+        assert_eq!(fs_tools::Workspace::read(&app.workspace, "/partial.txt").unwrap().trim_end(), "six");
+        let error = ToolHost::call_tool(
+            &mut app,
+            "shell",
+            &json!({ "command": "echo seven > /partial.txt; cat /missing-after-write" }),
+        )
+        .unwrap_err();
+        assert!(error.contains("Earlier workspace edits remain in RAM"), "{error}");
+        drain_store(&mut app);
+        assert_eq!(backend.inner.get(&key).as_deref(), Some("two"));
+    }
+
+    #[test]
+    fn workspace_edit_rolls_back_a_partially_mutating_error() {
+        let backend = WorkspaceWriteStore::new();
+        let mut app = backend.app();
+        fs_tools::Workspace::write(&mut app.workspace, "/a", "before").unwrap();
+        app.persist_workspace().unwrap();
+        drain_store(&mut app);
+        let before = workspace_snapshot(&backend.inner);
+        let err = app
+            .workspace_edit::<()>(|ws| {
+                fs_tools::Workspace::write(ws, "/a", "partial")?;
+                fs_tools::Workspace::write(ws, "/extra", "also partial")?;
+                Err("the second operation failed".to_string())
+            })
+            .unwrap_err();
+        assert!(err.contains("second operation failed"), "{err}");
+        assert_eq!(fs_tools::Workspace::read(&app.workspace, "/a").unwrap(), "before");
+        assert!(fs_tools::Workspace::read(&app.workspace, "/extra").is_err());
+        assert!(app.flush_store("test-writer").is_empty());
+        assert_eq!(workspace_snapshot(&backend.inner), before);
+    }
+
+    #[test]
+    fn workspace_failed_queued_file_write_can_be_retried() {
+        let backend = WorkspaceWriteStore::new();
+        let mut app = backend.app();
+        let key = crate::keys::workspace_file("/a");
+        app.workspace_edit(|ws| fs_tools::Workspace::write(ws, "/a", "old")).unwrap();
+        drain_store(&mut app);
+        *backend.refuse.lock().unwrap() = Some(key.clone());
+        app.workspace_edit(|ws| fs_tools::Workspace::write(ws, "/a", "new")).unwrap();
+        assert_eq!(backend.inner.get(&key).as_deref(), Some("old"), "only admission so far");
+        let report = app.flush_store("test-writer");
+        assert!(report.failed > 0);
+        assert!(app.flush_store("test-writer").is_empty(), "a failure is not an automatic retry");
+        *backend.refuse.lock().unwrap() = None;
+        app.persist_workspace().unwrap();
+        drain_store(&mut app);
+        assert_eq!(
+            backend.inner.get(&key).as_deref(),
+            Some("new"),
+            "failed admission hashes suppressed retry"
+        );
+        assert_eq!(app.workspace.saved.get("/a"), Some(&crate::keys::fnv1a("new")));
+    }
+
+    #[test]
+    fn workspace_failed_index_publication_preserves_previous_indexed_files() {
+        let backend = WorkspaceWriteStore::new();
+        let mut app = backend.app();
+        app.workspace_edit(|ws| fs_tools::Workspace::write(ws, "/obsolete", "previous")).unwrap();
+        drain_store(&mut app);
+        let old_index = backend.inner.get(crate::keys::WORKSPACE_INDEX).unwrap();
+        let old_key = crate::keys::workspace_file("/obsolete");
+        *backend.refuse.lock().unwrap() = Some(crate::keys::WORKSPACE_INDEX.to_string());
+        app.workspace_edit(|ws| {
+            fs_tools::Workspace::remove(ws, "/obsolete")?;
+            fs_tools::Workspace::write(ws, "/new", "next")
+        })
+        .unwrap();
+        assert!(app.flush_store("test-writer").failed > 0);
+        assert_eq!(backend.inner.get(crate::keys::WORKSPACE_INDEX).as_deref(), Some(old_index.as_str()));
+        assert_eq!(
+            backend.inner.get(&old_key).as_deref(),
+            Some("previous"),
+            "a refused index cannot remove a referenced value"
+        );
+        assert_eq!(fs_tools::Workspace::read(&backend.app().workspace, "/obsolete").unwrap(), "previous");
+        *backend.refuse.lock().unwrap() = None;
+        app.persist_workspace().unwrap();
+        let report = app.flush_store("test-writer");
+        assert_eq!(report.failed, 0);
+        assert!(backend.inner.get(&old_key).is_none());
+        assert!(backend.inner.get(crate::keys::WORKSPACE_INDEX).unwrap().contains("/new"));
+    }
+
+    #[test]
+    fn workspace_failed_migration_publication_preserves_legacy_data() {
+        for chunked in [false, true] {
+            let backend = WorkspaceWriteStore::new();
+            let old = r#"{"version":1,"files":{"/a":"legacy"}}"#;
+            if chunked {
+                store::write_blob(&mut backend.inner.clone(), "ws", old, WORKSPACE_PLAN).unwrap();
+            } else {
+                backend.inner.clone().set("ws", old);
+                backend.inner.clone().set("ws.1", "legacy tail");
+            }
+            let before = workspace_snapshot(&backend.inner);
+            *backend.refuse.lock().unwrap() = Some(crate::keys::WORKSPACE_INDEX.to_string());
+            let mut app = backend.app();
+            app.persist_workspace().unwrap();
+            assert!(app.flush_store("test-writer").failed > 0);
+            for (key, value) in &before {
+                assert_eq!(
+                    backend.inner.get(key).as_deref(),
+                    Some(value.as_str()),
+                    "{key} removed before migration published"
+                );
+            }
+            assert!(backend.inner.get(crate::keys::WORKSPACE_INDEX).is_none());
+            *backend.refuse.lock().unwrap() = None;
+            app.persist_workspace().unwrap();
+            drain_store(&mut app);
+            assert!(backend.inner.get("ws").is_none());
+            assert!(backend.inner.get("ws.1").is_none());
+            assert_eq!(fs_tools::Workspace::read(&backend.app().workspace, "/a").unwrap(), "legacy");
+        }
+    }
+
+    #[test]
+    fn workspace_pending_reverts_replace_newer_values_and_confirmed_saves_stay_incremental() {
+        let backend = WorkspaceWriteStore::new();
+        let mut app = backend.app();
+        app.workspace_edit(|ws| {
+            fs_tools::Workspace::write(ws, "/a", "durable")?;
+            fs_tools::Workspace::write(ws, "/b", "unchanged")
+        })
+        .unwrap();
+        drain_store(&mut app);
+        app.workspace_edit(|ws| fs_tools::Workspace::write(ws, "/a", "pending")).unwrap();
+        assert_eq!(
+            app.workspace.saved.get("/a"),
+            Some(&crate::keys::fnv1a("durable")),
+            "admission did not change the saved hash"
+        );
+        app.workspace_edit(|ws| fs_tools::Workspace::write(ws, "/a", "durable")).unwrap();
+        let report = app.flush_store("test-writer");
+        assert_eq!(report.failed, 0);
+        assert_eq!(backend.inner.get(&crate::keys::workspace_file("/a")).as_deref(), Some("durable"));
+        assert!(!report.keys.contains(&crate::keys::workspace_file("/b")));
+        app.persist_workspace().unwrap();
+        assert_eq!(app.flush_store("test-writer").keys, vec![crate::keys::WORKSPACE_INDEX]);
+    }
+
+    #[test]
+    fn workspace_failed_dependency_preserves_the_index_and_invalidates_replaced_hashes() {
+        let backend = WorkspaceWriteStore::new();
+        let mut app = backend.app();
+        app.workspace_edit(|ws| fs_tools::Workspace::write(ws, "/a", "previous")).unwrap();
+        drain_store(&mut app);
+        let old_index = backend.inner.get(crate::keys::WORKSPACE_INDEX).unwrap();
+        *backend.refuse.lock().unwrap() = Some(crate::keys::workspace_file("/b"));
+        app.workspace_edit(|ws| {
+            fs_tools::Workspace::write(ws, "/a", "replacement")?;
+            fs_tools::Workspace::write(ws, "/b", "unpublished")
+        })
+        .unwrap();
+        let report = app.flush_store("test-writer");
+        assert_eq!(report.failed, 2, "file refusal and skipped index: {report:?}");
+        assert_eq!(backend.inner.get(crate::keys::WORKSPACE_INDEX).as_deref(), Some(old_index.as_str()));
+        assert!(
+            !app.workspace.saved.contains_key("/a"),
+            "a replaced value with no published index is not a confirmed old hash"
+        );
+        assert_eq!(
+            backend.inner.get(&crate::keys::workspace_file("/a")).as_deref(),
+            Some("replacement"),
+            "path-derived keys cannot roll back all files"
+        );
+        *backend.refuse.lock().unwrap() = None;
+        app.workspace_edit(|ws| {
+            fs_tools::Workspace::write(ws, "/a", "previous")?;
+            fs_tools::Workspace::remove(ws, "/b")
+        })
+        .unwrap();
+        drain_store(&mut app);
+        assert_eq!(
+            backend.inner.get(&crate::keys::workspace_file("/a")).as_deref(),
+            Some("previous"),
+            "a revert must restore a successfully replaced dependency too"
+        );
+        assert_eq!(backend.inner.get(crate::keys::WORKSPACE_INDEX).as_deref(), Some(old_index.as_str()));
+    }
+
+    #[test]
+    fn workspace_cleanup_failure_keeps_published_hashes_and_is_explicitly_retryable() {
+        let backend = WorkspaceWriteStore::new();
+        let mut app = backend.app();
+        app.workspace_edit(|ws| fs_tools::Workspace::write(ws, "/obsolete", "old")).unwrap();
+        drain_store(&mut app);
+        let obsolete = crate::keys::workspace_file("/obsolete");
+        let current = crate::keys::workspace_file("/current");
+        *backend.refuse_remove.lock().unwrap() = Some(obsolete.clone());
+        app.workspace_edit(|ws| {
+            fs_tools::Workspace::remove(ws, "/obsolete")?;
+            fs_tools::Workspace::write(ws, "/current", "new")
+        })
+        .unwrap();
+        let report = app.flush_store("test-writer");
+        assert_eq!(report.failed, 1);
+        assert_eq!(report.failures[0].op, store::StoreOp::Remove);
+        assert_eq!(app.workspace.saved.get("/current"), Some(&crate::keys::fnv1a("new")));
+        assert!(app.workspace_stale_keys.contains(&obsolete));
+        assert_eq!(backend.inner.get(&obsolete).as_deref(), Some("old"));
+        assert!(!backend.inner.get(crate::keys::WORKSPACE_INDEX).unwrap().contains("/obsolete"));
+        let index_at = report.keys.iter().position(|key| key == crate::keys::WORKSPACE_INDEX).unwrap();
+        let cleanup_at = report.keys.iter().position(|key| key == &obsolete).unwrap();
+        assert!(index_at < cleanup_at, "cleanup follows confirmed index publication");
+        assert!(app.flush_store("test-writer").is_empty(), "no background retry loop");
+        *backend.refuse_remove.lock().unwrap() = None;
+        app.persist_workspace().unwrap();
+        let retry = app.flush_store("test-writer");
+        assert_eq!(retry.failed, 0);
+        assert!(!retry.keys.contains(&current), "do not rewrite confirmed file content to retry cleanup");
+        assert!(backend.inner.get(&obsolete).is_none());
+        assert!(app.workspace_stale_keys.is_empty());
+    }
+
+    #[test]
+    fn workspace_admission_refusal_restores_ram_and_the_complete_previous_queue() {
+        let backend = WorkspaceWriteStore::new();
+        let mut app = backend.app();
+        app.workspace_edit(|ws| fs_tools::Workspace::write(ws, "/a", "prior request")).unwrap();
+        let queue = app.store_queue();
+        let remaining = store::PENDING_BYTES_MAX - queue.pending_bytes() - 1024;
+        assert!(app.store.set("budget", &"x".repeat(remaining)));
+        let before_index = app.store.get(crate::keys::WORKSPACE_INDEX).unwrap();
+        let before = (queue.pending(), queue.pending_bytes());
+        let error = app
+            .workspace_edit(|ws| {
+                fs_tools::Workspace::write(ws, "/a", &"a".repeat(4096))?;
+                fs_tools::Workspace::write(ws, "/new", &"b".repeat(4096))
+            })
+            .unwrap_err();
+        assert!(error.contains("STORE_QUEUE_FULL"), "{error}");
+        assert_eq!((queue.pending(), queue.pending_bytes()), before);
+        assert_eq!(app.store.get(crate::keys::WORKSPACE_INDEX).as_deref(), Some(before_index.as_str()));
+        assert_eq!(app.store.get(&crate::keys::workspace_file("/a")).as_deref(), Some("prior request"));
+        assert!(app.store.get(&crate::keys::workspace_file("/new")).is_none());
+        assert_eq!(fs_tools::Workspace::read(&app.workspace, "/a").unwrap(), "prior request");
+        assert!(fs_tools::Workspace::read(&app.workspace, "/new").is_err());
+        assert!(app.workspace_pending.as_ref().unwrap().receipt.outcome().is_none());
+        assert!(app.store.remove("budget"));
+        drain_store(&mut app);
+        assert_eq!(fs_tools::Workspace::read(&backend.app().workspace, "/a").unwrap(), "prior request");
     }
 
     /// A store whose workspace writes always fail, which is what a full NVS looks like from
@@ -10690,7 +12690,7 @@ mod tests {
         assert!(fs_tools::Workspace::remove(&mut ws, "/a/b.txt").is_ok());
         assert!(fs_tools::Workspace::remove(&mut ws, "/a/b.txt").is_err());
         // What is stored is what comes back.
-        let reloaded = AppWorkspace::from_json(&ws.to_json());
+        let reloaded = AppWorkspace::from_json(&ws.to_json()).expect("valid version-1 workspace");
         assert_eq!(reloaded.len(), ws.len());
     }
 
@@ -10913,6 +12913,176 @@ mod tests {
         assert!(names.contains(&"board".to_string()));
         assert!(!names.contains(&"mpu6050_read".to_string()));
         assert!(!names.contains(&"lcd_text".to_string()));
+    }
+
+    #[test]
+    fn tool_disable_is_enforced_by_mcp_and_the_internal_agent() {
+        for name in ["script", "shell", "write", "board_status"] {
+            let mut app = test_app();
+            app.cfg.mcp.disabled_tools = vec![name.into()];
+            let args = match name {
+                "script" => json!({"source": "1"}),
+                "shell" => json!({"command": "echo hello"}),
+                "write" => json!({"path": "/blocked", "text": "no"}),
+                _ => json!({}),
+            };
+            let direct = app.call_tool(name, &args);
+            assert!(
+                direct.as_ref().is_err_and(|e| e.message.contains("disabled")),
+                "disabled {name} ran through App: {direct:?}"
+            );
+            let host = ToolHost::call_tool(&mut app, name, &args);
+            assert!(
+                host.as_ref().is_err_and(|e| e.contains("disabled")),
+                "disabled {name} ran through ToolHost: {host:?}"
+            );
+            let rpc = app
+                .handle_rpc(
+                    &json!({"jsonrpc": "2.0", "id": 1,
+                "method": "tools/call", "params": {"name": name, "arguments": args}})
+                    .to_string(),
+                    None,
+                )
+                .unwrap();
+            assert_eq!(rpc["result"]["isError"], true, "{name}: {rpc}");
+        }
+
+        let shared = Arc::new(Mutex::new(test_app()));
+        {
+            let mut app = shared.lock().unwrap();
+            point_at_the_stub(&mut app);
+            app.cfg.mcp.disabled_tools = vec!["write".into()];
+            app.agent.push_user("try the disabled write", "http", 1);
+        }
+        let mut model = Scripted::new(vec![
+            Scripted::tool_call("blocked", "write", r#"{"path":"/blocked","text":"no"}"#),
+            Scripted::answer("the write was refused"),
+        ]);
+        assert_eq!(run_turn(&shared, &mut model), "the write was refused");
+        let app = shared.lock().unwrap();
+        let result = app.agent.history.iter().find(|m| m.tool_call_id.as_deref() == Some("blocked")).unwrap();
+        assert!(result.text.contains("disabled"), "{}", result.text);
+        assert!(fs_tools::Workspace::read(&app.workspace, "/blocked").is_err());
+    }
+
+    #[test]
+    fn tool_disable_survives_alias_family_and_generic_dispatch() {
+        let mut app = test_app();
+        app.cfg.mcp.disabled_tools =
+            vec!["fs_write".into(), "board_status".into(), "oled_text".into(), "bme280_read".into()];
+        for (name, args) in [
+            ("write", json!({"path": "/blocked", "text": "no"})),
+            ("fs_write", json!({"path": "/blocked", "text": "no"})),
+            ("board", json!({"command": "status"})),
+            ("display", json!({"command": "oled_text", "arguments": {"text": "no"}})),
+            ("device_invoke", json!({"device": "bme280", "tool": "bme280_read"})),
+        ] {
+            assert!(app.call_tool(name, &args).is_err(), "{name} bypassed a disabled target");
+        }
+        assert!(!tool_names(&mut app).contains(&"write".into()), "the alias should not be offered");
+        app.cfg.mcp.disabled_tools = vec!["board".into(), "display".into()];
+        assert!(app.call_tool("board_status", &json!({})).is_err());
+        assert!(app.call_tool("oled_text", &json!({"text": "no"})).is_err());
+        assert!(app
+            .call_tool(
+                "device_invoke",
+                &json!({"device": "oled", "tool": "oled_text", "arguments": {"text": "no"}})
+            )
+            .is_err());
+        app.cfg.mcp.disabled_tools.clear();
+        app.cfg.mcp.tools_mode = "generic".into();
+        assert!(
+            app.call_tool("device_invoke", &json!({"device": "bme280", "tool": "bme280_read"})).is_ok(),
+            "generic visibility is not a disable"
+        );
+
+        let board = crate::virtual_board::VirtualBoard::new();
+        let calls = board.hw_calls.clone();
+        let mut app =
+            App::new(Box::new(board), Box::new(MemoryStore::new()), LogBuf::new(32), FwMeta::default());
+        let applied = app.call_tool("manifest_apply", &json!({"manifest": {"tools": [
+            {"name": "wrapped_read", "exec": {"type": "driver", "driver": "bme280", "action": "bme280_read"}},
+            {"name": "nested_read", "safety": {"max_calls_per_min": 1}, "exec": {"type": "sequence", "steps": [
+                {"exec": {"type": "gpio_write", "pin": 12, "level": 1}},
+                {"exec": {"type": "sequence", "steps": [{"exec": {"type": "gpio_read", "pin": 0}}]}}
+            ]}},
+            {"name": "wrapped_delay", "exec": {"type": "sequence", "steps": [
+                {"exec": {"type": "gpio_write", "pin": 12, "level": 1}},
+                {"ms": 1, "exec": {"type": "gpio_write", "pin": 12, "level": 0}}
+            ]}}
+        ]}})).unwrap();
+        assert_eq!(applied["applied"], true, "{applied}");
+        for (disabled, tool) in [
+            ("bme280_read", "wrapped_read"),
+            ("gpio_read", "nested_read"),
+            ("bus", "nested_read"),
+            ("delay", "wrapped_delay"),
+        ] {
+            app.cfg.mcp.disabled_tools = vec![disabled.into()];
+            let before = calls.load(std::sync::atomic::Ordering::SeqCst);
+            let err =
+                app.call_tool(tool, &json!({})).expect_err("a manifest cannot bypass its target's disable");
+            assert!(err.message.contains("disabled"), "{disabled} via {tool}: {err}");
+            assert_eq!(
+                calls.load(std::sync::atomic::Ordering::SeqCst),
+                before,
+                "a disabled later step must be found before the first hardware effect"
+            );
+        }
+        app.cfg.mcp.disabled_tools.clear();
+        assert!(
+            app.call_tool("nested_read", &json!({})).is_ok(),
+            "a refused preflight must not consume the rate-limit allowance"
+        );
+    }
+
+    #[test]
+    fn tool_disable_blocks_script_and_shell_file_bypasses() {
+        let mut app = test_app();
+        app.call_tool("write", &json!({"path": "/source", "text": "hello"})).unwrap();
+        app.cfg.mcp.disabled_tools = vec!["write".into()];
+        for command in [
+            "echo no > /blocked",
+            "echo no >> /blocked",
+            "echo no | tee /blocked",
+            "touch /blocked",
+            "base64enc /source -o /blocked",
+            "cp /source /blocked",
+            "mv /source /blocked --confirm",
+            "wget http://127.0.0.1/healthz -o /blocked",
+        ] {
+            let result = app.call_tool("shell", &json!({"command": command}));
+            assert!(
+                result.as_ref().is_err_and(|e| e.message.contains("disabled")),
+                "disabled write via {command}: {result:?}"
+            );
+            assert!(fs_tools::Workspace::read(&app.workspace, "/blocked").is_err());
+        }
+        let script = app.call_tool(
+            "script",
+            &json!({"source": "tool(\"fs_write\", {path: \"/blocked\", text: \"no\"})"}),
+        );
+        assert!(script.as_ref().is_err_and(|e| e.message.contains("disabled")), "{script:?}");
+        assert_eq!(fs_tools::Workspace::read(&app.workspace, "/source").unwrap(), "hello");
+        app.cfg.mcp.disabled_tools = vec!["read".into()];
+        for command in [
+            "cat /source",
+            "head /source",
+            "echo no < /source",
+            "base64enc /source",
+            "sha256sum /source",
+            "crc32 /source",
+            "zip a.zip /source",
+        ] {
+            let result = app.call_tool("shell", &json!({"command": command}));
+            assert!(
+                result.as_ref().is_err_and(|e| e.message.contains("disabled")),
+                "disabled read via {command}: {result:?}"
+            );
+        }
+        let script = app.call_tool("script", &json!({"path": "/source"}));
+        assert!(script.as_ref().is_err_and(|e| e.message.contains("disabled")), "{script:?}");
+        assert!(ToolHost::call_tool(&mut app, "fs_read", &json!({"path": "/source"})).is_err());
     }
 
     #[test]
@@ -11532,9 +13702,120 @@ mod tests {
     }
 
     /// A device the board does not have is not a tool, and the sentence explains it.
-    ///
-    /// `image_read` is the live case: a camera is a driver on a DVP bus, and a board with
-    /// neither can only answer "a camera is not available on this board".
+    /// Attachments are replaced only after all metadata, encodings and message limits pass.
+    #[test]
+    fn attachments_are_admitted_atomically_and_belong_to_one_message() {
+        let image = json!({"name": "old.png", "mime": "image/png", "data_b64": "eA=="});
+        for invalid in [
+            json!({"text": "x".repeat(AGENT_TEXT_MAX + 1), "attachments": [image.clone()]}),
+            json!({"text": "new", "attachments": [{"name": "new.png", "mime": "image/png", "data_b64": "eQ=="}, {"name": "bad", "data_b64": "?"}]}),
+            json!({"text": "new", "attachments": [{"name": "bad", "mime": "image/png\r\nInjected: yes", "data_b64": "eA=="}]}),
+            json!({"text": "new", "attachments": [image.clone(), image.clone()]}),
+            json!({"text": "new", "attachments": "not an array"}),
+            json!({"text": "new", "attachments": [{"name": 42, "data_b64": "eA=="}]}),
+            json!({"text": "new", "attachments": [{"mime": ["image/png"], "data_b64": "eA=="}]}),
+            json!({"text": "new", "attachments": [{"data_b64": false}]}),
+            json!({"text": "new", "attachments": [{"name": "x".repeat(129), "data_b64": "eA=="}]}),
+            json!({"text": "new", "attachments": [{"name": "big", "data_b64": crate::util::b64_encode(&vec![0; MAX_ATTACHMENT_BYTES + 1])}]}),
+        ] {
+            let mut app = test_app();
+            assert_eq!(
+                app.route(&post(
+                    "/api/agent/message",
+                    &json!({"text": "look", "attachments": [image.clone()]}).to_string()
+                ))
+                .status,
+                202
+            );
+            let original = app.agent.pending.as_ref().unwrap().text.clone();
+            let resp = app.route(&post("/api/agent/message", &invalid.to_string()));
+            assert!((400..500).contains(&resp.status), "accepted invalid attachments: {}", body_json(&resp));
+            assert_eq!(app.attachments.len(), 1, "refused input changed the download list");
+            assert_eq!(app.attachments[0].name, "old.png", "refused input replaced the old image");
+            assert_eq!(app.agent.pending.as_ref().unwrap().text, original);
+        }
+        let mut app = test_app();
+        assert_eq!(
+            app.route(&post(
+                "/api/agent/message",
+                &json!({"text": "look", "attachments": [image]}).to_string()
+            ))
+            .status,
+            202
+        );
+        assert_eq!(app.route(&post("/api/agent/message", r#"{"text":"text only"}"#)).status, 202);
+        assert!(app.attachments.is_empty(), "a text-only message retained the previous download");
+        assert!(
+            app.agent.pending.as_ref().unwrap().attachments.is_empty(),
+            "a text-only turn resent an old image"
+        );
+
+        assert_eq!(app.route(&post("/api/agent/message", &json!({"text": "look", "attachments": [{"name": "running.png", "mime": "image/png", "data_b64": "eA=="}]}).to_string())).status, 202);
+        point_at_the_stub(&mut app);
+        assert!(matches!(app.agent_begin(), Some(AgentStep::Ask { .. })));
+        assert_eq!(app.route(&post("/api/agent/message", r#"{"text":"next text-only turn"}"#)).status, 202);
+        assert!(app.attachments.is_empty());
+        app.tool_transport = Some(Box::new(Scripted::new(vec![Scripted::answer("the running image")])));
+        assert_eq!(
+            app.call_tool("image_read", &json!({})).unwrap()["name"],
+            "running.png",
+            "a newer queued message replaced the running turn's image"
+        );
+        assert!(matches!(
+            app.agent_reply(Ok(llm::ModelReply { content: "done".into(), ..Default::default() })),
+            AgentStep::Done(_)
+        ));
+        assert!(app.call_tool("image_read", &json!({})).is_err(), "a finished turn retained an active image");
+        assert_eq!(app.route(&post("/api/agent/reset", "{}")).status, 200);
+        assert!(app.attachments.is_empty());
+    }
+
+    #[test]
+    fn image_read_uses_the_configured_adapter_without_a_camera() {
+        for protocol in ["responses", "anthropic", "chat"] {
+            let mut app = test_app();
+            point_at_the_stub(&mut app);
+            app.llm.protocol = protocol.into();
+            app.attachments = vec![crate::agent::Attachment {
+                name: "photo.png".into(),
+                mime: "image/png".into(),
+                data_b64: "eA==".into(),
+            }];
+            let response = match protocol {
+                "responses" => json!({"output": [{"type": "message", "content": [{"type": "output_text", "text": "a photo"}]}]}).to_string(),
+                "anthropic" => json!({"content": [{"type": "text", "text": "a photo"}]}).to_string(),
+                _ => Scripted::answer("a photo"),
+            };
+            let transport = Scripted::new(vec![response]);
+            let seen = transport.seen.clone();
+            app.tool_transport = Some(Box::new(transport));
+            let answer = app.call_tool("image_read", &json!({"prompt": "describe"})).expect(protocol);
+            assert_eq!(answer["text"], "a photo");
+            let body: Value = serde_json::from_str(&seen.lock().unwrap()[0]).unwrap();
+            match protocol {
+                "responses" => {
+                    assert_eq!(body["input"][0]["content"][1]["type"], "input_image");
+                    assert_eq!(body["input"][0]["content"][1]["image_url"], "data:image/png;base64,eA==");
+                }
+                "anthropic" => assert_eq!(body["messages"][0]["content"][1]["source"]["data"], "eA=="),
+                _ => assert_eq!(
+                    body["messages"][0]["content"][1]["image_url"]["url"],
+                    "data:image/png;base64,eA=="
+                ),
+            }
+            assert!(
+                tool_names(&mut app).contains(&"image_read".into()),
+                "an uploaded image does not require a camera"
+            );
+            app.llm.vision = false;
+            assert!(app.call_tool("image_read", &json!({})).unwrap_err().message.contains("vision"));
+            assert_eq!(seen.lock().unwrap().len(), 1, "disabled vision still contacted the model");
+            app.llm.vision = true;
+            app.attachments[0].mime = "application/pdf".into();
+            assert!(app.call_tool("image_read", &json!({})).is_err(), "a PDF was sent as an image");
+        }
+    }
+
     #[test]
     fn a_tool_with_no_device_behind_it_is_hidden_and_says_why() {
         let mut app = test_app();
@@ -11819,6 +14100,21 @@ mod tests {
             .unwrap_err();
         assert!(err.message.contains("auto, generic or all"), "{err:?}");
         assert_eq!(app.cfg.mcp.tools_mode, "auto", "the value changed anyway");
+        let before = app.cfg.clone();
+        for body in [
+            json!(null),
+            json!([]),
+            json!(42),
+            json!("settings"),
+            json!({"mode": "generik"}),
+            json!({"mode": 12}),
+            json!({"mode": "generic", "disabled": "oops"}),
+            json!({"mode": "generic", "disabled": ["gpio_write", 3]}),
+        ] {
+            let response = app.route(&post("/api/tools", &body.to_string()));
+            assert_eq!(response.status, 400, "accepted malformed selection: {body}");
+            assert_eq!(app.cfg, before, "partially applied malformed selection: {body}");
+        }
     }
 
     /// The devkit's own peripherals are opt-out: a board that wants the smallest possible
@@ -11949,6 +14245,33 @@ mod tests {
         // ... and the second one is answered by the strip, not refused as unknown.
         let out = app.call_tool("led_set_2", &json!({ "color": "#102030" })).unwrap();
         assert_eq!(out["ok"], json!(true), "{out}");
+        for tool in ["led_set_2", "led_set"] {
+            let out = app
+                .call_tool(
+                    "device_invoke",
+                    &json!({
+                        "device": "lamp", "tool": tool, "arguments": {"color": "#203040"}
+                    }),
+                )
+                .expect("both the published name and the stored raw alias reach the second strip");
+            assert_eq!(out["ok"], true, "{tool}: {out}");
+        }
+        app.cfg.mcp.disabled_tools = vec!["led_set_2".into()];
+        for tool in ["led_set_2", "led_set"] {
+            let err = app
+                .call_tool(
+                    "device_invoke",
+                    &json!({
+                        "device": "lamp", "tool": tool, "arguments": {"color": "#203040"}
+                    }),
+                )
+                .expect_err("a raw alias cannot bypass an instance's disable");
+            assert!(err.message.contains("disabled"), "{tool}: {err}");
+        }
+        assert!(
+            app.call_tool("led_set", &json!({"color": "#102030"})).is_ok(),
+            "disabling the second strip does not disable the first"
+        );
     }
 
     #[test]
@@ -12243,7 +14566,23 @@ mod tests {
         req.headers.insert("authorization".into(), "Bearer tok".into());
         let resp = app.route(&req);
         assert_eq!(resp.status, 200);
-        assert!(resp.headers.iter().any(|(k, _)| k == "Mcp-Session-Id"));
+        let sid = resp.headers.iter().find(|(k, _)| k == "Mcp-Session-Id").unwrap().1.clone();
+        req.method = "DELETE".into();
+        req.body.clear();
+        req.headers.insert("mcp-session-id".into(), sid.clone());
+        for credential in [None, Some("tok"), Some("Basic tok"), Some("Bearer wrong")] {
+            req.headers.remove("authorization");
+            if let Some(value) = credential {
+                req.headers.insert("authorization".into(), value.into());
+            }
+            assert_eq!(app.route(&req).status, 401, "{credential:?} bypassed session deletion auth");
+            assert!(app.runtime.sessions.iter().any(|s| s.id == sid));
+        }
+        req.headers.insert("authorization".into(), "bearer tok".into());
+        assert_eq!(app.route(&req).status, 204);
+        assert!(!app.runtime.sessions.iter().any(|s| s.id == sid));
+        app.cfg.mcp.enabled = false;
+        assert_eq!(app.route(&req).status, 503, "disabled MCP must refuse every mutating method");
     }
 
     #[test]
@@ -12307,6 +14646,13 @@ mod tests {
             .unwrap_err();
         assert_eq!(err.code, code::FORBIDDEN, "got {}", err.message);
         assert!(err.message.contains("confirm"), "{}", err.message);
+        for (name, args) in [
+            ("bme280_read", json!({})),
+            ("device_invoke", json!({"device": "bme280", "tool": "bme280_read"})),
+        ] {
+            let err = app.call_tool(name, &args).expect_err("the driver and generic views share the policy");
+            assert!(err.message.contains("confirm"), "{name}: {err}");
+        }
         // With the confirmation the same call goes through the policy and works.
         assert!(app
             .call_tool(
@@ -12605,8 +14951,8 @@ mod tests {
         assert_eq!(body["ok"], false, "{body}");
     }
 
-    /// The tree: every file in one answer, and the directories derived from the paths. One
-    /// request for the whole workspace, because the whole workspace is 8 KB.
+    /// The tree lists file metadata and directories derived from bounded canonical paths,
+    /// without returning every file's contents.
     #[test]
     fn the_files_tree_lists_directories_and_files() {
         use crate::tools::fs::Workspace as _;

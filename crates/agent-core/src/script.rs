@@ -1,13 +1,13 @@
 //! A small scripting language the agent can write and the board can run.
 //!
-//! Why not Lua or Rhai: this firmware has ~40 kB of free internal RAM and ships as one
-//! binary, and the point of the language is not general purpose programming — it is
+//! This interpreter ships in the firmware without another runtime dependency. Its
+//! purpose is not general purpose programming — it is
 //! letting the model express *loops and conditions over tool calls* that the fixed tool
 //! vocabulary cannot: "probe every bus, adopt the OLED, then blink until the button is
 //! pressed".
 //!
 //! The language is deliberately tiny and genuinely Turing-complete (assignment plus
-//! `while`), with no pointers, no user functions and no I/O of its own:
+//! `while`), with bounded user functions/recursion, no pointers and no I/O of its own:
 //!
 //! ```text
 //! let found = tool("i2c_scan", {})
@@ -21,8 +21,8 @@
 //!
 //! `tool(name, args)` is the only way out: it calls any MCP tool the board already has,
 //! through the same dispatcher, so a script has exactly the permissions of the caller and
-//! cannot reach anything the tool list does not expose. `script` itself is refused inside
-//! a script — recursion through the tool layer is how a 40 kB board runs out of stack.
+//! cannot bypass disabled tools. Listing profiles do not revoke an enabled legacy name.
+//! `script` itself is refused inside a script to prevent recursion through the tool layer.
 //!
 //! Everything is bounded: a step budget, a depth limit, and caps on string, list and map
 //! growth. A runaway script stops with a message instead of taking the board down.
@@ -48,15 +48,14 @@ pub const MAX_MS: u64 = 30_000;
 pub const MAX_STEPS: u64 = 5_000_000;
 /// Nested blocks (and `if`/`while` bodies) a script may enter.
 const MAX_DEPTH: usize = 32;
-/// Recursion depth. Each frame is a map of its own, so this is also a memory bound: 32
-/// frames of a few locals is what an 8 KB workspace and a few kilobytes of stack allow.
+/// Recursion depth. Each frame has locals and uses the call stack, so this is an
+/// independent execution budget, not a consequence of the workspace's text capacity.
 const MAX_CALLS: usize = 32;
-/// A string or a list may not grow past this: the board has kilobytes, not megabytes.
+/// Per-value growth limits keep scripts bounded independently of the board's total heap.
 const MAX_STRING: usize = 4096;
 const MAX_LIST: usize = 256;
 const MAX_MAP: usize = 64;
-/// Source length. The whole script arrives as a tool argument (2 KB result cap applies to
-/// results, not arguments, but a small model will not write more than this anyway).
+/// Source-length budget for parsing, separate from the 64 KiB tool-result ceiling.
 pub const MAX_SOURCE: usize = 8192;
 
 /// What a script may call to act on the board.
@@ -69,8 +68,8 @@ pub trait ScriptHost {
 ///
 /// A tool description is one paragraph, and a language needs more than that: the first
 /// run of a real agent guessed `tool()` (the example was in the description) and then
-/// asked for `speaker_tone` without knowing it existed. Sections rather than one document
-/// because a tool result is capped at 2 KB and a truncated reference is worse than none.
+/// asked for `speaker_tone` without knowing it existed. Compact sections keep the
+/// reference cheap in context; their 2 KiB policy is not the global tool-result ceiling.
 pub fn help(section: &str) -> Result<String, String> {
     match section {
         "" | "overview" => Ok(OVERVIEW.to_string()),
@@ -99,6 +98,9 @@ STATEMENTS
          l[0] = 9 / m.k = 9
          if cond { ... } else { ... }
          while cond { ... }        break inside
+         for item in expr { ... }   list, map keys, string chars
+         fn name(a) { ... }         top-level definitions are hoisted
+         return value              exits the function or script, even inside a loop
          # comment
 OPERATORS  + - * / %   == != < <= > >=   and or not   (unary -)
            `+` also joins strings and concatenates lists
@@ -120,6 +122,7 @@ Only these, plus `tool`:
   num(x)        "12" -> 12, true -> 1
   type(x)       "number" | "string" | "bool" | "nil" | "list" | "map"
   log(x, ...)   one line into the run output (64 lines max)
+  print/echo    aliases of log
   sleep(ms)     wait, at most 2 s per call and 5 s per script
   tool(name, args)   call any board tool; args is a map; returns its JSON
 
@@ -202,24 +205,36 @@ pub fn lint(source: &str) -> Lint {
             return out;
         }
     };
-    let mut calls = Vec::new();
+    // Match runtime hoisting: only top-level definitions exist before calls start.
+    // This includes forward/mutual recursion, but not a definition hidden in a block.
+    let declared: std::collections::BTreeSet<&str> = program
+        .iter()
+        .filter_map(|stmt| if let Stmt::Fn(name, _, _) = stmt { Some(name.as_str()) } else { None })
+        .collect();
+    let mut calls = LintCalls::default();
     collect_calls(&program, &mut calls);
-    for name in calls {
-        if !BUILTINS_NAMES.contains(&name.as_str()) {
+    for name in calls.functions {
+        if !BUILTINS_NAMES.contains(&name.as_str()) && !declared.contains(name.as_str()) {
             out.warnings
                 .push(format!("unknown function `{name}`; the builtins are {}", BUILTINS_NAMES.join(", ")));
         }
-        if name == "script" {
-            out.warnings.push("`tool(\"script\", …)` is refused when the script runs".into());
-        }
+    }
+    if calls.recursive_script_tool && !declared.contains("tool") {
+        out.warnings.push("`tool(\"script\", …)` is refused when the script runs".into());
     }
     out
 }
 
-/// The functions a script may call, other than `tool`.
+/// Builtin names, including `tool` and the output aliases.
 pub const BUILTINS_NAMES: &[&str] = &["len", "str", "num", "type", "log", "print", "echo", "sleep", "tool"];
 
-fn collect_calls(stmts: &[Stmt], out: &mut Vec<String>) {
+#[derive(Default)]
+struct LintCalls {
+    functions: Vec<String>,
+    recursive_script_tool: bool,
+}
+
+fn collect_calls(stmts: &[Stmt], out: &mut LintCalls) {
     for stmt in stmts {
         match stmt {
             Stmt::Let(_, e) | Stmt::Assign(_, e) | Stmt::Expr(e) => collect_expr(e, out),
@@ -248,7 +263,7 @@ fn collect_calls(stmts: &[Stmt], out: &mut Vec<String>) {
     }
 }
 
-fn collect_expr(expr: &Expr, out: &mut Vec<String>) {
+fn collect_expr(expr: &Expr, out: &mut LintCalls) {
     match expr {
         Expr::Lit(_) | Expr::Var(_) => {}
         Expr::List(items) => items.iter().for_each(|e| collect_expr(e, out)),
@@ -264,7 +279,12 @@ fn collect_expr(expr: &Expr, out: &mut Vec<String>) {
         }
         Expr::Member(a, _) => collect_expr(a, out),
         Expr::Call(name, args) => {
-            out.push(name.clone());
+            out.functions.push(name.clone());
+            if name == "tool"
+                && matches!(args.first(), Some(Expr::Lit(Val::Str(target))) if target == "script")
+            {
+                out.recursive_script_tool = true;
+            }
             args.iter().for_each(|e| collect_expr(e, out));
         }
     }
@@ -1268,8 +1288,10 @@ impl<'a> Run<'a> {
                     if !self.eval(cond)?.truthy() {
                         break;
                     }
-                    if let Flow::Break = self.block(body)? {
-                        break;
+                    match self.block(body)? {
+                        Flow::Break => break,
+                        Flow::Return(value) => return Ok(Flow::Return(value)),
+                        Flow::Normal => {}
                     }
                 }
                 Ok(Flow::Normal)
@@ -1843,6 +1865,40 @@ len(r.issues)"#),
         let err = run("let i = 0\nwhile i < 70 { print(i)  i = i + 1 }", &mut host).expect_err("refused");
         assert!(err.contains("64 lines"), "{err}");
         let _ = host;
+    }
+
+    #[test]
+    fn lint_agrees_with_hoisted_functions_and_literal_tool_recursion() {
+        let source = "even(4)\nfn even(n) { if n == 0 { return true } return odd(n - 1) }\nfn odd(n) { if n == 0 { return false } return even(n - 1) }";
+        let checked = lint(source);
+        assert!(checked.ok() && checked.warnings.is_empty(), "{:?}", checked.warnings);
+        assert_eq!(ok(source), json!(true));
+        let checked = lint("fn script() { return 1 } script()");
+        assert!(checked.warnings.is_empty(), "a user function is not a recursive tool call");
+        let checked = lint("fn tool(name, args) { return 1 } tool(\"script\", {})");
+        assert!(checked.warnings.is_empty(), "a hoisted function also shadows the tool builtin");
+        let checked = lint("fn real() { return missing() } real()");
+        assert_eq!(checked.warnings.len(), 1, "{:?}", checked.warnings);
+        assert!(checked.warnings[0].contains("unknown function `missing`"));
+        let checked = lint("tool(\"script\", {})");
+        assert!(checked.warnings.iter().any(|warning| warning.contains("refused")), "{:?}", checked.warnings);
+        let checked = lint("if true { fn nested() { return 1 } } nested()");
+        assert!(
+            checked.warnings.iter().any(|warning| warning.contains("unknown function `nested`")),
+            "nested definitions are not hoisted at runtime"
+        );
+    }
+
+    #[test]
+    fn returns_inside_while_propagate_to_the_script_or_function() {
+        for source in [
+            "let n = 1\nwhile n > 0 { n = n - 1; return 7 }\n9",
+            "fn once(n) { while n > 0 { n = n - 1; return 7 } return 9 }\nonce(1)",
+            "fn nested(n) { while n > 0 { n = n - 1; for x in [7] { return x } } return 9 }\nnested(1)",
+        ] {
+            assert_eq!(ok(source), json!(7), "{source}");
+        }
+        assert_eq!(ok("fn once(n) { while n > 0 { n = n - 1; return 7 } return 9 }\nonce(0)"), json!(9));
     }
 
     #[test]

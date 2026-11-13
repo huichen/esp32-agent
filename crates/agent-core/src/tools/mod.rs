@@ -182,7 +182,7 @@ pub fn board_tools() -> Vec<ToolDef> {
             .requires(&[cap::I2C])
             .schema(object_schema(&[("bus", integer(0, 3, "bus index, default 0"))], &[]))
             .bind(|ctx, args| {
-                let bus = j::opt_i64(args, "bus").map(|b| b as u8).unwrap_or_else(|| default_bus(ctx));
+                let bus = j::optional_ranged_i64(args, "bus", 0, 3)?.map(|b| b as u8).unwrap_or_else(|| default_bus(ctx));
                 let addrs = ctx.hw.i2c_scan(bus)?;
                 Ok(json!({
                     "bus": bus,
@@ -207,10 +207,10 @@ pub fn board_tools() -> Vec<ToolDef> {
             &["addr"],
         ))
         .bind(|ctx, args| {
-            let addr = j::ranged_i64(args, "addr", 0, 1, 127)? as u8;
-            let len = j::ranged_i64(args, "length", 1, 1, 64)? as usize;
-            let reg = j::opt_i64(args, "reg").map(|r| r as u8);
-            let bus = j::opt_i64(args, "bus").map(|b| b as u8).unwrap_or_else(|| default_bus(ctx));
+            let addr = j::required_ranged_i64(args, "addr", 1, 127)? as u8;
+            let len = j::optional_ranged_u64(args, "length", 1, 64)?.unwrap_or(1) as usize;
+            let reg = j::optional_ranged_i64(args, "reg", 0, 255)?.map(|r| r as u8);
+            let bus = j::optional_ranged_i64(args, "bus", 0, 3)?.map(|b| b as u8).unwrap_or_else(|| default_bus(ctx));
             let mut buf = vec![0u8; len];
             ctx.hw.i2c_read(bus, addr, reg, &mut buf)?;
             Ok(json!({
@@ -236,14 +236,16 @@ pub fn board_tools() -> Vec<ToolDef> {
             ))
             .mutating()
             .bind(|ctx, args| {
-                let addr = j::ranged_i64(args, "addr", 0, 1, 127)? as u8;
-                let reg = j::opt_i64(args, "reg").map(|r| r as u8);
-                let bus = j::opt_i64(args, "bus").map(|b| b as u8).unwrap_or_else(|| default_bus(ctx));
+                let addr = j::required_ranged_i64(args, "addr", 1, 127)? as u8;
+                let reg = j::optional_ranged_i64(args, "reg", 0, 255)?.map(|r| r as u8);
+                let bus = j::optional_ranged_i64(args, "bus", 0, 3)?.map(|b| b as u8).unwrap_or_else(|| default_bus(ctx));
                 let data: Vec<u8> = j::arr(args, "data")
                     .ok_or_else(|| McpError::invalid_params("`data` must be an array of bytes"))?
                     .iter()
-                    .map(|v| v.as_u64().unwrap_or(0).min(255) as u8)
-                    .collect();
+                    .enumerate()
+                    .map(|(i, v)| v.as_u64().and_then(|n| u8::try_from(n).ok()).ok_or_else(||
+                        McpError::invalid_params(format!("`data[{i}]` must be an integer within 0..=255"))))
+                    .collect::<crate::error::Result<_>>()?;
                 ctx.hw.i2c_write(bus, addr, reg, &data)?;
                 Ok(json!({ "ok": true, "addr": format!("0x{addr:02X}"), "bytes": data.len() }))
             }),
@@ -253,7 +255,7 @@ pub fn board_tools() -> Vec<ToolDef> {
             .requires(&[cap::GPIO])
             .schema(object_schema(&[("pin", integer(0, 48, "GPIO number"))], &["pin"]))
             .bind(|ctx, args| {
-                let pin = j::ranged_i64(args, "pin", 0, 0, 48)? as i32;
+                let pin = j::required_ranged_i64(args, "pin", 0, 48)? as i32;
                 ctx.hw.gpio_config(pin, PinMode::InputPullup)?;
                 let level = ctx.hw.gpio_read(pin)?;
                 Ok(json!({ "pin": pin, "level": if level { 1 } else { 0 }, "high": level }))
@@ -271,8 +273,8 @@ pub fn board_tools() -> Vec<ToolDef> {
             ))
             .mutating()
             .bind(|ctx, args| {
-                let pin = j::ranged_i64(args, "pin", 0, 0, 48)? as i32;
-                let level = j::ranged_i64(args, "level", 0, 0, 1)? != 0;
+                let pin = j::required_ranged_i64(args, "pin", 0, 48)? as i32;
+                let level = j::required_ranged_i64(args, "level", 0, 1)? != 0;
                 ctx.hw.gpio_config(pin, PinMode::Output)?;
                 ctx.hw.gpio_write(pin, level)?;
                 Ok(json!({ "ok": true, "pin": pin, "level": if level { 1 } else { 0 } }))
@@ -290,7 +292,7 @@ pub fn board_tools() -> Vec<ToolDef> {
             ))
             .mutating()
             .bind(|ctx, args| {
-                let pin = j::ranged_i64(args, "pin", 0, 0, 48)? as i32;
+                let pin = j::required_ranged_i64(args, "pin", 0, 48)? as i32;
                 let m = j::str_arg(args, "mode")?;
                 let mode = PinMode::parse(&m)
                     .ok_or_else(|| McpError::invalid_params(format!("unknown mode `{m}`")))?;
@@ -303,7 +305,7 @@ pub fn board_tools() -> Vec<ToolDef> {
             .requires(&[cap::ADC])
             .schema(object_schema(&[("pin", integer(0, 48, "ADC-capable GPIO"))], &["pin"]))
             .bind(|ctx, args| {
-                let pin = j::ranged_i64(args, "pin", 0, 0, 48)? as i32;
+                let pin = j::required_ranged_i64(args, "pin", 0, 48)? as i32;
                 let mv = ctx.hw.adc_mv(pin)?;
                 Ok(json!({ "pin": pin, "millivolts": mv, "volts": (mv as f32 / 1000.0 * 1000.0).round() / 1000.0 }))
             }),
@@ -416,33 +418,18 @@ pub fn system_tools() -> Vec<ToolDef> {
                     "count": ctx.tasks.len(),
                 })),
                 "add" => {
-                    let prompt = j::opt_str(args, "prompt").unwrap_or_default();
-                    if prompt.trim().is_empty() {
-                        return Err(McpError::invalid_params("`prompt` is required to add a task"));
+                    if ctx.tasks.len() >= crate::app::MAX_TASKS {
+                        return Err(McpError::invalid_params(format!("at most {} scheduled tasks", crate::app::MAX_TASKS)));
                     }
-                    let every_s = j::opt_i64(args, "every_s").unwrap_or(0).clamp(0, 86_400) as u32;
-                    let at_hhmm = j::opt_str(args, "at_hhmm").unwrap_or_default();
-                    if every_s == 0 && at_hhmm.is_empty() {
-                        return Err(McpError::invalid_params(
-                            "give `every_s` or `at_hhmm`; a task with neither never fires",
-                        ));
-                    }
-                    // The id is derived, not asked for: a model inventing one twice would
-                    // silently replace its own task.
-                    let id = format!("t{}", ctx.tasks.len() + 1);
-                    ctx.tasks.push(crate::sched::ScheduledTask {
-                        id: id.clone(),
-                        prompt,
-                        script: j::opt_str(args, "script").unwrap_or_default(),
-                        every_s,
-                        at_hhmm,
-                        enabled: j::opt_bool(args, "enabled").unwrap_or(true),
-                        // The clock starts now. `due()` compares this with the wall clock in
-                        // milliseconds, so a fresh task carrying 0 is 1970 - `since_last` is
-                        // 1.79e12 and it fires during the very turn that created it (measured:
-                        // `schedule add {every_s:120}`, then the LED changed before the answer).
-                        last_run_ms: crate::app::now_ms(),
-                    });
+                    // The id is derived, not asked for, and remains unique after removals.
+                    let id = crate::app::next_schedule_task_id(ctx.tasks);
+                    let mut input = args.clone();
+                    input["id"] = json!(id);
+                    // The tool creates a new task, so its clock always starts now. An
+                    // existing REST edit/replacement may instead preserve its old clock.
+                    input["last_run_ms"] = json!(crate::app::now_ms());
+                    let task = crate::app::task_from_api(&input, &id)?;
+                    ctx.tasks.push(task);
                     ctx.runtime.sched_dirty = true;
                     ctx.log.info("agent", format!("schedule: task `{id}` added from a tool call"));
                     Ok(json!({ "ok": true, "id": id, "count": ctx.tasks.len() }))
@@ -542,7 +529,7 @@ pub fn agent_extra_specs() -> Value {
             "type": "function",
             "function": {
                 "name": "write",
-                "description": "Create or overwrite a text file in the board workspace. Parent directories are created. A file is limited to 2048 bytes and the workspace to 8 KB.",
+                "description": format!("Create or overwrite a UTF-8 text file in the board workspace. Parent directories are created. A file is limited to {} bytes and the workspace to {} bytes of text in total. Success reports queue admission, not storage completion.", fs::MAX_FILE_BYTES, crate::app::WORKSPACE_TOTAL_MAX),
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -558,7 +545,7 @@ pub fn agent_extra_specs() -> Value {
             "type": "function",
             "function": {
                 "name": "edit",
-                "description": "Replace exactly one occurrence of `find` in a file. Fails when it occurs zero or several times, so an ambiguous edit never rewrites the wrong place.",
+                "description": "Replace exactly one occurrence of `find` in a file. Fails when it occurs zero or several times, so an ambiguous edit never rewrites the wrong place. Success reports queue admission, not storage completion.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -658,14 +645,10 @@ fn device_invoke_tool() -> ToolDef {
         let device = j::str_arg(args, "device")?;
         let tool = j::str_arg(args, "tool")?;
         let inner = j::field(args, "arguments").cloned().unwrap_or_else(|| json!({}));
-        // One gate for every entry point: if a manifest tool wraps this driver
-        // action, its confirm / safety / rate-limit policy is what applies. Going
-        // straight to the driver here would let a write with `confirm: true` slip
-        // through without the confirmation.
-        if let Some(policy) = ctx.manifest.driver_tool(&device, &tool).cloned() {
-            return crate::manifest::run_tool(&policy, ctx, &inner);
+        if !inner.is_object() {
+            return Err(crate::error::McpError::invalid_params("device tool arguments must be an object"));
         }
-        ctx.devices.call(&device, &tool, &inner, ctx.hw)
+        crate::device::invoke(ctx, &device, &tool, &inner)
     })
 }
 

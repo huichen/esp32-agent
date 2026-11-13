@@ -28,6 +28,7 @@ pub mod font6x8;
 pub mod hardware;
 pub mod hash;
 pub mod http;
+pub mod http_client;
 pub mod json;
 pub mod keys;
 pub mod llm;

@@ -3,8 +3,8 @@
 ## 0. The image you flash
 
 There is no prebuilt binary here: the repository contains no release workflow and publishes
-no image, so the build in section 1 is the only way to a `.bin`. Once you have built one,
-the merged image is written with:
+no image. Section 1 builds an ELF, which can be flashed directly. If you have separately
+created a merged image for this layout, write that image with:
 
 ```bash
 # espflash (Rust, any OS)
@@ -35,11 +35,11 @@ espup install
 . $HOME/export-esp.sh        # macOS/Linux; on Windows it is export-esp.ps1
 ```
 
-With that environment sourced, the build is plain cargo:
+With that environment sourced, select the ESP toolchain explicitly:
 
 ```bash
 cd firmware
-cargo build --release --target xtensa-esp32s3-espidf
+cargo +esp build --release --target xtensa-esp32s3-espidf
 espflash flash --chip esp32s3 --flash-size 16mb \
   --partition-table partitions.csv --target-app-partition factory \
   target/xtensa-esp32s3-espidf/release/esp32-agent
@@ -50,8 +50,9 @@ workarounds documented in section 8 (`LIBCLANG_PATH`, and the short output path 
 insists on) — worth reading even when you are not on Windows, because the second one bites
 on any path with a long name.
 
-ESP-IDF v5.4+ is required (`firmware/.cargo/config.toml` pins `v5.5.2`). On the first
-build, `embuild`/`esp-idf-sys` downloads ESP-IDF and its tools itself (several GB,
+The checked-in target pins ESP-IDF **v5.5.2** in `firmware/.cargo/config.toml`; other
+versions are unverified. The bench target is an ESP32-S3 N16R8 with 16 MiB flash and
+8 MiB octal PSRAM. On the first build, `embuild`/`esp-idf-sys` downloads ESP-IDF and its tools itself (several GB,
 10–30 minutes).
 
 ## 2. Build and flash
@@ -73,7 +74,7 @@ bash scripts/build-firmware.sh --flash --port /dev/ttyACM0
 Another chip: pass `-Mcpu esp32c3 -Target riscv32imc-esp-espidf` (`--mcpu esp32c3
 --target riscv32imc-esp-espidf`); the script rewrites `target` and `MCU` in
 `firmware/.cargo/config.toml` to match. `firmware/sdkconfig.defaults` is hand-edited (for
-example drop the PSRAM settings on a part without it).
+example drop the PSRAM settings on a part without it). Alternate-chip builds are unverified here.
 
 ### Adding a component needs the esp-idf-sys build directory gone
 
@@ -98,10 +99,10 @@ rm -rf target/xtensa-esp32s3-espidf/release/build/esp-idf-sys-* \
 
 ### Do not let the flasher generate its own partition table
 
-Without `--partition-table`, `espflash flash <elf>` builds **its own single-partition
-table** and writes it into flash, overwriting the one `partitions.csv` defines. The boot
-log still looks normal, but `otadata`/`ota_0`/`ota_1` are gone. Flashing by hand, pass the
-table explicitly:
+Without `--partition-table`, `espflash flash <elf>` can replace the custom layout with
+its generated single-app table. A normal-looking boot log is not evidence that the
+`storage` partition has the expected offset and size. Flashing by hand, pass the table
+and app slot explicitly:
 
 ```powershell
 espflash flash --chip esp32s3 --port COM3 --baud 921600 --flash-size 16mb `
@@ -112,13 +113,14 @@ espflash flash --chip esp32s3 --port COM3 --baud 921600 --flash-size 16mb `
 The path is `<clone>\target\…` because that is where the build script keeps it; with
 `-TargetDir` (`--target-dir`) elsewhere, use that directory instead.
 
-The scripts themselves run `espflash flash --monitor <elf>` and add `--port` when you give
-one, so read the flash log rather than assuming: if you passed `-Flash` / `--flash` and the
-seven entries do not appear, flash again with the explicit command above.
+The scripts select the ELF from the requested release/debug profile and pass
+`--partition-table` and `--target-app-partition factory` themselves. A failed build,
+missing ELF/table or failed flash is an error; they do not fall back to an older image.
 
-After flashing, check the serial output: the bootloader's `Partition Table:` must list
-seven entries (`nvs`, `otadata`, `phy_init`, `factory`, `ota_0`, `ota_1`, `storage`), and
-the firmware itself prints the real table again through `esp_partition_find`.
+After an authorized flash, check the serial output: the bootloader's `Partition Table:`
+must list **four** entries (`nvs`, `phy_init`, `factory`, `storage`), and the firmware
+prints the real table again through `esp_partition_find`. This is a verification procedure,
+not a claim that the audit firmware has been flashed.
 
 ### On Windows, build from a short path
 
@@ -149,16 +151,16 @@ instead of re-deriving the fix:
 
 | Name | Type | Offset | Size |
 |---|---|---|---|
-| `nvs` | data/nvs | 0x9000 | 24 KB |
-| `otadata` | data/ota | 0xF000 | 8 KB |
-| `phy_init` | data/phy | 0x11000 | 4 KB |
-| `factory` | app | 0x20000 | 3 MB |
-| `ota_0` | app | 0x320000 | 3 MB |
-| `ota_1` | app | 0x620000 | 3 MB |
-| `storage` | data/littlefs | 0x410000 | 11.94 MB |
+| `nvs` | data/nvs | 0x9000 | 0x6000 = 24 KiB |
+| `phy_init` | data/phy | 0xf000 | 0x1000 = 4 KiB |
+| `factory` | app/factory | 0x10000 | 0x400000 = 4 MiB |
+| `storage` | data/spiffs | 0x410000 | 0xbf0000 = 12,517,376 bytes = 11.9375 MiB |
 
-OTA is not implemented yet, but the slots are reserved. `storage` is held for future
-static web assets and fonts.
+There is no `otadata`, `ota_0` or `ota_1`, and no OTA implementation. The CSV subtype is
+`spiffs`, but the runtime mounts **LittleFS**, not SPIFFS, on `storage`. Transcript and
+workspace files live there; configuration and secrets remain in NVS. The console's web
+assets are embedded in the firmware. See [storage guarantees](storage.md) for physical
+keys, migration and the mount-formatting policy.
 
 ## 4. First power-up: provisioning over the access point
 
@@ -217,18 +219,22 @@ Two details decide whether it works on a given bench:
 
 ## 6. Optional: console PIN and MCP token
 
+`POST /api/config` with this JSON body:
+
 ```json
-POST /api/config
-{ "auth": { "portal_pin": "1234", "mcp_token": "<long random string>" } }
+{ "auth": { "portal_pin": "<your portal PIN>", "mcp_token": "<long random string>" } }
 ```
 
-- `portal_pin`: write operations then require `X-Portal-Pin`.
-- `mcp_token`: the MCP endpoint then requires `Authorization: Bearer …`.
+- `portal_pin`: REST writes and selected sensitive reads require `X-Portal-Pin` or a
+  portal bearer credential. The exact read coverage is in [security](security.md).
+- `mcp_token`: MCP POST/DELETE use `Authorization: Bearer …` when this token is set;
+  otherwise they fall back to the portal credential. With both empty, MCP is open.
 
 ## 7. Recovery
 
 - Lost the PIN: if the console is out of reach, erase the NVS partition over serial:
-  `python -m esptool -p COM3 erase-region 0x9000 0x6000`
+  `python -m esptool -p COM3 erase-region 0x9000 0x6000`. This also clears WiFi/model
+  configuration and secrets; it does not erase the LittleFS transcript/workspace.
 - Full factory reset: `python -m esptool -p COM3 erase-flash`, then flash again.
 
 ## 8. Common build problems
@@ -239,4 +245,4 @@ POST /api/config
 | `error: linker 'ldproxy' not found` | same; the linker name in `.cargo/config.toml` must match what is installed |
 | missing `riscv`/`xtensa` target | after `espup install` you need `source export-esp.sh/.ps1`, or build with `cargo +esp build` |
 | `esp-idf-sys` download fails | point `IDF_PATH` at a local ESP-IDF, or retry behind a mirror |
-| Builds, but panics on boot | check that the PSRAM settings in `sdkconfig.defaults` match the board (only N16R8 has octal PSRAM) and that the build used that file at all |
+| Builds, but panics on boot | check that the PSRAM settings in `sdkconfig.defaults` match the module (the bench N16R8 uses octal PSRAM) and that the build used that file at all |

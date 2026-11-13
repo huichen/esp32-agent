@@ -12,13 +12,7 @@
 #
 # Flags mirror the .ps1 parameters: --mcpu, --target, --flash, --port, --debug
 # (the .ps1 defaults to -Release; -Release:$false is --debug here), --target-dir.
-set -
-
-# Which commit this image came from, and when, so "did the flash take" is a string
-# comparison in /api/status rather than a guess.
-ESP32_AGENT_COMMIT="$(git -C "$repo" rev-parse --short HEAD 2>/dev/null || echo unknown)"
-ESP32_AGENT_BUILT_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-export ESP32_AGENT_COMMIT ESP32_AGENT_BUILT_ATu
+set -euo pipefail
 
 mcpu=esp32s3
 target=xtensa-esp32s3-espidf
@@ -27,14 +21,21 @@ port=''
 release=1
 target_dir=''
 
+value_required() {
+  if [ "$#" -lt 2 ] || [ -z "$2" ] || [[ "$2" == --* ]]; then
+    echo "$1 requires a value" >&2
+    exit 2
+  fi
+}
+
 while [ $# -gt 0 ]; do
   case $1 in
-    --mcpu) mcpu=$2; shift 2 ;;
-    --target) target=$2; shift 2 ;;
+    --mcpu) value_required "$@"; mcpu=$2; shift 2 ;;
+    --target) value_required "$@"; target=$2; shift 2 ;;
     --flash) flash=1; shift ;;
-    --port) port=$2; shift 2 ;;
+    --port) value_required "$@"; port=$2; shift 2 ;;
     --debug) release=0; shift ;;
-    --target-dir) target_dir=$2; shift 2 ;;
+    --target-dir) value_required "$@"; target_dir=$2; shift 2 ;;
     -h|--help)
       awk 'NR > 1 && !/^#/ { exit } NR > 1 { sub(/^# ?/, ""); print }' "$0"
       exit 0 ;;
@@ -45,6 +46,11 @@ done
 repo=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 fw="$repo/firmware"
 
+# Resolve the repository before stamping metadata, and export both fields.
+ESP32_AGENT_COMMIT="$(git -C "$repo" rev-parse --short HEAD 2>/dev/null || echo unknown)"
+ESP32_AGENT_BUILT_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+export ESP32_AGENT_COMMIT ESP32_AGENT_BUILT_AT
+
 need() {
   if ! command -v "$1" > /dev/null 2>&1; then
     echo "missing \`$1\` — $2" >&2
@@ -53,7 +59,8 @@ need() {
 }
 
 need cargo 'install Rust: https://rustup.rs'
-if ! rustup toolchain list | grep -q esp; then
+need rustup 'install Rust: https://rustup.rs'
+if ! rustup toolchain list | grep -q '^esp\([[:space:]]\|$\)'; then
   echo 'missing the esp toolchain — run: cargo install espup; espup install' >&2
   exit 1
 fi
@@ -112,10 +119,12 @@ case $wrapped in
     echo "warning: cargo is configured with rustc-wrapper = $wrapped; esp-idf-sys fails with 'os error 206' because its command line is too long. Remove the [build] rustc-wrapper line from the cargo config for this build." >&2 ;;
 esac
 
-if [ -z "${CARGO_TARGET_DIR:-}" ]; then
-  if [ -n "$target_dir" ]; then CARGO_TARGET_DIR="$target_dir"; else CARGO_TARGET_DIR="$repo/target"; fi
-  export CARGO_TARGET_DIR
+if [ -n "$target_dir" ]; then
+  CARGO_TARGET_DIR="$target_dir"
+elif [ -z "${CARGO_TARGET_DIR:-}" ]; then
+  CARGO_TARGET_DIR="$repo/target"
 fi
+export CARGO_TARGET_DIR
 
 # esp-idf-sys refuses an output directory over 88 characters on Windows; the
 # warning is cheap and saves an afternoon on a deep clone.
@@ -124,20 +133,26 @@ if [ "${#out_probe}" -gt 84 ]; then
   echo "warning: the output path is ${#out_probe} characters; esp-idf-sys refuses more than 88 — pass --target-dir with a shorter path" >&2
 fi
 
-profile='--release'
-if [ "$release" -eq 0 ]; then profile=''; fi
-echo "cargo +esp build $profile --target $target (MCU=$mcpu, target-dir=$CARGO_TARGET_DIR)"
-# shellcheck disable=SC2086
-cargo +esp build $profile --target "$target" || { echo 'firmware build failed' >&2; exit 1; }
+build_args=(+esp build --target "$target")
+profile_name=release
+if [ "$release" -eq 1 ]; then
+  build_args+=(--release)
+else
+  profile_name=debug
+fi
+echo "cargo ${build_args[*]} (MCU=$mcpu, target-dir=$CARGO_TARGET_DIR)"
+cargo "${build_args[@]}" || { echo 'firmware build failed' >&2; exit 1; }
 
 if [ "$flash" -eq 1 ]; then
   need espflash 'cargo install espflash'
-  bin="$CARGO_TARGET_DIR/$target/release/esp32-agent"
-  if [ ! -f "$bin" ]; then bin="$CARGO_TARGET_DIR/$target/debug/esp32-agent"; fi
-  set -- flash --monitor "$bin"
-  if [ -n "$port" ]; then set -- "$@" --port "$port"; fi
-  echo "espflash $*"
-  espflash "$@"
+  bin="$CARGO_TARGET_DIR/$target/$profile_name/esp32-agent"
+  if [ ! -f "$bin" ]; then echo "built firmware not found: $bin" >&2; exit 1; fi
+  table="$fw/partitions.csv"
+  if [ ! -f "$table" ]; then echo "partition table not found: $table" >&2; exit 1; fi
+  flash_args=(flash --monitor "$bin" --partition-table "$table" --target-app-partition factory)
+  if [ -n "$port" ]; then flash_args+=(--port "$port"); fi
+  echo "espflash ${flash_args[*]}"
+  espflash "${flash_args[@]}" || { echo 'firmware flash failed' >&2; exit 1; }
 else
   echo 'build ok — flash with: bash scripts/build-firmware.sh --flash --port /dev/ttyACM0'
 fi
