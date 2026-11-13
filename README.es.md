@@ -97,7 +97,7 @@ instrucción sirve para cada placa que pueda alcanzar. Sin ninguna clave, `base_
 
 | Parte | Estado |
 |---|---|
-| `agent-core` | 829 pruebas unitarias y 5 de integración pasan; `scripts/smoke.ps1` pasa de extremo a extremo |
+| `agent-core` | 831 pruebas unitarias y 5 de integración pasan; `scripts/smoke.ps1` pasa de extremo a extremo |
 | Simulador | la consola, MCP y el bucle de agente funcionan de extremo a extremo |
 | Firmware | firmware histórico del banco en una ESP32-S3-DevKitC-1 N16R8 (IDF v5.5.2): 42 herramientas, OLED 128×32, micrófono y amplificador I²S, WS2812, consola TLS, turnos del modelo por HTTPS; cambios de la auditoría no verificados en la placa |
 | No implementado / no verificado | OTA y captura DVP del firmware no implementados. Los drivers SD de sectores sin procesar y DHT11/22 tienen pruebas en el host, no verificación en la placa. Ver `ROADMAP.md` |
