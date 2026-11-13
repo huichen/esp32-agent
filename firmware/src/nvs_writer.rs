@@ -84,7 +84,8 @@ pub fn start(shared: Shared, log: Arc<LogBuf>) -> Result<(), String> {
 /// Used by the reboot path, where waiting for the writer's next 100 ms tick would be a coin
 /// flip: `esp_restart` does not wait for it. The check is the same one the writer makes —
 /// this is a `spi_flash` window, so the stack has to be in internal RAM — and an unsafe
-/// answer refuses instead of rebooting the board.
+/// answer refuses instead of rebooting the board. The final batch deliberately holds the
+/// app lock; `false` also reports backend refusals, not only an unsafe calling stack.
 pub fn flush_now(shared: &Shared, log: &LogBuf, who: &str) -> bool {
     if !on_internal_stack() {
         log.warn(
@@ -95,8 +96,7 @@ pub fn flush_now(shared: &Shared, log: &LogBuf, who: &str) -> bool {
         );
         return false;
     }
-    with_app_mut(shared, |app| app.flush_store(who));
-    true
+    with_app_mut(shared, |app| app.flush_store(who).failed == 0)
 }
 
 /// Is the calling task's stack in internal RAM?
@@ -142,21 +142,20 @@ fn run(shared: Shared, log: Arc<LogBuf>) {
         }
     }
 
+    let queue = with_app_mut(&shared, |app| app.store_queue());
     let mut reported = false;
     loop {
         unsafe { sys::vTaskDelay(PERIOD_MS) };
-        let (written_now, total) = with_app_mut(&shared, |app| {
-            // `flush_store` is where a refusal becomes one `log.error` line per key — key,
-            // operation, the store's `esp_err_t` and its name — because this task is the
-            // one that runs it. `/api/status.store.last_failure` carries the newest one.
-            let report = app.flush_store(NAME);
-            (report.written, app.store_queue().written())
-        });
+        // Flash I/O stays on this checked internal-RAM stack, but not under the app lock.
+        // The helper reacquires that lock only to acknowledge finished generations and
+        // log each refusal; queue/backend callers may still wait for the drain itself.
+        let written_now = App::flush_shared_store(&shared, NAME).written;
         // One line after the first real write, saying how much of the stack it took: the
         // number a later change to this file has to beat is a measurement, not a guess.
         if written_now > 0 && !reported {
             reported = true;
             let head_room = unsafe { sys::uxTaskGetStackHighWaterMark(ptr::null_mut()) } as usize;
+            let total = queue.written();
             log.info(
                 "store",
                 format!(

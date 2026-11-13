@@ -567,9 +567,9 @@ impl App {
 
     /// The queue handle a platform's writer task drains.
     ///
-    /// Handing it out is the whole mechanism: the writer keeps this and calls
-    /// [`App::flush_store`] under the app lock, and nothing else in the firmware touches
-    /// NVS after boot.
+    /// Platforms use [`App::flush_shared_store`] to drain outside the app mutex and then
+    /// acknowledge completed workspace generations under it. A reboot path may deliberately
+    /// use [`App::flush_store`] while holding that mutex for its final batch.
     pub fn store_queue(&self) -> store::StoreQueue {
         self.store_queue.clone()
     }
@@ -614,6 +614,17 @@ impl App {
     pub fn flush_store(&mut self, who: &str) -> store::FlushReport {
         let report = self.store_queue.flush();
         self.acknowledge_store_flush(who, &report);
+        report
+    }
+
+    /// Drain outside the app mutex, then settle receipts and log under a short app lock.
+    /// Queue/backend access can still block during I/O; this is not a lock-free store.
+    /// The same internal-stack-only precondition as `flush_store` applies, and the platform
+    /// must check the calling task before using this helper.
+    pub fn flush_shared_store(shared: &Shared, who: &str) -> store::FlushReport {
+        let queue = app_lock(shared).store_queue();
+        let report = queue.flush();
+        app_lock(shared).acknowledge_store_flush(who, &report);
         report
     }
 
@@ -2803,18 +2814,32 @@ impl App {
         if let Some(free) = self.psram_free_bytes() {
             workspace_fits(&self.workspace, Some(free))?;
         }
-        let before = self.workspace.clone();
+        let prior_receipt = self.workspace_pending.as_ref().map(|save| save.receipt.clone());
+        let mut before = self.workspace.clone();
         let outcome = match change(&mut self.workspace) {
             Ok(outcome) => outcome,
             Err(e) => {
                 self.workspace = before;
+                self.acknowledge_workspace();
                 return Err(e);
             }
         };
         match self.persist_workspace() {
             Ok(()) => Ok(outcome),
             Err(e) => {
+                // The old writer may have completed after the rollback clone, and
+                // persist_workspace may already have settled that receipt before refusing
+                // this new admission. Undo file edits, not that durability acknowledgement
+                // (or hash invalidation): otherwise a later revert can skip a required write.
+                if self.workspace_pending.is_none()
+                    && prior_receipt.as_ref().is_some_and(|receipt| {
+                        matches!(receipt.outcome(), Some(store::PublicationOutcome::Finished { .. }))
+                    })
+                {
+                    before.saved = std::mem::take(&mut self.workspace.saved);
+                }
                 self.workspace = before;
+                self.acknowledge_workspace();
                 Err(format!(
                     "{e}. The change was dropped, so `read` shows the file as it was before this call"
                 ))
@@ -11729,6 +11754,181 @@ mod tests {
         }
         fn last_error(&self) -> Option<store::StoreError> {
             self.last_error.clone()
+        }
+    }
+
+    #[test]
+    fn a_shared_store_flush_releases_the_app_lock_and_acknowledges_only_finished_generations() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::mpsc;
+        use std::time::{Duration, Instant};
+
+        struct SlowStore {
+            inner: WorkspaceWriteStore,
+            key: String,
+            pause: Arc<AtomicBool>,
+            entered: mpsc::Sender<()>,
+            resume: mpsc::Receiver<()>,
+        }
+        impl KvStore for SlowStore {
+            fn get(&self, key: &str) -> Option<String> {
+                self.inner.get(key)
+            }
+            fn set(&mut self, key: &str, value: &str) -> bool {
+                if key == self.key && self.pause.swap(false, Ordering::AcqRel) {
+                    self.entered.send(()).unwrap();
+                    self.resume.recv_timeout(Duration::from_secs(10)).expect("release blocked store");
+                }
+                self.inner.set(key, value)
+            }
+            fn remove(&mut self, key: &str) -> bool {
+                self.inner.remove(key)
+            }
+            fn keys(&self) -> Vec<String> {
+                self.inner.keys()
+            }
+            fn whole_value_bytes(&self) -> Option<usize> {
+                self.inner.whole_value_bytes()
+            }
+            fn last_error(&self) -> Option<store::StoreError> {
+                self.inner.last_error()
+            }
+        }
+
+        for (refused, admission_refused) in [(false, false), (true, false), (false, true), (true, true)] {
+            let backend = WorkspaceWriteStore::new();
+            let pause = Arc::new(AtomicBool::new(false));
+            let (entered_tx, entered_rx) = mpsc::channel();
+            let (resume_tx, resume_rx) = mpsc::channel();
+            let key = crate::keys::workspace_file("/a");
+            let slow = SlowStore {
+                inner: backend.clone(),
+                key: key.clone(),
+                pause: pause.clone(),
+                entered: entered_tx,
+                resume: resume_rx,
+            };
+            let mut app =
+                App::new(Box::new(VirtualBoard::new()), Box::new(slow), LogBuf::new(128), FwMeta::default());
+            app.workspace_edit(|ws| fs_tools::Workspace::write(ws, "/a", "durable")).unwrap();
+            drain_store(&mut app);
+            app.workspace_edit(|ws| fs_tools::Workspace::write(ws, "/a", "first generation")).unwrap();
+            let first = app.workspace_pending.as_ref().unwrap().receipt.clone();
+            if refused {
+                *backend.refuse.lock().unwrap() = Some(if admission_refused {
+                    crate::keys::WORKSPACE_INDEX.to_string()
+                } else {
+                    key.clone()
+                });
+            }
+            pause.store(true, Ordering::Release);
+            let shared: Shared = Arc::new(Mutex::new(app));
+            let writer = std::thread::spawn({
+                let shared = shared.clone();
+                move || App::flush_shared_store(&shared, "slow-test-writer")
+            });
+            if let Err(error) = entered_rx.recv_timeout(Duration::from_secs(10)) {
+                let _ = resume_tx.send(());
+                let _ = writer.join();
+                panic!("the writer never entered the blocked store: {error}");
+            }
+            let mut guard = match shared.try_lock() {
+                Ok(guard) => guard,
+                Err(error) => {
+                    let _ = resume_tx.send(());
+                    let _ = writer.join();
+                    panic!("the writer held the app lock during blocked backend I/O: {error}");
+                }
+            };
+            assert_eq!(guard.workspace.saved.get("/a"), Some(&crate::keys::fnv1a("durable")));
+            assert_eq!(fs_tools::Workspace::read(&guard.workspace, "/a").unwrap(), "first generation");
+            assert!(first.outcome().is_none(), "the blocked save is not durable yet");
+            // RAM-only work can proceed while flash is blocked, including error rollback.
+            let error = guard
+                .workspace_edit::<()>(|ws| {
+                    fs_tools::Workspace::write(ws, "/a", "partial")?;
+                    fs_tools::Workspace::write(ws, "/scratch", "partial")?;
+                    Err("partial edit refused".to_string())
+                })
+                .unwrap_err();
+            assert_eq!(error, "partial edit refused");
+            assert_eq!(fs_tools::Workspace::read(&guard.workspace, "/a").unwrap(), "first generation");
+            assert!(fs_tools::Workspace::read(&guard.workspace, "/scratch").is_err());
+
+            // Keep the app lock so the older writer cannot do app bookkeeping yet. Wait on
+            // the generation's receipt, not elapsed time, for the backend drain to finish.
+            let finish_first = || {
+                resume_tx.send(()).unwrap();
+                let deadline = Instant::now() + Duration::from_secs(10);
+                while first.outcome().is_none() {
+                    assert!(Instant::now() < deadline, "the released backend did not finish its publication");
+                    std::thread::yield_now();
+                }
+                assert_eq!(
+                    first.outcome(),
+                    Some(store::PublicationOutcome::Finished {
+                        published: !refused,
+                        cleanup_failed: Vec::new()
+                    })
+                );
+            };
+            let first_saved = (!refused).then(|| crate::keys::fnv1a("first generation"));
+            let next = if admission_refused {
+                let mut budget = store::QueuedStore::new(guard.store_queue());
+                let error = guard
+                    .workspace_edit(|ws| {
+                        fs_tools::Workspace::write(ws, "/a", "second generation")?;
+                        // Complete the old publication after the rollback clone, then refuse
+                        // the new admission. Restoring RAM must retain that completed outcome.
+                        finish_first();
+                        assert!(budget.set("budget", &"x".repeat(store::PENDING_BYTES_MAX - 256)));
+                        Ok(())
+                    })
+                    .unwrap_err();
+                assert!(error.contains("STORE_QUEUE_FULL"), "{error}");
+                assert_eq!(fs_tools::Workspace::read(&guard.workspace, "/a").unwrap(), "first generation");
+                assert_eq!(
+                    guard.workspace.saved.get("/a").copied(),
+                    first_saved,
+                    "rollback lost a completed publication outcome"
+                );
+                assert!(budget.remove("budget"));
+                "durable" // A revert must rewrite any value replaced before the failed index.
+            } else {
+                finish_first();
+                "second generation"
+            };
+            *backend.refuse.lock().unwrap() = None;
+            guard.workspace_edit(|ws| fs_tools::Workspace::write(ws, "/a", next)).unwrap();
+            let second = guard.workspace_pending.as_ref().unwrap().receipt.clone();
+            assert_eq!(guard.workspace.saved.get("/a").copied(), first_saved);
+            assert!(second.outcome().is_none());
+            drop(guard);
+
+            let report = writer.join().expect("writer completes after the app lock is released");
+            assert_eq!(
+                report.failed,
+                if refused {
+                    if admission_refused {
+                        1
+                    } else {
+                        2
+                    }
+                } else {
+                    0
+                }
+            );
+            let guard = app_lock(&shared);
+            assert_eq!(guard.workspace.saved.get("/a").copied(), first_saved);
+            assert!(second.outcome().is_none(), "the old report cannot acknowledge a newer queued save");
+            assert_eq!(
+                backend.inner.get(&key).as_deref(),
+                Some(if refused && !admission_refused { "durable" } else { "first generation" })
+            );
+            drop(guard);
+            assert_eq!(App::flush_shared_store(&shared, "next-test-writer").failed, 0);
+            assert_eq!(backend.inner.get(&key).as_deref(), Some(next));
+            assert_eq!(app_lock(&shared).workspace.saved.get("/a"), Some(&crate::keys::fnv1a(next)));
         }
     }
 
