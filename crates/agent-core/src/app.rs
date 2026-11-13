@@ -4512,14 +4512,29 @@ impl App {
             Ok(v) => v,
             Err(e) => return Response::error_json(400, &format!("invalid JSON: {e}")),
         };
-        if let Some(mode) = body.get("mode").and_then(|m| m.as_str()) {
-            if matches!(mode, "auto" | "all" | "generic") {
-                self.cfg.mcp.tools_mode = mode.to_string();
-            }
+        if !body.is_object() {
+            return Response::error_json(400, "tool selection must be an object");
         }
-        if let Some(disabled) = body.get("disabled").and_then(|d| d.as_array()) {
-            self.cfg.mcp.disabled_tools =
-                disabled.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect();
+        let mode = match body.get("mode") {
+            None => None,
+            Some(Value::String(mode)) if matches!(mode.as_str(), "auto" | "all" | "generic") => {
+                Some(mode.clone())
+            }
+            Some(_) => return Response::error_json(400, "mode must be auto, generic or all"),
+        };
+        let disabled = match body.get("disabled") {
+            None => None,
+            Some(Value::Array(names)) if names.iter().all(Value::is_string) => {
+                Some(names.iter().filter_map(Value::as_str).map(str::to_string).collect())
+            }
+            Some(_) => return Response::error_json(400, "disabled must be an array of tool-name strings"),
+        };
+        // Validate the complete selection before changing either field.
+        if let Some(mode) = mode {
+            self.cfg.mcp.tools_mode = mode;
+        }
+        if let Some(disabled) = disabled {
+            self.cfg.mcp.disabled_tools = disabled;
         }
         self.runtime.config_dirty = true;
         self.persist_config();
@@ -13944,6 +13959,21 @@ mod tests {
             .unwrap_err();
         assert!(err.message.contains("auto, generic or all"), "{err:?}");
         assert_eq!(app.cfg.mcp.tools_mode, "auto", "the value changed anyway");
+        let before = app.cfg.clone();
+        for body in [
+            json!(null),
+            json!([]),
+            json!(42),
+            json!("settings"),
+            json!({"mode": "generik"}),
+            json!({"mode": 12}),
+            json!({"mode": "generic", "disabled": "oops"}),
+            json!({"mode": "generic", "disabled": ["gpio_write", 3]}),
+        ] {
+            let response = app.route(&post("/api/tools", &body.to_string()));
+            assert_eq!(response.status, 400, "accepted malformed selection: {body}");
+            assert_eq!(app.cfg, before, "partially applied malformed selection: {body}");
+        }
     }
 
     /// The devkit's own peripherals are opt-out: a board that wants the smallest possible

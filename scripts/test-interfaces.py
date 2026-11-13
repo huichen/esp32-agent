@@ -567,7 +567,7 @@ def discovery(rec, sim, fake):
     http_case(rec, sim, "wrong-api-method", "PATCH", "/api/config", {}, 404)
     rec.equal("captive-redirect", sim.request("GET", "/generate_204").headers.get("location"), "/")
     http_case(rec, sim, "favicon", "GET", "/favicon.ico", status=204)
-    for path in ["/api/config", "/api/manifest", "/api/agent/config", "/api/script", "/api/sched", "/api/wifi/connect"]:
+    for path in ["/api/config", "/api/tools", "/api/manifest", "/api/agent/config", "/api/script", "/api/sched", "/api/wifi/connect"]:
         http_case(rec, sim, "invalid-json:" + path, "POST", path, b"{", 400)
     reply = sim.request("OPTIONS", "/mcp", headers={"Origin": "http://fixture.invalid"})
     rec.equal("cors-preflight", reply.status, 204)
@@ -575,6 +575,12 @@ def discovery(rec, sim, fake):
     rec.check("cors-auth-headers", "X-Portal-Pin" in reply.headers.get("access-control-allow-headers", ""))
     rec.equal("PUT-config-alias", sim.request("PUT", "/api/config", {"device_name": "put-audit"}).status, 200)
     rec.equal("PUT-manifest-alias", sim.request("PUT", "/api/manifest", {"manifest": {}}).status, 200)
+    before = sim.get("/api/config")
+    for i, value in enumerate([None, [], 42, "settings", {"mode": "generik"}, {"mode": 12},
+                               {"mode": "generic", "disabled": "oops"},
+                               {"mode": "generic", "disabled": ["gpio_write", 3]}]):
+        rec.equal("tool-selection-invalid:" + str(i), sim.request("POST", "/api/tools", value).status, 400)
+        rec.equal("tool-selection-atomic:" + str(i), sim.get("/api/config"), before)
     rec.note("The GET/POST map is exercised, not treated as a completeness oracle; media and SSE are in their own areas. Captive paths intentionally redirect.")
 
 
