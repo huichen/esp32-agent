@@ -511,6 +511,7 @@ fn tick(
         for source in app.sched_tick(now, minute) {
             log.info("agent", format!("scheduler queued {source}"));
         }
+        app.run_next_script();
 
         // Thread stacks come from internal RAM, and the heap figure the portal shows
         // counts PSRAM. A board that cannot spawn an HTTP connection thread reports
