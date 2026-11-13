@@ -1,6 +1,6 @@
 # esp32-agent
 
-**简体中文** · [English](README.md) · [Français](README.fr.md) · [Español](README.es.md) · [Русский](README.ru.md) · [العربية](README.ar.md)
+[English](README.md) · **简体中文** · [Français](README.fr.md) · [Español](README.es.md) · [Русский](README.ru.md) · [العربية](README.ar.md) · [日本語](README.ja.md) · [한국어](README.ko.md)
 
 运行自身智能体循环并提供 MCP 端点的 ESP32 固件，因此一个模型可以直接驱动这块板，任何
 外部智能体也能通过 HTTP 使用同一批工具。

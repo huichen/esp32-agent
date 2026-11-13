@@ -1,6 +1,6 @@
 # esp32-agent
 
-**Русский** · [English](README.md) · [简体中文](README.zh.md) · [Français](README.fr.md) · [Español](README.es.md) · [العربية](README.ar.md)
+[English](README.md) · [简体中文](README.zh.md) · [Français](README.fr.md) · [Español](README.es.md) · **Русский** · [العربية](README.ar.md) · [日本語](README.ja.md) · [한국어](README.ko.md)
 
 Прошивка для ESP32, которая выполняет собственный цикл агента и отдаёт эндпоинт MCP, так что
 одна модель может управлять платой напрямую, а любой внешний агент — пользоваться теми же
