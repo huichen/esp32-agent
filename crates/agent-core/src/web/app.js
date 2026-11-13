@@ -1227,7 +1227,7 @@ async function loadStatus() {
     // in flight. It used to be set only by the SSE stream, which this page deliberately does
     // not open while idle — so a freshly loaded portal sat grey until the first turn, and a
     // grey dot next to a working board reads as a fault.
-    setLink(d.agent && d.agent.pending ? "busy" : "live");
+    setLink(d.agent && (d.agent.pending || d.agent.run_active) ? "busy" : "live");
   } catch (e) {
     if (!String(e.message).includes("PIN")) {
       $("#sub").textContent = "offline";

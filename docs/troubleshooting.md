@@ -106,8 +106,10 @@ whether a certificate exists and why not.
   kilobyte for the memory.
 - `could not spawn tls thread` in the log, `ERR_CONNECTION_RESET` in the browser: a thread
   per TLS connection needs its stack *before* the handshake starts, and a browser opens six
-  sockets for one page. The listener now does the handshake inline on its one thread, and
-  only streaming responses get a thread.
+  sockets for one page. The current server preallocates reusable 16 KiB workers shared by
+  ordinary requests, handshakes and streams; it does not create a pthread per request.
+  The intermediate bounded per-request design still hit `pthread: Failed to create task`
+  during sustained board churn, so a concurrency counter alone is not a memory reservation.
 - `agent thread did not start: Not enough space` at boot: the TLS listener was given its own
   thread. It now shares the plaintext accept thread; adding a second one costs the agent,
   which costs the whole board.
@@ -128,11 +130,11 @@ whether a certificate exists and why not.
   numbers ("8 kB of internal heap, 6 kB largest block") as the reason it lowered
   `SPIRAM_MALLOC_ALWAYSINTERNAL`; see [how much memory the board has](#how-much-memory-the-board-has)
   for the later historical figures and how to read them.
-- The connection is served one at a time: a page that opens six sockets loads, just not in
-  parallel. If a page seems to hang, check whether an event stream (`/api/agent/stream`) is
-  open — event streams have their own threads, while `/audio/pcm` and `/av` uploads
-  occupy the ordinary accept thread. Read the log rather than assuming any long request
-  is a deadlock.
+- A long tool no longer occupies the accept thread: bounded workers execute requests,
+  and plaintext status/cancel has one reserved worker. `GET /api/status` may report
+  `stale: true` and increasing `age_ms` while App is busy; that is old hardware data,
+  not a frozen uptime. Other reads (history/files/logs) still need App and can wait.
+  See [concurrency](concurrency.md); do not infer a deadlock from one blocked request.
 
 ## Applying a manifest fails
 
@@ -154,11 +156,12 @@ Three things produce the same symptom — a browser showing nothing — and the 
 tells them apart:
 
 - `***ERROR*** A stack overflow in task pthread` → a handler outgrew its stack. `/api/tools`
-  serialising every tool descriptor is the heavy one; the accept thread runs with 16 kB for
-  that reason.
+  serialising every tool descriptor is a heavy handler; request workers use 16 KiB,
+  rather than putting handlers or full status construction on a 6 KiB store-writer stack.
 - `could not spawn connection thread` → a task's required capability pool lacks a
-  **contiguous** stack block. Ordinary requests no longer create a thread each; event
-  response threads use 6 KiB on the board. Read `memory.largest_internal_kb` in
+  **contiguous** stack block. The current server allocates its four reusable 16 KiB
+  worker stacks at startup, not per ready request; streams reuse them. Idle keep-alive
+  sockets do not occupy a worker (the pool's stack reservation still exists). Read `memory.largest_internal_kb` in
   `/api/status` and the boot `mem:` lines. PSRAM stacks are possible only on execution
   paths safe when the flash cache is off; they are not a universal workaround.
 - Connections reset with no log line at all → the socket pool. Every closed connection sits

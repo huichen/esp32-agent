@@ -5,11 +5,12 @@ through `config.mcp.port`).
 
 Port **443** serves the same routes over TLS, with a certificate the board generated for
 itself on first boot (EC P-256, stored in NVS, fingerprint at `GET /api/tls`). Both ports
-share **one accept thread**, so a TLS client is served while plaintext clients wait in the
-listen backlog for the duration of one request. This avoids an internal-RAM stack per
-ordinary connection; earlier bench firmware failed to spawn those threads and browsers
-saw `ERR_CONNECTION_RESET`. That historical failure is not the current free-heap budget.
-TLS connections are not kept alive.
+share **one accept thread** and bounded request workers. Parsing, handlers, TLS
+handshakes and stream bodies run on workers, not the listener. Three ordinary workers
+plus one reserved plaintext control worker reserve four 16 KiB stacks on ESP-IDF
+at startup and reuse them; requests do not create pthreads. Idle plaintext sockets
+occupy no worker. TLS connections are not kept alive.
+See [concurrency and lock ownership](concurrency.md) for pool limits and freshness.
 
 `/agent.json` reports the scheme that answered: fetched over https its `base_url` and the
 MCP `initialize` instructions both say `https://…:443`, not the plaintext port.
@@ -60,7 +61,7 @@ with no body. Batch arrays are handled as JSON-RPC batches.
 | `Mcp-Session-Id` (response) | Allocated on `initialize` or the first request; the client may reuse it |
 | `MCP-Protocol-Version` | The server version comes back in the `initialize` response |
 | `Authorization: Bearer <token>` | POST and DELETE require `auth.mcp_token` when configured (real Bearer scheme, otherwise 401); if unset, they use the portal credential gate |
-| `Connection: keep-alive` | Supported. An idle socket is parked (up to 8 of them) and dropped after 30 s; the next request on it is answered by the accept thread |
+| `Connection: keep-alive` | Supported. An idle socket is parked within the six-connection shared budget and dropped after 30 s; the next request runs on a bounded worker |
 | `Transfer-Encoding: chunked` | Supported (Node's fetch uses it) |
 | `Expect: 100-continue` | Answers 100 first, then reads the body |
 
@@ -119,6 +120,11 @@ is on that list, because neither is offered anywhere — see
 | GET | `/api/attachment/<name>` | The file attached to the last message, with its own mime type ([attachments](#5-attachments)) |
 | POST | `/api/auth` | `{pin}`, check the console PIN |
 
+`GET /healthz` returns public JSON health, device count and uptime. It and
+`GET /api/status` use a published snapshot without acquiring App. Responses include
+`snapshot`, `age_ms` and `stale`; hardware/counters may be old during a long tool,
+but uptime advances and `agent.run_active` is read from live control state.
+
 `/assets/app.js` and `/assets/style.css` are served separately from the console HTML.
 All three carry `Cache-Control: no-store` so old assets are not reused with new firmware.
 The console loads no external asset dependencies.
@@ -163,6 +169,11 @@ SSE/downloads, also accept a minted portal token as a URL-encoded `?token=` valu
 PIN is rejected there, and this parameter cannot authorize mutations. MCP uses its
 dedicated token, or the portal gate when that token is unset.
 
+The cancellation route uses a short-lived control lock, not App. Script execution
+and script/shell sleeps observe interruption at bounded checkpoints (sleep slices
+are 25 ms). Driver and network waits remain cooperative, not forcibly cancelled.
+Ending a turn clears the flag; cancellation is effective even with `tool_timeout_s: 0`.
+
 Model `timeout_s` is clamped to 5–180 seconds and passed at request time to Chat,
 Responses, Anthropic and `image_read`. The host transport uses one whole-request deadline;
 platform DNS resolution cannot necessarily be interrupted by it. This is not a measured
@@ -202,8 +213,9 @@ The MIME essence must be exactly `audio/pcm` (`415` otherwise; optional paramete
 allowed), not a string that merely starts with it. The portal credential is required
 when configured, and only 24000 Hz is wired, so `?rate=` accepts that value alone (`400`
 otherwise). Past 30 s the upload is refused rather than truncated: send the next piece as
-a second request. There is one speaker, so one upload at a time — a second waits in the
-listen backlog like any other request.
+a second request. There is one speaker, so writes to that device remain serialized. A second upload competes for App
+between chunks; ordinary workers are bounded and status/cancellation have a separate
+plaintext lane. This is not an asynchronous audio mixer.
 
 `POST /av` is the same route with a picture attached: the body is a sequence of
 `tag | u16le length | payload` records (`A` audio, `F` a 1-bpp frame, `E` end), consumed in

@@ -1,0 +1,225 @@
+#!/usr/bin/env python3
+"""Real-server concurrency regression; works with a simulator or the bench board.
+
+No credentials are read from files. --pin is optional for a configured portal.
+--agent temporarily points the model at the BOARD'S OWN selftest endpoint, keeps
+its key untouched, and restores the three public settings in finally. It adds one
+explicit test turn; it does not clear any history or change WiFi/manifest settings.
+"""
+import argparse
+import base64
+import concurrent.futures
+import json
+import statistics
+import time
+import urllib.request
+
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument('--host', default='http://192.168.3.7')
+    p.add_argument('--pin', default='')
+    p.add_argument('--soak', type=int, default=0)
+    p.add_argument('--agent', action='store_true')
+    p.add_argument('--soak-only', action='store_true')
+    p.add_argument('--max-ms', type=int, default=1000)
+    args = p.parse_args()
+    if args.soak_only and args.agent:
+        p.error('--soak-only cannot be combined with --agent')
+    host = args.host.rstrip('/')
+    latencies = []
+    handler_latencies = []
+    slowest_control = {}
+    checks = 0
+
+    def request(path, body=None, timeout=40, timing=False):
+        nonlocal checks
+        data = None if body is None else json.dumps(body).encode()
+        headers = {'Content-Type': 'application/json', 'Connection': 'close'}
+        if args.pin:
+            headers['X-Portal-Pin'] = args.pin
+        req = urllib.request.Request(host + path, data=data, headers=headers)
+        with urllib.request.urlopen(req, timeout=timeout) as response:
+            raw = response.read()
+            server_timing = response.headers.get('Server-Timing', '')
+        checks += 1
+        result = json.loads(raw)
+        if timing:
+            duration = server_timing.partition('handler;dur=')[2].split(',')[0].split(';')[0].strip()
+            assert duration.isdigit(), ('Missing handler timing', server_timing)
+            return result, int(duration)
+        return result
+
+    def control(path='/api/status'):
+        nonlocal slowest_control
+        start = time.monotonic()
+        result, handler_ms = request(path, timeout=args.max_ms / 1000 + 1, timing=True)
+        elapsed = (time.monotonic() - start) * 1000
+        latencies.append(elapsed)
+        handler_latencies.append(handler_ms)
+        if elapsed > slowest_control.get('client_ms', -1):
+            slowest_control = {'path': path, 'client_ms': round(elapsed,1),
+                               'handler_ms': handler_ms, 'snapshot_age_ms': result.get('age_ms')}
+        assert elapsed < args.max_ms, (path, elapsed)
+        assert result.get('snapshot') is True, result
+        return result
+
+    def tool(name, arguments):
+        response = request('/mcp', {'jsonrpc': '2.0', 'id': 9101,
+            'method': 'tools/call', 'params': {'name': name, 'arguments': arguments}})
+        assert 'error' not in response, response
+        result = response['result']
+        assert not result.get('isError'), result
+        return result.get('structuredContent', result)
+
+    initial = control()
+    firmware = initial['firmware']['commit']
+    # A just-published startup snapshot can precede recovery of a persisted turn.
+    # Give the runner an idle window before we add tools or change model settings.
+    idle_until = time.monotonic() + 5
+    while time.monotonic() < idle_until:
+        s = control()
+        assert not (s['agent'].get('run_active') or s['agent'].get('pending')), \
+            'Do not start the test over a live or queued user turn'
+        time.sleep(0.2)
+
+    initial_tasks = sorted(t['name'] for t in s['threads'])
+
+    def exercise(name, calls):
+        if args.soak_only:
+            return
+        before = len(latencies)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(calls)) as pool:
+            futures = [pool.submit(tool, tool_name, arguments) for tool_name, arguments in calls]
+            time.sleep(0.25)
+            while not all(f.done() for f in futures):
+                control('/api/status')
+                control('/healthz')
+                time.sleep(0.1)
+            for future in futures:
+                future.result()
+        assert len(latencies) > before, 'Tool did not stay in flight for the test'
+        print(name, 'control_reads=', len(latencies)-before,
+              'max_ms=', round(max(latencies[before:]), 1), flush=True)
+
+    exercise('shell-sleep', [('shell', {'command': 'sleep 5'})])
+    exercise('script-sleep-and-nested-tool', [('script', {'source':
+        'sleep(5000)\ntool("shell", {command: "echo concurrency"})'})])
+    exercise('two-serialized-tools', [('shell', {'command': 'sleep 4'}),
+        ('script', {'source': 'sleep(4000)\n1'})])
+    exercise('three-serialized-tools', [('script', {'source': 'sleep(2000)\n1'})] * 3)
+    if not args.soak_only:
+        clip = '_mutex_probe'
+        tool('clip_new', {'name': clip, 'kind': 'pcm', 'bytes': 48000, 'rate_hz': 24000})
+        try:
+            tool('clip_append', {'name': clip, 'data_b64': base64.b64encode(bytes(48000)).decode()})
+            exercise('silent-pcm-playback', [('clip_play', {'name': clip, 'loops': 5})])
+        finally:
+            tool('clip_drop', {'name': clip})
+
+    if args.agent:
+        cfg = request('/api/agent/config')
+        saved = {key: cfg[key] for key in ('base_url', 'model', 'protocol')}
+        own_turn = False
+        try:
+            # The existing key never leaves the board for a new host.
+            request('/api/agent/config', {'base_url': host + '/selftest/chat/completions',
+                'model': 'selftest', 'protocol': 'chat'})
+            own_turn = True
+            request('/api/agent/message', {'text': 'concurrency regression: run the scripted test'})
+            deadline = time.monotonic() + 35
+            while time.monotonic() < deadline:
+                s = control()
+                activity = s['agent'].get('active_tool') or {}
+                if s['agent'].get('run_active') and activity.get('owner') == 'agent' \
+                        and activity.get('name') == 'script':
+                    break
+                time.sleep(0.1)
+            else:
+                raise AssertionError('Agent never entered the long locked tool')
+            start = time.monotonic()
+            cancelled = request('/api/agent/cancel', {}, timeout=2)
+            accepted_ms = (time.monotonic()-start)*1000
+            assert cancelled.get('cancelling') is True, cancelled
+            while time.monotonic()-start < 3:
+                if not control()['agent'].get('run_active'):
+                    break
+                time.sleep(0.05)
+            else:
+                raise AssertionError('Cancelled script did not stop within 3 seconds')
+            stopped_ms = (time.monotonic()-start)*1000
+            history = request('/api/agent/history')
+            print('agent-interrupt accepted_ms=', round(accepted_ms,1),
+                  'stopped_ms=', round(stopped_ms,1), flush=True)
+            assert history, 'History remains available after interrupt'
+        finally:
+            # Never restore a real provider while our test is still queued/running.
+            # In particular, age_ms alone does not prove the Agent entered script.
+            if own_turn:
+                s = control()
+                if s['agent'].get('run_active'):
+                    request('/api/agent/cancel', {}, timeout=2)
+                end_cleanup = time.monotonic() + 70
+                idle_since = None
+                while time.monotonic() < end_cleanup:
+                    s = control()
+                    busy = s['agent'].get('run_active') or s['agent'].get('pending')
+                    idle_since = None if busy else (idle_since or time.monotonic())
+                    if idle_since and time.monotonic() - idle_since >= 3:
+                        break
+                    time.sleep(0.2)
+                else:
+                    raise AssertionError('Own test did not finish; do not restore a provider mid-turn')
+            request('/api/agent/config', saved)
+            restored = request('/api/agent/config')
+            assert all(restored[k] == v for k, v in saved.items()), 'Model settings were not restored'
+
+    end = time.monotonic() + args.soak
+    last = control()['uptime_s']
+    soak_calls = 0
+    soak_started = time.monotonic()
+    next_report = soak_started + 60
+    # Keep real tools in flight throughout the soak, rather than just idling.
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        future = None
+        while time.monotonic() < end:
+            if future is None or future.done():
+                if future is not None:
+                    future.result()
+                future = pool.submit(tool, 'script', {'source': 'sleep(2000)\n1'})
+                soak_calls += 1
+            s = control()
+            assert s['uptime_s'] >= last, 'Unexpected board reset'
+            assert s['firmware']['commit'] == firmware, 'Firmware changed during test'
+            assert s['agent']['thread'] == 'running', s['agent']
+            last = s['uptime_s']
+            control('/healthz')
+            if time.monotonic() >= next_report:
+                print('soak elapsed_s=', round(time.monotonic()-soak_started),
+                      'tool_calls=', soak_calls, 'control_reads=', len(latencies),
+                      'max_ms=', round(max(latencies),1), flush=True)
+                next_report += 60
+            time.sleep(1)
+        if future is not None:
+            future.result()
+    time.sleep(1)
+    final = control()
+    final_tasks = sorted(t['name'] for t in final['threads'])
+    if args.soak_only:
+        assert final_tasks == initial_tasks, ('Task set changed under request churn', initial_tasks, final_tasks)
+    samples = sorted(latencies)
+    print(json.dumps({'firmware': firmware, 'checks': checks, 'control_reads': len(samples),
+        'median_ms': round(statistics.median(samples),1),
+        'p95_ms': round(samples[int((len(samples)-1)*0.95)],1),
+        'max_ms': round(max(samples),1), 'handler_max_ms': max(handler_latencies),
+        'slowest_control': slowest_control, 'uptime_s': final['uptime_s'],
+        'soak_s': args.soak, 'soak_tool_calls': soak_calls,
+        'task_set_stable': final_tasks == initial_tasks, 'task_count': len(final_tasks),
+        'memory': {p['pool']: {k: p[k] for k in ('free_kb', 'largest_kb', 'min_free_kb')}
+                   for p in final['memory']['pools']},
+        'owned_stack_headroom_kb': {t['name']: t['high_water_kb'] for t in final['threads']
+                                   if t.get('core') is not None}}, indent=2), flush=True)
+
+
+if __name__ == '__main__':
+    main()
