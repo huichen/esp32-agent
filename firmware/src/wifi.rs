@@ -144,7 +144,7 @@ fn run(
     };
     log::info!("radio driver created");
 
-    let (ssid, password, ap_ssid, ap_password, ap_fallback, auto_reconnect) = {
+    let (ssid, password, ap_ssid, ap_password, ap_fallback, keep_ap, auto_reconnect) = {
         let guard = app.lock().map_err(|_| anyhow::anyhow!("poisoned"))?;
         (
             guard.cfg.wifi.ssid.clone(),
@@ -152,6 +152,7 @@ fn run(
             guard.cfg.wifi.ap_ssid.clone(),
             guard.cfg.wifi.ap_password.clone(),
             guard.cfg.wifi.ap_fallback,
+            guard.cfg.wifi.keep_ap,
             guard.cfg.wifi.auto_reconnect,
         )
     };
@@ -208,6 +209,9 @@ fn run(
     let mut last_state = String::new();
     let mut reconnect_ticks = 0u32;
     let mut overrides_due = 0u32;
+    // The setup AP is closed once, the first time the station gets an address. Closing it on
+    // every tick would fight the driver; closing it again after a reconnect would flap.
+    let mut ap_closed = false;
     loop {
         match rx.recv_timeout(Duration::from_millis(1000)) {
             Ok(WifiCmd::Connect { ssid: new_ssid, password }) => {
@@ -226,6 +230,8 @@ fn run(
                 }
                 ssid = new_ssid;
                 ap_ssid = "esp32-agent-setup".into();
+                // A new join starts over: the AP may be needed again while it associates.
+                ap_closed = false;
             }
             Ok(WifiCmd::Scan(reply)) => {
                 let result = scan_now(&mut wifi).map_err(|e| McpError::hardware(format!("{e}")));
@@ -245,6 +251,28 @@ fn run(
         let sta_connected = sta_ip.map(|ip| !ip.is_unspecified()).unwrap_or(false);
         let ap_ip = wifi.ap_netif().get_ip_info().ok().map(|i| i.ip);
         let ap_up = ap_ip.is_some();
+        // The access point exists to get the board onto a network. Once the station has an
+        // address it is closed — the portal shows that address, so there is nothing left for
+        // the AP to do. `wifi.keep_ap` asks for both networks on purpose.
+        if !keep_ap && !ap_closed && sta_connected && ap_up {
+            let rc = unsafe { sys::esp_wifi_set_mode(sys::wifi_mode_t_WIFI_MODE_STA) };
+            match rc {
+                0 => {
+                    ap_closed = true;
+                    log.info(
+                        "wifi",
+                        format!(
+                            "station up at {}; setup AP `{ap_ssid}` closed (wifi.keep_ap is off)",
+                            sta_ip.map(|ip| ip.to_string()).unwrap_or_default()
+                        ),
+                    );
+                }
+                other => log.warn(
+                    "wifi",
+                    format!("could not close the setup AP (esp_wifi_set_mode returned {other}); it stays up"),
+                ),
+            }
+        }
         let state = match (sta_connected, ap_up) {
             (true, true) => "ap+sta",
             (true, false) => "connected",
