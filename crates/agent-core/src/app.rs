@@ -5035,11 +5035,12 @@ impl App {
                 archive.len()
             ));
         }
+        // No `stored`: nothing is written anywhere. `zip` hands the archive back as base64 and
+        // the field said otherwise, which is a claim a caller could act on and be wrong.
         Ok(json!({
             "name": name,
             "bytes": archive.len(),
             "entries": entries.iter().map(|(n, _)| n.clone()).collect::<Vec<_>>(),
-            "stored": true,
             "archive_b64": crate::util::b64_encode(&archive),
         })
         .to_string())
