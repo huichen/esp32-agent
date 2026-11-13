@@ -1368,33 +1368,124 @@ fn message_json(seq: usize, message: &Message) -> Value {
 ///
 /// Why this shape rather than one JSON array: a blob torn by a power cut loses its last
 /// lines, and a line-oriented format plus a checksum in the header makes that detectable
-/// instead of half-adopted. The per-message caps ([`MAX_SAVED_TEXT_BYTES`],
-/// [`MAX_SAVED_REASONING_BYTES`], [`MAX_SAVED_ARG_BYTES`]) are what keep the whole thing
-/// inside [`MAX_SAVED_BYTES`] instead of storing a 2 KB tool result fifty times over.
+/// instead of half-adopted. Per-message caps ([`MAX_SAVED_TEXT_BYTES`],
+/// [`MAX_SAVED_REASONING_BYTES`], [`MAX_SAVED_ARG_BYTES`]) limit retained detail; a capped
+/// newest-first writer bounds the complete file and its retained serialization buffer.
+/// A cut keeps complete user exchanges with their call/result pairs. If the newest
+/// exchange cannot fit, it is counted as dropped rather than saved as an invalid tail.
 ///
-/// Attachments are not stored: a base64 screenshot is larger than the entire budget, and
-/// the image had already been seen by the model when the turn ran.
+/// Attachments are not stored: the model already saw them during the original turn.
 pub fn transcript_jsonl(history: &[Message], at_ms: u64) -> String {
-    let lines: Vec<String> = history.iter().map(stored_message_line).collect();
-    // Keep the newest messages, dropping the oldest until the tail fits. The header is
-    // priced in up front, so assembling it cannot push the blob over the budget.
-    let mut start = 0usize;
-    while start + 1 < lines.len() {
-        let body: usize = lines[start..].iter().map(|line| line.len() + 1).sum();
-        if body + SAVED_HEADER_RESERVE <= MAX_SAVED_BYTES {
+    transcript_jsonl_with(history, at_ms, MAX_SAVED_BYTES, |message, writer| {
+        serde_json::to_writer(writer, &StoredMessageRef(message))
+    })
+}
+
+/// The formatter seam proves that serialization stops at the byte ceiling,
+/// rather than visiting the whole history. One buffer holds newest-first lines;
+/// no serialize-all list or joined copy.
+fn transcript_jsonl_with(
+    history: &[Message],
+    at_ms: u64,
+    max_bytes: usize,
+    mut serialize: impl FnMut(&Message, &mut JsonByteWriter<'_>) -> serde_json::Result<()>,
+) -> String {
+    use std::io::Write;
+    let body_limit = max_bytes.saturating_sub(SAVED_HEADER_RESERVE);
+    let has_users = history.iter().any(|m| m.role == Role::User);
+    let mut body = Vec::new();
+    let mut needed = std::collections::BTreeMap::<&str, usize>::new();
+    let mut safe_start = history.len();
+    let mut safe_bytes = 0usize;
+    for (index, message) in history.iter().enumerate().rev() {
+        let before = body.len();
+        let complete = {
+            let mut writer = JsonByteWriter { buf: &mut body, limit: body_limit, overflow: false };
+            if writer.write_all(b"\n").is_err() {
+                false
+            } else {
+                let result = serialize(message, &mut writer);
+                if !writer.overflow {
+                    result.expect("a stored message and an in-memory writer are serializable");
+                }
+                !writer.overflow
+            }
+        };
+        if !complete {
+            body.truncate(before);
             break;
         }
-        start += 1;
+        match message.role {
+            Role::Tool => *needed.entry(message.tool_call_id.as_deref().unwrap_or("")).or_default() += 1,
+            Role::Assistant => {
+                for call in &message.tool_calls {
+                    if let Some(count) = needed.get_mut(call.id.as_str()) {
+                        if *count == 1 {
+                            needed.remove(call.id.as_str());
+                        } else {
+                            *count -= 1;
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+        // Keep whole user exchanges when cutting a prefix, and never a result
+        // without its call. A history that already begins with an assistant
+        // remains supported, as do open calls from an interrupted final turn.
+        if needed.is_empty()
+            && (message.role == Role::User || index == 0 || (!has_users && message.role != Role::Tool))
+        {
+            safe_start = index;
+            safe_bytes = body.len();
+        }
     }
-    // A tail that begins with a tool result carries a `tool_call_id` whose call was cut
-    // with the message before it, and every provider rejects that. Those go too, and they
-    // are counted as dropped: they are gone from what a boot restores.
-    while start + 1 < lines.len() && history[start].role == Role::Tool {
-        start += 1;
+    body.truncate(safe_bytes);
+    // Each JSON line escapes embedded newlines. Reversing the buffer and then
+    // each newline-delimited chunk restores chronological order in place.
+    body.reverse();
+    for line in body.split_mut(|b| *b == b'\n') {
+        line.reverse();
     }
-    let body = if start < lines.len() { lines[start..].join("\n") + "\n" } else { String::new() };
-    let header = stored_header(at_ms, start, checksum(body.as_bytes()));
-    format!("{header}\n{body}")
+    let header = stored_header(at_ms, safe_start, checksum(&body));
+    let prefix = format!("{header}\n");
+    debug_assert!(prefix.len() <= SAVED_HEADER_RESERVE);
+    let mut out = String::from_utf8(body).expect("complete JSON lines are UTF-8");
+    out.reserve_exact(prefix.len());
+    out.insert_str(0, &prefix);
+    out
+}
+
+/// Short writes stop serde at the ceiling, even inside a huge id/name/argument.
+/// Capacity growth is capped too; callers discard an incomplete message.
+struct JsonByteWriter<'a> {
+    buf: &'a mut Vec<u8>,
+    limit: usize,
+    overflow: bool,
+}
+
+impl std::io::Write for JsonByteWriter<'_> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if bytes.is_empty() {
+            return Ok(0);
+        }
+        let take = bytes.len().min(self.limit.saturating_sub(self.buf.len()));
+        if take == 0 {
+            self.overflow = true;
+            return Err(std::io::Error::other("stored JSON exceeds its byte ceiling"));
+        }
+        let need = self.buf.len() + take;
+        if need > self.buf.capacity() {
+            let capacity = need.max(self.buf.capacity().max(128).saturating_mul(2)).min(self.limit);
+            self.buf.reserve_exact(capacity - self.buf.len());
+        }
+        self.buf.extend_from_slice(&bytes[..take]);
+        Ok(take)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 /// Read back what [`transcript_jsonl`] wrote: the messages and how many older ones the
@@ -1448,46 +1539,92 @@ fn stored_header(at_ms: u64, dropped: usize, checksum: u64) -> String {
     .to_string()
 }
 
-/// One stored message. Absent fields are absent rather than empty: the blob is read under
-/// a 16 KB ceiling and an `"is_error":false` per line is bytes that buy nothing.
-fn stored_message_line(message: &Message) -> String {
-    let mut out = serde_json::Map::new();
-    out.insert("role".into(), json!(message.role.as_str()));
-    if !message.text.is_empty() {
-        out.insert("text".into(), json!(llm::truncate_bytes(&message.text, MAX_SAVED_TEXT_BYTES)));
+/// Borrow the message instead of cloning it into a second JSON Value. Absent
+/// fields stay absent, and attachments remain deliberately excluded from flash.
+struct StoredMessageRef<'a>(&'a Message);
+
+impl serde::Serialize for StoredMessageRef<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let message = self.0;
+        let mut out = serializer.serialize_map(None)?;
+        out.serialize_entry("role", message.role.as_str())?;
+        if !message.text.is_empty() {
+            out.serialize_entry("text", &llm::truncate_bytes(&message.text, MAX_SAVED_TEXT_BYTES))?;
+        }
+        if !message.reasoning.is_empty() {
+            out.serialize_entry(
+                "reasoning",
+                &llm::truncate_bytes(&message.reasoning, MAX_SAVED_REASONING_BYTES),
+            )?;
+        }
+        if !message.tool_calls.is_empty() {
+            out.serialize_entry("tool_calls", &StoredCallsRef(&message.tool_calls))?;
+        }
+        if let Some(id) = &message.tool_call_id {
+            out.serialize_entry("tool_call_id", id)?;
+        }
+        if message.is_error {
+            out.serialize_entry("is_error", &true)?;
+        }
+        if !message.source.is_empty() {
+            out.serialize_entry("source", &message.source)?;
+        }
+        out.serialize_entry("at_ms", &message.at_ms)?;
+        out.end()
     }
-    if !message.reasoning.is_empty() {
-        out.insert(
-            "reasoning".into(),
-            json!(llm::truncate_bytes(&message.reasoning, MAX_SAVED_REASONING_BYTES)),
-        );
+}
+
+struct StoredCallsRef<'a>(&'a [ToolCall]);
+
+impl serde::Serialize for StoredCallsRef<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeSeq;
+        let mut out = serializer.serialize_seq(Some(self.0.len()))?;
+        for call in self.0 {
+            out.serialize_element(&StoredCallRef(call))?;
+        }
+        out.end()
     }
-    if !message.tool_calls.is_empty() {
-        let calls: Vec<Value> = message
-            .tool_calls
-            .iter()
-            .map(|call| {
-                let arguments = llm::arguments_request_json(call);
-                json!({
-                    "id": call.id,
-                    "name": call.name,
-                    "arguments": llm::truncate_bytes(&arguments, MAX_SAVED_ARG_BYTES),
-                })
-            })
-            .collect();
-        out.insert("tool_calls".into(), Value::Array(calls));
+}
+
+struct StoredCallRef<'a>(&'a ToolCall);
+
+impl serde::Serialize for StoredCallRef<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let mut out = serializer.serialize_map(Some(3))?;
+        out.serialize_entry("id", &self.0.id)?;
+        out.serialize_entry("name", &self.0.name)?;
+        out.serialize_entry("arguments", &stored_arguments(self.0))?;
+        out.end()
     }
-    if let Some(id) = &message.tool_call_id {
-        out.insert("tool_call_id".into(), json!(id));
+}
+
+/// Keep a bounded serialized prefix without first allocating a whole file write.
+fn stored_arguments(call: &ToolCall) -> String {
+    if llm::arguments_error(call).is_some() {
+        return "{}".into();
     }
-    if message.is_error {
-        out.insert("is_error".into(), json!(true));
+    let mut buf = Vec::new();
+    let overflow = {
+        let mut writer = JsonByteWriter { buf: &mut buf, limit: MAX_SAVED_ARG_BYTES, overflow: false };
+        let result = serde_json::to_writer(&mut writer, &call.arguments);
+        if !writer.overflow {
+            result.expect("a JSON Value and an in-memory writer are serializable");
+        }
+        writer.overflow
+    };
+    // A short write can stop in a UTF-8 scalar; keep exactly the valid prefix.
+    if let Err(error) = std::str::from_utf8(&buf) {
+        buf.truncate(error.valid_up_to());
     }
-    if !message.source.is_empty() {
-        out.insert("source".into(), json!(message.source));
+    let mut out = String::from_utf8(buf).expect("the valid JSON prefix is UTF-8");
+    if overflow {
+        out.reserve_exact(llm::TRUNCATED_MARK.len());
+        out.push_str(llm::TRUNCATED_MARK);
     }
-    out.insert("at_ms".into(), json!(message.at_ms));
-    Value::Object(out).to_string()
+    out
 }
 
 fn stored_message(line: &str) -> Option<Message> {
@@ -2945,6 +3082,18 @@ mod tests {
         let (restored, _) = transcript_from_jsonl(&transcript_jsonl(&with_image, 2)).expect("parses");
         assert!(restored[0].attachments.is_empty());
         assert_eq!(restored[0].text, "look");
+        let unicode = vec![
+            Message::user("问题\n😀\r\t", "来源", 1),
+            Message::assistant_with_reasoning("réponse\n界", "推理\n", Vec::new(), 2),
+        ];
+        let (restored, dropped) = transcript_from_jsonl(&transcript_jsonl(&unicode, 3)).expect("UTF-8 JSONL");
+        assert_eq!(dropped, 0);
+        for (before, after) in unicode.iter().zip(&restored) {
+            assert_eq!(
+                (&before.text, &before.reasoning, &before.source),
+                (&after.text, &after.reasoning, &after.source)
+            );
+        }
     }
 
     #[test]
@@ -2987,6 +3136,24 @@ mod tests {
         let header: Value = serde_json::from_str(lines[0]).expect("the header is JSON");
         assert_eq!(header["v"], json!(TRANSCRIPT_VERSION));
         assert_eq!(header["dropped"], json!(0));
+
+        let call = ToolCall {
+            id: "unicode".into(),
+            name: "write".into(),
+            arguments: json!({ "content": "界\n\"".repeat(2000), "nested": [null, true] }),
+        };
+        assert_eq!(
+            stored_arguments(&call),
+            llm::truncate_bytes(&llm::arguments_request_json(&call), MAX_SAVED_ARG_BYTES)
+        );
+        let huge = ToolCall {
+            id: "write".into(),
+            name: "write".into(),
+            arguments: json!({ "content": "x".repeat(MAX_HISTORY_BYTES) }),
+        };
+        let prefix = stored_arguments(&huge);
+        assert!(prefix.len() <= MAX_SAVED_ARG_BYTES + llm::TRUNCATED_MARK.len());
+        assert!(prefix.ends_with(llm::TRUNCATED_MARK));
     }
 
     #[test]
@@ -3024,6 +3191,39 @@ mod tests {
         // And the header says how much is missing, which is what the prompt repeats.
         let header: Value = serde_json::from_str(stored.lines().next().unwrap()).expect("header");
         assert_eq!(header["dropped"], json!(dropped));
+
+        // The actual 1024-message / near-2-MiB ring. Count formatter calls rather
+        // than imposing a flaky timing threshold: older dropped messages must
+        // never be serialized, and the one retained buffer stays below the cap.
+        let mut full = Vec::with_capacity(MAX_HISTORY_MESSAGES);
+        for i in 0..MAX_HISTORY_MESSAGES / 2 {
+            full.push(Message::user(&"q".repeat(2040), "http", 2 * i as u64));
+            full.push(Message::assistant(&"a".repeat(2040), Vec::new(), 2 * i as u64 + 1));
+        }
+        let input_bytes: usize = full.iter().map(Message::payload_bytes).sum();
+        assert!(input_bytes <= MAX_HISTORY_BYTES);
+        assert!(input_bytes > MAX_HISTORY_BYTES - 8192);
+        let mut formatted = 0usize;
+        let mut max_capacity = 0usize;
+        let started = std::time::Instant::now();
+        let stored = transcript_jsonl_with(&full, 10_000, MAX_SAVED_BYTES, |message, writer| {
+            formatted += 1;
+            let result = serde_json::to_writer(&mut *writer, &StoredMessageRef(message));
+            max_capacity = max_capacity.max(writer.buf.capacity());
+            assert!(writer.buf.len() <= writer.limit);
+            assert!(writer.buf.capacity() <= writer.limit);
+            result
+        });
+        let elapsed = started.elapsed();
+        assert!(formatted < full.len() / 2, "serialized the discarded prefix: {formatted} calls");
+        assert!(stored.len() <= MAX_SAVED_BYTES);
+        assert!(stored.capacity() <= MAX_SAVED_BYTES);
+        let (restored, dropped) = transcript_from_jsonl(&stored).expect("bounded saved tail parses");
+        assert_eq!(restored.len() + dropped, full.len());
+        assert_eq!(restored.first().map(|m| m.role), Some(Role::User), "cut only between exchanges");
+        assert_eq!(restored.last().map(|m| m.at_ms), full.last().map(|m| m.at_ms));
+        println!("saved ring: input_bytes={input_bytes}, messages={}, formatted={formatted}, kept={}, output_bytes={}, max_buffer_capacity={max_capacity}, elapsed_us={}",
+            full.len(), restored.len(), stored.len(), elapsed.as_micros());
     }
 
     /// The case the whole checksum exists for: a power cut in the middle of a write leaves
@@ -3091,5 +3291,38 @@ mod tests {
         let (restored, _) = transcript_from_jsonl(&transcript_jsonl(&interrupted, 4)).expect("parses");
         assert!(restored.last().map(|m| m.role) == Some(Role::Tool));
         assert_eq!(restored.last().and_then(|m| m.tool_call_id.clone()).as_deref(), Some("c1"));
+
+        let open = &interrupted[..2];
+        let (restored, _) =
+            transcript_from_jsonl(&transcript_jsonl(open, 4)).expect("an open final call survives");
+        assert_eq!(restored.last().unwrap().tool_calls[0].id, "c1");
+
+        // A cut cannot save only the assistant/result half of a user exchange.
+        let bytes: usize =
+            interrupted.iter().map(|m| serde_json::to_vec(&StoredMessageRef(m)).unwrap().len() + 1).sum();
+        let user_bytes = serde_json::to_vec(&StoredMessageRef(&interrupted[0])).unwrap().len() + 1;
+        let stored =
+            transcript_jsonl_with(&interrupted, 4, SAVED_HEADER_RESERVE + bytes - user_bytes, |m, writer| {
+                serde_json::to_writer(writer, &StoredMessageRef(m))
+            });
+        let (restored, dropped) =
+            transcript_from_jsonl(&stored).expect("an exchange that cannot fit is dropped");
+        assert!(restored.is_empty());
+        assert_eq!(dropped, interrupted.len());
+
+        // An oversized call cannot be serialized in full just to discover that
+        // it will be dropped. Its result must not survive as an orphan either.
+        let call = Message::assistant(
+            "",
+            vec![ToolCall { id: "huge".into(), name: "x".repeat(MAX_SAVED_BYTES + 1), arguments: json!({}) }],
+            1,
+        );
+        for history in [vec![call.clone()], vec![call, Message::tool("huge", "{}", 2)]] {
+            let stored = transcript_jsonl(&history, 3);
+            assert!(stored.len() <= MAX_SAVED_BYTES, "one oversized line bypassed the file cap");
+            let (restored, dropped) = transcript_from_jsonl(&stored).expect("a bounded tail is still valid");
+            assert!(restored.is_empty(), "an unpaired result must not be saved");
+            assert_eq!(dropped, history.len());
+        }
     }
 }
