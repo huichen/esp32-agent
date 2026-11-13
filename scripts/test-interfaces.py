@@ -776,6 +776,10 @@ def permissions(rec, sim, fake):
     login = sim.post("/api/auth", {"pin": pin})
     rec.equal("portal-token-lifetime", login["expires_in"], 43200)
     rec.equal("minted-token-authorizes", sim.request("GET", "/api/config", headers={"Authorization": "Bearer " + login["token"]}).status, 200)
+    url_token = urllib.parse.quote(login["token"], safe="")
+    rec.equal("minted-URL-token-authorizes-read", sim.request("GET", "/api/config?token=" + url_token).status, 200)
+    rec.equal("URL-token-cannot-authorize-write", sim.request("POST", "/api/agent/reset?token=" + url_token, {}).status, 401)
+    rec.equal("raw-PIN-is-not-URL-token", sim.request("GET", "/api/config?token=" + pin).status, 401)
     rec.equal("forged-token-refused", sim.request("GET", "/api/config", headers={"Authorization": "Bearer fabricated"}).status, 401)
     rec.equal("query-PIN-authorizes", sim.request("GET", "/api/config?pin=" + pin).status, 200)
     public = sim.get("/api/config", credential)
@@ -792,6 +796,9 @@ def permissions(rec, sim, fake):
     rec.check("MCP-config-tool-no-secrets", token.encode() not in encode(cfg), short(cfg))
     # DELETE is also part of the MCP transport, not an unauthenticated side door.
     rec.equal("MCP-session-delete-needs-bearer", sim.request("DELETE", "/mcp", headers={"Mcp-Session-Id": sim.sid}).status, 401)
+    sim.post("/api/config", {"auth": {"mcp_token": ""}}, credential)
+    rec.equal("MCP-unset-token-keeps-portal-gate", sim.rpc("ping").status, 401)
+    rec.equal("MCP-portal-fallback-authorizes", sim.rpc("ping", headers={"Authorization": "Bearer " + login["token"]}).status, 200)
     sim.post("/api/config", {"auth": {"portal_pin": "", "mcp_token": ""}}, credential)
     for disabled, name, arguments in [
         ("write", "write", {"path": "/denied.txt", "text": "denied"}),
@@ -1549,6 +1556,7 @@ def storage(rec, sim, fake):
     sim.state.mkdir()
     saved = sim.post("/api/agent/config", {"model": "cannot-persist"})
     rec.check("failed-save-not-acknowledged-as-durable", saved.get("saved") is not True, short(saved))
+    rec.equal("config-response-distinguishes-admission", saved.get("queued"), True)
     result = sim.call("write", {"path": "/cannot-save.txt", "text": "must not claim durable"})
     rec.check("failed-workspace-save-not-acknowledged-as-durable", result.get("isError") is True or content(result).get("ok") is not True, short(result))
     status = wait_for(lambda: sim.get("/api/status")["store"], lambda s: s["pending"] == 0 and s["failed"] > 0)
