@@ -120,3 +120,49 @@ a looser 2-second test bound; passing it does not establish the default 1-second
 target. Warm serial resets, cold power cuts,
 TLS stack headroom, real-provider cancellation and hardware sound/display quality
 are separate checks. Passing host concurrency tests does not establish them.
+
+## Board evidence — 2026-11-14
+
+Final source `62d183a`, ESP32-S3 N16R8 on COM3, station `192.168.3.7`:
+release compilation/linking passed with 35 warnings (20 duplicates). The flashed
+app is 3,166,224 / 4,194,304 bytes (75.49%); the partition table was supplied
+explicitly. These tests do not erase storage or read credential files.
+
+- Quick real-board suite: 355 checks, including 337 control reads while shell/script
+  sleeps, two/three serialized tools and five seconds of silent buffered PCM run.
+  Median 56.9 ms, p95 172.1 ms, maximum 654.4 ms. Maximum handler duration was
+  235 ms. Agent-owned script interruption was accepted in 18.6 ms; inactive state
+  was observed 1,041.5 ms later. This is not forced socket or driver cancellation.
+- Continuous **570-second** soak: 252 script calls and 1,026 control reads
+  (1,278 checks), zero failures under an explicitly selected **2-second** bound.
+  Median 61.8 ms, p95 134.0 ms, maximum 1,502.4 ms. The slowest request's handler
+  took 9 ms and its snapshot was 115 ms old; maximum handler duration over the
+  soak was 15 ms. The remaining end-to-end delay is outside that measurement;
+  its exact queue/network/client cause is not established.
+- The default **1-second** target is **not achieved**: the earlier integrated
+  `93d4175` soak failed at 1,576.5 ms, and the final soak also exceeded 1 second.
+  The 2-second acceptance bound must not be presented as a 1-second guarantee.
+- All 21 task IDs remained stable. Internal heap free/largest/minimum were
+  84/31/83 KiB, DMA 76/31/75 KiB, PSRAM 7,102/3,648/3,636 KiB at the end.
+  Known task stack headroom: main 4.3 KiB, writer 2.4 KiB, agent 7.7 KiB,
+  radio 8.3 KiB, DNS 2.1 KiB, provisioning 4.8 KiB. Worker stacks are reserved
+  in advance; this intentionally spends 64 KiB of internal RAM rather than
+  gambling on repeated allocation during requests. No reset occurred in the soak.
+- Three subsequent serial warm resets recovered connected WiFi, the running
+  Agent thread and a working MCP `shell` echo, with the setup AP still off.
+  First post-reset observations reported uptime 8/6/8 seconds. These are
+  observations, not precise boot-latency measurements or cold power-cut tests.
+
+Reproduce the final acceptance calls separately:
+
+```bash
+python scripts/test-concurrency.py --host http://192.168.3.7 --agent --soak 0 --max-ms 2000
+python scripts/test-concurrency.py --host http://192.168.3.7 --soak-only --soak 570 --max-ms 2000
+```
+
+Host gates passed: 938 unit tests, 5 integration tests, simulator build, smoke,
+strict Clippy, formatting and eight-README checks. The refreshed all-area interface
+suite passed 1,299 checks. TLS exhaustion, cold power loss, human audio/visual
+quality, independent device-tool execution and long-term fragmentation remain
+unverified or unimplemented. Earlier boot-panic explanations remain hypotheses;
+a quiet serial capture is not positive proof of working UART monitoring.
