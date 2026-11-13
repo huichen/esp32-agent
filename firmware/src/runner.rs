@@ -495,9 +495,8 @@ fn tick(
     // answering while the model thinks.
     let queued = {
         let mut app = lock(shared);
-        // Sample wifi/tasks/heap into plain data once per tick: the status path then reads
-        // the sample instead of taking the radio's lock under the App mutex.
-        app.refresh_hw_view();
+        // The main maintenance task publishes hardware/status views. Do not add
+        // that stack/allocation work to the agent's tool execution path.
         // A portal edit to the timeout must reach the next request, not the next boot.
         let configured = clamp_timeout(app.llm.timeout_s);
         if timeout_s.load(Ordering::Relaxed) != configured {

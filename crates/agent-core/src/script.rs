@@ -64,6 +64,10 @@ pub const MAX_SOURCE: usize = 8192;
 
 /// What a script may call to act on the board.
 pub trait ScriptHost {
+    /// Independent control-plane signal; checking it must not acquire the App lock.
+    fn cancelled(&self) -> bool {
+        false
+    }
     /// Call a board tool by name. The arguments are the tool's own JSON object.
     fn call_tool(&mut self, name: &str, arguments: &Value) -> Result<Value, String>;
 }
@@ -1233,6 +1237,9 @@ impl<'a> Run<'a> {
     }
 
     fn tick(&mut self) -> Result<(), String> {
+        if self.steps & 0x3ff == 0 && self.host.cancelled() {
+            return Err("interrupted by the user".into());
+        }
         self.steps += 1;
         if self.steps > MAX_STEPS {
             return Err(format!("script stopped after {MAX_STEPS} steps (a loop without progress?)"));
@@ -1652,8 +1659,15 @@ impl<'a> Run<'a> {
                         self.budget_ms
                     ));
                 }
-                if ms > 0 {
-                    std::thread::sleep(std::time::Duration::from_millis(ms));
+                let end = std::time::Instant::now() + std::time::Duration::from_millis(ms);
+                while std::time::Instant::now() < end {
+                    if self.host.cancelled() {
+                        return Err("interrupted by the user".into());
+                    }
+                    std::thread::sleep(
+                        end.saturating_duration_since(std::time::Instant::now())
+                            .min(std::time::Duration::from_millis(25)),
+                    );
                 }
                 Ok(Val::Nil)
             }

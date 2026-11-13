@@ -126,14 +126,15 @@ piece straight to `i2s_out_write` as it arrives:
 | Sample format | PCM16LE, mono, 24000 Hz | `drivers::audio::AMP_RATE_HZ` |
 | One upload | at most **30 s** = 1 440 000 bytes | `AUDIO_STREAM_MAX_BYTES` |
 | Sink buffers | reused byte/sample `Vec`s, initially 1025 + 1024 bytes; socket/stereo/DMA buffers are additional | `[source]` `AudioSink` |
-| New task thread | **none** — the request runs on the accept thread it already owns | `http.rs` |
+| Request worker | one bounded 16 KiB ESP-IDF worker, shared with ordinary/TLS/SSE requests | `http.rs` |
 | Lock held | one piece at a time (about 1 KB, 21 ms), never for the song | `AudioSink::push` |
 
 The three numbers that matter, in the order they bite:
 
-- **No new stack.** The upload runs inline on the accept thread. While it plays, that
-  thread cannot serve a new ordinary request; other sockets wait. Existing event streams
-  have their own threads. Releasing the App mutex does not make the accept loop concurrent.
+- **Bounded request stacks.** The upload occupies one ordinary worker, not the accept
+  thread. Three ordinary/TLS/SSE workers and one reserved plaintext control worker bound
+  stack use. Status and cancellation do not acquire App; other device/file operations
+  still require it. See [concurrency](concurrency.md).
 - **No whole-body buffer.** PCM arrives at 48,000 bytes/s. The sink reuses piece buffers,
   and `i2s_channel_write` blocks until DMA accepts them. This is backpressure, not an
   unbounded song-sized allocation.
@@ -374,8 +375,8 @@ Firmware not built/verified for the codec.
 
 The bench board played a 30 s clip with its animation on the 128x32 OLED: PCM down one TCP
 port, one frame per MCP `display` call out of the other. The current server has no
-background audio task and one ordinary accept thread, so this route carries the content
-as **one body**; record order is the synchronisation.
+background audio task. The bounded request worker consumes this route as **one body**;
+record order is the synchronisation, not a separate audio/video scheduler.
 
 | Record | Payload | What the board does |
 |---|---|---|

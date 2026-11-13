@@ -1,7 +1,8 @@
 //! Spawning a Rust thread with a name `ps` can show and a stack the caller chose.
 //!
 //! `std::thread::Builder::name` sets the *pthread* name. `ps` and `/api/status.threads`
-//! read `pcTaskName`, and `pthread_create` takes that from the **creating** thread's
+//! use owned task labels (never post-snapshot `pcTaskName` pointers), while
+//! `pthread_create` takes its FreeRTOS name from the **creating** thread's
 //! `esp_pthread_cfg_t` — the same struct that decides where the stack comes from. So a
 //! thread's visible name and its stack capabilities are one decision, made on the wrong
 //! side of the call, and a config left behind by one spawn becomes the next thread's name
@@ -10,7 +11,8 @@
 //! threads came up under it — `ps` showed four `nvs-writer`s, three of them the wrong task
 //! at the wrong priority.
 //!
-//! Every spawn in this firmware goes through [`spawn`]. It sets the name, the size and the
+//! Firmware-owned long-lived tasks go through [`spawn`]. Core HTTP workers use their
+//! own bounded spawner. This helper sets the name, the size and the
 //! capabilities; spawns; then restores the **default** config — never "whatever was there
 //! before", because every `esp_pthread_set_cfg` here is scoped to one spawn, so a
 //! remembered value is either the default or a leak, and restoring a leak is exactly the
@@ -21,8 +23,39 @@
 //! its own does not pass this name on.
 
 use esp_idf_svc::sys;
+use std::collections::BTreeMap;
 use std::os::raw::c_char;
+use std::sync::{Mutex, OnceLock};
 use std::thread::{Builder, JoinHandle};
+
+// Own the labels independently of FreeRTOS task storage. TaskStatus_t's name
+// pointer and handle may already be freed once uxTaskGetSystemState returns.
+static LABELS: OnceLock<Mutex<BTreeMap<u32, (String, i32)>>> = OnceLock::new();
+
+pub fn task_labels() -> BTreeMap<u32, (String, i32)> {
+    LABELS.get_or_init(Default::default).lock().unwrap_or_else(|p| p.into_inner()).clone()
+}
+
+struct TaskLabel(u32);
+impl TaskLabel {
+    fn register(name: String) -> Self {
+        // Safe: this thread owns its current task's lifetime until it exits.
+        let task = unsafe { sys::xTaskGetCurrentTaskHandle() };
+        let id = unsafe { sys::uxTaskGetTaskNumber(task) } as u32;
+        let affinity = unsafe { sys::xTaskGetCoreID(task) };
+        LABELS
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(id, (name, affinity));
+        Self(id)
+    }
+}
+impl Drop for TaskLabel {
+    fn drop(&mut self) {
+        LABELS.get_or_init(Default::default).lock().unwrap_or_else(|p| p.into_inner()).remove(&self.0);
+    }
+}
 
 /// A stack that survives the flash cache being off — what any thread that may write NVS
 /// needs (`nvs_writer.rs` has the arithmetic and the assert).
@@ -64,7 +97,11 @@ where
 
     let rc = unsafe { sys::esp_pthread_set_cfg(&cfg) };
     let spawned = if rc == sys::ESP_OK {
-        Builder::new().name(name.clone()).stack_size(stack_bytes).spawn(body)
+        let label = name.clone();
+        Builder::new().name(name.clone()).stack_size(stack_bytes).spawn(move || {
+            let _label = TaskLabel::register(label);
+            body()
+        })
     } else {
         Err(std::io::Error::other(format!("thread `{name}`: esp_pthread_set_cfg returned {rc}")))
     };

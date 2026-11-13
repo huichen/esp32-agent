@@ -149,6 +149,7 @@ fn main() {
                 guard.runtime.restart_requested = false;
             }
             tick_ms = u64::from(clamp_tick_ms(guard.cfg.agent.tick_ms));
+            guard.publish_status_view();
             (reboot, due)
         };
         for source in due {
