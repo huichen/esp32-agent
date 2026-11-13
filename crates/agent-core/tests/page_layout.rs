@@ -484,12 +484,24 @@ window.__esp32Clear = async function () {
         touches: type === "touchend" ? [] : [point], changedTouches: [point], bubbles: true,
       }));
     };
+    // Hold the history read so the refresh is observably in flight: a spinner nobody can
+    // catch is the thing this test exists to prevent.
+    f.historyGate = defer();
     touch("touchstart", 300); touch("touchmove", 390); touch("touchend", 390);
+    await until(() => q("#pull-hint").classList.contains("refreshing"));
+    out.pullSpinner = {
+      shown: q("#pull-hint").classList.contains("show"),
+      spinning: getComputedStyle(q("#pull-hint").querySelector(".spinner")).display !== "none",
+      label: q("#pull-label").textContent,
+    };
+    f.historyGate.resolve(); f.historyGate = null;
     // Wait for what the gesture produces, not merely for the request it starts: the toast is
     // the part a person sees.
     await until(() => q("#toast").textContent.includes("Conversation refreshed"));
     out.pull = { reads: historyReads() - beforePull, toast: q("#toast").textContent,
-      hintHidden: !q("#pull-hint").classList.contains("show") };
+      hintHidden: !q("#pull-hint").classList.contains("show"),
+      refreshingCleared: !q("#pull-hint").classList.contains("refreshing"),
+      label: q("#pull-label").textContent };
 
     // A failed cursor refresh never re-enables replay from zero: retry the head before
     // sending, and leave the draft and empty conversation alone if that also fails.
@@ -972,7 +984,14 @@ fn assert_conversation_clear(metrics: &Value, width: u32) {
         text("sendFailure", "toast")
     );
 
-    // Pulling past the last message refreshes the transcript in place.
+    // Pulling past the last message refreshes the transcript in place, and says it is working.
+    expect("pullSpinner", "shown", json!(true));
+    expect("pullSpinner", "spinning", json!(true));
+    assert!(
+        text("pullSpinner", "label").contains("Refreshing"),
+        "{width} px: the hint has to name what it is doing: {}",
+        text("pullSpinner", "label")
+    );
     assert_eq!(clear["pull"]["reads"], json!(1), "{width} px: the pull did not reload the transcript");
     assert!(
         text("pull", "toast").contains("Conversation refreshed"),
@@ -980,6 +999,8 @@ fn assert_conversation_clear(metrics: &Value, width: u32) {
         text("pull", "toast")
     );
     expect("pull", "hintHidden", json!(true));
+    expect("pull", "refreshingCleared", json!(true));
+    assert_eq!(text("pull", "label"), "Pull down to refresh", "{width} px: the hint must reset");
 
     expect("memory", "tailBody", json!("{\"keep\":1}"));
     expect("memory", "tailClean", json!(true));

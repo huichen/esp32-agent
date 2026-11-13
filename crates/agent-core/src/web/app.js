@@ -502,20 +502,41 @@ function renderHistory(data) {
   scrollToEnd();
 }
 
+/** The one thing that draws the pull hint, so its words and its spinner cannot disagree. */
+function setPullHint(state, text) {
+  const hint = $("#pull-hint");
+  if (text) $("#pull-label").textContent = text;
+  hint.classList.toggle("show", state !== "idle");
+  hint.classList.toggle("refreshing", state === "refreshing");
+}
+
 /** Reload what the board has, without touching the draft or the settings.
  *
  * This is what the pull gesture at the end of the transcript asks for: the same history
  * read and cursor sync a reload would do, minus a page refresh that would discard a
- * half-typed message. */
+ * half-typed message. The hint stays up with a turning ring while it runs, because a
+ * request that takes a second and shows nothing reads as a dead page. */
 async function refreshConversation() {
   if (S.changingConversation || S.sending) return;
-  const ok = await loadHistory(true);
-  if (!ok) return;
-  try { await syncEventCursor(); } catch { /* the next send retries it */ }
-  // The transcript is what was asked for; a status read that fails must not swallow the
-  // confirmation and leave the gesture looking like nothing happened.
-  try { await loadStatus(); } catch { /* offline or busy: the history is still reloaded */ }
-  toast("Conversation refreshed");
+  const started = performance.now();
+  setPullHint("refreshing", "Refreshing\u2026");
+  let ok = true;
+  try {
+    ok = await loadHistory(true);
+  } catch {
+    ok = false;
+  }
+  if (ok) {
+    try { await syncEventCursor(); } catch { /* the next send retries it */ }
+    // The transcript is what was asked for; a status read that fails must not swallow the
+    // confirmation.
+    try { await loadStatus(); } catch { /* offline or busy: the history is still reloaded */ }
+  }
+  // A ring that appears and vanishes inside one frame reads as a glitch rather than as work.
+  const spent = performance.now() - started;
+  if (spent < 300) await new Promise((resolve) => setTimeout(resolve, 300 - spent));
+  setPullHint("idle", "Pull down to refresh");
+  toast(ok ? "Conversation refreshed" : "Refresh failed; the conversation was not reloaded");
 }
 
 /** At the end of the transcript, dragging down used to do nothing: the page bounced and a
@@ -523,7 +544,6 @@ async function refreshConversation() {
  * last message the drag now offers a refresh, which reloads the transcript in place. */
 function wirePullToRefresh() {
   const chat = $("#chat");
-  const hint = $("#pull-hint");
   const THRESHOLD = 60;
   let startY = null;
   let pulled = 0;
@@ -536,18 +556,19 @@ function wirePullToRefresh() {
     if (startY === null) return;
     pulled = event.touches[0].clientY - startY;
     if (pulled > 12) {
-      hint.textContent = pulled >= THRESHOLD ? "Release to refresh" : "Pull down to refresh";
-      hint.classList.add("show");
+      setPullHint("pulling", pulled >= THRESHOLD ? "Release to refresh" : "Pull down to refresh");
     } else {
-      hint.classList.remove("show");
+      setPullHint("idle");
     }
   }, { passive: true });
   const finish = () => {
     const shouldRefresh = startY !== null && pulled >= THRESHOLD;
     startY = null;
     pulled = 0;
-    hint.classList.remove("show");
+    // `refreshConversation` owns the hint from here: clearing it first would blank the
+    // spinner for the frame between the gesture and the request.
     if (shouldRefresh) refreshConversation();
+    else setPullHint("idle");
   };
   chat.addEventListener("touchend", finish);
   chat.addEventListener("touchcancel", finish);
