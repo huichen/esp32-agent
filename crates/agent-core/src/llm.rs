@@ -559,11 +559,37 @@ fn responses_input(messages: &Value) -> Value {
                     }));
                 }
             }
-            "system" => out.push(json!({ "role": "system", "content": message["content"] })),
-            _ => out.push(json!({ "role": "user", "content": message["content"] })),
+            "system" => {
+                out.push(json!({ "role": "system", "content": responses_content(&message["content"]) }))
+            }
+            _ => out.push(json!({ "role": "user", "content": responses_content(&message["content"]) })),
         }
     }
     Value::Array(out)
+}
+
+/// Chat multimodal parts use a different vocabulary and nesting from Responses.
+fn responses_content(content: &Value) -> Value {
+    match content {
+        Value::Array(parts) => Value::Array(
+            parts
+                .iter()
+                .map(|part| match part["type"].as_str().unwrap_or_default() {
+                    "text" => json!({ "type": "input_text", "text": part["text"] }),
+                    "image_url" => {
+                        let mut image =
+                            json!({ "type": "input_image", "image_url": part["image_url"]["url"] });
+                        if let Some(detail) = part["image_url"].get("detail") {
+                            image["detail"] = detail.clone();
+                        }
+                        image
+                    }
+                    _ => part.clone(),
+                })
+                .collect(),
+        ),
+        _ => content.clone(),
+    }
 }
 
 fn responses_tools(tools: &Value) -> Vec<Value> {
@@ -603,11 +629,10 @@ fn parse_responses_reply(body: &str) -> Result<ModelReply, String> {
                 }
             }
             "function_call" => {
-                let arguments = item["arguments"].as_str().unwrap_or("{}");
                 calls.push(ToolCall {
                     id: item["call_id"].as_str().unwrap_or_default().to_string(),
                     name: item["name"].as_str().unwrap_or_default().to_string(),
-                    arguments: serde_json::from_str(arguments).unwrap_or_else(|_| json!({})),
+                    arguments: tool_arguments(item.get("arguments")),
                 });
             }
             _ => {}
@@ -789,7 +814,7 @@ fn parse_anthropic_reply(body: &str) -> Result<ModelReply, String> {
             "tool_use" => calls.push(ToolCall {
                 id: block["id"].as_str().unwrap_or_default().to_string(),
                 name: block["name"].as_str().unwrap_or_default().to_string(),
-                arguments: block["input"].clone(),
+                arguments: tool_arguments(block.get("input")),
             }),
             _ => {}
         }
@@ -845,32 +870,33 @@ fn parse_reply(body: &str) -> Result<ModelReply, String> {
             let function = call.get("function");
             let name =
                 function.and_then(|f| f.get("name")).and_then(Value::as_str).unwrap_or_default().to_string();
-            let arguments = match function.and_then(|f| f.get("arguments")) {
-                // The documented wire format: a JSON *string*.
-                Some(Value::String(raw)) => match serde_json::from_str::<Value>(raw) {
-                    Ok(Value::Object(map)) => Value::Object(map),
-                    Ok(other) => {
-                        return Err(format!(
-                            "llm: tool call {name}: arguments parsed to {}, expected an object",
-                            json_kind(&other)
-                        ))
-                    }
-                    Err(e) => {
-                        json!({ ARGS_ERROR_KEY: format!("arguments are not JSON ({e}): {}", body_prefix(raw, 120)) })
-                    }
-                },
-                // Tolerated: a server that already decoded the object for us.
-                Some(value @ Value::Object(_)) => value.clone(),
-                Some(other) => {
-                    json!({ ARGS_ERROR_KEY: format!("arguments have type {}, expected a JSON string", json_kind(other)) })
-                }
-                None => json!({}),
-            };
+            let arguments = tool_arguments(function.and_then(|f| f.get("arguments")));
             tool_calls.push(ToolCall { id, name, arguments });
         }
     }
 
     Ok(ModelReply { content, reasoning, tool_calls, usage, retry_note: String::new() })
+}
+
+/// Decode tool input consistently across all adapters. A malformed or non-object
+/// value keeps the call id for its error result, but can never reach the tool host.
+fn tool_arguments(value: Option<&Value>) -> Value {
+    match value {
+        Some(Value::String(raw)) => match serde_json::from_str::<Value>(raw) {
+            Ok(value @ Value::Object(_)) => value,
+            Ok(other) => json!({ ARGS_ERROR_KEY: format!(
+                "arguments parsed to {}, expected an object", json_kind(&other)
+            ) }),
+            Err(e) => json!({ ARGS_ERROR_KEY: format!(
+                "arguments are not JSON ({e}): {}", body_prefix(raw, 120)
+            ) }),
+        },
+        Some(value @ Value::Object(_)) => value.clone(),
+        Some(other) => json!({ ARGS_ERROR_KEY: format!(
+            "arguments have type {}, expected an object", json_kind(other)
+        ) }),
+        None => json!({}),
+    }
 }
 
 /// The argument-parse error of `tc`, if `chat` degraded its arguments.
@@ -1070,6 +1096,21 @@ mod tests {
         assert_eq!(input[2]["type"], "function_call");
         assert_eq!(input[3]["type"], "function_call_output");
         assert_eq!(body["tools"][0]["name"], "oled_read", "flat tool objects, not nested");
+
+        // Chat's text/image_url content parts are not Responses input parts.
+        let image_messages = json!([{ "role": "user", "content": [
+            { "type": "text", "text": "what is this?" },
+            { "type": "image_url", "image_url": { "url": "data:image/png;base64,aGVsbG8=" } }
+        ] }]);
+        chat(&mut stub, &proto_cfg("responses"), &image_messages, &wire_tools()).expect("image reply");
+        let body: Value = serde_json::from_str(&stub.seen.borrow()[1].1).expect("json");
+        assert_eq!(body["input"][0]["content"][0], json!({ "type": "input_text", "text": "what is this?" }));
+        assert_eq!(
+            body["input"][0]["content"][1],
+            json!({
+                "type": "input_image", "image_url": "data:image/png;base64,aGVsbG8="
+            })
+        );
     }
 
     #[test]
@@ -1228,6 +1269,29 @@ mod tests {
         assert!(err.contains("not JSON"), "unexpected error text: {err}");
         // Echoed back to the model as `{}`, never as our private error key.
         assert_eq!(arguments_request_json(call), "{}");
+
+        // Every adapter must preserve the failure instead of turning malformed or
+        // non-object input into a runnable call with guessed/default arguments.
+        for raw in ["{\"path\": \"/a.txt\"", "[]", "null", "42", "\"text\""] {
+            let responses = parse_responses_reply(&json!({
+                "output": [{ "type": "function_call", "call_id": "bad", "name": "fs_write", "arguments": raw }]
+            }).to_string()).expect("the call survives as an error result");
+            let call = &responses.tool_calls[0];
+            assert!(arguments_error(call).is_some(), "Responses accepted {raw}: {call:?}");
+            assert_eq!(arguments_request_json(call), "{}");
+        }
+        for input in [Value::Null, json!([]), json!(42), json!("text")] {
+            let anthropic = parse_anthropic_reply(
+                &json!({
+                    "content": [{ "type": "tool_use", "id": "bad", "name": "fs_write", "input": input }]
+                })
+                .to_string(),
+            )
+            .expect("the call survives as an error result");
+            let call = &anthropic.tool_calls[0];
+            assert!(arguments_error(call).is_some(), "Anthropic accepted {input}: {call:?}");
+            assert_eq!(arguments_request_json(call), "{}");
+        }
     }
 
     #[test]
