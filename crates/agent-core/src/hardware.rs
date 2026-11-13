@@ -272,6 +272,18 @@ pub trait Hardware: Send {
         None
     }
 
+    /// A buffer for media: PSRAM when the platform has it, ordinary heap on a host.
+    ///
+    /// Returns the pool name with the bytes so a caller can report where a recording or an
+    /// animation actually lives. The `Vec` comes back **empty with that capacity** — a
+    /// reservation, not content. A board with PSRAM returns `None` rather than falling back
+    /// to internal RAM: stacks, DMA descriptors and every flash-safe allocation come from
+    /// there, and quietly spending it on a 2 MB clip is how a board loses the RAM it needs
+    /// to answer.
+    fn media_buffer(&mut self, len: usize) -> Option<(Vec<u8>, &'static str)> {
+        Some((Vec::with_capacity(len), "internal"))
+    }
+
     /// Let the rest of the system run for a moment.
     ///
     /// A multi-megabyte write to flash is one long stretch of CPU, and the task watchdog fires

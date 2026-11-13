@@ -319,6 +319,57 @@ Background playback needs a media worker, still on [the roadmap](../ROADMAP.md#m
 Host simulator tests cover this tool; firmware not built/verified, and physical timing
 has not been measured on the bench.
 
+#### Compressing bitmap page bytes: `bitmap_pack` / `bitmap_unpack`
+
+A 128×32 frame is **512 raw bytes / 684 base64 characters**; 30 frames are **15,360
+raw bytes** before compression. `bitmap_pack {data_b64}` compresses those already
+bit-packed **page-format bytes**, not text, base64 characters or individual pixels.
+It returns `{packed_b64, raw_bytes, packed_bytes, ratio, runs}`. `ratio` is
+`packed_bytes / raw_bytes` (lower is better; `null` for empty input); `runs` counts
+emitted repeat pairs, not literal blocks. Frames can be concatenated before packing.
+
+The headerless **`bitmap-rle-v1`** stream uses a control byte whose low seven bits
+are `count - 1`, for **1–128 bytes**. Controls `0x00`–`0x7f` precede `count` literal
+bytes; controls `0x80`–`0xff` precede one value byte to repeat `count` times. The
+encoder uses repeat pairs only for runs of at least three bytes and keeps shorter
+runs in literal blocks. There is no terminator, padding, checksum or stored length;
+this is not TIFF PackBits (`0x80` is a one-byte repeat, not a no-op). Worst-case
+size is **`n + ceil(n / 128)`**, just **4 extra bytes for a 512-byte noise frame**.
+
+Host tests measure and assert these full 128×32 frame results:
+
+| Pattern | Raw bytes | Packed bytes | Ratio (packed/raw) | Repeat pairs | Packed base64 characters |
+|---|---:|---:|---:|---:|---:|
+| Solid `0x00` | 512 | 8 | 0.015625 | 4 | 12 |
+| `HELLO BOARD`, one line of the board's 6×8 glyphs | 512 | 67 | 0.130859375 | 9 | 92 |
+| xorshift32 noise, seed `0x12345678` | 512 | 516 | 1.0078125 | 0 | 688 |
+
+The same test packs 30 concatenated solid frames: **15,360 → 240 bytes**, ratio
+**0.015625**, or **20,480 → 320 base64 characters**. That is a solid-pattern
+measurement, not a promised animation ratio.
+
+The text fixture re-renders the bench text/readback recorded in commit `2187401`
+through the current SSD1306 driver and font; these are host codec measurements,
+not a new bench capture. Compression depends on content: the noise case grows by
+**0.78125%** and still round-trips every byte. Reproduce the printed measurements
+with `cargo test -p esp32-agent-core bitmap::tests:: -- --nocapture`.
+
+`bitmap_unpack {packed_b64, bytes}` returns `{data_b64, raw_bytes}` and requires
+`bytes` to be the **exact original decoded length**, not the base64 length. It
+refuses truncated run pairs/literals, a stream missing complete final blocks,
+trailing blocks, or any run/literal exceeding that length. Decoded packed input is
+capped at **64 KiB** before allocation. Both tools limit raw data to **32 KiB**:
+worst-case packing produces at most 33,024 bytes / 44,032 base64 characters, leaving
+room for JSON inside the separate 64 KiB tool-result ceiling. The independent Rust
+API, `esp32_agent_core::bitmap::{pack, unpack}`, accepts up to 64 KiB of packed
+input and raw output when unpacking; `pack` itself is caller-bounded.
+
+Both tools are read-only, need no OLED, and do not store or draw anything.
+**`media_play` still takes raw `bitmap_b64`: unpack first**, then pass the returned
+`data_b64` as that frame field. There is no automatic unpacking or `compress: true`
+frame option. The existing bitmap encoding and playback contract are unchanged.
+Firmware not built/verified for the codec.
+
 ## 8. Sound with a picture: `POST /av`
 
 The bench board played a 30 s clip with its animation on the 128x32 OLED: PCM down one TCP
@@ -365,7 +416,63 @@ seeking, looping or overlaying means a second body. And the panel's row count is
 the top half of a taller buffer, which is the same thing the register setup already got
 wrong (see `docs/adding-a-device.md`, or set `pins: {"oled.height": 32}`).
 
-## 9. How to check these numbers again
+## 9. Clips: media that does not fit one tool result
+
+The two routes above carry the bytes themselves, and both are bounded by the same wall: a
+tool result is capped at 64 KiB, so a 20 s recording or a 30-frame animation cannot travel
+through the conversation, and each piece that does travel is re-sent with the transcript on
+every later turn. A **clip** is the other way round: bytes go into PSRAM now, stay out of the
+transcript, and one later call says "/play/ it".
+
+| | Value |
+|---|---|
+| Per clip | 2 MiB (`CLIP_MAX_BYTES`) = 43 s of 24 kHz mono PCM, or 4096 frames of 128×32 (512 bytes each) |
+| All clips | 4 MiB (`CLIPS_TOTAL_MAX`), counted by *reserved* capacity, not content |
+| How many | 6 (`CLIPS_MAX`) |
+| One `clip_append` | 48 KiB decoded (`CLIP_APPEND_MAX`); growth is in 8 KiB steps |
+| Recording | 16 kHz (`MIC_RATE_HZ`), 100 ms – 60 s per call |
+
+**Where the bytes live is a fact, not a wish.** A clip is allocated through
+`Hardware::media_buffer`, whose firmware implementation asks for
+`MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT` and returns `None` rather than falling back to internal
+RAM — stacks, DMA descriptors and every flash-safe allocation come from there, and quietly
+spending it on a 2 MB clip is how a board loses the RAM it needs to answer. Every reply
+carries `pool`, and `/api/status.clips` repeats it. Growth re-allocates through the same
+call, so a clip that grew is still where it started.
+
+| Tool | What it does |
+|---|---|
+| `clip_new {name, kind, bytes?, rate_hz?, fps?}` | Opens or resets a clip. `kind` is `pcm` (16-bit LE mono at `rate_hz`, default 24000) or `bitmap` (whole framebuffer-sized frames, played at `fps`, default 8) |
+| `clip_append {name, data_b64}` | Appends samples or whole frames; refuses over the per-clip, per-call and pool ceilings *before* copying |
+| `clip_record {name, ms}` | Records the microphone into a clip, in 1 s pieces, stripping the WAV container |
+| `clip_play {name, volume?, loops?}` | PCM → 4096-sample writes to the speaker; bitmap → frames drawn on the OLED at `fps` |
+| `clip_list`, `clip_drop {name?}` | What is held and where; free one clip or all of them |
+
+Three consequences worth stating plainly:
+
+- **A recording is not at the amplifier's rate.** The microphone runs at 16 kHz and the
+  amplifier at 24 kHz, so `clip_play` resamples (linear interpolation) on the way out and
+  reports `resampled: true`. Without that step a recording plays 1.5× fast, which sounds like
+  a hardware fault and is not one. Recording into a clip that already holds another rate is
+  refused instead of mixing two clocks in one buffer.
+- **Playback is synchronous.** `clip_play` holds the caller until the sound is out or the
+  frames are drawn; there is no media worker and no background queue. The default tool budget
+  is 30 s, so a clip longer than that cannot play to its end in one call at the default
+  setting — raise `agent.tool_timeout_s` (max 300) or keep takes shorter. The result reports
+  `played_ms` and the timeout error reports how much did play.
+- **Clips are lost on reboot.** They are not in the workspace, not in NVS and not in the
+  transcript, so nothing about them survives a power cut. Write a recording you want to keep
+  into the workspace instead.
+
+### Checking it on a board
+
+`GET /api/status` → `clips` (and `clip_list`) report `pool`, `bytes`, `reserved`, `ms`,
+`frames` and the totals. To check the pool itself rather than the report: read
+`memory.pools` before and after `clip_new {bytes: 1048576}`, and the `spiram` pool's `free`
+should drop by ~1 MiB while `internal_8bit` does not move — a clip that lands in internal RAM
+is the bug this whole section exists to prevent.
+
+## 10. How to check these numbers again
 
 - Flash: `espflash flash --partition-table firmware/partitions.csv --target-app-partition
   factory <elf>` prints `App size … (N%)`; record bytes and percent against the current

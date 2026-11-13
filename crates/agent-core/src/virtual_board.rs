@@ -326,6 +326,18 @@ impl Hardware for VirtualBoard {
         false
     }
 
+    /// The host has no PSRAM; the virtual board still answers the shape, so a caller that
+    /// checks before allocating exercises the same path here.
+    fn psram_largest_free(&mut self) -> Option<usize> {
+        Some(7_800 * 1024)
+    }
+
+    /// The virtual board's PSRAM pool, named: a test that reads `pool` sees the same string
+    /// the bench board reports, so "where did the bytes land" is exercised on the host too.
+    fn media_buffer(&mut self, len: usize) -> Option<(Vec<u8>, &'static str)> {
+        Some((Vec::with_capacity(len), "psram"))
+    }
+
     /// Two pools, because the point of the reading is that the firmware asks instead of
     /// assuming: a client sees the shape here and reads real numbers off a board. The
     /// values are fixed, like the virtual board's other memory figures.
