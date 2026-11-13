@@ -22,16 +22,18 @@ what is not done or not verified.
 - ✅ Model latency is outside the `App` lock: a turn in flight no longer queues the
   portal (historical bench: `/api/status` ≤ 253 ms while a 2.5 s model call runs)
 - ✅ Live journal over SSE (`/api/agent/stream`), `tool_progress`, `agent.tick_ms`
-- ⚠️ Final audit firmware source not built/verified on the board. A previous firmware build
-  or flash is not validation of subsequent source changes
+- ✅ Audit firmware release compilation reported for `5dc35c0` with ESP-IDF v5.5.2
+  (2026-11-13); this is a build check, not hardware validation
+- ⚠️ Audit firmware has not been flashed or board-tested. Earlier flashes do not validate
+  subsequent source changes
 - ⚠️ Not measured: WS2812/RMT, ADC/PWM values, boot time and power draw under a full
   sdkconfig; the portal's live console has only been driven with `curl -N`, not in a
   browser
 - ⚠️ Storage/runtime validation remains: transcript and workspace already use LittleFS on
   `storage` (`0xbf0000` = 12,517,376 bytes = 11.9375 MiB); configuration and secrets remain
-  in 24 KiB NVS. Host tests cover bounded parsing/admission and refused restores, but queue
-  admission is not flash acknowledgement and power-cut behavior is not board-verified.
-  See [storage guarantees](docs/storage.md)
+  in 24 KiB NVS. Host tests cover bounded parsing/admission and refused restores. Ordinary
+  configuration writes acknowledge queue admission; workspace writes wait for publication
+  receipt. Neither is a board power-cut measurement. See [storage guarantees](docs/storage.md)
 - ⚠️ Historical media bench (2026-11-12, recorded in `e7a9623`): `POST /audio/pcm` and `POST /av`
   played on the board; a 30.00 s clip
   with 362 frames completed in 30.19 s with the sound judged correct by ear, and its audio
