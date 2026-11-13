@@ -492,7 +492,8 @@ pub(crate) fn board_extra_tools() -> Vec<ToolDef> {
 pub fn manifest_family() -> ToolDef {
     Family::new(
         "manifest",
-        "Read, describe, validate and apply the device manifest; `command: help` lists what each command takes",
+        "Declare hardware the probe did not find, and give it tools the model can call: `get`, \
+         `describe` a driver, `validate`, `apply` (live at once, no reboot), `reset`",
         manifest_commands(),
     )
     .into_tool()
