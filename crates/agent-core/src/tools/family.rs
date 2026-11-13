@@ -102,7 +102,13 @@ impl Family {
                 if takes == "none" {
                     format!("{word}()")
                 } else {
-                    format!("{word}({takes})")
+                    // The argument's own hint, when it has one: `led_set(color: string)` left the
+                    // model passing `"green"`, which the board then refused with "must be
+                    // #rrggbb, [r,g,b] or {r,g,b}" - one wasted call that the sub-tool's
+                    // description already had the answer to (measured on the board, first turn
+                    // of a battery over every tool). Cut short so a family of ten stays a
+                    // paragraph.
+                    format!("{word}({})", argument_hints(&d.spec.input_schema))
                 }
             })
             .collect();
@@ -173,6 +179,53 @@ fn first_sentence(text: &str) -> String {
 }
 
 /// `name: type` for each argument, without the prose — one line per command in `help`.
+/// The same as [`arguments_of`] but carrying the note an argument can have about its *shape*.
+///
+/// A type is not a format: `color: string` is true of `"green"` and of `"#00ff00"`, and the
+/// board refuses the first. The note is where `led_set` and `speaker_play` already say which one
+/// they mean, so it belongs in the one line the model reads without a `help` call - cut short so
+/// a family of ten commands stays a paragraph.
+fn argument_hints(schema: &Value) -> String {
+    let Some(props) = schema.get("properties").and_then(Value::as_object) else {
+        return "none".to_string();
+    };
+    let required: Vec<&str> = schema
+        .get("required")
+        .and_then(Value::as_array)
+        .map(|a| a.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    let mut parts: Vec<String> = Vec::new();
+    for (name, spec) in props {
+        let kind = spec.get("type").and_then(Value::as_str).unwrap_or("any");
+        let mark = if required.contains(&name.as_str()) { "" } else { "?" };
+        let note = spec.get("description").and_then(Value::as_str).map(clip_note).unwrap_or_default();
+        // Only a note that shows the value's *shape*: `#rrggbb`, `{hz: 523, ms: 400}`, `[r,g,b]`.
+        // A sentence about what the field means belongs in `help`; a family that repeats every
+        // sentence is bigger than the tools it replaced, which is the one thing grouping exists
+        // to avoid (a test enforces that budget).
+        if note.contains('#') || note.contains('{') || note.contains('[') {
+            parts.push(format!("{name}{mark}: {kind} ({note})"));
+        } else {
+            parts.push(format!("{name}{mark}: {kind}"));
+        }
+    }
+    parts.join(", ")
+}
+
+/// An argument's note, cut to the part that says what the value looks like.
+fn clip_note(note: &str) -> String {
+    const MAX: usize = 24;
+    let note = note.trim().trim_end_matches('.');
+    if note.chars().count() <= MAX {
+        return note.to_string();
+    }
+    let cut: String = note.chars().take(MAX).collect();
+    match cut.rsplit_once(' ') {
+        Some((head, _)) => head.to_string(),
+        None => cut,
+    }
+}
+
 fn arguments_of(schema: &Value) -> String {
     let Some(props) = schema.get("properties").and_then(Value::as_object) else {
         return "none".to_string();
