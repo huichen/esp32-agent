@@ -2195,8 +2195,9 @@ impl App {
     /// Take the store's own counters, without the backend lock.
     ///
     /// `pending`, `written`, `failed` and `last_failure` are the queue's own state; `space`
-    /// is left out on purpose, because that one is sampled on the writer's thread
-    /// ([`StoreSpaceSample`]) to keep the lock order one-way (store, then App).
+    /// is left out on purpose: the writer samples it independently before App
+    /// acknowledgement ([`StoreSpaceSample`]), after releasing the backend lock.
+    /// Queue-counter locks here are short-lived; none acquires a backend or App lock.
     fn sample_store(&mut self) {
         let queue = &self.store_queue;
         let pending = queue.pending();
