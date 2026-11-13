@@ -30,8 +30,12 @@
 <form id="composer" class="composer" autocomplete="off">
   <div id="attach-chip" class="attach-chip" hidden></div>
   <input id="attach-input" type="file" accept="image/*" hidden>
-  <button id="attach" class="attach" type="button" aria-label="Attach an image">+</button>
-  <textarea id="input" rows="1" placeholder="Ask the board&hellip;" enterkeyhint="send"></textarea>
+  <!-- The attach button lives inside the field: as a sibling it cost 42 px of the row's
+       width plus a gap, for a control used once per message. -->
+  <div class="field">
+    <button id="attach" class="attach" type="button" aria-label="Attach an image">+</button>
+    <textarea id="input" rows="1" placeholder="Ask the board&hellip;" enterkeyhint="send"></textarea>
+  </div>
   <button id="send" class="send" type="submit" aria-label="Send">&#8593;</button>
 </form>
 

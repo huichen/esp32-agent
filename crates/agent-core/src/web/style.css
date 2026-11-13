@@ -321,14 +321,22 @@ body {
   position: relative;
   flex: 0 0 auto;
   z-index: 15;
-  padding: 8px 12px calc(8px + env(safe-area-inset-bottom));
+  /* Full width, explicitly: `margin: 0 auto` alone made the row shrink to its content, and
+     a textarea's intrinsic width (20 columns) is what then decided how much room there was
+     to type in. */
+  width: 100%;
+  box-sizing: border-box;
+  /* Gutters cost the field twice (left and right) and the send button is the only
+     control that has to stay outside the field, so the padding is 6 px and the gap 6 px:
+     at 390 px that is 372 px of field instead of 266. */
+  padding: 6px 4px calc(6px + env(safe-area-inset-bottom));
   background: linear-gradient(to top, var(--bg) 62%, transparent);
   display: flex;
   /* The attachment chip claims a whole line above the field (`flex: 1 0 100%`); without
      wrapping, "a whole line" is a line the composer does not have, and the chip pushes the
      field and the send button past the right edge instead of sitting over them. */
   flex-wrap: wrap;
-  gap: 8px;
+  gap: 4px;
   /* Centre, not bottom: the field is taller than the 42 px circles once its padding and
      line-height are counted, so bottom-aligning left the + and Send sitting low against it. */
   align-items: center;
@@ -338,16 +346,32 @@ body {
   transform: translateY(0);
 }
 
+/* The field is the pill, and the attach button sits inside it. As a sibling it cost its
+   own width plus a gap out of the row, which came straight off the space available to type
+   in — the one thing this bar is for. */
+.field {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  border: 1px solid var(--line);
+  border-radius: 21px;
+  background: var(--bg-soft);
+  padding-left: 4px;
+}
+.field:focus-within { border-color: var(--accent); }
+
 .composer textarea {
   box-sizing: border-box;
   flex: 1;
+  min-width: 0;
   resize: none;
   max-height: 132px;
   min-height: 42px;
-  padding: 11px 14px;
-  border-radius: 21px;
-  border: 1px solid var(--line);
-  background: var(--bg-soft);
+  padding: 10px 12px 10px 6px;
+  border: none;
+  border-radius: 0;
+  background: transparent;
   color: var(--text);
   font: inherit;
   line-height: 1.35;
@@ -357,7 +381,6 @@ body {
   scrollbar-width: none;
 }
 .composer textarea::-webkit-scrollbar { width: 0; height: 0; }
-.composer textarea:focus { border-color: var(--accent); }
 
 .send {
   appearance: none;
@@ -376,11 +399,12 @@ body {
 .composer .attach {
   appearance: none;
   flex: 0 0 auto;
-  width: 42px;
-  height: 42px;
+  width: 36px;
+  height: 36px;
+  margin-right: 2px;
+  border: none;
   border-radius: 50%;
-  border: 1px solid var(--line);
-  background: var(--panel);
+  background: transparent;
   color: var(--muted);
   font-size: 20px;
   line-height: 1;
