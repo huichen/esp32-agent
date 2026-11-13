@@ -14,9 +14,10 @@
 //!   enabled, `GAIN` floating = 9 dB.
 //!
 //! The tools are deliberately small: a level meter, a bounded recording, a generated
-//! tone, and a bounded playback. `mic_record` keeps its own result under 2 KB — well
-//! inside `agent::MAX_TOOL_RESULT_BYTES` — because 512 samples is already 32 ms of audio
-//! and a longer answer would spend a model's context on samples it cannot hear.
+//! tone, and a bounded playback. `mic_record` sizes itself against
+//! `agent::MAX_TOOL_RESULT_BYTES` rather than against a number of its own: 16,000 samples
+//! (one second) is the most that fits one result with the envelope, and the default stays
+//! at 256 because every sample here is re-sent with the transcript on later turns.
 //!
 //! Playback has the opposite budget and it is not a generous one. A request body is
 //! 128 KB, so a `pcm_b64` argument could in principle carry 1.9 s of audio — but five
@@ -40,20 +41,26 @@ pub const MIC_RATE_HZ: u32 = 16_000;
 /// Amplifier rate: 24 kHz, 16-bit, Philips, mono.
 pub const AMP_RATE_HZ: u32 = 24_000;
 
-/// Largest recording a tool result can carry: 512 samples = 1024 bytes = ~1.4 KB of
-/// base64, which leaves room for the envelope inside the 2 KB tool result.
-pub const MAX_RECORD_SAMPLES: usize = 512;
+/// Largest recording one tool result can carry: 16,000 samples = 32,000 bytes of PCM, plus
+/// the 44-byte header, which base64 turns into ~42.7 KB — inside the 64 KB
+/// [`crate::agent::MAX_TOOL_RESULT_BYTES`] with room for the envelope. That is one second at
+/// 16 kHz, and it is not free: 42.7 KB of base64 is about 11k tokens in the transcript, sent
+/// again on every later turn, which is why the schema's default is still 256 samples.
+pub const MAX_RECORD_SAMPLES: usize = 16_000;
 
 /// Bytes in the RIFF/WAVE header this module writes: one `fmt ` chunk and the `data`
 /// header, with no metadata chunks. 44 is what every decoder expects to skip.
 pub const WAV_HEADER_BYTES: usize = 44;
 
-/// Longest melody the board will synthesize, in milliseconds of audio: 6 s is 144,000
-/// samples, 288,000 bytes of mono PCM (and twice that once the driver duplicates each
-/// sample into a stereo frame). The cap is a memory budget, not a musical one: 8 s also
-/// fits in PSRAM, but the peak is then over 1 MB for a buffer that exists only to be
-/// handed to the DMA, and this board has 8 MB shared with everything else.
-pub const MAX_MELODY_MS: u32 = 6_000;
+/// Longest melody the board will synthesize, in milliseconds of audio: 12 s is 288,000
+/// samples, 576,000 bytes of mono PCM, and 1.15 MB once the driver duplicates each sample
+/// into a stereo frame — so ~1.7 MB of PSRAM held at the peak, 21% of the 7.9 MB free on
+/// this board. The cap is a budget, not a musical one: 30 s would also fit (4.3 MB at the
+/// peak), but two things push back. A buffer that exists only to be handed to the DMA
+/// should not be the largest allocation on the board, and the write blocks the agent
+/// thread for the length of the melody — `/api/status` and every other tool wait behind
+/// it. 12 s is a phrase; past that the host should stream PCM (`POST /audio/pcm`).
+pub const MAX_MELODY_MS: u32 = 12_000;
 
 /// Most notes in one melody. A 64-note score is still well under a kilobyte of JSON.
 pub const MAX_MELODY_NOTES: usize = 64;
@@ -133,7 +140,7 @@ impl crate::device::Device for Mic {
             }),
             ToolDef::new(
                 "mic_record",
-                "Record from the microphone and return a complete WAV file as base64: 16-bit mono PCM at 16 kHz, taken from the top 16 bits of the 24-bit samples. At most 512 samples (32 ms) — a tool result is capped at 2 KB, so longer audio belongs on a host, which is also where it is encoded (the board records WAV, see docs/audio.md)",
+                "Record from the microphone and return a complete WAV file as base64: 16-bit mono PCM at 16 kHz, taken from the top 16 bits of the 24-bit samples. At most 16,000 samples (1 s) — that is what fits one 64 KB tool result, and 42.7 KB of base64 is about 11k tokens in the transcript, so ask for what you need; longer audio belongs on a host, which is also where it is encoded (the board records WAV, see docs/audio.md)",
             )
             .title("Record")
             .category("audio")
@@ -237,7 +244,7 @@ impl crate::device::Device for Speaker {
             }),
             ToolDef::new(
                 "speaker_play",
-                "Play audio on the amplifier. `notes` is a melody the board synthesizes into one continuous buffer (up to 64 notes / 6 s), so a tune costs one call and has no gap between its notes; a note is `{\"hz\": 523, \"ms\": 400}` and `hz` 0 is a rest. `pcm_b64` is pre-rendered samples (16-bit mono, 24 kHz), at most 2048 bytes = 43 ms — for audio you already hold, and longer than that, stream it into `POST /audio/pcm` instead of growing this argument (docs/audio.md §6, §7)",
+                "Play audio on the amplifier. `notes` is a melody the board synthesizes into one continuous buffer (up to 64 notes / 12 s), so a tune costs one call and has no gap between its notes; a note is `{\"hz\": 523, \"ms\": 400}` and `hz` 0 is a rest. `pcm_b64` is pre-rendered samples (16-bit mono, 24 kHz), at most 2048 bytes = 43 ms — for audio you already hold, and longer than that, stream it into `POST /audio/pcm` instead of growing this argument (docs/audio.md §6, §7)",
             )
             .title("Play")
             .category("audio")
@@ -843,10 +850,16 @@ mod tests {
         let e = speaker.call("speaker_play", &json!({ "notes": too_many }), &mut ear).unwrap_err();
         assert!(e.message.contains(&MAX_MELODY_NOTES.to_string()), "{}", e.message);
 
-        // 7 notes of 1 s is past the 6 s cap even though each note is legal.
-        let too_long: Vec<Value> = (0..7).map(|_| json!({"hz": 440, "ms": 1000})).collect();
+        // 13 notes of 1 s is past the 12 s cap even though each note is legal.
+        let over = MAX_MELODY_MS / 1000 + 1;
+        let too_long: Vec<Value> = (0..over).map(|_| json!({"hz": 440, "ms": 1000})).collect();
         let e = speaker.call("speaker_play", &json!({ "notes": too_long }), &mut ear).unwrap_err();
-        assert!(e.message.contains("7000 ms") && e.message.contains("6000"), "{}", e.message);
+        assert!(
+            e.message.contains(&format!("{} ms", over * 1000))
+                && e.message.contains(&MAX_MELODY_MS.to_string()),
+            "{}",
+            e.message
+        );
 
         // The score and the samples are alternatives; both at once is a caller mistake
         // worth naming rather than silently preferring one.
@@ -877,9 +890,10 @@ mod tests {
         let pcm = melody(&[(440.0, MAX_MELODY_MS)], 0.5);
         assert_eq!(pcm.len(), samples_for(MAX_MELODY_MS));
         let bytes = pcm.len() * 2;
-        assert_eq!(bytes, 288_000, "6 s of 16-bit mono at 24 kHz");
+        assert_eq!(bytes, 576_000, "12 s of 16-bit mono at 24 kHz");
         // 8 MB of PSRAM, ~7.8 MB free at runtime: the mono buffer plus the driver's stereo
-        // duplicate is ~864 kB, which is 11% of what is free.
-        assert!((bytes * 3) < 1_024 * 1_024, "mono + stereo copy = {} bytes", bytes * 3);
+        // duplicate is ~1.7 MB, which is 21% of what is free. The test bounds it at 2 MB so
+        // that raising MAX_MELODY_MS again has to move this number on purpose.
+        assert!((bytes * 3) < 2 * 1_024 * 1_024, "mono + stereo copy = {} bytes", bytes * 3);
     }
 }

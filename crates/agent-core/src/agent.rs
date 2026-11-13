@@ -21,7 +21,12 @@ use crate::llm::{self, ChatTransport, LlmConfig, ToolCall};
 use serde_json::{json, Value};
 
 /// Oldest messages are dropped above this count.
-pub const MAX_HISTORY_MESSAGES: usize = 256;
+///
+/// Raised from 256 together with the byte cap. At two messages a turn the count used to
+/// bind long before the bytes did (it stopped a run at ~101 KB while the byte cap was
+/// 512 KB), which makes the byte budget decorative; 2 MB of short turns is roughly a
+/// thousand messages.
+pub const MAX_HISTORY_MESSAGES: usize = 1_024;
 /// Oldest messages are dropped above this much text.
 ///
 /// Not a physical limit of the chip: the transcript and the request built from it live
@@ -31,11 +36,17 @@ pub const MAX_HISTORY_MESSAGES: usize = 256;
 /// out in one POST, and the board has to build and send that body while its internal
 /// SRAM is down to a few kilobytes after TLS.
 ///
-/// Measured on the bench, and then measured again at a larger size (see
-/// `docs/troubleshooting.md`): 507 KB of transcript still served turns, and the board
-/// rebooted somewhere below 1 MB with the cause not yet captured. 512 KB is therefore the
-/// highest size with a measurement behind it, not a wish.
-pub const MAX_HISTORY_BYTES: usize = 512 * 1024;
+/// **2 MB is a chosen ceiling, not a measured one.** The bench ladder reached 507 KB with
+/// ~6.6 MB of PSRAM still free (`docs/troubleshooting.md`); nothing above that has run on
+/// the board. What the arithmetic says: during a turn the transcript, its journal entry
+/// and the serialised request exist at once, so the peak is roughly twice the cap plus the
+/// 18 KB of tool schemas — about 4 MB here, against 7.9 MB free. Watch `spiram.free_kb`
+/// in `/api/memory` between turns rather than trusting the cap.
+///
+/// Note that 2 MB is above what the default 262 144-token window carries (~209 000 tokens
+/// is ~840 KB of ASCII), so in normal use the token trigger fires first and this is the
+/// ring's backstop.
+pub const MAX_HISTORY_BYTES: usize = 2 * 1024 * 1024;
 /// How many question-and-answer exchanges survive compression verbatim.
 ///
 /// Four is enough to keep the thread of a task (what was asked, what the last tools did)
@@ -967,7 +978,7 @@ impl Agent {
     /// Tool arguments count too: a `write` of two kilobytes is the largest thing a single
     /// message can carry, and leaving it out would let a run of them look free.
     ///
-    /// Memoised on `history_version`: a 512 KB transcript is half a million character
+    /// Memoised on `history_version`: a 2 MB transcript is two million character
     /// classifications, and `needs_compaction` used to pay for that on every step.
     pub fn history_tokens(&mut self) -> u32 {
         if let Some((version, len, tokens)) = self.token_cache {
@@ -1867,13 +1878,29 @@ mod tests {
             "history grew to {} messages",
             agent.history.len()
         );
-        // 80 messages were produced, so the oldest questions are gone and the
-        // newest turn is intact.
-        assert_eq!(agent.history[0].role, Role::User);
-        assert_eq!(agent.history[0].text, format!("question {}", 40 - agent.history.len() / 2));
+        // 80 messages fit inside the 1024-message cap, so this run drops nothing: the
+        // assertion above is the invariant, and the trimming below is what exercises the
+        // ceiling itself.
+        assert_eq!(agent.history[0].text, "question 0");
         assert_eq!(agent.history.last().map(|m| m.text.as_str()), Some("answer 39"));
         assert!(agent.history_bytes() <= MAX_HISTORY_BYTES);
         assert_eq!(agent.runs, 40);
+
+        // Fill past the message cap directly: the oldest turns must go, and what is left
+        // must still start at a user turn — a tool result at the head would be orphaned
+        // from the call it answers.
+        for i in 0..MAX_HISTORY_MESSAGES {
+            agent.history.push(Message::user(&format!("filler {i}"), "http", 100_000 + i as u64));
+            agent.history.push(Message::tool("c", "{}", 200_000 + i as u64));
+            agent.trim();
+        }
+        assert!(
+            agent.history.len() <= MAX_HISTORY_MESSAGES,
+            "history grew to {} messages",
+            agent.history.len()
+        );
+        assert_eq!(agent.history[0].role, Role::User);
+        assert_eq!(agent.history.last().map(|m| m.text.as_str()), Some("{}"));
     }
 
     #[test]
