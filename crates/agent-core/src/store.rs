@@ -653,18 +653,19 @@ impl StoreQueue {
         }
     }
 
-    /// Note a write (`Some`) or a removal (`None`). A key queued twice keeps the position
-    /// of the first time and the value of the last, so a task that rewrites the same blob
-    /// every tick costs one operation, not one per tick.
+    /// Note a write (`Some`) or a removal (`None`). A key queued twice keeps the
+    /// position and value of its latest request. Coalescing still costs one operation,
+    /// but a blob header rewritten after a newly added chunk must move behind it.
     fn enqueue(&self, key: &str, value: Option<String>) -> bool {
         let mut pending = match self.pending.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         };
-        match pending.iter_mut().find(|(queued, _)| queued == key) {
-            Some(entry) => entry.1 = value,
-            None => pending.push((key.to_string(), value)),
-        }
+        let key = match pending.iter().position(|(queued, _)| queued == key) {
+            Some(index) => pending.remove(index).0,
+            None => key.to_string(),
+        };
+        pending.push((key, value));
         true
     }
 
@@ -1575,6 +1576,9 @@ mod tests {
         let inner = Shared::default();
         let queue = StoreQueue::new(Box::new(inner.clone()));
         let mut store = QueuedStore::new(queue.clone());
+        write_blob(&mut store, "ws", "first", PLAN).expect("fits");
+        // Growing a blob before the drain adds a new chunk. A header that kept its
+        // first position would now publish before that new chunk, not after it.
         write_blob(&mut store, "ws", &"x".repeat(2 * CHUNK_BYTES), PLAN).expect("fits");
         let report = queue.flush();
         assert_eq!(report.keys, vec!["ws.1".to_string(), "ws.2".to_string(), "ws".to_string()]);
@@ -1593,7 +1597,7 @@ mod tests {
         let report = queue.flush();
         assert_eq!(report.written, 2);
         assert_eq!(inner.get("sched").as_deref(), Some("second"));
-        assert_eq!(report.keys, vec!["sched".to_string(), "other".to_string()], "first position kept");
+        assert_eq!(report.keys, vec!["other".to_string(), "sched".to_string()], "latest request order kept");
     }
 
     #[test]
