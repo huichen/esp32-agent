@@ -1970,33 +1970,56 @@ impl App {
         if self.load_workspace_files() {
             return;
         }
-        // Older layouts: one document (current shape) or the chunked one, each of which is
-        // migrated to one-value-per-file below, so a board that upgrades mid-life keeps its
-        // files. Two layouts live under this key. `ws1 ...` is the chunked one written while
-        // the store could only take values; a document that starts with `{` is the current one.
-        let mut peek = [0u8; 4];
-        let head = match self.store.read_at(NVS_KEY_WORKSPACE, 0, &mut peek) {
-            Some(n) if n > 0 => n,
-            _ => return,
-        };
-        if head >= 4 && &peek == b"ws1 " {
+        // Peek through the streaming reader, not `get`/the queue's default `read_at`,
+        // which would materialize the complete legacy document before its limits apply.
+        let mut chunked = false;
+        let loaded = (|| -> std::result::Result<Option<AppWorkspace>, serde_json::Error> {
+            use std::io::Read as _;
+            let Some(mut reader) = self.store.reader(NVS_KEY_WORKSPACE).or_else(|| {
+                self.store
+                    .get(NVS_KEY_WORKSPACE)
+                    .map(|text| Box::new(std::io::Cursor::new(text.into_bytes())) as Box<dyn std::io::Read>)
+            }) else {
+                return Ok(None);
+            };
+            let mut peek = [0u8; 4];
+            let mut head = 0;
+            while head < peek.len() {
+                match reader.read(&mut peek[head..]) {
+                    Ok(0) => break,
+                    Ok(n) => head += n,
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(e) => return Err(serde_json::Error::io(e)),
+                }
+            }
+            if head == 4 && &peek == b"ws1 " {
+                chunked = true;
+                return Ok(None);
+            }
+            AppWorkspace::from_reader(std::io::Cursor::new(&peek[..head]).chain(reader)).map(Some)
+        })();
+        if chunked {
             self.load_workspace_chunked();
             return;
         }
-        let Some(reader) = self.store.reader(NVS_KEY_WORKSPACE) else { return };
-        match AppWorkspace::from_reader(reader) {
-            Ok(ws) => {
+        match loaded {
+            Ok(Some(ws)) => {
                 self.workspace = ws;
                 self.migrate_workspace("one document");
             }
-            Err(e) => {
-                // The value cannot be read by this build or any other, so leaving it in
-                // flash only costs the space and hides the fact from the next boot.
-                self.log.error(
-                    "agent",
-                    format!("the stored workspace is unreadable ({e}); starting with an empty one"),
-                );
-                store::clear_blob(self.store.as_mut(), NVS_KEY_WORKSPACE, WORKSPACE_PLAN);
+            other => {
+                // A reader cannot distinguish absent from unreadable on every backend.
+                // Look up names only on this failure path; never discard orphaned values.
+                let has_workspace =
+                    self.store.keys().iter().any(|key| key == NVS_KEY_WORKSPACE || key.starts_with("ws."));
+                if has_workspace {
+                    let error =
+                        other.err().map_or_else(|| "missing workspace header".to_string(), |e| e.to_string());
+                    let why =
+                        format!("the stored workspace is unreadable ({error}); stored data was preserved");
+                    self.log.error("agent", why.clone());
+                    self.workspace.refuse_load(why);
+                }
             }
         }
     }
@@ -2023,70 +2046,114 @@ impl App {
     /// Read the workspace from its index and one value per file. `false` when there is no
     /// index, which means this board still holds an older layout.
     fn load_workspace_files(&mut self) -> bool {
-        let Some(doc) = self.store.get(crate::keys::WORKSPACE_INDEX) else { return false };
-        let index: std::collections::BTreeMap<String, String> = match serde_json::from_str(&doc) {
-            Ok(index) => index,
+        let loaded = (|| -> std::result::Result<AppWorkspace, serde_json::Error> {
+            let reader = self
+                .store
+                .reader(crate::keys::WORKSPACE_INDEX)
+                .or_else(|| {
+                    self.store.get(crate::keys::WORKSPACE_INDEX).map(|text| {
+                        Box::new(std::io::Cursor::new(text.into_bytes())) as Box<dyn std::io::Read>
+                    })
+                })
+                .ok_or_else(|| {
+                    serde_json::Error::io(std::io::Error::other("workspace index is absent or unreadable"))
+                })?;
+            // Validate the complete index, including each derived key, before accessing
+            // any file content. An invalid suffix must not authorize reads from other keys.
+            let index = workspace_json::index(reader)?;
+            let mut ws = AppWorkspace::default();
+            for (path, key) in index {
+                let reader = self
+                    .store
+                    .reader(&key)
+                    .or_else(|| {
+                        self.store.get(&key).map(|text| {
+                            Box::new(std::io::Cursor::new(text.into_bytes())) as Box<dyn std::io::Read>
+                        })
+                    })
+                    .ok_or_else(|| {
+                        serde_json::Error::io(std::io::Error::other(
+                            "indexed workspace file is absent or unreadable",
+                        ))
+                    })?;
+                let allowance = WORKSPACE_FILE_MAX.min(WORKSPACE_TOTAL_MAX - ws.bytes());
+                let text = workspace_json::text(reader, allowance)?;
+                ws.insert_checked(&path, std::borrow::Cow::Owned(text), false)
+                    .map_err(<serde_json::Error as serde::de::Error>::custom)?;
+            }
+            ws.saved = ws.files.iter().map(|(path, text)| (path.clone(), crate::keys::fnv1a(text))).collect();
+            Ok(ws)
+        })();
+        match loaded {
+            Ok(ws) => {
+                self.log.info(
+                    "agent",
+                    format!("workspace: {} file(s), {} bytes from the index", ws.len(), ws.bytes()),
+                );
+                self.workspace = ws;
+                true
+            }
             Err(e) => {
-                self.log
-                    .error("agent", format!("the workspace index is unreadable ({e}); no files were loaded"));
-                return true;
-            }
-        };
-        let mut ws = AppWorkspace::default();
-        let mut missing = 0usize;
-        let mut bytes = 0usize;
-        for (path, key) in &index {
-            match self.store.get(key) {
-                Some(text) => {
-                    bytes += text.len();
-                    ws.files.insert(path.clone(), text);
+                if !self.store.keys().iter().any(|key| key == crate::keys::WORKSPACE_INDEX) {
+                    return false;
                 }
-                None => missing += 1,
+                let why = format!("the workspace index is unreadable ({e}); no files were loaded; stored data was preserved");
+                self.log.error("agent", why.clone());
+                self.workspace.refuse_load(why);
+                true
             }
         }
-        if missing > 0 {
-            self.log.error(
-                "agent",
-                format!("{} workspace file(s) named by the index are missing from the store", missing),
-            );
-        }
-        self.log
-            .info("agent", format!("workspace: {} file(s), {bytes} bytes from the index", ws.files.len()));
-        ws.saved = ws.files.iter().map(|(path, text)| (path.clone(), crate::keys::fnv1a(text))).collect();
-        self.workspace = ws;
-        true
     }
 
     /// The chunked layout: a `ws1` header under `ws` and the document in `ws.1`, `ws.2`, ...
     fn load_workspace_chunked(&mut self) {
-        let (text, legacy) = match store::read_blob(self.store.as_ref(), NVS_KEY_WORKSPACE, WORKSPACE_PLAN) {
-            store::BlobState::Missing => return,
-            store::BlobState::Stored(text) => (text, false),
-            store::BlobState::Legacy(text) => (text, true),
-            store::BlobState::Corrupt(why) => {
-                self.log.error(
-                    "agent",
-                    format!("the stored workspace does not check out ({why}); starting with an empty one"),
-                );
-                store::clear_blob(self.store.as_mut(), NVS_KEY_WORKSPACE, WORKSPACE_PLAN);
-                return;
+        let loaded = (|| -> std::result::Result<(AppWorkspace, bool), String> {
+            // The historical header/chunks each fit an NVS value. Stage only that bounded
+            // snapshot before reusing the shared checksum validation, never an unbounded `get`.
+            let mut snapshot = store::MemoryStore::new();
+            let reader = self.store.reader(NVS_KEY_WORKSPACE).ok_or("workspace header is unreadable")?;
+            let header = workspace_json::text(reader, store::VALUE_MAX).map_err(|e| e.to_string())?;
+            let count = if header.starts_with("ws1 ") {
+                let count = header
+                    .split_whitespace()
+                    .nth(1)
+                    .and_then(|n| n.parse::<usize>().ok())
+                    .ok_or("invalid workspace chunk count")?;
+                if count > WORKSPACE_PLAN.chunks_max {
+                    return Err("workspace chunk count exceeds its limit".to_string());
+                }
+                count
+            } else {
+                0
+            };
+            snapshot.set(NVS_KEY_WORKSPACE, &header);
+            for chunk in 1..=count {
+                let key = crate::keys::workspace_chunk(chunk);
+                let reader = self.store.reader(&key).ok_or("workspace chunk is unreadable")?;
+                let text = workspace_json::text(reader, store::CHUNK_BYTES).map_err(|e| e.to_string())?;
+                snapshot.set(&key, &text);
             }
-        };
-        match serde_json::from_str::<Value>(&text) {
-            Ok(v) => self.workspace = AppWorkspace::from_json(&v),
+            let (text, legacy) = match store::read_blob(&snapshot, NVS_KEY_WORKSPACE, WORKSPACE_PLAN) {
+                store::BlobState::Stored(text) => (text, false),
+                store::BlobState::Legacy(text) => (text, true),
+                store::BlobState::Corrupt(why) => return Err(why),
+                store::BlobState::Missing => return Err("workspace header is missing".to_string()),
+            };
+            let ws = AppWorkspace::from_reader(text.as_bytes()).map_err(|e| e.to_string())?;
+            Ok((ws, legacy))
+        })();
+        match loaded {
+            Ok((ws, legacy)) => {
+                self.workspace = ws;
+                if legacy {
+                    self.migrate_workspace("one value");
+                }
+            }
             Err(e) => {
-                // The value cannot be read by this build or any other, so leaving it in
-                // flash only costs the space and hides the fact from the next boot.
-                self.log.error(
-                    "agent",
-                    format!("the stored workspace is unreadable ({e}); starting with an empty one"),
-                );
-                store::clear_blob(self.store.as_mut(), NVS_KEY_WORKSPACE, WORKSPACE_PLAN);
-                return;
+                let why = format!("the stored workspace is unreadable ({e}); stored data was preserved");
+                self.log.error("agent", why.clone());
+                self.workspace.refuse_load(why);
             }
-        }
-        if legacy {
-            self.migrate_workspace("one value");
         }
     }
 
@@ -2610,7 +2677,7 @@ impl App {
         // an allocation that fails is `memory allocation of N bytes failed` followed by
         // `abort()` - a reboot, measured on this board.
         if let Some(free) = self.psram_free_bytes() {
-            workspace_fits(self.workspace.bytes(), Some(free))?;
+            workspace_fits(&self.workspace, Some(free))?;
         }
         let before = self.workspace.clone();
         let outcome = change(&mut self.workspace)?;
@@ -6179,37 +6246,51 @@ fn rule_problem(r: &SensorRule) -> Option<String> {
 
 // ---------------------------------------------------------------- workspace
 
-/// The agent's file workspace: an in-RAM map persisted as one JSON blob in NVS.
+#[path = "workspace_json.rs"]
+mod workspace_json;
+
+/// Metadata has its own limits: empty files and long names still occupy RAM.
+pub const WORKSPACE_FILES_MAX: usize = 1024;
+pub const WORKSPACE_PATH_MAX: usize = 256;
+pub const WORKSPACE_NAMES_MAX: usize = 128 * 1024;
+/// Permit a little redundant path syntax without accepting an unbounded raw name.
+const WORKSPACE_RAW_PATH_MAX: usize = 4 * WORKSPACE_PATH_MAX;
+/// Conservative per-map-entry allowance for tree-node slack and allocator bookkeeping.
+const WORKSPACE_ENTRY_RAM: usize = 192;
+
+/// The agent's bounded in-RAM file map, persisted as an index and one value per file.
 ///
-/// Deliberately small (a file is <= 2 KB, the whole workspace <= 8 KB) because it
-/// shares the chip's heap with the model transcript; SPIFFS can replace it later
-/// behind the same [`crate::tools::fs::Workspace`] trait.
+/// Text limits remain 256 KiB per file and 4 MiB in total. Logical path and entry
+/// budgets are separate from the short physical keys; see `docs/storage.md`.
 #[derive(Default, Debug, Clone)]
 pub struct AppWorkspace {
     files: std::collections::BTreeMap<String, String>,
-    /// What was last written for each path, so a save rewrites only what changed.
-    ///
-    /// The hash is content-only: the key for a path never changes, so a failed write leaves the
-    /// previous bytes in place and the hash stays wrong until the next attempt, which retries.
+    /// Per-path content hashes maintained by App's incremental persistence path.
+    /// This map alone does not establish that a queued write reached storage.
     saved: std::collections::BTreeMap<String, u64>,
+    /// A refused restore must not be replaced by boot-time seeding or a partial edit.
+    /// Repairing storage (or an explicit reset) makes the next load writable again.
+    load_refused: Option<String>,
 }
 
-/// Whether a change of `bytes` can be made with `free` bytes of PSRAM.
+/// Whether a change of `workspace` can be made with `free` bytes of PSRAM.
 ///
 /// Two copies: the rollback keeps the map as it was, and the change builds the new text. The
 /// margin is the allocator's overhead and whatever else a turn is holding. The point of asking
 /// is that the failure has two shapes and only one of them is usable: a refusal here says
 /// "nothing was changed", while an allocation that fails prints `memory allocation of N bytes
 /// failed` and calls `abort()` - measured on this board, at a 1.25 MB workspace.
-pub fn workspace_fits(bytes: usize, free: Option<usize>) -> std::result::Result<(), String> {
+pub fn workspace_fits(workspace: &AppWorkspace, free: Option<usize>) -> std::result::Result<(), String> {
+    workspace.writable()?;
     let Some(free) = free else { return Ok(()) };
+    let bytes = workspace.ram_bytes();
     let need = bytes.saturating_mul(2).saturating_add(64 * 1024);
     if free >= need {
         return Ok(());
     }
     Err(format!(
-        "the file workspace is {bytes} bytes and a change needs about {need} bytes of PSRAM \
-         (a rollback copy plus the new text); {free} is free, so nothing was changed"
+        "the file workspace uses an estimated {bytes} bytes of RAM and a change needs about {need} bytes of PSRAM \
+         (a rollback copy, file text, names and entry overhead); {free} is free, so nothing was changed"
     ))
 }
 
@@ -6238,23 +6319,13 @@ impl AppWorkspace {
         out.write_all(b"}}")
     }
 
-    /// Parse the document [`AppWorkspace::write_json`] writes, straight into the map.
+    /// Parse version-1 JSON incrementally, with bounded encoded input and decoded strings.
     ///
-    /// `from_json(&Value)` needed the whole document as a `String`, then a `Value` of it, then
-    /// the map - three copies on every boot. serde deserialises into the map directly, so the
-    /// peak is the map plus the parser's own buffer.
-    /// Incremental, and buffered: serde_json's reader pulls one byte at a time while it parses a
-    /// string, so handing it the store's reader directly meant a file open and seek per byte.
-    /// 8 KB of buffer turns that into one pull per 8 KB of document.
+    /// No intermediate `Value`, full-document `String`, or unbounded parser string buffer:
+    /// each path is checked before its content, and each decoded byte before allocation.
+    /// Legacy documents that omit `version` or `files` retain their version-1 meaning.
     pub fn from_reader(reader: impl std::io::Read) -> std::result::Result<Self, serde_json::Error> {
-        #[derive(serde::Deserialize)]
-        struct Doc {
-            #[serde(default)]
-            files: std::collections::BTreeMap<String, String>,
-        }
-        let mut buffered = std::io::BufReader::with_capacity(8192, reader);
-        let doc: Doc = serde_json::from_reader(&mut buffered)?;
-        Ok(Self { files: doc.files, saved: Default::default() })
+        workspace_json::document(reader)
     }
 
     pub fn to_json(&self) -> Value {
@@ -6265,16 +6336,108 @@ impl AppWorkspace {
         json!({ "version": 1, "files": files })
     }
 
-    pub fn from_json(v: &Value) -> Self {
+    /// The already-materialized legacy form. Validate before copying any entry.
+    /// The caller's `Value` allocation is not owned by this function.
+    pub fn from_json(v: &Value) -> std::result::Result<Self, String> {
+        let doc = v.as_object().ok_or("workspace document must be an object")?;
+        if doc.keys().any(|field| field != "version" && field != "files") {
+            return Err("unknown workspace field".to_string());
+        }
+        if doc.get("version").is_some_and(|version| version.as_u64() != Some(1)) {
+            return Err("workspace version must be the integer 1".to_string());
+        }
         let mut ws = Self::default();
-        if let Some(map) = v.get("files").and_then(|f| f.as_object()) {
+        if let Some(files) = doc.get("files") {
+            let map = files.as_object().ok_or("workspace files must be an object")?;
             for (path, text) in map {
-                if let Some(text) = text.as_str() {
-                    ws.files.insert(path.clone(), text.to_string());
-                }
+                let text = text.as_str().ok_or("workspace file content must be a string")?;
+                ws.insert_checked(path, std::borrow::Cow::Borrowed(text), false)?;
             }
         }
-        ws
+        Ok(ws)
+    }
+
+    fn file_path(path: &str) -> std::result::Result<String, String> {
+        let path = normalize_path(path)?;
+        if path == "/" {
+            return Err("the workspace root is a directory, not a file".to_string());
+        }
+        Ok(path)
+    }
+
+    /// Shared admission for normal writes and both restoration formats.
+    /// A restore cannot silently overwrite a canonical-name collision.
+    fn check_insert(&self, path: &str, bytes: usize, overwrite: bool) -> std::result::Result<String, String> {
+        self.writable()?;
+        let key = Self::file_path(path)?;
+        let previous = self.files.get(&key);
+        if !overwrite && previous.is_some() {
+            return Err(format!("duplicate canonical workspace path `{key}`"));
+        }
+        if previous.is_none() {
+            let physical = crate::keys::workspace_file(&key);
+            if self.files.keys().any(|existing| {
+                Self::path_conflicts(existing, &key) || crate::keys::workspace_file(existing) == physical
+            }) {
+                return Err(format!("workspace path `{key}` collides with an existing file or directory"));
+            }
+            if self.files.len() >= WORKSPACE_FILES_MAX {
+                return Err(format!("the workspace holds at most {WORKSPACE_FILES_MAX} files"));
+            }
+            let names = self.files.keys().map(|path| path.len()).sum::<usize>();
+            if !matches!(names.checked_add(key.len()), Some(n) if n <= WORKSPACE_NAMES_MAX) {
+                return Err(format!("workspace filenames hold at most {WORKSPACE_NAMES_MAX} bytes"));
+            }
+        }
+        if bytes > WORKSPACE_FILE_MAX {
+            return Err(format!(
+                "`{key}` is {bytes} bytes; the limit is {WORKSPACE_FILE_MAX} bytes per file"
+            ));
+        }
+        let others = self.bytes().saturating_sub(previous.map_or(0, String::len));
+        if !matches!(others.checked_add(bytes), Some(n) if n <= WORKSPACE_TOTAL_MAX) {
+            return Err(format!(
+                "the workspace holds at most {WORKSPACE_TOTAL_MAX} bytes; remove a file first"
+            ));
+        }
+        Ok(key)
+    }
+
+    fn path_conflicts(left: &str, right: &str) -> bool {
+        left == right
+            || left.strip_prefix(right).is_some_and(|rest| rest.starts_with('/'))
+            || right.strip_prefix(left).is_some_and(|rest| rest.starts_with('/'))
+    }
+
+    fn insert_checked(
+        &mut self,
+        path: &str,
+        text: std::borrow::Cow<'_, str>,
+        overwrite: bool,
+    ) -> std::result::Result<(), String> {
+        let key = self.check_insert(path, text.len(), overwrite)?;
+        let text = match text {
+            std::borrow::Cow::Owned(text) => text,
+            std::borrow::Cow::Borrowed(text) => {
+                let mut copy = String::new();
+                copy.try_reserve_exact(text.len()).map_err(|_| "workspace text allocation was refused")?;
+                copy.push_str(text);
+                copy
+            }
+        };
+        self.files.insert(key, text);
+        Ok(())
+    }
+
+    fn writable(&self) -> std::result::Result<(), String> {
+        match &self.load_refused {
+            Some(why) => Err(format!("the stored workspace was not loaded ({why}); writes are blocked to preserve it; repair or explicitly reset storage")),
+            None => Ok(()),
+        }
+    }
+
+    fn refuse_load(&mut self, why: impl Into<String>) {
+        self.load_refused = Some(why.into());
     }
 
     pub fn len(&self) -> usize {
@@ -6288,7 +6451,22 @@ impl AppWorkspace {
 
     /// Total text bytes across every file: the number [`WORKSPACE_TOTAL_MAX`] is about.
     pub fn bytes(&self) -> usize {
-        self.files.values().map(|text| text.len()).sum()
+        self.files.values().fold(0usize, |total, text| total.saturating_add(text.len()))
+    }
+
+    /// Allocation-capacity estimate, not a measured heap size. Include both maps'
+    /// strings and a generous allowance per tree entry; text-only `bytes()` stays unchanged.
+    pub fn ram_bytes(&self) -> usize {
+        let files = self.files.iter().fold(0usize, |total, (path, text)| {
+            total
+                .saturating_add(path.capacity())
+                .saturating_add(text.capacity())
+                .saturating_add(WORKSPACE_ENTRY_RAM)
+        });
+        let saved = self.saved.keys().fold(0usize, |total, path| {
+            total.saturating_add(path.capacity()).saturating_add(WORKSPACE_ENTRY_RAM)
+        });
+        files.saturating_add(saved).saturating_add(self.load_refused.as_ref().map_or(0, String::capacity))
     }
 
     pub fn is_empty(&self) -> bool {
@@ -6299,20 +6477,15 @@ impl AppWorkspace {
 /// `/a/b` from `a//b/`, `/a/./b`; `..` is refused rather than resolved, so a tool
 /// call can never climb out of the workspace.
 fn normalize_path(path: &str) -> std::result::Result<String, String> {
-    let mut out = String::from("/");
-    for part in path.split('/') {
-        match part {
-            "" | "." => {}
-            ".." => return Err(format!("`{path}` leaves the workspace root")),
-            p => {
-                if !out.ends_with('/') {
-                    out.push('/');
-                }
-                out.push_str(p);
-            }
-        }
+    // Check before normalization allocates a vector or a canonical path.
+    if path.len() > WORKSPACE_RAW_PATH_MAX {
+        return Err(format!("a raw workspace path holds at most {WORKSPACE_RAW_PATH_MAX} bytes"));
     }
-    Ok(out)
+    let path = fs_tools::normalize(path)?;
+    if path.len() > WORKSPACE_PATH_MAX {
+        return Err(format!("a canonical workspace path holds at most {WORKSPACE_PATH_MAX} bytes"));
+    }
+    Ok(path)
 }
 
 impl fs_tools::Workspace for AppWorkspace {
@@ -6342,30 +6515,17 @@ impl fs_tools::Workspace for AppWorkspace {
     }
 
     fn read(&self, path: &str) -> std::result::Result<String, String> {
-        let key = normalize_path(path)?;
+        let key = Self::file_path(path)?;
         self.files.get(&key).cloned().ok_or_else(|| format!("no file `{key}`"))
     }
 
     fn write(&mut self, path: &str, text: &str) -> std::result::Result<(), String> {
-        let key = normalize_path(path)?;
-        if text.len() > WORKSPACE_FILE_MAX {
-            return Err(format!(
-                "`{key}` is {} bytes; the limit is {WORKSPACE_FILE_MAX} bytes per file",
-                text.len()
-            ));
-        }
-        let others: usize = self.files.iter().filter(|(k, _)| **k != key).map(|(_, v)| v.len()).sum();
-        if others + text.len() > WORKSPACE_TOTAL_MAX {
-            return Err(format!(
-                "the workspace holds at most {WORKSPACE_TOTAL_MAX} bytes; remove a file first"
-            ));
-        }
-        self.files.insert(key, text.to_string());
-        Ok(())
+        self.insert_checked(path, std::borrow::Cow::Borrowed(text), true)
     }
 
     fn remove(&mut self, path: &str) -> std::result::Result<(), String> {
-        let key = normalize_path(path)?;
+        self.writable()?;
+        let key = Self::file_path(path)?;
         match self.files.remove(&key) {
             Some(_) => Ok(()),
             None => Err(format!("no file `{key}`")),
@@ -10368,6 +10528,400 @@ mod tests {
 
     // ------------------------------------------------- the workspace across a reboot
 
+    fn workspace_document_refused(doc: &Value) {
+        assert!(AppWorkspace::from_json(doc).is_err(), "Value loader accepted an invalid workspace");
+        let encoded = serde_json::to_vec(doc).unwrap();
+        assert!(
+            AppWorkspace::from_reader(encoded.as_slice()).is_err(),
+            "stream loader accepted an invalid workspace"
+        );
+    }
+
+    fn workspace_snapshot(store: &SharedStore) -> std::collections::BTreeMap<String, String> {
+        store
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(key, _)| *key == "ws" || key.starts_with("ws."))
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect()
+    }
+
+    struct WorkspaceCountedRead<R> {
+        inner: R,
+        bytes: std::rc::Rc<std::cell::Cell<usize>>,
+        pull: usize,
+    }
+
+    impl<R: std::io::Read> std::io::Read for WorkspaceCountedRead<R> {
+        fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+            let want = out.len().min(self.pull);
+            let count = self.inner.read(&mut out[..want])?;
+            self.bytes.set(self.bytes.get() + count);
+            Ok(count)
+        }
+    }
+
+    /// Reads without cloning values, and can refuse a key after a partial successful read.
+    struct WorkspaceReadStore {
+        inner: SharedStore,
+        reads: Arc<Mutex<Vec<String>>>,
+        failure: Option<(String, usize)>,
+    }
+
+    impl KvStore for WorkspaceReadStore {
+        fn get(&self, key: &str) -> Option<String> {
+            self.reads.lock().unwrap().push(key.to_string());
+            self.inner.get(key)
+        }
+        fn set(&mut self, key: &str, value: &str) -> bool {
+            self.inner.set(key, value)
+        }
+        fn remove(&mut self, key: &str) -> bool {
+            self.inner.remove(key)
+        }
+        fn keys(&self) -> Vec<String> {
+            self.inner.keys()
+        }
+        fn whole_value_bytes(&self) -> Option<usize> {
+            self.inner.whole_value_bytes()
+        }
+        fn read_at(&self, key: &str, offset: usize, out: &mut [u8]) -> Option<usize> {
+            self.reads.lock().unwrap().push(key.to_string());
+            let until = self
+                .failure
+                .as_ref()
+                .filter(|(failed, _)| failed == key)
+                .map_or(usize::MAX, |(_, after)| *after);
+            if offset >= until {
+                return None;
+            }
+            let values = self.inner.0.lock().unwrap();
+            let bytes = values.get(key)?.as_bytes();
+            if offset >= bytes.len() {
+                return Some(0);
+            }
+            let count = out.len().min(bytes.len() - offset).min(until - offset);
+            out[..count].copy_from_slice(&bytes[offset..offset + count]);
+            Some(count)
+        }
+    }
+
+    #[test]
+    fn workspace_restore_enforces_the_existing_text_budgets() {
+        workspace_document_refused(
+            &json!({"version": 1, "files": {"/big": "x".repeat(WORKSPACE_FILE_MAX + 1)}}),
+        );
+        let mut files = serde_json::Map::new();
+        for n in 0..16 {
+            files.insert(format!("/f{n}"), json!("x".repeat(WORKSPACE_FILE_MAX)));
+        }
+        let full = json!({"version": 1, "files": files});
+        assert_eq!(AppWorkspace::from_json(&full).unwrap().bytes(), WORKSPACE_TOTAL_MAX);
+        let encoded = serde_json::to_vec(&full).unwrap();
+        assert_eq!(AppWorkspace::from_reader(encoded.as_slice()).unwrap().bytes(), WORKSPACE_TOTAL_MAX);
+        let mut over = full;
+        over["files"]["/one-more-byte"] = json!("x");
+        workspace_document_refused(&over);
+    }
+
+    #[test]
+    fn workspace_restore_and_writes_bound_names_and_file_count() {
+        let mut files = serde_json::Map::new();
+        for n in 0..10_000 {
+            files.insert(format!("/empty-{n}"), json!(""));
+        }
+        workspace_document_refused(&json!({"version": 1, "files": files}));
+
+        let mut ws = AppWorkspace::default();
+        for n in 0..WORKSPACE_FILES_MAX {
+            fs_tools::Workspace::write(&mut ws, &format!("/e{n:04}"), "").unwrap();
+        }
+        assert_eq!(ws.bytes(), 0);
+        assert!(fs_tools::Workspace::write(&mut ws, "/extra", "").is_err());
+        fs_tools::Workspace::write(&mut ws, "/e0000", "replacement").unwrap();
+        assert_eq!(ws.len(), WORKSPACE_FILES_MAX);
+        fs_tools::Workspace::remove(&mut ws, "/e0000").unwrap();
+        fs_tools::Workspace::write(&mut ws, "/extra", "").unwrap();
+
+        let mut names = AppWorkspace::default();
+        for n in 0..(WORKSPACE_NAMES_MAX / WORKSPACE_PATH_MAX) {
+            let path = format!("/n{n:04}{}", "p".repeat(WORKSPACE_PATH_MAX - 6));
+            fs_tools::Workspace::write(&mut names, &path, "").unwrap();
+        }
+        assert_eq!(names.files.keys().map(String::len).sum::<usize>(), WORKSPACE_NAMES_MAX);
+        assert!(fs_tools::Workspace::write(&mut names, "/extra", "").is_err());
+        let mut over = names.to_json();
+        over["files"]["/extra"] = json!("");
+        workspace_document_refused(&over);
+    }
+
+    #[test]
+    fn workspace_paths_share_normalization_and_directory_rules() {
+        let mut ws = AppWorkspace::default();
+        fs_tools::Workspace::write(&mut ws, " notes//./a/ ", "hello").unwrap();
+        assert_eq!(fs_tools::Workspace::read(&ws, "/notes/a").unwrap(), "hello");
+        assert_eq!(fs_tools::Workspace::read(&ws, "notes/a").unwrap(), "hello");
+        for path in ["/", " ", "/a/../b", "/a\\b", "/a\0b"] {
+            assert!(fs_tools::Workspace::write(&mut ws, path, "").is_err(), "accepted {path:?}");
+            assert!(fs_tools::Workspace::read(&ws, path).is_err(), "read {path:?}");
+            assert!(fs_tools::Workspace::remove(&mut ws, path).is_err(), "removed {path:?}");
+        }
+        assert!(fs_tools::Workspace::list(&ws, "/").is_ok());
+        assert!(fs_tools::Workspace::write(&mut ws, "/notes", "file over directory").is_err());
+        assert!(fs_tools::Workspace::write(&mut ws, "/notes/a/b", "directory under file").is_err());
+        let enormous = format!("/{}", "p".repeat(WORKSPACE_TOTAL_MAX));
+        assert!(fs_tools::Workspace::write(&mut ws, &enormous, "").is_err());
+        let exact = format!("/{}", "p".repeat(WORKSPACE_PATH_MAX - 1));
+        fs_tools::Workspace::write(&mut ws, &exact, "").unwrap();
+        assert!(fs_tools::Workspace::write(&mut ws, &(exact + "p"), "").is_err());
+        let relative = json!({"files": {"relative": "readable"}});
+        assert_eq!(
+            fs_tools::Workspace::read(&AppWorkspace::from_json(&relative).unwrap(), "/relative").unwrap(),
+            "readable"
+        );
+    }
+
+    #[test]
+    fn workspace_restore_rejects_bad_shapes_and_canonical_collisions() {
+        for bad in [
+            json!(null),
+            json!([]),
+            json!({"files": null}),
+            json!({"files": []}),
+            json!({"files": {"/x": 7}}),
+            json!({"version": "1"}),
+            json!({"version": 1.0}),
+            json!({"version": 2}),
+            json!({"version": true}),
+            json!({"unknown": {}}),
+            json!({"files": {"/": "root"}}),
+            json!({"files": {"relative": "hidden", "/a/../b": "hidden"}}),
+            json!({"files": {"/a": "one", "a": "two"}}),
+            json!({"files": {"/a/b": "one", "/a//b": "two"}}),
+            json!({"files": {"/a": "file", "/a/b": "child"}}),
+        ] {
+            workspace_document_refused(&bad);
+        }
+        for raw in [
+            r#"{"version":1,"version":1}"#,
+            r#"{"files":{},"files":{}}"#,
+            r#"{"files":{"/a":"one","/a":"two"}}"#,
+            r#"{"files":{},}"#,
+            r#"{"files":{"/a":"x",}}"#,
+            r#"{"files":{}} {}"#,
+        ] {
+            assert!(AppWorkspace::from_reader(raw.as_bytes()).is_err(), "accepted {raw}");
+        }
+        for valid in [json!({}), json!({"version": 1}), json!({"files": {}})] {
+            assert!(AppWorkspace::from_json(&valid).unwrap().is_empty());
+            assert!(AppWorkspace::from_reader(valid.to_string().as_bytes()).unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn workspace_stream_parser_agrees_with_json_string_decoding() {
+        let raw = br#"{"files":{"/\u754c":"ASCII \" \\ \/ \b \f \n \r \t \u0000 \uD83D\uDE00"},"version":1}"#;
+        let expected: Value = serde_json::from_slice(raw).unwrap();
+        let counter = std::rc::Rc::new(std::cell::Cell::new(0));
+        let reader = WorkspaceCountedRead { inner: &raw[..], bytes: counter, pull: 1 };
+        let ws = AppWorkspace::from_reader(reader).unwrap();
+        assert_eq!(
+            fs_tools::Workspace::read(&ws, "/界").unwrap(),
+            expected["files"]["/界"].as_str().unwrap()
+        );
+        let unicode = json!({"version": 1, "files": {"/日本語.md": "界 한글 😀"}});
+        assert_eq!(AppWorkspace::from_reader(unicode.to_string().as_bytes()).unwrap().to_json(), unicode);
+        for invalid in [
+            &br#"{"files":{"/a":"\q"}}"#[..],
+            &br#"{"files":{"/a":"\uD800"}}"#[..],
+            &br#"{"files":{"/a":"\uDC00"}}"#[..],
+            &br#"{"files":{"/a":"\uD800\u0041"}}"#[..],
+            &br#"{"files":{"/a":"\uZZZZ"}}"#[..],
+            &b"{\"files\":{\"/a\":\"\xff\"}}"[..],
+            &b"{\"files\":{\"/a\":\"unescaped\nnewline\"}}"[..],
+        ] {
+            assert!(AppWorkspace::from_reader(invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn workspace_stream_parser_stops_before_unbounded_strings_are_materialized() {
+        use std::io::Read as _;
+        for (prefix, limit) in [
+            (br#"{"files":{"/a":""#.as_slice(), WORKSPACE_FILE_MAX),
+            (br#"{"files":{""#.as_slice(), WORKSPACE_RAW_PATH_MAX),
+        ] {
+            let count = std::rc::Rc::new(std::cell::Cell::new(0));
+            let reader = WorkspaceCountedRead {
+                inner: std::io::Cursor::new(prefix).chain(std::io::repeat(b'x')),
+                bytes: count.clone(),
+                pull: usize::MAX,
+            };
+            let error = AppWorkspace::from_reader(reader).unwrap_err();
+            assert!(error.to_string().contains("limit"), "{error}");
+            println!(
+                "decoded string limit={limit}: stopped after {} input bytes including read-ahead",
+                count.get()
+            );
+            assert!(count.get() <= prefix.len() + limit + 1 + 8192, "drained {} bytes", count.get());
+        }
+        let prefix = br#"{"files":{"/a":""#;
+        let count = std::rc::Rc::new(std::cell::Cell::new(0));
+        let escapes = std::io::Cursor::new(br#"\u0061"#.repeat(WORKSPACE_FILE_MAX + 10_000));
+        let reader = WorkspaceCountedRead {
+            inner: std::io::Cursor::new(prefix).chain(escapes),
+            bytes: count.clone(),
+            pull: usize::MAX,
+        };
+        assert!(AppWorkspace::from_reader(reader).is_err());
+        assert!(count.get() <= prefix.len() + 6 * (WORKSPACE_FILE_MAX + 1) + 8192);
+    }
+
+    #[test]
+    fn workspace_ram_estimate_counts_empty_files_and_saved_paths() {
+        let mut ws = AppWorkspace::default();
+        for n in 0..WORKSPACE_FILES_MAX {
+            fs_tools::Workspace::write(&mut ws, &format!("/empty-{n}"), "").unwrap();
+        }
+        assert_eq!(ws.bytes(), 0);
+        assert!(ws.ram_bytes() >= WORKSPACE_FILES_MAX * WORKSPACE_ENTRY_RAM);
+        assert!(workspace_fits(&ws, Some(64 * 1024)).is_err());
+        let before = ws.ram_bytes();
+        ws.saved = ws.files.keys().map(|path| (path.clone(), 0)).collect();
+        assert!(ws.ram_bytes() >= before + WORKSPACE_FILES_MAX * WORKSPACE_ENTRY_RAM);
+        assert!(workspace_fits(&ws, Some(2 * ws.ram_bytes() + 64 * 1024)).is_ok());
+    }
+
+    #[test]
+    fn workspace_rejected_documents_survive_boot_seeding_and_later_edits() {
+        for doc in [
+            "{torn".to_string(),
+            json!({"version": 2, "files": {}}).to_string(),
+            json!({"version": 1, "files": {"/big": "x".repeat(WORKSPACE_FILE_MAX + 1)}}).to_string(),
+        ] {
+            let store = SharedStore::new();
+            store.clone().set("ws", &doc);
+            let before = workspace_snapshot(&store);
+            let mut app = app_with(&store);
+            assert!(app.workspace.is_empty());
+            assert!(fs_tools::Workspace::write(&mut app.workspace, "/new", "no overwrite").is_err());
+            assert!(fs_tools::Workspace::remove(&mut app.workspace, "/new").is_err());
+            drain_store(&mut app);
+            assert_eq!(workspace_snapshot(&store), before);
+        }
+    }
+
+    #[test]
+    fn workspace_rejected_chunked_snapshots_are_preserved() {
+        let mut memory = MemoryStore::new();
+        store::write_blob(&mut memory, "ws", r#"{"version":2,"files":{}}"#, WORKSPACE_PLAN).unwrap();
+        for corrupt in [false, true] {
+            let store = SharedStore::new();
+            for key in memory.keys() {
+                store.clone().set(&key, &memory.get(&key).unwrap());
+            }
+            if corrupt {
+                store.clone().set("ws.1", "different bytes");
+            }
+            let before = workspace_snapshot(&store);
+            let mut app = app_with(&store);
+            assert!(app.workspace.load_refused.is_some());
+            drain_store(&mut app);
+            assert_eq!(workspace_snapshot(&store), before);
+        }
+    }
+
+    #[test]
+    fn workspace_index_validates_every_name_and_key_before_content_reads() {
+        let good = crate::keys::workspace_file("/good");
+        let cases = [
+            json!({"/good": good, "/wrong": "other"}),
+            json!({"/a": crate::keys::workspace_file("/a"), "a": crate::keys::workspace_file("/a")}),
+            json!({"/a": crate::keys::workspace_file("/a"), "/a/b": crate::keys::workspace_file("/a/b")}),
+            json!({"/a/../b": "other"}),
+            json!({"/": "other"}),
+        ];
+        for index in cases {
+            let store = SharedStore::new();
+            store.clone().set(crate::keys::WORKSPACE_INDEX, &index.to_string());
+            store.clone().set(&good, "must not be read before the index is valid");
+            store.clone().set("other", "must never be fetched as workspace data");
+            let before = workspace_snapshot(&store);
+            let reads = Arc::new(Mutex::new(Vec::new()));
+            let backend = WorkspaceReadStore { inner: store.clone(), reads: reads.clone(), failure: None };
+            let mut app = App::new(
+                Box::new(VirtualBoard::new()),
+                Box::new(backend),
+                LogBuf::new(64),
+                FwMeta::default(),
+            );
+            assert!(app.workspace.load_refused.is_some());
+            assert!(!reads.lock().unwrap().iter().any(|key| key == "other" || key == &good));
+            drain_store(&mut app);
+            assert_eq!(workspace_snapshot(&store), before);
+        }
+    }
+
+    #[test]
+    fn workspace_index_content_errors_preserve_the_complete_previous_index() {
+        let key = crate::keys::workspace_file("/bad");
+        for failure in [false, true] {
+            let store = SharedStore::new();
+            store.clone().set(crate::keys::WORKSPACE_INDEX, &json!({"/bad": key}).to_string());
+            store.clone().set(&key, &"x".repeat(WORKSPACE_FILE_MAX + 1));
+            let before = workspace_snapshot(&store);
+            let backend = WorkspaceReadStore {
+                inner: store.clone(),
+                reads: Arc::new(Mutex::new(Vec::new())),
+                failure: failure.then(|| (key.clone(), 7)),
+            };
+            let mut app = App::new(
+                Box::new(VirtualBoard::new()),
+                Box::new(backend),
+                LogBuf::new(64),
+                FwMeta::default(),
+            );
+            assert!(app.workspace.is_empty());
+            assert!(app.workspace.load_refused.is_some());
+            drain_store(&mut app);
+            assert_eq!(workspace_snapshot(&store), before);
+        }
+        let store = SharedStore::new();
+        let mut index = serde_json::Map::new();
+        for n in 0..17 {
+            let path = format!("/f{n:02}");
+            let key = crate::keys::workspace_file(&path);
+            index.insert(path, json!(key));
+            store.clone().set(&key, &"x".repeat(if n == 16 { 1 } else { WORKSPACE_FILE_MAX }));
+        }
+        store.clone().set(crate::keys::WORKSPACE_INDEX, &Value::Object(index).to_string());
+        let before = workspace_snapshot(&store);
+        let mut app = app_with(&store);
+        assert!(app.workspace.is_empty(), "must not adopt a partial over-budget index");
+        assert!(app.workspace.load_refused.is_some());
+        drain_store(&mut app);
+        assert_eq!(workspace_snapshot(&store), before);
+    }
+
+    #[test]
+    fn workspace_transient_read_refusal_preserves_the_legacy_document() {
+        let store = SharedStore::new();
+        store.clone().set("ws", r#"{"version":1,"files":{"/a":"keep me"}}"#);
+        let before = workspace_snapshot(&store);
+        let backend = WorkspaceReadStore {
+            inner: store.clone(),
+            reads: Arc::new(Mutex::new(Vec::new())),
+            failure: Some(("ws".to_string(), 4)),
+        };
+        let mut app =
+            App::new(Box::new(VirtualBoard::new()), Box::new(backend), LogBuf::new(64), FwMeta::default());
+        assert!(app.workspace.load_refused.is_some());
+        drain_store(&mut app);
+        assert_eq!(workspace_snapshot(&store), before);
+    }
+
     /// The document is written as it is generated and parsed as it is read, so the two halves
     /// of the streaming path have to agree - and the result has to still be the JSON every
     /// other reader expects.
@@ -10399,14 +10953,18 @@ mod tests {
     /// (the rollback and the change) plus a margin, against what is actually free.
     #[test]
     fn a_workspace_change_is_refused_before_psram_runs_out() {
-        // 1 MB of workspace needs ~2.06 MB free; a board with 7.9 MB says yes.
-        assert!(super::workspace_fits(1_000_000, Some(7_900_000)).is_ok());
+        let mut ws = AppWorkspace::default();
+        for file in 0..4 {
+            fs_tools::Workspace::write(&mut ws, &format!("/f{file}"), &"x".repeat(250_000)).unwrap();
+        }
+        // 1 MB of text plus metadata needs slightly over 2.06 MB free.
+        assert!(super::workspace_fits(&ws, Some(7_900_000)).is_ok());
         // The same board with 1 MB left says no, and says why.
-        let err = super::workspace_fits(1_000_000, Some(1_000_000)).unwrap_err();
+        let err = super::workspace_fits(&ws, Some(1_000_000)).unwrap_err();
         assert!(err.contains("nothing was changed"), "{err}");
         assert!(err.contains("PSRAM"), "{err}");
         // A platform that cannot answer is not blocked: no measurement is not a refusal.
-        assert!(super::workspace_fits(1_000_000, None).is_ok());
+        assert!(super::workspace_fits(&ws, None).is_ok());
     }
 
     /// The space a backend reports has to say what that backend has, or the field lies.
@@ -10690,7 +11248,7 @@ mod tests {
         assert!(fs_tools::Workspace::remove(&mut ws, "/a/b.txt").is_ok());
         assert!(fs_tools::Workspace::remove(&mut ws, "/a/b.txt").is_err());
         // What is stored is what comes back.
-        let reloaded = AppWorkspace::from_json(&ws.to_json());
+        let reloaded = AppWorkspace::from_json(&ws.to_json()).expect("valid version-1 workspace");
         assert_eq!(reloaded.len(), ws.len());
     }
 
