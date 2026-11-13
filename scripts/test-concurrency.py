@@ -21,8 +21,11 @@ def main():
     p.add_argument('--pin', default='')
     p.add_argument('--soak', type=int, default=0)
     p.add_argument('--agent', action='store_true')
+    p.add_argument('--soak-only', action='store_true')
     p.add_argument('--max-ms', type=int, default=1000)
     args = p.parse_args()
+    if args.soak_only and args.agent:
+        p.error('--soak-only cannot be combined with --agent')
     host = args.host.rstrip('/')
     latencies = []
     checks = 0
@@ -67,7 +70,11 @@ def main():
             'Do not start the test over a live or queued user turn'
         time.sleep(0.2)
 
+    initial_tasks = sorted(t['name'] for t in s['threads'])
+
     def exercise(name, calls):
+        if args.soak_only:
+            return
         before = len(latencies)
         with concurrent.futures.ThreadPoolExecutor(max_workers=len(calls)) as pool:
             futures = [pool.submit(tool, tool_name, arguments) for tool_name, arguments in calls]
@@ -88,13 +95,14 @@ def main():
     exercise('two-serialized-tools', [('shell', {'command': 'sleep 4'}),
         ('script', {'source': 'sleep(4000)\n1'})])
     exercise('three-serialized-tools', [('script', {'source': 'sleep(2000)\n1'})] * 3)
-    clip = '_mutex_probe'
-    tool('clip_new', {'name': clip, 'kind': 'pcm', 'bytes': 48000, 'rate_hz': 24000})
-    try:
-        tool('clip_append', {'name': clip, 'data_b64': base64.b64encode(bytes(48000)).decode()})
-        exercise('silent-pcm-playback', [('clip_play', {'name': clip, 'loops': 5})])
-    finally:
-        tool('clip_drop', {'name': clip})
+    if not args.soak_only:
+        clip = '_mutex_probe'
+        tool('clip_new', {'name': clip, 'kind': 'pcm', 'bytes': 48000, 'rate_hz': 24000})
+        try:
+            tool('clip_append', {'name': clip, 'data_b64': base64.b64encode(bytes(48000)).decode()})
+            exercise('silent-pcm-playback', [('clip_play', {'name': clip, 'loops': 5})])
+        finally:
+            tool('clip_drop', {'name': clip})
 
     if args.agent:
         cfg = request('/api/agent/config')
@@ -156,6 +164,8 @@ def main():
     end = time.monotonic() + args.soak
     last = control()['uptime_s']
     soak_calls = 0
+    soak_started = time.monotonic()
+    next_report = soak_started + 60
     # Keep real tools in flight throughout the soak, rather than just idling.
     with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
         future = None
@@ -171,17 +181,26 @@ def main():
             assert s['agent']['thread'] == 'running', s['agent']
             last = s['uptime_s']
             control('/healthz')
+            if time.monotonic() >= next_report:
+                print('soak elapsed_s=', round(time.monotonic()-soak_started),
+                      'tool_calls=', soak_calls, 'control_reads=', len(latencies),
+                      'max_ms=', round(max(latencies),1), flush=True)
+                next_report += 60
             time.sleep(1)
         if future is not None:
             future.result()
     time.sleep(1)
     final = control()
+    final_tasks = sorted(t['name'] for t in final['threads'])
+    if args.soak_only:
+        assert final_tasks == initial_tasks, ('Task set changed under request churn', initial_tasks, final_tasks)
     samples = sorted(latencies)
     print(json.dumps({'firmware': firmware, 'checks': checks, 'control_reads': len(samples),
         'median_ms': round(statistics.median(samples),1),
         'p95_ms': round(samples[int((len(samples)-1)*0.95)],1),
         'max_ms': round(max(samples),1), 'uptime_s': final['uptime_s'],
         'soak_s': args.soak, 'soak_tool_calls': soak_calls,
+        'task_set_stable': final_tasks == initial_tasks, 'task_count': len(final_tasks),
         'memory': {p['pool']: {k: p[k] for k in ('free_kb', 'largest_kb', 'min_free_kb')}
                    for p in final['memory']['pools']},
         'owned_stack_headroom_kb': {t['name']: t['high_water_kb'] for t in final['threads']
