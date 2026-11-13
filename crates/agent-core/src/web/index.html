@@ -19,9 +19,7 @@
       <p id="sub">connecting&hellip;</p>
     </div>
     <span id="link" class="dot" title="connection"></span>
-    <button id="clear-chat" class="clear-chat" type="button" aria-label="Clear conversation / 清空会话">
-      <span>Clear chat</span><span lang="zh">清空会话</span>
-    </button>
+    <button id="clear-chat" class="clear-chat" type="button" aria-label="Clear conversation">Clear chat</button>
   </div>
 </header>
 
@@ -38,6 +36,21 @@
 </form>
 
 <div id="toast" class="toast" role="status" aria-live="polite" aria-atomic="true"></div>
+
+<!-- One dialog for every "are you sure": the browser's own confirm() renders its
+     buttons in the device's language and cannot be styled, which made an English page
+     grow Chinese buttons on a phone. This one is ours, so the words are ours. -->
+<div id="confirm-dialog" class="modal" role="dialog" aria-modal="true" aria-labelledby="confirm-title"
+     aria-describedby="confirm-body" hidden>
+  <div class="modal-card">
+    <h2 id="confirm-title">Confirm</h2>
+    <p id="confirm-body"></p>
+    <div class="modal-actions">
+      <button id="confirm-cancel" class="btn ghost" type="button">Cancel</button>
+      <button id="confirm-ok" class="btn" type="button">Continue</button>
+    </div>
+  </div>
+</div>
 
 <section id="sheet" class="sheet" hidden>
   <div class="sheet-head">
