@@ -1103,6 +1103,50 @@ function stopStream() {
 
 // ---------------------------------------------------------------- panels
 
+/** In-flight panel reads, and the loader that says so.
+ *
+ * Every tab that renders board state fetches it on open, and until this existed a slow
+ * answer looked exactly like an empty tab: the previous panel's content disappeared, the new
+ * one had nothing in it, and nothing said whether that was the truth or a request in flight.
+ *
+ * The loader waits 150 ms before appearing — a LAN answer that arrives in 20 ms should not
+ * flash a spinner — and stays until the last read finishes, so entering Agent (which reads
+ * both the model and the schedule) does not hide the loader between the two.
+ */
+let loadsInFlight = 0;
+let loadTimer = null;
+
+function beginPanelLoad(label) {
+  loadsInFlight += 1;
+  if (loadTimer === null && loadsInFlight === 1) {
+    loadTimer = setTimeout(() => {
+      loadTimer = null;
+      if (loadsInFlight > 0) showPanelLoading(label);
+    }, 150);
+  }
+}
+
+function endPanelLoad() {
+  loadsInFlight = Math.max(0, loadsInFlight - 1);
+  if (loadsInFlight > 0) return;
+  if (loadTimer !== null) {
+    clearTimeout(loadTimer);
+    loadTimer = null;
+  }
+  showPanelLoading(null);
+}
+
+function showPanelLoading(label) {
+  const box = $("#panel-loading");
+  if (!box) return;
+  if (!label) {
+    box.hidden = true;
+    return;
+  }
+  $("#panel-loading-label").textContent = label;
+  box.hidden = false;
+}
+
 function kv(el, pairs) {
   el.innerHTML = pairs
     .map(([k, v]) => "<span>" + escapeHtml(k) + "</span><span>" + escapeHtml(String(v)) + "</span>")
@@ -1385,17 +1429,33 @@ async function loadSettings() {
   }
 }
 
+/** Run one panel read with the loader around it.
+ *
+ * The loader counts reads rather than panels, so entering Agent (model + schedule) keeps it
+ * up until both answers are in, and a second tab opened mid-flight cannot hide the first
+ * one's spinner. */
+function panelLoad(label, read) {
+  beginPanelLoad(label);
+  return read().finally(endPanelLoad);
+}
+
 function showPanel(name) {
   S.panel = name;
   $$(".tabs button").forEach((b) => b.setAttribute("aria-selected", String(b.dataset.panel === name)));
   $$(".panel").forEach((p) => (p.hidden = p.id !== "panel-" + name));
-  if (name === "devices") loadDevices();
-  if (name === "tools") loadTools();
+  if (name === "devices") panelLoad("Loading devices\u2026", loadDevices);
+  if (name === "tools") panelLoad("Loading tools\u2026", loadTools);
   // The schedule queues turns for this agent, so it lives on the Agent panel; the log is
   // the other thing to read when the board misbehaves, so it lives on Settings.
-  if (name === "agent") { loadAgent(); loadSched(); }
-  if (name === "files") loadTree();
-  if (name === "settings") { loadSettings(); loadLogs(); }
+  if (name === "agent") {
+    panelLoad("Loading the agent\u2026", loadAgent);
+    panelLoad("Loading the schedule\u2026", loadSched);
+  }
+  if (name === "files") panelLoad("Loading files\u2026", loadTree);
+  if (name === "settings") {
+    panelLoad("Loading settings\u2026", loadSettings);
+    panelLoad("Loading the log\u2026", loadLogs);
+  }
 }
 
 // ---------------------------------------------------------------- wiring
@@ -1512,10 +1572,18 @@ function init() {
   });
 
   $("#devices-probe").onclick = async () => {
-    try { await api("/api/devices/probe", { method: "POST", body: {} }); toast("probing"); setTimeout(loadDevices, 1500); }
-    catch (e) { toast(e.message); }
+    beginPanelLoad("Probing the buses\u2026");
+    try {
+      await api("/api/devices/probe", { method: "POST", body: {} });
+      toast("probing");
+      setTimeout(() => panelLoad("Loading devices\u2026", loadDevices), 1500);
+    } catch (e) {
+      toast(e.message);
+    } finally {
+      endPanelLoad();
+    }
   };
-  $("#devices-refresh").onclick = loadDevices;
+  $("#devices-refresh").onclick = () => panelLoad("Loading devices\u2026", loadDevices);
 
   $("#agent-save").onclick = async () => {
     const body = {
