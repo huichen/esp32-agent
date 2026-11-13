@@ -279,6 +279,11 @@ impl Hardware for EspHw {
                         // high-water mark is already a byte count. Calling it "words" sent
                         // one reading of this table to the wrong conclusion.
                         "stack_free_bytes": t.usStackHighWaterMark,
+                        // Which core the task is on right now. `TaskStatus_t` in this
+                        // binding has no core field, so ask the scheduler with the handle;
+                        // without it `ps` cannot answer "who is where", which is the first
+                        // question when two peripherals are run at once.
+                        "core": sys::xTaskGetCoreID(t.xHandle),
                     })
                 })
                 .collect()

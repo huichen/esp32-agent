@@ -308,10 +308,13 @@ impl Hardware for VirtualBoard {
     }
 
     fn tasks(&mut self) -> Vec<serde_json::Value> {
+        // `core` is part of the shape even here: a host has no SMP scheduling to report, so
+        // every task claims core 0, and `ps` on the simulator still shows the column the
+        // board fills in.
         vec![
-            json!({"name": "main", "state": "running", "priority": 1, "stack_free_bytes": 2048}),
-            json!({"name": "httpd", "state": "blocked", "priority": 5, "stack_free_bytes": 1024}),
-            json!({"name": "agent", "state": "blocked", "priority": 4, "stack_free_bytes": 1536}),
+            json!({"name": "main", "state": "running", "priority": 1, "stack_free_bytes": 2048, "core": 0}),
+            json!({"name": "httpd", "state": "blocked", "priority": 5, "stack_free_bytes": 1024, "core": 0}),
+            json!({"name": "agent", "state": "blocked", "priority": 4, "stack_free_bytes": 1536, "core": 0}),
         ]
     }
 
