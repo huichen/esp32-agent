@@ -1,6 +1,7 @@
 //! Short-lived control-plane lock. Never acquires App, hardware or storage locks.
 //! Cancellation can therefore reach a tool that is holding the App mutex.
 use crate::http::{Request, Response};
+use serde::Serialize;
 use serde_json::json;
 use std::sync::{Arc, Mutex};
 
@@ -15,6 +16,25 @@ struct State {
     auth_failures: u64,
     http_requests: u64,
     sessions: usize,
+    tool: Option<ToolActivity>,
+}
+
+#[derive(Clone, Serialize)]
+pub struct ToolActivity {
+    name: String,
+    owner: &'static str,
+}
+
+/// Tracks the current synchronous tool without borrowing App. Nested guards
+/// restore their parent and never acquire App/hardware/storage in Drop.
+pub struct ToolLease {
+    gate: RunGate,
+    previous: Option<ToolActivity>,
+}
+impl Drop for ToolLease {
+    fn drop(&mut self) {
+        self.gate.0.lock().unwrap_or_else(|p| p.into_inner()).tool = self.previous.take();
+    }
 }
 
 #[derive(Clone, Default)]
@@ -61,6 +81,17 @@ impl RunGate {
     }
     pub fn sessions(&self) -> usize {
         self.0.lock().unwrap_or_else(|p| p.into_inner()).sessions
+    }
+    pub fn tool_activity(&self) -> Option<ToolActivity> {
+        self.0.lock().unwrap_or_else(|p| p.into_inner()).tool.clone()
+    }
+    pub fn enter_tool(&self, name: &str, owner: Option<&'static str>) -> ToolLease {
+        let mut s = self.0.lock().unwrap_or_else(|p| p.into_inner());
+        let previous = s.tool.take();
+        let owner = owner.or_else(|| previous.as_ref().map(|t| t.owner)).unwrap_or("external");
+        s.tool = Some(ToolActivity { name: name.chars().take(64).collect(), owner });
+        drop(s);
+        ToolLease { gate: self.clone(), previous }
     }
     pub fn note_request(&self) {
         let mut s = self.0.lock().unwrap_or_else(|p| p.into_inner());
@@ -119,5 +150,31 @@ impl RunGate {
             s.cancelled = true;
         }
         Some(Response::json(&json!({"cancelling":cancelling,"run_active":s.active})))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tool_activity_restores_the_owner_and_parent_even_after_a_panic() {
+        let gate = RunGate::default();
+        let root = gate.enter_tool("script", Some("agent"));
+        assert_eq!(json!(gate.tool_activity()), json!({"name":"script","owner":"agent"}));
+        {
+            let _nested = gate.enter_tool("shell", None);
+            assert_eq!(json!(gate.tool_activity()), json!({"name":"shell","owner":"agent"}));
+        }
+        assert_eq!(json!(gate.tool_activity())["name"], "script");
+        drop(root);
+        assert!(gate.tool_activity().is_none());
+        let caught = std::panic::catch_unwind(|| {
+            let _external = gate.enter_tool("shell", None);
+            assert_eq!(json!(gate.tool_activity())["owner"], "external");
+            panic!("test guard cleanup");
+        });
+        assert!(caught.is_err());
+        assert!(gate.tool_activity().is_none());
     }
 }

@@ -1882,6 +1882,7 @@ impl App {
     }
 
     pub fn call_tool(&mut self, name: &str, args: &Value) -> Result<Value> {
+        let _activity = self.run_gate.enter_tool(name, None);
         // A top-level call installs the configured deadline; a nested one (a script's
         // `tool(…)`, a family command, a shell stage) keeps the outer one. Ten tools inside
         // one script are one call as far as the portal is concerned.
@@ -4761,6 +4762,7 @@ impl ToolHost for App {
     }
 
     fn call_tool(&mut self, name: &str, arguments: &Value) -> std::result::Result<String, String> {
+        let _activity = self.run_gate.enter_tool(name, Some("agent"));
         self.fs_or_net_call(name, arguments)
     }
 }
@@ -7466,7 +7468,12 @@ pub fn make_handler(app: Shared) -> Handler {
                 return response;
             }
             return match views.current() {
-                Some(view) => view.response(req.path == "/healthz", gate.active(), gate.sessions()),
+                Some(view) => view.response(
+                    req.path == "/healthz",
+                    gate.active(),
+                    gate.sessions(),
+                    gate.tool_activity(),
+                ),
                 None => Response::error_json(503, "status has not been sampled yet"),
             };
         }
@@ -8037,8 +8044,8 @@ mod tests {
             sampled_ms: 1099,
             sampled_at: Instant::now() - Duration::from_millis(10),
         };
-        assert_eq!(body_json(&view.response(true, false, 0))["uptime_s"], 1);
-        assert_eq!(body_json(&view.response(false, false, 0))["uptime_s"], 1);
+        assert_eq!(body_json(&view.response(true, false, 0, None))["uptime_s"], 1);
+        assert_eq!(body_json(&view.response(false, false, 0, None))["uptime_s"], 1);
     }
 
     #[test]
@@ -8093,7 +8100,7 @@ mod tests {
         for (name, args) in
             [("shell", json!({"command":"sleep 10"})), ("script", json!({"source":"sleep(10000)\n1"}))]
         {
-            let mut app = test_app();
+            let app = test_app();
             app.run_gate.set_active(true);
             let shared: Shared = Arc::new(Mutex::new(app));
             let handler = make_handler(shared.clone());

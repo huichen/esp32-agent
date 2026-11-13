@@ -46,8 +46,13 @@ not construct or publish a full status view.
 Responses expose `snapshot: true`, `age_ms`, and `stale` (age over 1 second).
 Heap, device and storage information can therefore be old during a long tool;
 `age_ms` is not hidden. Uptime advances from the last monotonic reading plus elapsed
-`Instant` time, independent of SNTP. `agent.run_active` and `mcp.sessions` are overlaid from the live
-run-control state rather than reported from an old snapshot. Control-plane HTTP
+`Instant` time, independent of SNTP. `agent.run_active`, `agent.active_tool`
+(`name` and `owner`: `agent` or `external`), and `mcp.sessions` are overlaid
+from the live run-control state rather than reported from an old snapshot.
+Nested tool activity restores its parent on completion or unwinding. A growing
+`age_ms` alone is not proof that an Agent is executing a tool: model calls,
+queued writes and other callers can also delay publication. The regression
+waits for an Agent-owned `script`, after a startup idle window, before cancelling. Control-plane HTTP
 and auth-failure counters are merged into App at the next control-state sync.
 
 Portal PIN/token policy is synchronized immediately after route/tool changes,
