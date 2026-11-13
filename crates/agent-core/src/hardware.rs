@@ -251,6 +251,36 @@ pub trait Hardware: Send {
             .map(|p| (p.free_kb.saturating_mul(1024), p.largest_kb.saturating_mul(1024)))
     }
 
+    /// Whether the *calling* thread's stack is in internal RAM.
+    ///
+    /// This is the condition an `spi_flash` write runs under: both caches are disabled while it
+    /// happens, and ESP-IDF asserts that the task doing it has a stack the CPU can still reach
+    /// (internal RAM, never PSRAM). A store write that goes through the queue is safe whatever
+    /// the caller is; a write this thread performs itself has to ask first.
+    ///
+    /// `true` is the honest default for a platform with no PSRAM stacks (the simulator): every
+    /// thread there can write flash.
+    fn stack_is_internal(&self) -> bool {
+        true
+    }
+
+    /// The largest single allocation PSRAM can satisfy right now, in bytes.
+    ///
+    /// `free` is not the number that matters for a buffer: it is the largest *contiguous* block,
+    /// because an allocation is one run of memory. `None` where the question does not apply.
+    fn psram_largest_free(&mut self) -> Option<usize> {
+        None
+    }
+
+    /// Let the rest of the system run for a moment.
+    ///
+    /// A multi-megabyte write to flash is one long stretch of CPU, and the task watchdog fires
+    /// when an idle task has not run for five seconds - measured here: `task_wdt: IDLE1 (CPU 1)
+    /// did not reset the watchdog in time`, then a reboot, from a 1.75 MB workspace save. The
+    /// streaming code calls this every few dozen kilobytes. A platform with no watchdog has
+    /// nothing to do, which is why the default is empty.
+    fn let_others_run(&mut self) {}
+
     /// The chip's own temperature sensor, where the part has one. `None` is a real
     /// answer: the ESP32-C3 has no such sensor, and a board that made one up would be
     /// worse than a board that says it cannot.
