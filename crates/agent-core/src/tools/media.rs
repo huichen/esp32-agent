@@ -16,6 +16,8 @@ use std::time::Duration;
 
 /// At most a 12 s, 30 fps strip. Duplicate timestamps still consume entries.
 pub const MAX_MEDIA_FRAMES: usize = MAX_MELODY_MS as usize * 30 / 1000;
+/// Tool-argument budget, independent of the 64 KiB tool-result ceiling.
+pub const MAX_MEDIA_BITMAP_BYTES: usize = 32 * 1024;
 const WRITE_SAMPLES: usize = 4_096;
 
 /// The compound tool exists when either medium is available. Its handler checks
@@ -40,11 +42,12 @@ pub fn tools(devices: &Devices) -> Vec<ToolDef> {
             })),
             ("frames", json!({
                 "type": "array", "minItems": 1, "maxItems": MAX_MEDIA_FRAMES,
-                "description": "frames in any order, each drawn once at/after its at_ms slot; at most 360 entries",
+                "description": "frames in any order, each drawn once at/after its at_ms slot; at most 360 entries and 32768 decoded bitmap bytes in the whole request",
                 "items": {
                     "type": "object",
                     "properties": {
                         "at_ms": integer(0, MAX_MELODY_MS.into(), "offset from playback start, excluding synthesis"),
+                        "bitmap_b64": string("base64 of a full-panel 1-bpp bitmap, oled_bitmap/POST /av page format, bit0 = top row; exactly 512 bytes (128x32) or 1024 (128x64); cannot be combined with rects, text or line"),
                         "rects": {
                             "type": "array", "maxItems": MAX_FRAME_RECTS,
                             "items": {
@@ -64,6 +67,14 @@ pub fn tools(devices: &Devices) -> Vec<ToolDef> {
                         "line": integer(0, 7, "text row, default 0; must be inside the detected panel"),
                     },
                     "required": ["at_ms"],
+                    "oneOf": [
+                        {"required": ["bitmap_b64"], "not": {"anyOf": [
+                            {"required": ["rects"]}, {"required": ["text"]}, {"required": ["line"]},
+                        ]}},
+                        {"not": {"required": ["bitmap_b64"]}, "anyOf": [
+                            {"required": ["rects"]}, {"required": ["text"]},
+                        ]},
+                    ],
                     "additionalProperties": false,
                 },
             })),
@@ -75,7 +86,7 @@ pub fn tools(devices: &Devices) -> Vec<ToolDef> {
     schema["anyOf"] = json!([{"required": ["notes"]}, {"required": ["frames"]}]);
     vec![ToolDef::new(
         "media_play",
-        "Play a score and OLED frames on one clock in one synchronous call. Optional notes use speaker_play's 64-note / 12 s budget; frames use at_ms slots (0-12000), replace the panel, and combine rectangles with text in one flush. Audio is synthesized once and written in 4096-sample chunks; frames due between writes are drawn in timestamp order, including after the sound ends. The result reports frames_drawn, frames_late and max_late_ms rather than claiming exact audiovisual sync. This holds the caller; background playback is not implemented (docs/audio.md).",
+        "Play a score and OLED frames on one clock in one synchronous call. Optional notes use speaker_play's 64-note / 12 s budget; frames use at_ms slots (0-12000), replace the panel with a bitmap or rectangles plus text in one flush, and accept at most 32 KiB of decoded bitmap arguments per call. All frames are validated before playback. Audio is synthesized once and written in 4096-sample chunks; frames due between writes are drawn in timestamp order, including after the sound ends. The result reports frames_drawn, frames_late and max_late_ms rather than claiming exact audiovisual sync. This holds the caller; background playback is not implemented (docs/audio.md).",
     )
     .title("Play sound and picture")
     .category("audio")
@@ -165,12 +176,22 @@ fn prepare(ctx: &ToolCtx<'_>, args: &Value) -> Result<Plan> {
             .as_u64()
             .and_then(|v| u8::try_from(v).ok())
             .ok_or_else(|| McpError::internal("OLED height is missing"))?;
+        let mut bitmap_bytes = 0;
         for (index, frame) in entries.iter().enumerate() {
             let bad = |e: McpError| McpError::invalid_params(format!("`frames[{index}]` {}", e.message));
             let at_ms = j::optional_ranged_u64(frame, "at_ms", 0, MAX_MELODY_MS.into())
                 .map_err(bad)?
                 .ok_or_else(|| bad(McpError::invalid_params("`at_ms` is required")))?;
             let content = MediaFrame::parse(frame, width, height).map_err(bad)?;
+            if let Some(bytes) = content.bitmap_bytes() {
+                bitmap_bytes += bytes;
+                if bitmap_bytes > MAX_MEDIA_BITMAP_BYTES {
+                    return Err(bad(McpError::invalid_params(format!(
+                        "brings decoded bitmap arguments to {bitmap_bytes} bytes; at most {MAX_MEDIA_BITMAP_BYTES} bytes are accepted per call",
+                    ))));
+                }
+                require_action(ctx, &oled.id, "oled_bitmap")?;
+            }
             if content.has_rects() {
                 require_action(ctx, &oled.id, "oled_rect")?;
             }
@@ -488,6 +509,14 @@ mod tests {
         oled.framebuffer().to_vec()
     }
 
+    fn bitmap_frame(at_ms: u64, bytes: &[u8]) -> Value {
+        json!({"at_ms": at_ms, "bitmap_b64": crate::util::b64_encode(bytes)})
+    }
+
+    fn bitmap_pattern() -> Vec<u8> {
+        (0..512).map(|index| if index / 128 % 2 == 0 { 0xAA } else { 0x55 }).collect()
+    }
+
     fn no_output(board: &RecordedBoard) {
         let state = board.0.lock().unwrap();
         assert_eq!(state.board.i2s_written, 0, "invalid parameters must not play a partial melody");
@@ -520,6 +549,64 @@ mod tests {
         assert_eq!(result["frames_late"], 3);
         assert_eq!(result["max_late_ms"], 141);
         assert_eq!(result["played_ms"], 400);
+    }
+
+    #[test]
+    fn bitmap_frames_preserve_the_exact_oled_bitmap_bytes() {
+        let (mut app, board) = fixture();
+        let bytes = bitmap_pattern();
+        let result = run(&mut app, &json!({"frames": [bitmap_frame(0, &bytes)]})).unwrap();
+        {
+            let state = board.0.lock().unwrap();
+            assert_eq!(state.frames.len(), 1);
+            assert_eq!(state.frames[0].pixels, bytes, "every page/column byte reached the virtual panel");
+            assert!(state.writes.is_empty(), "a bitmap-only plan needs no audio write");
+        }
+        assert_eq!(result["frames_drawn"], 1);
+        assert_eq!(result["frames_late"], 0);
+        assert_eq!(result["played_ms"], 0);
+
+        let legacy = app
+            .call_tool(
+                "display",
+                &json!({
+                    "command": "oled_bitmap", "arguments": {"data_b64": crate::util::b64_encode(&bytes)},
+                }),
+            )
+            .unwrap();
+        assert_eq!(legacy["bytes"], bytes.len());
+        let state = board.0.lock().unwrap();
+        assert_eq!(state.frames.len(), 2);
+        assert_eq!(state.frames[1].pixels, bytes, "existing oled_bitmap draws the same unmodified bytes");
+    }
+
+    #[test]
+    fn bitmap_and_vector_frames_share_the_timestamp_order() {
+        let (mut app, board) = fixture();
+        let bytes = bitmap_pattern();
+        let inverse: Vec<_> = bytes.iter().map(|byte| !byte).collect();
+        let result = run(
+            &mut app,
+            &json!({
+                "notes": [{"hz": 440, "ms": 60}],
+                "frames": [
+                    {"at_ms": 240, "text": "LAST"}, bitmap_frame(200, &inverse),
+                    {"at_ms": 100, "text": "MID"}, bitmap_frame(0, &bytes),
+                ],
+            }),
+        )
+        .unwrap();
+        let state = board.0.lock().unwrap();
+        assert_eq!(
+            state.frames.iter().map(|frame| frame.pixels.clone()).collect::<Vec<_>>(),
+            [bytes, text_pixels("MID"), inverse, text_pixels("LAST")],
+            "both content forms replace the whole panel without an intermediate flush"
+        );
+        assert_eq!(state.frames.iter().map(|frame| frame.at_ms).collect::<Vec<_>>(), [0, 100, 200, 240]);
+        assert_eq!(state.writes, [1440]);
+        assert_eq!(result["frames_drawn"], 4);
+        assert_eq!(result["frames_late"], 0);
+        assert_eq!(result["played_ms"], 60);
     }
 
     #[test]
@@ -592,6 +679,10 @@ mod tests {
             (json!({"text": "X"}), "at_ms"),
             (json!({"at_ms": 20, "rects": {}}), "rects"),
             (json!({"at_ms": 20, "text": null}), "text"),
+            (json!({"at_ms": 20, "bitmap_b64": null}), "bitmap_b64"),
+            (json!({"at_ms": 20, "bitmap_b64": 123}), "bitmap_b64"),
+            (json!({"at_ms": 20, "bitmap_b64": "!!!!"}), "bitmap_b64"),
+            (json!({"at_ms": 20, "bitmap_b64": "AA=A"}), "bitmap_b64"),
             (json!({"at_ms": 20, "rects": [], "text": ""}), "drawable"),
         ] {
             let (mut app, board) = fixture();
@@ -611,6 +702,90 @@ mod tests {
             );
             no_output(&board);
         }
+    }
+
+    #[test]
+    fn bitmap_lengths_match_the_detected_panel_before_playback() {
+        for (height, expected) in [(32, 512), (64, 1024)] {
+            for actual in [0, 10, 511, 512, 513, 1023, 1024, 1025, 65_536] {
+                if actual == expected {
+                    continue;
+                }
+                let (mut app, board) = fixture();
+                app.cfg.pins.insert("oled.height".into(), height);
+                app.rebuild();
+                board.reset();
+                let error = run(
+                    &mut app,
+                    &json!({
+                        "notes": [{"hz": 440, "ms": 200}],
+                        "frames": [{"at_ms": 0, "text": "VALID"}, bitmap_frame(20, &vec![0xAA; actual])],
+                    }),
+                )
+                .unwrap_err();
+                assert_eq!(error.code, crate::error::code::INVALID_PARAMS);
+                assert!(error.message.contains("frames[1]"), "{}", error.message);
+                assert!(error.message.contains(&format!("{actual} decoded bytes")), "{}", error.message);
+                assert!(error.message.contains(&format!("expected {expected}")), "{}", error.message);
+                no_output(&board);
+            }
+        }
+    }
+
+    #[test]
+    fn bitmap_and_vector_fields_cannot_be_mixed() {
+        for (field, value) in [
+            ("rects", json!([{"x": 0, "y": 0, "w": 1, "h": 1}])),
+            ("rects", json!([])),
+            ("rects", json!(null)),
+            ("text", json!("OVERLAY")),
+            ("text", json!("")),
+            ("text", json!(null)),
+            ("line", json!(0)),
+            ("line", json!(null)),
+        ] {
+            let (mut app, board) = fixture();
+            let mut frame = bitmap_frame(20, &[0xAA; 512]);
+            frame[field] = value;
+            let error = run(
+                &mut app,
+                &json!({
+                    "notes": [{"hz": 440, "ms": 200}],
+                    "frames": [{"at_ms": 0, "text": "VALID"}, frame],
+                }),
+            )
+            .unwrap_err();
+            assert_eq!(error.code, crate::error::code::INVALID_PARAMS);
+            assert!(
+                error.message.contains("frames[1]")
+                    && error.message.contains("bitmap_b64")
+                    && error.message.contains(field),
+                "{}",
+                error.message
+            );
+            no_output(&board);
+        }
+    }
+
+    #[test]
+    fn bitmap_budget_is_for_the_entire_request_not_the_result() {
+        let (mut app, board) = fixture();
+        let bitmap = bitmap_frame(0, &[0xAA; 512]);
+        let accepted = MAX_MEDIA_BITMAP_BYTES / 512;
+        let mut frames = vec![json!({"at_ms": 0, "text": "VALID"})];
+        frames.extend(vec![bitmap.clone(); accepted + 1]);
+        let error = run(&mut app, &json!({"notes": [{"hz": 440, "ms": 200}], "frames": frames})).unwrap_err();
+        assert_eq!(error.code, crate::error::code::INVALID_PARAMS);
+        assert!(error.message.contains("frames[65]"), "{}", error.message);
+        assert!(error.message.contains("33280") && error.message.contains("32768"), "{}", error.message);
+        no_output(&board);
+
+        let args = json!({"frames": vec![bitmap; accepted]});
+        assert!(args.to_string().len() > MAX_MEDIA_BITMAP_BYTES, "base64/JSON is not the decoded budget");
+        let result = run(&mut app, &args).unwrap();
+        assert_eq!(result["frames_drawn"], 64);
+        assert_eq!(board.0.lock().unwrap().frames.len(), 64);
+        assert!(result.to_string().len() < crate::agent::MAX_TOOL_RESULT_BYTES);
     }
 
     #[test]
@@ -765,6 +940,9 @@ mod tests {
         let media =
             list["result"]["tools"].as_array().unwrap().iter().find(|t| t["name"] == "media_play").unwrap();
         assert!(media["inputSchema"]["anyOf"].is_array());
+        let frame_schema = &media["inputSchema"]["properties"]["frames"]["items"];
+        assert_eq!(frame_schema["properties"]["bitmap_b64"]["type"], "string");
+        assert_eq!(frame_schema["oneOf"].as_array().unwrap().len(), 2);
         assert!(media["inputSchema"]["properties"]["confirm"].is_null());
         assert_eq!(media["annotations"]["readOnlyHint"], false);
         let response = app.handle_rpc(r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"media_play","arguments":{"notes":[{"hz":440,"ms":20}],"frames":[{"at_ms":0,"text":"MCP"}]}}}"#, None).unwrap();
@@ -819,7 +997,25 @@ mod tests {
             );
             no_output(&board);
         }
+        let bitmap_args = json!({
+            "notes": [{"hz": 440, "ms": 100}],
+            "frames": [bitmap_frame(0, &[0xAA; 512])],
+        });
+        for disabled in ["display", "oled_bitmap", "speaker_play", "audio", "media_play"] {
+            let (mut app, board) = fixture();
+            app.cfg.mcp.disabled_tools.push(disabled.into());
+            assert_eq!(
+                app.call_tool("media_play", &bitmap_args).unwrap_err().code,
+                crate::error::code::FORBIDDEN,
+                "{disabled}"
+            );
+            no_output(&board);
+        }
         let (mut app, board) = fixture();
+        app.manifest = crate::manifest::Manifest::from_json_str(r#"{"tools":[{"name":"locked_bitmap","params":[],"exec":{"type":"driver","driver":"ssd1306","action":"oled_bitmap"},"safety":{"confirm":true}}]}"#).unwrap();
+        let error = run(&mut app, &bitmap_args).unwrap_err();
+        assert!(error.message.contains("locked_bitmap"));
+        no_output(&board);
         app.manifest = crate::manifest::Manifest::from_json_str(r#"{"tools":[{"name":"locked_audio","params":[],"exec":{"type":"driver","driver":"speaker","action":"speaker_play"},"safety":{"confirm":true}}]}"#).unwrap();
         let error = run(&mut app, &args).unwrap_err();
         assert!(error.message.contains("locked_audio"));
