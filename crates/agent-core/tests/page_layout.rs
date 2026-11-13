@@ -253,6 +253,7 @@ window.__esp32Clear = async function () {
   window.fetch = async (url, opts = {}) => {
     const path = new URL(url, location.href).pathname;
     if (!["/api/agent/history", "/api/agent/events", "/api/agent/reset", "/api/agent/forget",
+          "/api/agent/cancel",
           "/api/agent/message", "/api/auth", "/api/agent/config", "/api/agent/prompt",
           "/api/sched", "/api/devices"].includes(path)) return nativeFetch(url, opts);
     f.requests.push({ path, method: opts.method || "GET", body: opts.body || "",
@@ -280,6 +281,7 @@ window.__esp32Clear = async function () {
       f.messages = [];
       return response({ reset: true, removed, kept: 0 });
     }
+    if (path === "/api/agent/cancel") return response({ cancelling: true, run_active: true });
     if (path === "/api/agent/forget") {
       const body = JSON.parse(opts.body || "{}");
       const before = f.messages.length;
@@ -502,6 +504,31 @@ window.__esp32Clear = async function () {
     f.deviceGate.resolve(); f.deviceGate = null;
     await until(() => q("#panel-loading").hidden);
     out.panelLoading.hiddenAfter = q("#panel-loading").hidden;
+
+    // While a turn runs the field is off and Send is Interrupt; Enter interrupts instead of
+    // queueing a message that would only arrive after the run it was typed behind.
+    const messagesBefore = f.requests.filter((r) => r.path === "/api/agent/message").length;
+    S.busy = true;
+    conversationControls();
+    out.running = {
+      inputDisabled: q("#input").disabled,
+      attachDisabled: q("#attach").disabled,
+      label: q("#send").getAttribute("aria-label"),
+      text: q("#send").textContent,
+      stopClass: q("#send").classList.contains("stop"),
+    };
+    q("#composer").dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
+    await until(() => f.requests.some((r) => r.path === "/api/agent/cancel"));
+    out.running.cancelPosted = true;
+    out.running.messagesPosted =
+      f.requests.filter((r) => r.path === "/api/agent/message").length - messagesBefore;
+    S.busy = false;
+    conversationControls();
+    out.running.restored = {
+      inputDisabled: q("#input").disabled,
+      label: q("#send").getAttribute("aria-label"),
+      stopClass: q("#send").classList.contains("stop"),
+    };
 
     // Pulling past the last message refreshes the transcript instead of doing nothing.
     const historyReads = () => f.requests.filter((r) => r.path === "/api/agent/history").length;
@@ -1027,6 +1054,16 @@ fn assert_conversation_clear(metrics: &Value, width: u32) {
     expect("panelLoading", "spinning", json!(true));
     expect("panelLoading", "hiddenAfter", json!(true));
 
+    // A running turn takes the field away and turns Send into Interrupt.
+    expect("running", "inputDisabled", json!(true));
+    expect("running", "attachDisabled", json!(true));
+    expect("running", "label", json!("Interrupt"));
+    expect("running", "text", json!("\u{25a0}"));
+    expect("running", "stopClass", json!(true));
+    expect("running", "cancelPosted", json!(true));
+    expect("running", "messagesPosted", json!(0));
+    expect("running", "restored", json!({ "inputDisabled": false, "label": "Send", "stopClass": false }));
+
     // Pulling past the last message refreshes the transcript in place, and says it is working.
     expect("pullSpinner", "shown", json!(true));
     expect("pullSpinner", "spinning", json!(true));
@@ -1070,6 +1107,7 @@ fn assert_conversation_clear(metrics: &Value, width: u32) {
             "/api/agent/reset",
             "/api/agent/forget",
             "/api/agent/message",
+            "/api/agent/cancel",
         ]
         .contains(&path.as_str().unwrap_or(""))),
         "{width} px: clearing wrote to settings or the workspace: {mutations:?}"
