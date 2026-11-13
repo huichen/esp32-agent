@@ -1,9 +1,10 @@
 //! The machine-readable map of this board, for an external agent rather than a person.
 //!
-//! `GET /agent.json` (and its alias `/sitemap.json`) answers with every route, what it
-//! takes, what it returns, the MCP surface beside it, and the conventions that apply to
-//! all of them. An agent that has never seen this board should be able to read one
-//! document and know how to drive it.
+//! `GET /agent.json` answers with the routes an external agent should call, the portal's
+//! own routes listed apart with the tool that replaces each, what each takes and returns,
+//! the MCP surface beside them, and the conventions that apply to all of them. An agent
+//! that has never seen this board should be able to read one document and know how to
+//! drive it — and which of the two doors is its own.
 //!
 //! The table below is the single source of truth: a test in `app.rs` walks every entry
 //! and fails if the router answers `404`, so a route cannot be documented and missing,
@@ -33,6 +34,20 @@ impl Auth {
     }
 }
 
+/// Which of the two surfaces a route belongs to.
+///
+/// The board is reachable two ways: MCP for a model, and the portal's REST routes for the
+/// browser. Where a REST route only repeats a tool, saying so in the map is the difference
+/// between a client that picks the supported path and one that re-implements the portal.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Surface {
+    /// An external agent may call it directly: no MCP tool does the same job.
+    Model,
+    /// The portal's own backing route. It repeats an MCP tool, so it is listed apart from
+    /// `endpoints` and names that tool: a model reading this document should call the tool.
+    Portal,
+}
+
 /// One documented route.
 pub struct Route {
     pub method: &'static str,
@@ -45,8 +60,12 @@ pub struct Route {
     pub auth: Auth,
     /// Grouping for a client that wants to show the surface by area.
     pub tag: &'static str,
+    pub surface: Surface,
+    /// For a portal route, the MCP tool that does the same job; "" for a model route.
+    pub mcp: &'static str,
 }
 
+/// A route an external agent calls directly.
 const fn r(
     method: &'static str,
     path: &'static str,
@@ -56,7 +75,26 @@ const fn r(
     body: &'static str,
     returns: &'static str,
 ) -> Route {
-    Route { method, path, summary, body, returns, auth, tag }
+    Route { method, path, summary, body, returns, auth, tag, surface: Surface::Model, mcp: "" }
+}
+
+/// A route that exists for the portal and repeats the named tool.
+///
+/// Eight arguments because the table has eight columns; collapsing them into a struct would
+/// only move the same list one line down and hide the extra one that makes a route
+/// portal-only.
+#[allow(clippy::too_many_arguments)]
+const fn p(
+    method: &'static str,
+    path: &'static str,
+    tag: &'static str,
+    auth: Auth,
+    mcp: &'static str,
+    summary: &'static str,
+    body: &'static str,
+    returns: &'static str,
+) -> Route {
+    Route { method, path, summary, body, returns, auth, tag, surface: Surface::Portal, mcp }
 }
 
 /// Every route this firmware serves, in the order a client should read them.
@@ -71,17 +109,7 @@ pub const ROUTES: &[Route] = &[
         "",
         "the map you are reading",
     ),
-    r("GET", "/sitemap.json", "discovery", Auth::Open, "Alias of /agent.json", "", "the map you are reading"),
-    // --- health and identity -------------------------------------------------------
-    r(
-        "GET",
-        "/healthz",
-        "status",
-        Auth::Open,
-        "Cheapest liveness probe: no device work, no locks held for long",
-        "",
-        "{ok, uptime_s, devices}",
-    ),
+    // --- identity ------------------------------------------------------------------
     r(
         "POST",
         "/api/agent/prompt",
@@ -100,50 +128,35 @@ pub const ROUTES: &[Route] = &[
         "",
         "{enabled, port, fingerprint, error}",
     ),
-    r(
+    p(
         "GET",
         "/api/status",
         "status",
         Auth::Open,
-        "Board, memory, WiFi, MCP counters, device count, whether the agent thread is up, and each thread's stack headroom",
+        "board status",
+        "Board, memory, WiFi, MCP counters, device count, whether the agent thread is up, and each thread's stack headroom; the one reading `board status` does not carry is `threads`",
         "",
         "a status object",
     ),
-    r(
-        "GET",
-        "/api/memory",
-        "status",
-        Auth::Open,
-        "The heap pool by pool — internal, DMA, PSRAM (and IRAM where a chip registers one) — with free and largest free block each",
-        "",
-        "{available, pools: [{pool, note, total_kb, free_kb, largest_kb, min_free_kb}]}",
-    ),
-    r(
+    p(
         "GET",
         "/api/devices",
         "devices",
         Auth::Open,
+        "devices_list",
         "Every device the board has, plus addresses nothing claimed",
         "",
         "{devices, unidentified, buses}",
     ),
-    r(
+    p(
         "GET",
         "/api/tools",
         "tools",
         Auth::Open,
+        "tools/list",
         "Tool table with each tool's visibility and why anything is hidden",
         "",
         "{tools, visible, total, mode}",
-    ),
-    r(
-        "GET",
-        "/api/catalog",
-        "devices",
-        Auth::Open,
-        "Drivers this firmware knows, and which are implemented",
-        "",
-        "{drivers}",
     ),
     r(
         "POST", "/api/tools", "tools", Auth::Pin,
@@ -152,67 +165,44 @@ pub const ROUTES: &[Route] = &[
         "{tools, visible, total, mode}",
     ),
     // --- configuration -------------------------------------------------------------
-    r(
+    p(
         "GET",
         "/api/config",
         "config",
         Auth::Pin,
+        "board config_get",
         "Current configuration; secrets appear as __set__, never in the clear",
         "",
         "the config object",
     ),
-    r(
+    p(
         "POST",
         "/api/config",
         "config",
         Auth::Pin,
+        "board config_set",
         "Partial update; only the fields present change",
         "any subset of the config shape",
         "the config after the patch",
     ),
-    r(
-        "GET",
-        "/api/manifest",
-        "manifest",
-        Auth::Open,
-        "The live manifest and its revision",
-        "",
-        "{manifest, revision}",
-    ),
-    r(
-        "POST",
-        "/api/manifest",
-        "manifest",
-        Auth::Pin,
-        "Validate and apply a manifest; live immediately, no reboot",
-        "{manifest, mode?: replace|merge, dry_run?: bool}",
-        "the apply report",
-    ),
-    r(
-        "GET",
-        "/api/manifest/schema",
-        "manifest",
-        Auth::Open,
-        "The reference an author needs: document shape and the exec primitives",
-        "",
-        "{manifest_schema, primitives}",
-    ),
     // --- hardware ------------------------------------------------------------------
-    r(
+    p(
         "POST",
         "/api/devices/probe",
         "devices",
         Auth::Pin,
+        "devices_probe",
         "Probe the buses again and rebuild the device list",
         "",
         "the new device table",
     ),
-    r("GET", "/api/wifi/scan", "wifi", Auth::Open, "Scan for networks", "", "{networks}"),
-    r(
+    p("GET", "/api/wifi/scan", "wifi", Auth::Open, "wifi_scan", "Scan for networks", "", "{networks}"),
+    p(
         "POST",
         "/api/wifi/connect",
         "wifi",
         Auth::Pin,
+        "board config_set {wifi: {ssid, password}}",
         "Save credentials and join",
         "{ssid, password}",
         "{ok}",
@@ -298,18 +288,15 @@ pub const ROUTES: &[Route] = &[
         "", "the original decoded bytes and MIME type, or 404",
     ),
     // --- workspace -----------------------------------------------------------------
-    r(
-        "GET", "/api/files", "files", Auth::Pin,
-        "List one workspace directory", "?path=<directory>",
-        "{ok, path, count, entries, total_bytes, total_max, file_max}",
-    ),
-    r(
+    p(
         "GET", "/api/files/tree", "files", Auth::Pin,
+        "shell ls",
         "List the workspace as a directory tree and flat entries", "",
         "{ok, count, entries, total_bytes, total_max, file_max}",
     ),
-    r(
+    p(
         "GET", "/api/files/read", "files", Auth::Pin,
+        "read",
         "Read one UTF-8 workspace file", "?path=<file>",
         "{ok, path, text, size_bytes}, or {ok: false, error}",
     ),
@@ -333,21 +320,13 @@ pub const ROUTES: &[Route] = &[
         "{ok, audio_bytes, samples, ms, frames, ended, limit_bytes}",
     ),
     // --- scheduling ----------------------------------------------------------------
-    r("GET", "/api/sched", "sched", Auth::Open, "Scheduled tasks and sensor rules", "", "{tasks, rules}"),
-    r(
-        "POST",
-        "/api/script",
-        "script",
-        Auth::Pin,
-        "Run a script with the caller's own permissions; inline by default, or queue it",
-        "{source, async?: bool}",
-        "inline: {ok, result, output, steps, ms, error}; async: {id, state, poll} — GET that `poll` path for the result",
-    ),
-    r(
+    p("GET", "/api/sched", "sched", Auth::Open, "schedule list", "Scheduled tasks and sensor rules", "", "{tasks, rules}"),
+    p(
         "POST",
         "/api/sched",
         "sched",
         Auth::Pin,
+        "schedule add/remove/enable/disable",
         "Replace the scheduled tasks and sensor rules",
         "{tasks, rules}",
         "the stored schedule",
@@ -357,17 +336,13 @@ pub const ROUTES: &[Route] = &[
         "Run a scheduled task now without moving its timer", "{id}",
         "the queued prompt or script result, or 404 for an unknown id",
     ),
-    r(
-        "GET", "/api/script/<id>", "script", Auth::Pin,
-        "Poll the id returned by an asynchronous script submission", "",
-        "{id, state, ok, result, output, steps, ms, error}, or 404",
-    ),
     // --- diagnostics and recovery --------------------------------------------------
-    r(
+    p(
         "GET",
         "/api/logs",
         "logs",
         Auth::Pin,
+        "board logs_tail",
         "The ring log, newest last, bounded by log.ring",
         "?n=<count>&since=<seq>",
         "{lines}",
@@ -391,13 +366,15 @@ pub const ROUTES: &[Route] = &[
         "{pin}",
         "{ok, token, expires_in}",
     ),
-    r("POST", "/api/reboot", "system", Auth::Pin, "Reboot the board", "", "{ok}"),
-    r(
+    // The one route whose tool is deliberately hidden: a model must not restart the board,
+    // so the only way to do it is the portal, which is the reason a person has a page at all.
+    p(
         "POST",
-        "/api/factory-reset",
+        "/api/reboot",
         "system",
         Auth::Pin,
-        "Clear configuration and manifest, then reboot",
+        "reboot (hidden from the model on purpose)",
+        "Reboot the board",
         "",
         "{ok}",
     ),
@@ -499,20 +476,28 @@ pub fn mcp_json(path: &str, tools: usize, dedicated_token: bool, portal_pin: boo
 
 /// Build the document. `dynamic` carries what only the running board knows.
 pub fn document(dynamic: Value) -> Value {
-    let routed: Vec<Value> = ROUTES
-        .iter()
-        .map(|route| {
-            json!({
-                "method": route.method,
-                "path": route.path,
-                "tag": route.tag,
-                "auth": route.auth.as_str(),
-                "summary": route.summary,
-                "body": if route.body.is_empty() { Value::Null } else { json!(route.body) },
-                "returns": route.returns,
-            })
-        })
-        .collect();
+    let mut endpoints: Vec<Value> = Vec::new();
+    let mut portal: Vec<Value> = Vec::new();
+    for route in ROUTES {
+        let mut row = json!({
+            "method": route.method,
+            "path": route.path,
+            "tag": route.tag,
+            "auth": route.auth.as_str(),
+            "summary": route.summary,
+            "body": if route.body.is_empty() { Value::Null } else { json!(route.body) },
+            "returns": route.returns,
+        });
+        match route.surface {
+            Surface::Model => endpoints.push(row),
+            Surface::Portal => {
+                row["mcp"] = json!(route.mcp);
+                portal.push(row);
+            }
+        }
+    }
+    let model_count = endpoints.len();
+    let portal_count = portal.len();
 
     json!({
         "name": "esp32-agent",
@@ -556,9 +541,13 @@ pub fn document(dynamic: Value) -> Value {
                 "model_steps": "unlimited by default; POST /api/agent/config max_steps sets a cap (0 = off, 200 max)",
             },
         },
-        "endpoints": routed,
+        "endpoints": endpoints,
+        // The portal's own routes, kept apart from `endpoints` because each one repeats a
+        // tool. Naming the tool here is what stops a model from re-implementing the page.
+        "portal_endpoints": portal,
+        "portal_surface": "The portal at / calls these for the browser; every one has an MCP tool that does the same job, named in its `mcp` field. An agent with an MCP session should call the tool, not the route",
         "settings": crate::settings::json(),
-        "counts": {"endpoints": ROUTES.len()},
+        "counts": {"endpoints": model_count, "portal_endpoints": portal_count},
         "dynamic": dynamic,
     })
 }
@@ -585,8 +574,27 @@ mod tests {
                 route.method,
                 route.path
             );
+            match route.surface {
+                Surface::Model => assert!(
+                    route.mcp.is_empty(),
+                    "{} {} names a tool but is not a portal route",
+                    route.method,
+                    route.path
+                ),
+                Surface::Portal => assert!(
+                    !route.mcp.trim().is_empty(),
+                    "{} {} is the portal's route and repeats a tool, so it must name it",
+                    route.method,
+                    route.path
+                ),
+            }
         }
         assert!(ROUTES.len() > 25, "the surface is larger than this");
+        // The portal's half of the surface is what the page calls; `endpoints` must hold
+        // only the routes an agent has no tool for, or the split is decoration.
+        let portal = ROUTES.iter().filter(|r| r.surface == Surface::Portal).count();
+        assert!(portal >= 10, "the portal still drives its own routes");
+        assert!(portal < ROUTES.len() / 2, "most of the surface stays callable by an agent");
     }
 
     #[test]
@@ -598,25 +606,47 @@ mod tests {
     fn the_document_carries_the_routes_it_lists() {
         let doc = document(json!({"base_url": "http://board"}));
         let listed = doc["endpoints"].as_array().expect("endpoints");
-        assert_eq!(listed.len(), ROUTES.len());
-        assert_eq!(doc["counts"]["endpoints"], ROUTES.len());
+        let portal = doc["portal_endpoints"].as_array().expect("portal_endpoints");
+        assert_eq!(listed.len(), ROUTES.len() - portal.len());
+        assert_eq!(doc["counts"]["endpoints"], listed.len());
+        assert_eq!(doc["counts"]["portal_endpoints"], portal.len());
         assert_eq!(doc["dynamic"]["base_url"], "http://board");
         assert_eq!(doc["conventions"]["limits"]["tool_result_bytes"], crate::agent::MAX_TOOL_RESULT_BYTES);
         assert_eq!(doc["conventions"]["limits"]["reply_bytes"], crate::agent::MAX_REPLY_BYTES);
+        let has = |rows: &Vec<Value>, method: &str, path: &str| {
+            rows.iter().any(|route| route["method"] == method && route["path"] == path)
+        };
         for (method, path) in [
             ("POST", "/api/tools"),
-            ("GET", "/api/files"),
-            ("GET", "/api/files/tree"),
-            ("GET", "/api/files/read"),
             ("POST", "/api/sched/run"),
+            ("POST", "/api/wifi/forget"),
             ("POST", "/selftest/chat/completions"),
-            ("DELETE", "/mcp"),
-            ("GET", "/api/script/<id>"),
             ("GET", "/api/attachment/<name>"),
+            ("DELETE", "/mcp"),
+        ] {
+            assert!(has(listed, method, path), "implemented route omitted from discovery: {method} {path}");
+        }
+        // A route the portal owns is listed apart and names the tool that replaces it.
+        for (method, path, tool) in [
+            ("GET", "/api/status", "board status"),
+            ("GET", "/api/files/read", "read"),
+            ("POST", "/api/reboot", "reboot (hidden from the model on purpose)"),
         ] {
             assert!(
-                listed.iter().any(|route| route["method"] == method && route["path"] == path),
-                "implemented route omitted from discovery: {method} {path}"
+                !has(listed, method, path),
+                "{method} {path} repeats a tool but is listed as an agent endpoint"
+            );
+            let row = portal
+                .iter()
+                .find(|route| route["method"] == method && route["path"] == path)
+                .unwrap_or_else(|| panic!("portal route missing: {method} {path}"));
+            assert_eq!(row["mcp"], tool);
+        }
+        // The routes an agent has a tool for are gone from REST, not merely unlisted.
+        for path in ["/api/manifest", "/api/memory", "/healthz", "/sitemap.json", "/api/script"] {
+            assert!(
+                !ROUTES.iter().any(|r| r.path == path),
+                "{path} has an MCP tool and must not be advertised as REST"
             );
         }
         assert!(mcp_json("/mcp", 1, false, true)["auth"].as_str().unwrap().contains("portal credential"));

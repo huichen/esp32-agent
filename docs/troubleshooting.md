@@ -188,10 +188,12 @@ obsolete SRAM-based conclusions.
 
 ## How much memory the board has
 
-Four readings, and they answer different questions. `GET /api/memory` splits the heap by
-capability; `/api/status` carries `memory` (the one number that decides whether a socket or
-a handshake fits) and `threads` (each task and the stack it has left); `shell free` prints
-the total, which includes PSRAM and can look healthy while the internal pool is empty.
+Three readings, and they answer different questions. `/api/status` carries `memory` — the
+one number that decides whether a socket or a handshake fits, plus `pools`, the heap split
+by capability (internal, DMA, PSRAM, and IRAM where a chip registers one) that a memory
+change is checked against — and `threads`, each task and the stack it has left; `shell
+free` prints the total, which includes PSRAM and can look healthy while the internal pool
+is empty.
 
 Historical bench measurement (2026-11-12, ESP32-S3-DevKitC-1 N16R8, IDF v5.5.2,
 commit `93b0579`) after a boot,

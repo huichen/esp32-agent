@@ -4,7 +4,7 @@
 #
 # The POSIX counterpart of scripts/smoke.ps1: same build, same simulator
 # invocation, same HTTP calls, same checks. Starts esp32-agent-sim on a free
-# port, waits for /healthz, then walks the flow a model would:
+# port, waits for /api/status, then walks the flow a model would:
 # tools/list -> manifest_apply -> tools/list -> tool call -> an out-of-range
 # call that must be refused. Exits non-zero if any step fails.
 #
@@ -63,7 +63,7 @@ ready=0
 tries=0
 while [ "$tries" -lt 100 ]; do
   tries=$((tries + 1))
-  if curl -sS -m 2 "$base/healthz" > /dev/null 2>&1; then
+  if curl -sS -m 2 "$base/api/status" > /dev/null 2>&1; then
     ready=1
     break
   fi
@@ -78,12 +78,12 @@ echo "simulator up on $base"
 page=$(curl -sS "$base/")
 check 'portal serves HTML' bash -c 'grep -q esp32-agent <<<"$1" && grep -q manifest <<<"$1"' _ "$page"
 
-devices=$(curl -sS "$base/healthz" | sed -n 's/.*"devices":\([0-9][0-9]*\).*/\1/p')
-check 'healthz reports the detected devices' test "${devices:-0}" -ge 3
+devices=$(curl -sS "$base/api/status" | sed -n 's/.*"devices":{[^}]*"count":\([0-9][0-9]*\).*/\1/p')
+check 'status reports the detected devices' test "${devices:-0}" -ge 3
 
 before=$(rpc '{"jsonrpc":"2.0","id":1,"method":"tools/list"}')
 echo "tools before: $(grep -o '"name":"[a-z0-9_]*"' <<<"$before" | sed 's/"name":"//;s/"//' | tr '\n' ' ')"
-check 'OLED tools present because the panel was detected' grep -q '"name":"oled_text"' <<<"$before"
+check 'OLED tools present because the panel was detected' grep -q '"name":"display"' <<<"$before"
 check 'IMU tools absent because no MPU is wired' bash -c '! grep -q mpu6050_read <<<"$1"' _ "$before"
 
 manifest='{"mode":"merge","manifest":{"tools":[

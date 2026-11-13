@@ -243,12 +243,7 @@ fn script_arguments(given: Option<&serde_json::Value>) -> serde_json::Value {
     }
 }
 
-/// One run submitted through `POST /api/script`.
-///
-/// The board has one agent thread, so an asynchronous run is not a second thread: it is a
-/// job the platform tick picks up and finishes. That keeps the RAM cost at a string and a
-/// result, and makes "async" mean "you do not wait" rather than "the board runs two things
-/// at once", which a chip with kilobytes of internal SRAM cannot honour.
+/// One script run: what the caller asked for and what came back.
 #[derive(Clone, Debug, Default)]
 pub struct ScriptJob {
     pub id: String,
@@ -311,15 +306,12 @@ pub struct App {
     /// session made up, and writing it to NVS would turn a typo into a boot-time fact.
     /// Nothing here is persisted, and `env` says so.
     pub shell_env: std::collections::BTreeMap<String, String>,
-    /// Script runs submitted over HTTP, newest last. Bounded: this is a queue for a
-    /// person or an external agent, not for anything that retries in a loop.
-    pub scripts: Vec<ScriptJob>,
     /// The model-facing tool array. 51 schemas is the largest thing a step used to build,
     /// and it changes only when the manifest, the profile, the disabled set or the probe
     /// does. `RefCell` because `ToolHost::tool_specs` takes `&self`; the whole `App` is
     /// already behind a mutex, so there is no second borrow to lose.
     pub tool_specs_cache: std::cell::RefCell<Option<(u64, Value)>>,
-    /// Monotonic counter for job ids; not persisted, because the queue is not either.
+    /// Monotonic counter for script run ids; not persisted.
     pub script_seq: u64,
     /// Outbound HTTP for the `net_*` tools. The platform layer attaches it once; host
     /// tests leave it empty so nothing reaches the net. It is deliberately **not** the
@@ -514,7 +506,6 @@ impl App {
             llm: LlmConfig::default(),
             tasks: Vec::new(),
             rules: Vec::new(),
-            scripts: Vec::new(),
             tool_specs_cache: std::cell::RefCell::new(None),
             script_seq: 0,
             workspace: AppWorkspace::default(),
@@ -1338,6 +1329,10 @@ impl App {
                 // the total above includes PSRAM and can look healthy while this is empty.
                 "internal_kb": internal.map(|(free, _)| free / 1024),
                 "largest_internal_kb": internal.map(|(_, largest)| largest / 1024),
+                // The split, not just the total: a change that claims to free internal RAM
+                // can be checked against the pool it moved. Empty on a platform that cannot
+                // split its heap by capability.
+                "pools": self.hw.heap_pools(),
             },
             // The other half of the memory picture: which pool, and how much stack each
             // task has left at its deepest point. Without this, deciding whether a stack
@@ -1534,53 +1529,19 @@ impl App {
     /// `is_visible`, and `script` itself is refused to stop unbounded recursion.
     /// Submit a script for execution, returning the job.
     ///
-    /// `inline` runs it now and fills the result before returning; otherwise it is queued
-    /// and `run_next_script` (one per scheduler tick) finishes it. Both paths go through
-    /// [`Self::run_script`], so an asynchronous run has exactly the permissions of a
-    /// synchronous one and of the on-board agent: the same tool dispatch, the same
-    /// `mcp.disabled_tools`, the same refusal to call `script` from inside a script.
-    pub fn submit_script(&mut self, source: &str, inline: bool) -> ScriptJob {
+    /// Submit a script for execution, returning the finished job.
+    ///
+    /// One path, and it waits: the callers are a tool call and a scheduled task, both of
+    /// which already run on the board's one work thread. There used to be a queued variant
+    /// for `POST /api/script {async:true}`; when that route went, the job pool, the poll
+    /// route and the state machine it needed went with it.
+    pub fn submit_script(&mut self, source: &str) -> ScriptJob {
         let id = format!("s{}", self.script_seq + 1);
         self.script_seq += 1;
-        let job =
-            ScriptJob { id, source: source.to_string(), state: "queued".to_string(), ..Default::default() };
-        self.scripts.push(job);
-        // Four is enough for a person and an external agent to each have one in flight; a
-        // longer queue would only hide that the board runs one at a time anyway.
-        while self.scripts.len() > 4 {
-            self.scripts.remove(0);
-        }
-        if inline {
-            let id = self.scripts.last().expect("just pushed").id.clone();
-            self.run_script_job(&id);
-            return self.scripts.iter().find(|j| j.id == id).cloned().unwrap_or_default();
-        }
-        self.scripts.last().cloned().unwrap_or_default()
-    }
-
-    /// Finish the oldest queued job, if any. Called once per tick.
-    pub fn run_next_script(&mut self) {
-        let next = self.scripts.iter().find(|j| j.state == "queued").map(|j| j.id.clone());
-        if let Some(id) = next {
-            self.run_script_job(&id);
-        }
-    }
-
-    /// Look up a job by id, for `GET /api/script/<id>`.
-    pub fn script_job(&self, id: &str) -> Option<ScriptJob> {
-        self.scripts.iter().find(|j| j.id == id).cloned()
-    }
-
-    fn run_script_job(&mut self, id: &str) {
-        let Some(index) = self.scripts.iter().position(|j| j.id == id) else {
-            return;
-        };
-        let source = self.scripts[index].source.clone();
-        self.scripts[index].state = "running".to_string();
         let started = now_ms();
+        let mut job = ScriptJob { id, source: source.to_string(), ..Default::default() };
         match self.run_script(&json!({ "source": source })) {
             Ok(value) => {
-                let job = &mut self.scripts[index];
                 job.state = "done".to_string();
                 job.result = value.get("result").cloned().unwrap_or(Value::Null);
                 job.output = value
@@ -1590,15 +1551,14 @@ impl App {
                     .unwrap_or_default();
                 job.steps = value.get("steps").and_then(|s| s.as_u64()).unwrap_or(0);
                 job.ms = now_ms().saturating_sub(started);
-                job.error.clear();
             }
             Err(e) => {
-                let job = &mut self.scripts[index];
                 job.state = "failed".to_string();
                 job.ms = now_ms().saturating_sub(started);
                 job.error = e.message;
             }
         }
+        job
     }
 
     fn run_script(&mut self, args: &Value) -> Result<Value> {
@@ -2879,7 +2839,7 @@ impl App {
             // minute rule that pulses a relay should not pay for a chat turn.
             let script = if script.trim().is_empty() { None } else { Some(script) };
             if let Some(source_text) = script {
-                let job = self.submit_script(&source_text, true);
+                let job = self.submit_script(&source_text);
                 self.log.info("script", format!("{source} ran a script: {}", job.id));
                 fired.push(source);
             } else if !prompt.trim().is_empty() {
@@ -3363,50 +3323,6 @@ impl App {
         })
     }
 
-    /// `GET /api/files?path=/dir`: one directory of the workspace, directories first.
-    ///
-    /// Shaped like the `ls` tool on purpose — one workspace, one meaning of `size_bytes` —
-    /// plus the two totals. File bodies and the index are stored separately, so
-    /// "how much of it is used" is the question a person asks when a write is refused, and
-    /// a per-file number cannot answer it.
-    fn files_json(&self, path: &str) -> Value {
-        use crate::tools::fs::Workspace as _;
-        let dir = match fs_tools::normalize(path) {
-            Ok(d) => d,
-            Err(e) => return json!({ "ok": false, "error": e }),
-        };
-        let names = match self.workspace.list(&dir) {
-            Ok(n) => n,
-            Err(e) => return json!({ "ok": false, "path": dir, "error": e }),
-        };
-        let mut entries: Vec<Value> = Vec::new();
-        for name in names {
-            let child = fs_tools::join(&dir, &name);
-            // A name that does not read as a file is a directory: the trait's contract, and
-            // the same rule `ls` uses, so the two views cannot disagree.
-            match self.workspace.read(&child) {
-                Ok(text) => entries.push(json!({
-                    "name": name, "path": child, "dir": false, "size_bytes": text.len(),
-                })),
-                Err(_) => entries.push(json!({ "name": name, "path": child, "dir": true })),
-            }
-        }
-        entries.sort_by(|a, b| {
-            let ad = a["dir"].as_bool().unwrap_or(false);
-            let bd = b["dir"].as_bool().unwrap_or(false);
-            bd.cmp(&ad).then_with(|| a["name"].as_str().unwrap_or("").cmp(b["name"].as_str().unwrap_or("")))
-        });
-        json!({
-            "ok": true,
-            "path": dir,
-            "count": entries.len(),
-            "entries": entries,
-            "total_bytes": self.workspace.bytes(),
-            "total_max": WORKSPACE_TOTAL_MAX,
-            "file_max": WORKSPACE_FILE_MAX,
-        })
-    }
-
     /// `GET /api/files/read?path=/x.md`: one file, as text.
     fn file_text_json(&self, path: &str) -> Value {
         use crate::tools::fs::Workspace as _;
@@ -3585,7 +3501,7 @@ impl App {
         let script = if script.trim().is_empty() { None } else { Some(script) };
         let mut out = json!({ "id": id, "source": source });
         if let Some(text) = script {
-            let job = self.submit_script(&text, true);
+            let job = self.submit_script(&text);
             self.log.info("script", format!("{source} ran a script on demand: {}", job.id));
             out["kind"] = json!("script");
             out["job"] = json!(job.id);
@@ -4160,31 +4076,14 @@ impl App {
             ("GET", "/assets/app.js") => Response::js(web::APP_JS),
             ("GET", "/assets/style.css") => Response::css(web::STYLE_CSS),
             ("GET", "/favicon.ico") => Response::empty(204),
-            ("GET", "/healthz") => {
-                let up = self.runtime.uptime_s(self.hw.millis());
-                Response::json(&json!({ "ok": true, "uptime_s": up, "devices": self.devices.len() }))
-            }
-            // The map an external agent reads before it touches anything. Two paths so a
-            // client that guesses either name finds it.
-            ("GET", "/agent.json") | ("GET", "/sitemap.json") => Response::json(&self.sitemap_json(req)),
+            // The map an external agent reads before it touches anything. It is the entry
+            // point, so it is a plain GET with no credential: a client that cannot read this
+            // cannot discover how to authenticate either.
+            ("GET", "/agent.json") => Response::json(&self.sitemap_json(req)),
             ("GET", "/api/tls") => Response::json(&self.tls.json()),
             ("GET", "/api/status") => {
                 let v = self.status_json();
                 Response::json(&v)
-            }
-            // The heap, pool by pool. `/api/status` carries the one number that decides
-            // whether a socket or a handshake fits; this carries the split, so a change
-            // that claims to free internal RAM can be checked against the pool it moved.
-            ("GET", "/api/memory") => {
-                let pools = self.hw.heap_pools();
-                if pools.is_empty() {
-                    Response::json(&json!({
-                        "available": false,
-                        "why": "this platform cannot split its heap by capability; `memory` in /api/status and `shell ps` are the readings it has",
-                    }))
-                } else {
-                    Response::json(&json!({ "available": true, "pools": pools }))
-                }
             }
             ("GET", "/api/config") => {
                 if let Err(r) = self.require_read(req) {
@@ -4197,37 +4096,6 @@ impl App {
                     return r;
                 }
                 self.patch_config(req)
-            }
-            ("GET", "/api/manifest") => Response::json(&json!({
-                "revision": self.runtime.manifest_rev,
-                "manifest": self.manifest,
-            })),
-            ("POST", "/api/manifest") | ("PUT", "/api/manifest") => {
-                if let Err(r) = self.require_pin(req) {
-                    return r;
-                }
-                self.apply_manifest_http(req)
-            }
-            ("GET", "/api/manifest/schema") => {
-                // An HTTP response has no tool-result cap, so this route hands over the part of
-                // the reference needed to write a manifest in one go; the model asks for
-                // the same content one section at a time (`manifest_describe`).
-                let mut out = json!({});
-                for section in ["schema", "exec"] {
-                    match self.call_tool("manifest_describe", &json!({ "section": section })) {
-                        Ok(v) => {
-                            if let (Some(dst), Some(src)) = (out.as_object_mut(), v.as_object()) {
-                                for (key, value) in src {
-                                    if key != "section" && key != "note" {
-                                        dst.insert(key.clone(), value.clone());
-                                    }
-                                }
-                            }
-                        }
-                        Err(e) => return Response::json_status(500, &json!({ "error": e.message })),
-                    }
-                }
-                Response::json(&out)
             }
             ("GET", "/api/devices") => Response::json(&json!({
                 "devices": self.devices.infos(),
@@ -4407,71 +4275,6 @@ impl App {
                 self.agent_config_apply(req)
             }
             ("GET", "/api/sched") => Response::json(&self.sched_json()),
-            // Run a script from outside: a client writes one and wants the answer. Inline is
-            // the default because that is what "call and get the result" means; `async` hands
-            // back a job id for a script that loops over hardware for a while.
-            ("POST", "/api/script") => {
-                // A script can move pins, so it is a write whatever it does: the same PIN rule
-                // as `manifest_apply`, for the same reason.
-                if let Err(r) = self.require_pin(req) {
-                    return r;
-                }
-                let body = match req.json() {
-                    Ok(v) => v,
-                    Err(e) => return Response::error_json(400, &format!("invalid JSON: {e}")),
-                };
-                let source = body.get("source").and_then(|s| s.as_str()).unwrap_or("").to_string();
-                if source.trim().is_empty() {
-                    return Response::json_status(
-                        400,
-                        &json!({
-                            "error": "`source` is required; send {\"source\": \"<script>\"}",
-                            "help": "script {\"help\": true} prints the language",
-                        }),
-                    );
-                }
-                if source.len() > crate::script::MAX_SOURCE {
-                    return Response::json_status(
-                        413,
-                        &json!({ "error": format!("script is larger than {} bytes", crate::script::MAX_SOURCE) }),
-                    );
-                }
-                let want_async = body.get("async").and_then(|a| a.as_bool()).unwrap_or(false);
-                let job = self.submit_script(&source, !want_async);
-                let mut out = json!({ "id": job.id, "state": job.state, "async": want_async });
-                if want_async {
-                    out["poll"] = json!(format!("/api/script/{}", job.id));
-                } else {
-                    out["ok"] = json!(job.state == "done");
-                    out["result"] = job.result;
-                    out["output"] = json!(job.output);
-                    out["steps"] = json!(job.steps);
-                    out["ms"] = json!(job.ms);
-                    if !job.error.is_empty() {
-                        out["error"] = json!(job.error);
-                    }
-                }
-                Response::json(&out)
-            }
-            ("GET", path) if path.starts_with("/api/script/") => {
-                if let Err(r) = self.require_read(req) {
-                    return r;
-                }
-                let id = &path["/api/script/".len()..];
-                match self.script_job(id) {
-                    Some(job) => Response::json(&json!({
-                        "id": job.id,
-                        "state": job.state,
-                        "ok": job.state == "done",
-                        "result": job.result,
-                        "output": job.output,
-                        "steps": job.steps,
-                        "ms": job.ms,
-                        "error": job.error,
-                    })),
-                    None => Response::json_status(404, &json!({ "error": format!("no script job `{id}`") })),
-                }
-            }
             ("POST", "/api/sched") => {
                 if let Err(r) = self.require_pin(req) {
                     return r;
@@ -4524,17 +4327,9 @@ impl App {
                 v["firmware"] = json!(self.firmware.version);
                 Response::json(&v)
             }
-            ("GET", "/api/catalog") => Response::json(&drivers::catalog_json()),
             // The portal's Files tab is read-only but exposes private workspace contents.
             // Both answers carry the same numbers the `ls` and `read` tools return, because
             // there is one workspace and one meaning of "how big is it".
-            ("GET", "/api/files") => {
-                if let Err(r) = self.require_read(req) {
-                    return r;
-                }
-                let path = req.query_get("path").unwrap_or("/");
-                Response::json(&self.files_json(path))
-            }
             ("GET", "/api/files/tree") => {
                 if let Err(r) = self.require_read(req) {
                     return r;
@@ -4586,22 +4381,6 @@ impl App {
                 // The platform's loop notices the flag, flushes on a stack it has checked, and
                 // restarts — `/api/config` already works that way for a bus or board change.
                 Response::json(&json!({ "ok": true, "note": "rebooting" }))
-            }
-            ("POST", "/api/factory-reset") => {
-                if let Err(r) = self.require_pin(req) {
-                    return r;
-                }
-                self.cfg = Config::default();
-                self.manifest = Manifest::default();
-                self.runtime.config_dirty = true;
-                self.runtime.manifest_dirty = true;
-                self.runtime.restart_requested = true;
-                // A reset also restores the two things an owner's own decisions replaced:
-                // the built-in skills, wherever a file was deleted, and the flag that
-                // keeps them installed. An edited skill stays the owner's.
-                self.seed_default_skills();
-                self.log.warn("system", "factory reset from the portal");
-                Response::json(&json!({ "ok": true }))
             }
             ("GET", "/generate_204")
             | ("GET", "/hotspot-detect.html")
@@ -4817,28 +4596,6 @@ impl App {
                 Response::json(&v)
             }
             Err(e) => Response::json_status(400, &json!({ "error": e.message })),
-        }
-    }
-
-    fn apply_manifest_http(&mut self, req: &Request) -> Response {
-        let body = match req.json() {
-            Ok(v) => v,
-            Err(e) => return Response::error_json(400, &format!("invalid JSON: {e}")),
-        };
-        let mut args = body.clone();
-        if args.get("manifest").is_none() {
-            // Allow posting the document itself.
-            args = json!({ "manifest": body });
-        }
-        match self.call_tool("manifest_apply", &args) {
-            Ok(v) => {
-                let applied = v["applied"].as_bool().unwrap_or(false);
-                let mut v = v;
-                v["devices"] = json!(self.devices.infos());
-                v["revision"] = json!(self.runtime.manifest_rev);
-                Response::json_status(if applied { 200 } else { 422 }, &v)
-            }
-            Err(e) => Response::json_status(400, &json!({ "applied": false, "error": e.message })),
         }
     }
 
@@ -8507,7 +8264,7 @@ mod tests {
                 1,
                 "`{bad}` must produce one warning"
             );
-            assert_eq!(app.route(&get("/healthz")).status, 200, "boot leaves a usable app");
+            assert_eq!(app.route(&get("/api/status")).status, 200, "boot leaves a usable app");
             drain_store(&mut app);
             assert!(store.get(NVS_KEY_PENDING_MESSAGE).is_none(), "the writer must remove the bad value too");
             assert_eq!(app.route(&post("/api/agent/message", r#"{"text":"still usable"}"#)).status, 202);
@@ -9205,51 +8962,24 @@ mod tests {
         assert!(app.cfg.mcp.plain_http);
     }
 
+    /// The REST script route is gone. `script` is an MCP tool and the tool already waits
+    /// for the answer, so the route only added a second, queued way to say the same thing.
     #[test]
-    fn a_script_can_be_run_over_http_inline_or_as_a_job() {
+    fn the_script_route_is_not_served_over_http() {
         let mut app = test_app();
-
-        // Inline is the default: the caller gets the answer in the same response.
-        let resp = app.route(&post("/api/script", r#"{"source":"1 + 2"}"#));
-        assert_eq!(resp.status, 200);
-        let body = body_json(&resp);
-        assert_eq!(body["ok"], json!(true), "{body}");
-        assert_eq!(body["result"], json!(3));
-        assert_eq!(body["state"], json!("done"));
-
-        // Asynchronous: a job id comes back, the plateform tick runs it, the result is read.
-        let resp = app.route(&post(
-            "/api/script",
-            r#"{"source":"let t = 0\nfor x in [1,2,3] { t = t + x }\nt","async":true}"#,
-        ));
-        assert_eq!(resp.status, 200);
-        let body = body_json(&resp);
-        let id = body["id"].as_str().expect("an id").to_string();
-        assert_eq!(body["state"], json!("queued"), "{body}");
-        assert!(body["result"].is_null(), "nothing ran yet: {body}");
-
-        app.run_next_script();
-        let resp = app.route(&get(&format!("/api/script/{id}")));
-        assert_eq!(resp.status, 200);
-        let done = body_json(&resp);
-        assert_eq!(done["state"], json!("done"), "{done}");
-        assert_eq!(done["result"], json!(6));
-
-        // An unknown job is a 404 that names the id.
-        let resp = app.route(&get("/api/script/s999"));
-        assert_eq!(resp.status, 404);
-        assert!(body_json(&resp)["error"].as_str().unwrap_or("").contains("s999"));
-
-        // A failing script says so: `ok: false` with the interpreter's line and column, so
-        // a caller can tell "it ran and refused" from "it never ran".
-        let resp = app.route(&post("/api/script", r#"{"source":"let = 3"}"#));
-        let body = body_json(&resp);
-        assert_eq!(body["ok"], json!(false));
-        assert!(body["error"].as_str().unwrap_or("").contains("line"), "{body}");
-
-        // No source at all is refused before anything is queued.
-        let resp = app.route(&post("/api/script", "{}"));
-        assert_eq!(resp.status, 400);
+        for (method, path) in [("POST", "/api/script"), ("GET", "/api/script/s1")] {
+            let mut req = post(path, r#"{"source":"1 + 2"}"#);
+            req.method = method.into();
+            assert_eq!(app.route(&req).status, 404, "{method} {path} still answers");
+        }
+        // The tool path still runs a script, and a failure names the line it stopped on,
+        // so a caller can tell "it ran and refused" from "it never ran".
+        let job = app.submit_script("let = 3");
+        assert_eq!(job.state, "failed");
+        assert!(job.error.contains("line"), "{job:?}");
+        let job = app.submit_script("1 + 2");
+        assert_eq!(job.state, "done");
+        assert_eq!(job.result, json!(3));
     }
 
     #[test]
@@ -9268,10 +8998,9 @@ mod tests {
         assert_eq!(fired.len(), 2, "{fired:?}");
         assert!(fired.contains(&"schedule:t2".to_string()));
 
-        // The script task ran without the model: its value is in the job, and no turn was
-        // queued for it. The prompt task queued a message as before.
-        let job = app.scripts.iter().find(|j| j.state == "done").expect("a finished job");
-        assert_eq!(job.result, json!(2));
+        // The script task ran without the model: no turn was queued for it, and the
+        // board ran exactly one script. The prompt task queued a message as before.
+        assert_eq!(app.script_seq, 1, "the script task ran once");
         assert!(app.agent.pending.is_some(), "the prompt task still queues a message");
     }
 
@@ -9716,10 +9445,7 @@ mod tests {
         let mut missing = Vec::new();
         for route in crate::sitemap::ROUTES {
             let mut req = post(route.path, "{}");
-            if route.path == "/api/script/<id>" {
-                let job = app.submit_script("1 + 2", true);
-                req.path = format!("/api/script/{}", job.id);
-            } else if route.path == "/api/attachment/<name>" {
+            if route.path == "/api/attachment/<name>" {
                 app.attachments = vec![crate::agent::Attachment {
                     name: "fixture.txt".into(),
                     mime: "text/plain".into(),
@@ -9756,7 +9482,10 @@ mod tests {
         assert_eq!(doc["dynamic"]["base_url"], "http://192.168.3.7:8080");
         assert_eq!(doc["dynamic"]["mcp"]["path"], "/mcp");
         let endpoints = doc["endpoints"].as_array().expect("endpoints");
+        let portal = doc["portal_endpoints"].as_array().expect("portal_endpoints");
         assert!(endpoints.iter().any(|e| e["path"] == "/agent.json"));
+        // Wherever a private read is listed, its credential requirement goes with it.
+        let all: Vec<&Value> = endpoints.iter().chain(portal.iter()).collect();
         for path in [
             "/api/config",
             "/api/agent/history",
@@ -9764,11 +9493,10 @@ mod tests {
             "/api/agent/events",
             "/api/agent/stream",
             "/api/logs",
-            "/api/files",
-            "/api/script/<id>",
+            "/api/files/tree",
         ] {
             assert!(
-                endpoints.iter().any(|e| e["method"] == "GET" && e["path"] == path && e["auth"] != "none"),
+                all.iter().any(|e| e["method"] == "GET" && e["path"] == path && e["auth"] != "none"),
                 "discovery incorrectly advertises a private read as open: {path}"
             );
         }
@@ -10255,11 +9983,11 @@ mod tests {
     /// wait for itself: measured on the bench as a 45 s timeout. It is served in process now,
     /// and the check is the same JSON a socket would have carried.
     #[test]
-    fn asking_the_board_for_its_own_healthz_answers_in_process() {
+    fn asking_the_board_for_its_own_status_answers_in_process() {
         let mut app = test_app();
         let started = std::time::Instant::now();
         // The path MCP and the on-board agent both take for `net_*` is `ToolHost`.
-        let url = format!("http://127.0.0.1:{}/healthz", app.cfg.mcp.port);
+        let url = format!("http://127.0.0.1:{}/api/status", app.cfg.mcp.port);
         let out = ToolHost::call_tool(&mut app, "net_get", &json!({"url": url}))
             .expect("a self request is answered");
         let body: Value = serde_json::from_str(&out).expect("json");
@@ -10267,10 +9995,11 @@ mod tests {
         assert!(took < std::time::Duration::from_secs(1), "took {took:?}");
         assert_eq!(body["status"], 200);
         assert_eq!(body["in_process"], true);
-        assert!(body["body"].as_str().unwrap().contains("ok"));
+        assert!(body["body"].as_str().unwrap().contains("device_name"));
 
         // A different port is somebody else's service: it goes to the transport.
-        let other = ToolHost::call_tool(&mut app, "net_get", &json!({"url": "http://127.0.0.1:9/healthz"}));
+        let other =
+            ToolHost::call_tool(&mut app, "net_get", &json!({"url": "http://127.0.0.1:9/api/status"}));
         assert!(other.is_err(), "port 9 is not us");
     }
 
@@ -10800,7 +10529,7 @@ mod tests {
         );
         assert!(largest_kb <= internal_kb, "a block cannot exceed the pool: {status}");
 
-        // One source of truth: the same pool `/api/memory` lists, not a second measurement.
+        // One source of truth: the same pool the status document lists, not a second measurement.
         let (free, largest) = app.hw.heap_internal().expect("the board names its pools");
         assert_eq!(internal_kb, (free / 1024) as u64, "{status}");
         assert_eq!(largest_kb, (largest / 1024) as u64, "{status}");
@@ -11743,8 +11472,8 @@ mod tests {
         assert_eq!(app.route(&get("/api/agent/history")).status, 401);
         assert_eq!(app.route(&get("/api/config")).status, 401);
         assert_eq!(app.route(&get("/api/agent/prompt")).status, 401);
-        for path in ["/api/agent/events", "/api/agent/stream", "/api/logs", "/api/script/missing"] {
-            assert_eq!(app.route(&get(path)).status, 401, "{path} exposes conversation or script output");
+        for path in ["/api/agent/events", "/api/agent/stream", "/api/logs"] {
+            assert_eq!(app.route(&get(path)).status, 401, "{path} exposes conversation or board output");
         }
         assert_eq!(
             app.route(&post("/mcp", r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#)).status,
@@ -14055,7 +13784,7 @@ mod tests {
             "base64enc /source -o /blocked",
             "cp /source /blocked",
             "mv /source /blocked --confirm",
-            "wget http://127.0.0.1/healthz -o /blocked",
+            "wget http://127.0.0.1/api/status -o /blocked",
         ] {
             let result = app.call_tool("shell", &json!({"command": command}));
             assert!(
@@ -14658,15 +14387,15 @@ mod tests {
         }
     }
 
-    /// The heap pool by pool, when the platform can split it, and a plain "cannot" when it
+    /// The heap pool by pool, when the platform can split it, and an empty list when it
     /// cannot. The split is what a memory change is checked against: "internal RAM went up"
-    /// is only good news if the pool that went up is the one the change was about.
+    /// is only good news if the pool that went up is the one the change was about. It rides
+    /// on `/api/status` because a second route for one number was a second thing to keep true.
     #[test]
-    fn the_memory_route_splits_the_heap_or_says_it_cannot() {
+    fn the_status_reports_the_heap_pool_by_pool() {
         let mut app = test_app();
-        let split = body_json(&app.route(&get("/api/memory")));
-        assert_eq!(split["available"], json!(true), "{split}");
-        let pools = split["pools"].as_array().expect("pools");
+        let status = body_json(&app.route(&get("/api/status")));
+        let pools = status["memory"]["pools"].as_array().expect("pools");
         assert!(pools.len() >= 2, "the virtual board has an internal and a PSRAM pool");
         for pool in pools {
             for key in ["pool", "note", "total_kb", "free_kb", "largest_kb", "min_free_kb"] {
@@ -14685,9 +14414,8 @@ mod tests {
             LogBuf::new(64),
             FwMeta::default(),
         );
-        let one = body_json(&bare.route(&get("/api/memory")));
-        assert_eq!(one["available"], json!(false), "{one}");
-        assert!(one["why"].as_str().unwrap_or("").contains("cannot split"), "{one}");
+        let one = body_json(&bare.route(&get("/api/status")));
+        assert_eq!(one["memory"]["pools"].as_array().map(|p| p.len()), Some(0), "{one}");
     }
 
     /// Every thread in `/api/status` carries the stack it has left at its deepest point —
@@ -15911,34 +15639,17 @@ mod tests {
         app.workspace.write("/notes/one.md", "hello").expect("a file in a subdirectory");
         app.workspace.write("/top.md", "# title").expect("a root file");
 
-        let resp = app.route(&get("/api/files?path=/"));
+        let resp = app.route(&get("/api/files/tree"));
         assert_eq!(resp.status, 200, "{resp:?}");
         let body: Value = serde_json::from_slice(&resp.body).expect("json");
-        // Directories first, then by name — whatever else the seeded workspace already holds.
-        let dirs: Vec<&str> = body["entries"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .filter(|e| e["dir"] == true)
-            .map(|e| e["name"].as_str().unwrap())
-            .collect();
-        assert!(dirs.contains(&"notes"), "{body}");
-        let positions: Vec<usize> = body["entries"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .enumerate()
-            .filter(|(_, e)| e["name"] == "notes" || e["name"] == "top.md")
-            .map(|(i, e)| if e["name"] == "notes" { i } else { i + 100 })
-            .collect();
-        assert_eq!(positions.len(), 2, "{body}");
-        assert!(positions[0] < positions[1], "a directory comes before a file: {body}");
-        let top = body["entries"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|e| e["name"] == "top.md")
-            .expect("top.md in the listing");
+        // Directories first, then by name — the order the flat listing had, because the tree
+        // is now the only listing: two listings of one workspace were two things to keep equal.
+        let entries = body["entries"].as_array().expect("entries");
+        let notes = entries.iter().position(|e| e["name"] == "notes").expect("the directory");
+        assert_eq!(entries[notes]["dir"], true, "{body}");
+        let top = entries.iter().position(|e| e["name"] == "top.md").expect("top.md in the listing");
+        assert!(notes < top, "a directory comes before a file: {body}");
+        let top = &entries[top];
         assert_eq!(top["size_bytes"], 7, "{body}");
         assert_eq!(top["path"], "/top.md", "{body}");
         assert_eq!(body["total_max"], WORKSPACE_TOTAL_MAX, "{body}");
@@ -15953,7 +15664,7 @@ mod tests {
         assert_eq!(body["ok"], false, "{body}");
 
         // `..` is refused by the same normaliser the tools use, not by a second rule here.
-        let resp = app.route(&get("/api/files?path=/../etc"));
+        let resp = app.route(&get("/api/files/read?path=/../etc"));
         let body: Value = serde_json::from_slice(&resp.body).expect("json");
         assert_eq!(body["ok"], false, "{body}");
     }

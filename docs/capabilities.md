@@ -48,7 +48,7 @@ At boot (and on every `devices_probe` / `/api/devices/probe`):
 ## 2. Implemented drivers
 
 `CATALOG` in `drivers/mod.rs` is the list; every row there has `status: "implemented"`,
-and `GET /api/catalog` serves the same table to a client. Tools are named as the
+and the MCP resource `mcp://catalog` serves the same table to a client. Tools are named as the
 `tools/list` names them.
 
 | driver | Device | Identification | Tools | Notes |

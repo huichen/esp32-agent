@@ -127,23 +127,18 @@ When a script admits file edits, its MCP/internal-agent tool response also repor
 command error can follow an earlier admitted edit; that error reports the partial effect.
 See [storage acknowledgements](storage.md#workspace-publication-and-rollback).
 
-## Running one over HTTP
+## Running one
 
-The same interpreter is a route, for a client that would rather not wrap it in JSON-RPC:
+A script is a tool, so a client runs it over MCP: POST `/mcp` with `tools/call`,
+`{"name": "script", "arguments": {"source": "1 + 2"}}`. The call waits for the run and
+comes back with `result`, `output`, `steps` and `ms`; a failure comes back with the line and
+column it stopped on. The 8 KiB source limit applies.
 
-```bash
-curl -sS -X POST http://<board>:80/api/script -H 'Content-Type: application/json' \
-  -d '{"source":"1 + 2"}'
-# {"id":"s1","state":"done","async":false,"ok":true,"result":3,"output":[],"steps":3,"ms":2}
-```
-
-`POST /api/script` requires the configured portal credential, takes `{source, async?}`
-and uses the same 8 KiB source limit. Without `async` it waits for the run and answers with
-`result`, `output`, `steps`, `ms` and `error`. With `"async": true` it answers with
-`{id, state, poll}`; the background worker runs it even without a pending model turn.
-Poll `GET /api/script/<id>` for execution state/result/error. Only four job records are
-retained. `state: "done"` means the program finished, not that its file edits reached flash;
-check the `store` object in `GET /api/status` for persistence outcomes.
+There is no `POST /api/script` any more: it ran the same interpreter behind a second entry
+point, and its `async` mode needed a job pool, a poll route and a state machine to serve a
+caller that could just as well wait. `state: "done"` means the program finished, not that
+its file edits reached flash; check the `store` object in `GET /api/status` for persistence
+outcomes.
 
 Integers stay integers across the tool boundary (`address: 60`, not `60.0`), so copying a
 number from a tool result into `manifest_apply` does not create a spurious `u8` validation
