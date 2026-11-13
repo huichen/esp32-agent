@@ -156,9 +156,12 @@ body {
 
 .chat {
   flex: 1;
+  min-height: 0;
   overflow-y: auto;
   -webkit-overflow-scrolling: touch;
-  padding: 14px 12px calc(84px + env(safe-area-inset-bottom));
+  /* The composer is the next flex row, so the transcript only needs its own breathing room;
+     the 84 px it used to reserve for a fixed bar would be blank space above the keyboard. */
+  padding: 14px 12px 12px;
   display: flex;
   flex-direction: column;
   gap: 10px;
@@ -309,10 +312,14 @@ body {
 
 /* ---- composer ------------------------------------------------------------ */
 
+/* In the column, not floating over it. `position: fixed` is placed against the *layout*
+   viewport, and a phone keyboard does not always resize that: the composer then sits behind
+   the keys with its top half showing. As a flex child of a body whose height *is* the visual
+   viewport (`--vvh`, kept in step in app.js), it can only be at the bottom of what is
+   actually visible. */
 .composer {
-  position: fixed;
-  left: 0; right: 0;
-  bottom: 0;
+  position: relative;
+  flex: 0 0 auto;
   z-index: 15;
   padding: 8px 12px calc(8px + env(safe-area-inset-bottom));
   background: linear-gradient(to top, var(--bg) 62%, transparent);

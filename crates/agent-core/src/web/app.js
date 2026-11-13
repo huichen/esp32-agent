@@ -1506,42 +1506,38 @@ function autosize() {
   fitChatToComposer();
 }
 
-/** How far the composer was lifted off the bottom, by the keyboard listener below. */
+/** How far the composer was lifted off the bottom, by the keyboard listener below.
+ *
+ * Zero now: the composer is a flex child of a body whose height is the visual viewport, so
+ * there is no bar to lift. Kept because the transcript's padding and the page-layout test
+ * both read it. */
 let composerLift = 0;
 
 /** Reserve exactly what the composer covers at the bottom of the transcript.
  *
- * The chat's own `padding-bottom` is what keeps the last message from disappearing behind
- * the composer, and it used to be a flat 84 px — right only for a one-line field at `bottom:
- * 0`. A field that has grown to two or three rows, or a composer lifted above the keyboard
- * by `composerLift`, is taller than that, and the last bubble is then cut off by the bar.
- * Measuring the composer costs a `getBoundingClientRect` and cannot drift from it. */
+ * The composer is in the flex column now, so the transcript does not have to reserve room
+ * for it: the two are laid out one after the other. A small gap is all that is left. */
 function fitChatToComposer() {
   const composer = $("#composer");
   const chat = $("#chat");
   if (!composer || !chat) return 0;
-  const pad = Math.ceil(composer.getBoundingClientRect().height + composerLift + 10);
+  const pad = 12;
   chat.style.paddingBottom = pad + "px";
   return pad;
 }
 
-/** Keep the composer above the on-screen keyboard.
+/** Keep the page as tall as the part of it the keyboard leaves visible.
  *
- * A phone keyboard shrinks `visualViewport` without shrinking the layout viewport, so a
- * fixed composer stays where it was and the last line of the field ends up under the keys.
- * Binding the document height to the visual viewport (and scrolling the field into view on
- * focus) puts it back on top of the keyboard. */
+ * A phone keyboard shrinks `visualViewport` without necessarily shrinking the layout
+ * viewport. Binding the document height (`--vvh`, which `body` and the sheet use) to the
+ * visual viewport is what keeps the composer's bottom edge above the keys; `position:
+ * fixed` could not do that, which is why the field was half covered. */
 function trackViewport() {
   const vv = window.visualViewport;
   const apply = () => {
     const h = vv ? vv.height : window.innerHeight;
     document.documentElement.style.setProperty("--vvh", h + "px");
-    const composer = $("#composer");
-    if (vv && composer) {
-      const gap = Math.max(0, window.innerHeight - (vv.height + vv.offsetTop));
-      composerLift = gap;
-      composer.style.transform = `translateY(-${gap}px)`;
-    }
+    composerLift = 0;
     fitChatToComposer();
     if (document.activeElement === $("#input")) scrollToEnd();
   };
@@ -1549,9 +1545,12 @@ function trackViewport() {
     vv.addEventListener("resize", apply);
     vv.addEventListener("scroll", apply);
   }
+  window.addEventListener("resize", apply);
   window.addEventListener("orientationchange", () => setTimeout(apply, 250));
-  // The field grows on its own (up to 132 px) while it is typed into; the transcript's
-  // padding has to follow that, not a number chosen for an empty composer.
+  // Android reports the new visual viewport a little after focus, and the keyboard animation
+  // settles later still: reapply once after the keyboard has had time to appear.
+  $("#input").addEventListener("focus", () => setTimeout(apply, 350));
+  $("#input").addEventListener("blur", () => setTimeout(apply, 250));
   if (window.ResizeObserver) {
     new ResizeObserver(() => fitChatToComposer()).observe($("#composer"));
   }

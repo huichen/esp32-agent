@@ -156,6 +156,18 @@ window.__esp32Measure = function () {
   // one-line field, then three lines in the same field.
   out.chatPadBefore = parseFloat(getComputedStyle(q("#chat")).paddingBottom) || 0;
   out.composerHeightBefore = r(q("#composer")).height;
+  // Where the two rows meet: with the composer in the column it must start at or below the
+  // transcript's bottom, and a floating bar would not.
+  out.composerTop = r(q("#composer")).top;
+  out.composerBottom = r(q("#composer")).bottom;
+  out.chatBottom = r(q("#chat")).bottom;
+  // The keyboard case, without a keyboard: the visible height drops to 480 px and the
+  // composer must end inside it. A `position: fixed` bar stayed at the layout viewport's
+  // bottom and was half covered, which is the bug this checks for.
+  document.documentElement.style.setProperty("--vvh", "480px");
+  out.keyboard = { composerBottom: r(q("#composer")).bottom, fieldBottom: r(q("#input")).bottom,
+    visible: 480, bodyHeight: r(document.body).height };
+  document.documentElement.style.removeProperty("--vvh");
   var field = q("#input");
   field.value = "one\ntwo\nthree";
   autosize();
@@ -1260,27 +1272,44 @@ fn a_markdown_table_renders_as_a_table_on_a_phone() {
         );
         assert!(!pres[1].contains("\\n"), "{at}: the restored result still carries a literal \\n: {pres:?}");
 
-        // The transcript must not run under the composer: its padding covers whatever the
-        // composer currently is, not the 84 px a one-line field used to need.
+        // The transcript must not run under the composer. The composer is a row in the flex
+        // column now, so the check is geometric: its box starts at or below the transcript's
+        // bottom, and it ends inside the screen. A floating composer fails this the moment a
+        // keyboard shrinks the visible height, which is what it used to do.
         let pad_before = measured[width]["chatPadBefore"].as_f64().unwrap_or(0.0);
         let pad_after = measured[width]["chatPadAfter"].as_f64().unwrap_or(0.0);
         let h_before = measured[width]["composerHeightBefore"].as_f64().unwrap_or(0.0);
         let h_after = measured[width]["composerHeightAfter"].as_f64().unwrap_or(0.0);
         assert!(
-            pad_before >= h_before + 9.0,
-            "{width} px: {pad_before} px of padding for a {h_before} px composer"
-        );
-        assert!(
             h_after > h_before + 20.0,
             "{width} px: the three-line field did not grow the composer ({h_before} -> {h_after})"
         );
+        let composer_top = measured[width]["composerTop"].as_f64().unwrap_or(f64::NAN);
+        let composer_bottom = measured[width]["composerBottom"].as_f64().unwrap_or(f64::NAN);
+        let chat_bottom = measured[width]["chatBottom"].as_f64().unwrap_or(f64::NAN);
         assert!(
-            pad_after >= h_after + 9.0,
-            "{width} px: a {h_after} px composer but only {pad_after} px of padding"
+            composer_top >= chat_bottom - 1.0,
+            "{width} px: the composer starts at {composer_top} and the transcript ends at {chat_bottom}: they overlap"
         );
         assert!(
-            pad_after > pad_before,
-            "{width} px: padding did not follow the field ({pad_before} -> {pad_after})"
+            composer_bottom <= (measured[width]["height"].as_f64().unwrap_or(f64::NAN) + 1.0),
+            "{width} px: the composer ends at {composer_bottom}, past the visible height"
+        );
+        assert!(
+            pad_after <= 20.0 && pad_before <= 20.0,
+            "{width} px: a transcript in flow still reserves {pad_before}/{pad_after} px for a bar it no longer floats under"
+        );
+        // Keyboard case: 480 px of visible height, and the field has to be inside it.
+        let kb = &measured[width]["keyboard"];
+        let kb_bottom = kb["composerBottom"].as_f64().unwrap_or(f64::NAN);
+        let kb_field = kb["fieldBottom"].as_f64().unwrap_or(f64::NAN);
+        assert!(
+            kb_bottom <= 481.0,
+            "{width} px: with 480 px visible the composer ends at {kb_bottom}, behind the keyboard"
+        );
+        assert!(
+            kb_field <= 481.0,
+            "{width} px: with 480 px visible the field ends at {kb_field}, behind the keyboard"
         );
 
         // A wide table may scroll inside its wrapper; what it may not do is make the bubble
