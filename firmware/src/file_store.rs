@@ -1,4 +1,4 @@
-//! [`KvStore`] over a SPIFFS file per key, and the routing that decides which keys go there.
+//! [`KvStore`] over a LittleFS file per key, and the routing that decides which keys go there.
 //!
 //! NVS keeps a value to about 4 KB and divides its partition into 32-byte entries, which is
 //! fine for a configuration blob and wrong for the two things that grow: the transcript and
@@ -18,13 +18,13 @@ use std::path::{Path, PathBuf};
 const MOUNT: &str = "/storage";
 /// One file per key, directly under the mount point.
 ///
-/// SPIFFS in ESP-IDF has no directories: `esp_spiffs.c`'s `vfs_spiffs_mkdir` returns `ENOTSUP`
+/// LittleFS in ESP-IDF has no directories: `esp_files.c`'s `vfs_files_mkdir` returns `ENOTSUP`
 /// (measured on this board: `Error: Not supported (os error 134)` after a 38 s format, which is
 /// the format doing its job and the `mkdir` right after it failing). A flat namespace is also
-/// what SPIFFS is: the key names are already unique and short.
+/// what LittleFS is: the key names are already unique and short.
 const KV_DIR: &str = "/storage";
 
-pub struct SpiffsStore {
+pub struct FileStore {
     dir: PathBuf,
     last_error: Option<StoreError>,
     /// The file a sequential read is pulling from, kept open: reopening per chunk cost more than
@@ -41,7 +41,7 @@ fn error_of(code: i32, context: &str) -> StoreError {
             std::ffi::CStr::from_ptr(ptr).to_string_lossy().into_owned()
         }
     };
-    log::error!("spiffs {context}: {name}");
+    log::error!("files {context}: {name}");
     StoreError { code, name }
 }
 
@@ -51,21 +51,32 @@ fn error_of(code: i32, context: &str) -> StoreError {
 /// this table, and a board that refuses to boot because a filesystem was not formatted yet is
 /// worse than one that formats it once. That first format is slow - 38 s for 11.9 MB, measured
 /// on this board - so a freshly flashed board takes that long before its first packet.
-pub fn mount() -> anyhow::Result<SpiffsStore> {
+pub fn mount() -> anyhow::Result<FileStore> {
     let label = c"storage";
     let path = c"/storage";
-    let conf = sys::esp_vfs_spiffs_conf_t {
+    let mut conf = sys::littlefs::esp_vfs_littlefs_conf_t {
         base_path: path.as_ptr(),
         partition_label: label.as_ptr(),
-        max_files: 6,
-        format_if_mount_failed: true,
+        partition: std::ptr::null(),
+        ..Default::default()
     };
-    let rc = unsafe { sys::esp_vfs_spiffs_register(&conf) };
+    // Formatting is allowed only because this partition may hold the format a previous build
+    // wrote: LittleFS and LittleFS cannot read each other. That is a one-time cost on the first
+    // boot after the change, and it is the reason the release note says the transcript and the
+    // workspace start empty once.
+    conf.set_format_if_mount_failed(1);
+    conf.set_read_only(0);
+    conf.set_dont_mount(0);
+    conf.set_grow_on_mount(0);
+    let rc = unsafe { sys::littlefs::esp_vfs_littlefs_register(&conf) };
     if rc != sys::ESP_OK {
         // `ESP_ERR_INVALID_STATE` means it is already mounted (a restart of the app without a
         // reboot), which is not an error worth failing the boot over.
         if rc != sys::ESP_ERR_INVALID_STATE {
-            return Err(anyhow::anyhow!("esp_vfs_spiffs_register: {}", error_of(rc, "mount").name));
+            return Err(anyhow::anyhow!(
+                "esp_vfs_littlefs_register: {}",
+                error_of(rc, "mount").name
+            ));
         }
     }
     let (total, used) = capacity();
@@ -98,8 +109,8 @@ pub fn mount() -> anyhow::Result<SpiffsStore> {
     if restored > 0 {
         log::warn!("storage: put back {restored} value(s) an interrupted save had moved aside");
     }
-    log::info!("storage: SPIFFS on `storage`, mounted at {MOUNT}, {used} of {total} bytes used");
-    Ok(SpiffsStore {
+    log::info!("storage: LittleFS on `storage`, mounted at {MOUNT}, {used} of {total} bytes used");
+    Ok(FileStore {
         dir: PathBuf::from(KV_DIR),
         last_error: None,
         open: std::cell::RefCell::new(None),
@@ -111,14 +122,14 @@ fn capacity() -> (usize, usize) {
     let label = c"storage";
     let mut total: usize = 0;
     let mut used: usize = 0;
-    let rc = unsafe { sys::esp_spiffs_info(label.as_ptr(), &mut total, &mut used) };
+    let rc = unsafe { sys::littlefs::esp_littlefs_info(label.as_ptr(), &mut total, &mut used) };
     if rc != sys::ESP_OK {
         return (0, 0);
     }
     (total, used)
 }
 
-impl SpiffsStore {
+impl FileStore {
     fn path(&self, key: &str) -> PathBuf {
         self.dir.join(key)
     }
@@ -126,7 +137,7 @@ impl SpiffsStore {
     /// Where a value is written before it is published.
     ///
     /// The suffix marks it as not-a-key, so a value left behind by a power cut is never read
-    /// back as one. Keys are at most 15 bytes (`store::KEY_MAX`) and a SPIFFS name is 32, so
+    /// back as one. Keys are at most 15 bytes (`store::KEY_MAX`) and a LittleFS name is 32, so
     /// `transcript.tmp` fits with room to spare.
     fn temp_path(&self, key: &str) -> PathBuf {
         self.dir.join(format!("{key}.tmp"))
@@ -142,7 +153,7 @@ impl SpiffsStore {
     ///
     /// So the new value goes to a temporary name, is flushed to flash, and only then renamed
     /// over the original. `fsync` before `rename` matters: a rename that publishes a file
-    /// whose contents are still in a cache is the same loss with a smaller window. SPIFFS
+    /// whose contents are still in a cache is the same loss with a smaller window. LittleFS
     /// implements both (`CONFIG_VFS_SUPPORT_DIR` is on), and a rename is a directory-level
     /// operation that leaves the old file readable until it completes.
     fn replace(&self, key: &str, value: &str) -> std::io::Result<()> {
@@ -162,7 +173,7 @@ impl SpiffsStore {
 
     /// Put the file at `tmp` in place of `key`'s value, keeping the old one until it lands.
     ///
-    /// SPIFFS refuses to rename onto a name that exists (`SPIFFS_ERR_CONFLICTING_NAME`, which
+    /// LittleFS refuses to rename onto a name that exists (`LittleFS_ERR_CONFLICTING_NAME`, which
     /// ESP-IDF maps to EIO - measured here: the temporary file wrote and synced, the rename
     /// failed with `I/O error (os error 5)`), which is why the old value is moved aside first
     /// and put back if the publish fails. The name is empty for the length of one rename, and
@@ -201,13 +212,13 @@ impl SpiffsStore {
     }
 }
 
-impl KvStore for SpiffsStore {
+impl KvStore for FileStore {
     fn get(&self, key: &str) -> Option<String> {
         match std::fs::read_to_string(self.path(key)) {
             Ok(text) => Some(text),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
             Err(e) => {
-                log::warn!("spiffs read `{key}`: {e}");
+                log::warn!("files read `{key}`: {e}");
                 None
             }
         }
@@ -222,7 +233,7 @@ impl KvStore for SpiffsStore {
                 // about it, which is what `/api/status.store.last_failure` is for.
                 let code = e.raw_os_error().unwrap_or(0);
                 let name = format!("{e}");
-                log::error!("spiffs write `{key}`: {name} (the previous value is untouched)");
+                log::error!("files write `{key}`: {name} (the previous value is untouched)");
                 self.last_error = Some(StoreError { code, name });
                 false
             }
@@ -239,7 +250,7 @@ impl KvStore for SpiffsStore {
             Err(e) => {
                 let code = e.raw_os_error().unwrap_or(0);
                 let name = format!("{e}");
-                log::error!("spiffs remove `{key}`: {name}");
+                log::error!("files remove `{key}`: {name}");
                 self.last_error = Some(StoreError { code, name });
                 false
             }
@@ -250,7 +261,7 @@ impl KvStore for SpiffsStore {
     /// a rename.
     ///
     /// This is the write half of the memory fix: a 4 MB workspace never exists as one `String`
-    /// on the way out either. The temporary name is the same trick [`SpiffsStore::replace`]
+    /// on the way out either. The temporary name is the same trick [`FileStore::replace`]
     /// uses, so a write that fails half way leaves the old value alone.
     fn set_stream(
         &mut self,
@@ -270,7 +281,7 @@ impl KvStore for SpiffsStore {
         if let Err(e) = written {
             let _ = std::fs::remove_file(&tmp);
             log::error!(
-                "spiffs stream `{key}` refused: {e}; esp_spiffs_info total_bytes {} used_bytes {} free_bytes {}",
+                "files stream `{key}` refused: {e}; esp_files_info total_bytes {} used_bytes {} free_bytes {}",
                 capacity().0,
                 capacity().1,
                 capacity().0.saturating_sub(capacity().1)
@@ -282,7 +293,7 @@ impl KvStore for SpiffsStore {
             Ok(()) => true,
             Err(e) => {
                 log::error!(
-                    "spiffs publish `{key}` refused: {e}; esp_spiffs_info total_bytes {} used_bytes {} free_bytes {}",
+                    "files publish `{key}` refused: {e}; esp_files_info total_bytes {} used_bytes {} free_bytes {}",
                     capacity().0,
                     capacity().1,
                     capacity().0.saturating_sub(capacity().1)
@@ -328,9 +339,9 @@ impl KvStore for SpiffsStore {
         self.last_error.clone()
     }
 
-    /// What `esp_spiffs_info()` reports, in bytes.
+    /// What `esp_files_info()` reports, in bytes.
     ///
-    /// `total` is SPIFFS' own capacity figure, not the partition size: it is
+    /// `total` is LittleFS' own capacity figure, not the partition size: it is
     /// `(blocks - 2) * (pages_per_block - lookup_pages) + 1` data pages times the data page size,
     /// so the 12 517 376-byte partition minus two spare blocks and the object-lookup pages. On
     /// this board that is 45 811 * 251 = 11 498 561. `used` is the pages it has written. No
@@ -338,7 +349,7 @@ impl KvStore for SpiffsStore {
     /// one.
     ///
     /// Neither number promises that one allocation of that size fits: a 2.1 MB file was refused
-    /// with `ENOSPC` while `free` read 9.38 MB, because SPIFFS needs somewhere to move live pages
+    /// with `ENOSPC` while `free` read 9.38 MB, because LittleFS needs somewhere to move live pages
     /// while it writes a new file and reports no figure for that.
     fn space(&self) -> Option<StoreSpace> {
         let (total, used) = capacity();
@@ -393,13 +404,13 @@ impl std::io::Write for Paced<'_> {
 /// Two backends behind one store: big mutable blobs on the filesystem, everything else in NVS.
 pub struct SplitStore {
     /// The transcript and the workspace.
-    files: SpiffsStore,
+    files: FileStore,
     /// Configuration, manifest, the scheduler, the in-flight marker.
     nvs: crate::nvs_store::NvsStore,
 }
 
 impl SplitStore {
-    pub fn new(files: SpiffsStore, nvs: crate::nvs_store::NvsStore) -> Self {
+    pub fn new(files: FileStore, nvs: crate::nvs_store::NvsStore) -> Self {
         Self { files, nvs }
     }
 

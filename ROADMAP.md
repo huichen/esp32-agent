@@ -42,7 +42,7 @@ what is not done or not verified.
 1. **OTA**: firmware upload over `/api/ota` with rollback between the two app slots; the
    partition table is ready (`otadata`/`ota_0`/`ota_1` are in the image).
 2. **mDNS**: register `_mcp._tcp` so a client does not have to know the IP first.
-3. **File workspace on SPIFFS** (the 1 MB `storage` partition); today the workspace is a
+3. **File workspace on the storage partition** (LittleFS over 11.94 MB); today the workspace is a
    single 8 KB NVS blob.
 4. **Inbound TLS without the certificate the board made**: the board serves 443 itself with
    a self-signed certificate, so every client has to be taught the fingerprint. A

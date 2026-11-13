@@ -329,7 +329,7 @@ number in it has one source:
 
 | Field | Where it comes from |
 |---|---|
-| `total_bytes`, `used_bytes` (filesystem) | `esp_spiffs_info()`, i.e. `SPIFFS_info()`. Its `total` is SPIFFS' own capacity figure, **not** the partition size: `(blocks - 2) * (pages_per_block - lookup_pages) + 1` data pages times the data page size. On this board that is the 12 517 376-byte partition minus two spare blocks and the lookup pages: 45 811 x 251 = **11 498 561**. |
+| `total_bytes`, `used_bytes` (filesystem) | `esp_littlefs_info()`, whose `total` is the partition's size: 12 517 376 bytes, against SPIFFS' 11 498 561 on the same partition (SPIFFS reserves two spare blocks and the lookup pages). `used_bytes` counts blocks LittleFS has allocated, metadata included: 12 288 bytes on a freshly formatted partition. |
 | `free_bytes` | **Computed** as `total - used`. No backend reports a "free" number. |
 | `used_entries`, `free_entries`, `total_entries` (NVS) | `nvs_get_stats()`'s `nvs_stats_t`, counted in 32-byte entries. |
 | `used_bytes`, `total_bytes` (NVS) | **Computed** as entries x 32; NVS reports no bytes. |
@@ -337,11 +337,13 @@ number in it has one source:
 A filesystem reports no entries at all, so its JSON has none - `free_entries: 0` read as "full" on
 a partition with megabytes left, which is why the key is absent rather than zero.
 
-**What `free_bytes` is not:** a promise that one allocation of that size will succeed. Measured on
-this board: creating a 2.1 MB file returned `ENOSPC` while `free` read 9.38 MB, because SPIFFS
-needs somewhere to move live pages while it writes a new file, and reports no figure for that. The
-practical ceiling for a *single* allocation is roughly half of `free_bytes` - about 4.6 MB on an
-empty partition, less once the filesystem has been rewritten many times.
+**That measurement is historical.** It was taken on SPIFFS, which reserves two spare blocks and
+the lookup pages and reports 11 498 561 of a 12 517 376-byte partition; creating a 2.1 MB file then
+returned `ENOSPC` while `free` read 9.38 MB, because SPIFFS needs somewhere to move live pages while
+it writes a new file and reports no figure for that. The partition holds LittleFS now, which reports
+the partition's own size and allocates in 4 KB blocks, and the same writes take a fraction of the
+time: measured on this board after the change, a 1 KB create 0.22 s and an overwrite 0.03-0.17 s
+(SPIFFS: 1.6-2.1 s and 8.4-13.7 s), a 256 KB write 0.82 s (SPIFFS: 10.8-11 s), a 256 KB read 0.90 s.
 
 **The workspace no longer depends on that.** It used to be one document under `ws`, rewritten in
 full on every save: a 2.1 MB workspace needed a second 2.1 MB copy on flash while saving and was
