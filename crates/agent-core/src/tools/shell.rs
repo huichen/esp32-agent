@@ -1111,9 +1111,11 @@ fn description() -> String {
     format!(
         "Run a command on the board, as on a unix shell: one `command` string. Commands: {}. \
          Pipes (`|`), redirection (`>` `<` `>>`) and up to 5 stages work on one line; no `&&`, \
-         no `;`, no `$( )`, no variable expansion, no background job. Not every shell command \
-         exists — this is the list. `{{\"help\": true}}` prints it with a usage line for each, \
-         and `help <command>` prints one.",
+         no `;`, no `$( )`, no variable expansion, no background job. `rm` and `mv` need \
+         `--confirm` on the command line (`rm /notes/a.txt --confirm`): the confirmation is \
+         part of the command, not a field of this tool. Not every \
+         shell command exists — this is the list. `{{\"help\": true}}` prints it with a usage \
+         line for each, and `help <command>` prints one.",
         names.join(" ")
     )
 }

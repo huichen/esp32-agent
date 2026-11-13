@@ -643,11 +643,16 @@ impl Device for Ssd1306 {
                     j::opt_i64(args, "height").unwrap_or(0) as u32
                 };
                 if !self.set_bitmap(&bytes, w, h) {
+                    // Both accepted sizes by name: the panel's own frame, and the 128x32 page
+                    // format that a 128x64 panel draws into its top half. Naming the panel's
+                    // size twice ("expected 512 for 128x32 or 512 for 128x32") was what a
+                    // caller on a 128x32 panel read when it sent the wrong length.
                     return Err(McpError::invalid_params(format!(
-                        "bitmap is {} bytes; expected {} for 128x{} or 512 for 128x32",
+                        "bitmap is {} bytes; a page-format frame is 512 bytes for 128x32 or 1024 for 128x64 \
+                         (this panel is 128x{}, so its full frame is {} bytes)",
                         bytes.len(),
-                        self.fb.len(),
-                        self.height
+                        self.height,
+                        self.fb.len()
                     )));
                 }
                 self.flush(hw)?;

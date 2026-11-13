@@ -1521,9 +1521,340 @@ function showPanel(name) {
     panelLoad("Loading the schedule\u2026", loadSched);
   }
   if (name === "files") panelLoad("Loading files\u2026", loadTree);
+  if (name === "terminal") termFocus();
   if (name === "settings") {
     panelLoad("Loading settings\u2026", loadSettings);
     panelLoad("Loading the log\u2026", loadLogs);
+  }
+}
+
+// ---------------------------------------------------------------- terminal
+
+/** The console's terminal: a shell over the board, not a PTY.
+ *
+ * Every board tool is one JSON-RPC call away, so the terminal keeps a single MCP session for
+ * the page and sends `shell` calls down it — the same door an external agent uses, which is
+ * why a command typed here behaves exactly like one an agent calls. Three things are handled
+ * in the page rather than on the board (`help`, `clear`, `!name {json}`) because they are
+ * about the terminal, not about the hardware.
+ */
+const TERM = {
+  session: "", // Mcp-Session-Id, kept so the board does not open one per command
+  history: [], // what was typed, oldest first
+  at: 0, // where the arrows are in `history`; `history.length` is the line being typed
+  busy: false,
+  /** Scrollback is capped in the page, not on the board: a session left open must not grow
+   * until the tab is slow. 400 nodes is a few hundred kB of DOM at most. */
+  maxLines: 400,
+};
+
+const TERM_HELP = [
+  "the board's shell, one command per line:",
+  "  ls /       cat /MEMORY.md       df       free       ps       date",
+  "  grep -n tool /MEMORY.md | head -n 3       curl https://example.com | head",
+  "",
+  "handled in this page, not on the board:",
+  "  help                 this text",
+  "  clear                empty the screen (Ctrl-L)",
+  "  !name {json}         call any board tool, e.g. !board {\"command\":\"chip_temp\"}",
+  "",
+  "up/down walks the history; the board answers with JSON unless the command returns one text field.",
+].join("\n");
+
+/** Append one node to the screen, capped, and keep the newest line in view. */
+function termAppend(node) {
+  const out = $("#term-out");
+  if (!out) return;
+  out.appendChild(node);
+  while (out.children.length > TERM.maxLines) out.removeChild(out.firstElementChild);
+  const screen = $("#term-screen");
+  if (screen) screen.scrollTop = screen.scrollHeight;
+}
+
+function termEcho(text) {
+  const row = document.createElement("div");
+  row.className = "term-echo";
+  const prompt = document.createElement("span");
+  prompt.className = "term-prompt";
+  prompt.textContent = "\u203a";
+  const body = document.createElement("span");
+  body.className = "term-cmd";
+  body.textContent = text;
+  row.appendChild(prompt);
+  row.appendChild(body);
+  termAppend(row);
+}
+
+function termPrint(text, kind) {
+  const block = document.createElement("pre");
+  block.className = "term-text" + (kind ? " " + kind : "");
+  // textContent, never innerHTML: a `cat` of a file the agent wrote is not markup.
+  block.textContent = text === "" ? " " : text;
+  termAppend(block);
+}
+
+/** Say what the terminal is doing, in the header chip. */
+function termState(text, kind) {
+  const chip = $("#term-state");
+  if (!chip) return;
+  chip.textContent = text;
+  chip.className = "term-state" + (kind ? " " + kind : "");
+}
+
+/** `{"entries":[{name,dir}…]}` → the listing a person expects from `ls`. */
+function termLs(value) {
+  if (!Array.isArray(value.entries)) return null;
+  const names = value.entries.map((e) => {
+    const name = (e && e.name) || "";
+    return e && e.dir ? name + "/" : name;
+  });
+  const head = value.path ? value.path + "\n" : "";
+  return head + names.join("\n") + (names.length ? "" : "(empty)");
+}
+
+/** A tool result, split into what to print and whether it is JSON worth colouring. */
+function termResult(result) {
+  if (!result) return { text: "", json: false };
+  let value = result.structuredContent;
+  if (value === undefined) {
+    const text = (result.content || []).map((c) => (c && c.text) || "").join("");
+    try {
+      value = JSON.parse(text);
+    } catch {
+      return { text: text, json: false };
+    }
+  }
+  return termFormat(value);
+}
+
+function termFormat(value) {
+  if (value === null || value === undefined) return { text: "ok", json: false };
+  if (typeof value !== "object") return { text: String(value), json: false };
+  if (Array.isArray(value)) return { text: value.map((v) => termFormat(v).text).join("\n"), json: false };
+  const keys = Object.keys(value);
+  const listing = termLs(value);
+  if (listing !== null) return { text: listing, json: false };
+  const text = keys.filter((k) => typeof value[k] === "string");
+  // One long string beside metadata (`path`, `size_bytes`) is the answer; the metadata is
+  // what a person does not need on a screen this narrow.
+  if (text.includes("text") && keys.length <= 4) return { text: value.text, json: false };
+  if (keys.length === 1 && typeof value[keys[0]] === "string") return { text: value[keys[0]], json: false };
+  return { text: JSON.stringify(value, null, 2), json: true };
+}
+
+/** Print JSON with its keys, strings, numbers and literals told apart.
+ *
+ * Built from text nodes and `textContent`, never from `innerHTML`: the payload is whatever a
+ * tool returned, which includes files the agent wrote. One flat colour is the difference
+ * between a developer reading a result and squinting at a wall of grey — and it is a dozen
+ * spans, not a syntax highlighter.
+ */
+function termPrintJson(text) {
+  const block = document.createElement("pre");
+  block.className = "term-text";
+  const token = /("(?:\\.|[^"\\])*")(\s*:)?|\b(true|false|null)\b|(-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)/g;
+  let at = 0;
+  let match;
+  const push = (value, cls) => {
+    if (!value) return;
+    if (!cls) {
+      block.appendChild(document.createTextNode(value));
+      return;
+    }
+    const span = document.createElement("span");
+    span.className = cls;
+    span.textContent = value;
+    block.appendChild(span);
+  };
+  while ((match = token.exec(text))) {
+    push(text.slice(at, match.index), null);
+    if (match[1]) push(match[1], match[2] ? "j-key" : "j-str");
+    else if (match[3]) push(match[3], "j-lit");
+    else push(match[4], "j-num");
+    if (match[2]) push(match[2], null);
+    at = match.index + match[0].length;
+  }
+  push(text.slice(at), null);
+  termAppend(block);
+}
+
+/** One `tools/call` over the page's MCP session.
+ *
+ * A 401 here means the portal PIN is set and the token expired, which is the same case
+ * `api()` retries: unlock once, then send the same call again rather than making the person
+ * retype the command.
+ */
+async function termRpc(name, args) {
+  const headers = { "Content-Type": "application/json" };
+  if (S.token) headers.Authorization = "Bearer " + S.token;
+  if (TERM.session) headers["Mcp-Session-Id"] = TERM.session;
+  const res = await fetch("/mcp", {
+    method: "POST",
+    headers,
+    body: JSON.stringify({
+      jsonrpc: "2.0",
+      id: Date.now(),
+      method: "tools/call",
+      params: { name, arguments: args || {} },
+    }),
+  });
+  const sid = res.headers.get("Mcp-Session-Id");
+  if (sid) TERM.session = sid;
+  if (res.status === 401) {
+    const retried = await unlock();
+    if (retried) return termRpc(name, args);
+    throw new Error("PIN required");
+  }
+  const raw = await res.text();
+  let data = null;
+  try {
+    data = raw ? JSON.parse(raw) : null;
+  } catch {
+    throw new Error(raw.slice(0, 200) || res.status + " " + res.statusText);
+  }
+  if (!res.ok) throw new Error((data && data.error) || res.status + " " + res.statusText);
+  // A JSON-RPC error is the board refusing the call: it carries the sentence worth reading,
+  // and the session itself is fine. Tagged, because the caller must not throw the session
+  // away over a typo in a command.
+  if (data && data.error) {
+    const refused = new Error(data.error.message || "the board refused the call");
+    refused.refused = true;
+    throw refused;
+  }
+  if (data && data.result && data.result.isError) {
+    const why = (data.result.content || []).map((c) => (c && c.text) || "").join("");
+    const refused = new Error(why || "the tool reported an error");
+    refused.refused = true;
+    throw refused;
+  }
+  return data ? data.result : null;
+}
+
+/** Run one line. Local commands first, then the board. */
+async function termRun(line) {
+  const text = line.trim();
+  if (!text) return;
+  termEcho(text);
+
+  const word = text.split(/\s+/)[0].toLowerCase();
+  if (word === "help") {
+    termPrint(TERM_HELP, "term-note");
+    return;
+  }
+  if (word === "clear") {
+    termClear();
+    return;
+  }
+
+  let name = "shell";
+  let args = { command: text };
+  if (text.startsWith("!")) {
+    const rest = text.slice(1).trim();
+    const split = rest.search(/\s/);
+    name = split < 0 ? rest : rest.slice(0, split);
+    if (!name) {
+      termPrint("! needs a tool name: !board {\"command\":\"status\"}", "term-note");
+      return;
+    }
+    const raw = split < 0 ? "" : rest.slice(split + 1).trim();
+    args = {};
+    if (raw) {
+      try {
+        args = JSON.parse(raw);
+      } catch (e) {
+        // The board refuses a bad argument with its own sentence; a JSON typo is ours, and
+        // it is cheaper to say so here than to read "invalid JSON" back from a tool call.
+        termPrint("the arguments must be JSON: " + String(e.message || e), "term-err");
+        return;
+      }
+    }
+  }
+
+  TERM.busy = true;
+  termState("running\u2026", "busy");
+  const form = $("#term-form");
+  if (form) form.classList.add("running");
+  try {
+    const result = await termRpc(name, args);
+    const answer = termResult(result);
+    if (answer.json) termPrintJson(answer.text);
+    else termPrint(answer.text);
+    termState("shell");
+  } catch (e) {
+    termPrint("! " + String((e && e.message) || e), "term-err");
+    // A refusal is the board talking back: keep the session and the chip. A transport failure
+    // (a reboot, an expired TTL, a lost socket) is different — drop the session so the next
+    // command opens a new one, and say so instead of looking ready.
+    if (!e || !e.refused) {
+      TERM.session = "";
+      termState("offline", "bad");
+    }
+  } finally {
+    TERM.busy = false;
+    if (form) form.classList.remove("running");
+    const input = $("#term-input");
+    if (input && $("#panel-terminal") && !$("#panel-terminal").hidden) input.focus();
+  }
+}
+
+/** Take the line from the input: history first, then run it. */
+function termSubmit() {
+  const input = $("#term-input");
+  if (!input || TERM.busy) return;
+  const line = input.value;
+  input.value = "";
+  const text = line.trim();
+  // Typing the same command twice does not fill the history: up-arrow is how a person reruns
+  // the last one, and a list of one repeated line helps nobody.
+  if (text && TERM.history[TERM.history.length - 1] !== text) TERM.history.push(text);
+  TERM.at = TERM.history.length;
+  termRun(line);
+}
+
+function termClear() {
+  const out = $("#term-out");
+  if (out) out.textContent = "";
+  TERM.session = "";
+  termState("shell");
+}
+
+/** Opening the panel puts the caret where the next command goes; on a phone that is also
+ * what raises the keyboard, which is the difference between a terminal and a screenshot. */
+function termFocus() {
+  const input = $("#term-input");
+  if (!input) return;
+  if (!TERM.history.length && !$("#term-out").children.length) {
+    termPrint(
+      "esp32-agent console \u2014 the board's own shell. Type `help`, or `!board {\"command\":\"status\"}`.",
+      "term-note",
+    );
+  }
+  if (window.matchMedia && window.matchMedia("(pointer: coarse)").matches) return;
+  setTimeout(() => input.focus(), 30);
+}
+
+function termKey(event) {
+  const input = $("#term-input");
+  if (event.key === "ArrowUp") {
+    // Walking back through history stops at the oldest line; the line being typed is kept at
+    // the end of the list, so walking forward returns to it instead of losing it.
+    if (!TERM.history.length) return;
+    event.preventDefault();
+    TERM.at = Math.max(0, TERM.at - 1);
+    input.value = TERM.history[TERM.at] || "";
+    setTimeout(() => input.setSelectionRange(input.value.length, input.value.length), 0);
+    return;
+  }
+  if (event.key === "ArrowDown") {
+    if (!TERM.history.length) return;
+    event.preventDefault();
+    TERM.at = Math.min(TERM.history.length, TERM.at + 1);
+    input.value = TERM.history[TERM.at] || "";
+    return;
+  }
+  if (event.key === "l" && (event.ctrlKey || event.metaKey)) {
+    event.preventDefault();
+    termClear();
   }
 }
 
@@ -1597,6 +1928,19 @@ function init() {
   };
   $("#sheet-close").onclick = () => ($("#sheet").hidden = true);
   $$(".tabs button").forEach((b) => (b.onclick = () => showPanel(b.dataset.panel)));
+
+  // The terminal: a form so a phone keyboard has a Go key, an input because a command is one
+  // line, and a keydown handler for the history arrows the form does not give for free.
+  $("#term-form").onsubmit = (e) => {
+    e.preventDefault();
+    termSubmit();
+  };
+  $("#term-input").onkeydown = termKey;
+  $("#term-clear").onclick = () => {
+    termClear();
+    const input = $("#term-input");
+    if (input) input.focus();
+  };
 
   $("#composer").onsubmit = (e) => {
     e.preventDefault();
