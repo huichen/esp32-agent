@@ -18,7 +18,7 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 pub const MAX_HEADER_BYTES: usize = 8 * 1024;
-pub const MAX_BODY_BYTES: usize = 128 * 1024;
+pub const MAX_BODY_BYTES: usize = 1024 * 1024;
 const MAX_CONNECTIONS: usize = 6;
 const IDLE_TIMEOUT: Duration = Duration::from_secs(20);
 

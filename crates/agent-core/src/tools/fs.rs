@@ -18,7 +18,12 @@ use serde_json::{json, Value};
 
 /// Largest file this layer accepts. The board keeps the whole workspace in RAM
 /// (<= 8 KB), so a single file may take a quarter of it.
-pub const MAX_FILE_BYTES: usize = 2048;
+/// The most text one workspace file may hold.
+///
+/// It was 2048 because the whole workspace was a 17.5 KB blob over five NVS values. The
+/// workspace is a file on a 12 MB filesystem now, so this is the number a person would expect
+/// from a note pad and not from a sticky note: 256 KB of Markdown, or a JSON log.
+pub const MAX_FILE_BYTES: usize = 256 * 1024;
 
 /// How deep `fs_grep` walks before it gives up.
 const MAX_DEPTH: usize = 8;
@@ -724,7 +729,7 @@ mod tests {
         let mut ws = Mem::default();
         let big = "x".repeat(MAX_FILE_BYTES + 1);
         let err = run(&mut ws, "fs_write", json!({"path": "/big.txt", "text": big})).unwrap_err();
-        assert!(err.contains("limit is 2048"), "{err}");
+        assert!(err.contains(&format!("limit is {MAX_FILE_BYTES}")), "{err}");
         assert!(ws.files.is_empty());
 
         let ok = "x".repeat(MAX_FILE_BYTES);
