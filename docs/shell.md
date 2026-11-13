@@ -63,9 +63,12 @@ could not, and `echo hi | rm /x` is refused exactly as `rm /x` is.
 
 This is not bash:
 
-- no `&&`, no `;` — a word that *is* one of them is refused (`echo a && echo b` does not run
-  the second half); inside a sentence they are ordinary characters, so
-  `system_prompt set the pump is on GPIO12; never past it` stays one argument;
+- no `&&` or `||` conditions;
+- up to four commands separated by `;` run in order, stopping on the first error. A
+  semicolon splits only when the following word names a known shell command; inside
+  a sentence such as `system_prompt set the pump is on GPIO12; never past it` it is
+  ordinary text. Quoted or backslash-escaped semicolons never split commands, and an
+  escaped quote does not end its quoted word;
 - no `$(…)`, no backticks, no subshells — refused by name;
 - no `$VAR` expansion: `$HOME` is the five characters it is;
 - no background jobs: a `&` on its own is refused;
