@@ -156,6 +156,7 @@ window.__esp32Measure = function () {
   // one-line field, then three lines in the same field.
   out.chatPadBefore = parseFloat(getComputedStyle(q("#chat")).paddingBottom) || 0;
   out.composerHeightBefore = r(q("#composer")).height;
+  out.empty.fieldPill = r(q(".field"));
   // Where the two rows meet: with the composer in the column it must start at or below the
   // transcript's bottom, and a floating bar would not.
   out.composerTop = r(q("#composer")).top;
@@ -1155,6 +1156,23 @@ fn the_composer_fits_a_phone_screen() {
                 input.width >= 150.0,
                 "{width} px, chip {state}: the field is only {:.1} px wide — not a field to type into",
                 input.width
+            ); // The point of putting the attach button inside the pill: the visible input is
+               // most of the screen, not two thirds of it. The send button and the gutters are
+               // all that is left over.
+            assert!(
+                input.width >= viewport * 0.71,
+                "{width} px, chip {state}: the input is {:.1} px of a {viewport} px screen",
+                input.width
+            );
+            let pill = rect(metrics, "empty", "fieldPill");
+            assert!(
+                pill.width >= viewport * 0.85,
+                "{width} px: the field pill is only {:.1} px wide ({pill:?})",
+                pill.width
+            );
+            assert!(
+                pill.right <= viewport - 40.0 && pill.left <= 8.0,
+                "{width} px: the pill does not reach the edges ({pill:?})"
             );
             assert!(
                 send.left >= 0.0 && send.right <= viewport + 0.01,
