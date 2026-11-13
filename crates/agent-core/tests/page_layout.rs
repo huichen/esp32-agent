@@ -847,12 +847,20 @@ fn assert_conversation_clear(metrics: &Value, width: u32) {
     expect("header", "chineseLanguage", json!(false));
     assert!(text("header", "label").contains("Clear chat"), "the clear action must be named");
 
-    // Composer geometry: the attachment button is part of the row, not a stray box.
+    // Composer geometry: the attachment button is centred on the field, not parked at its
+    // bottom. The field is taller than 42 px (padding and line-height), so equal heights are
+    // not enough: the centres have to line up.
     let attach = rect(clear, "compose", "attach");
     let field = rect(clear, "compose", "field");
+    let attach_middle = (attach.top + attach.bottom) / 2.0;
+    let field_middle = (field.top + field.bottom) / 2.0;
     assert!(
-        (attach.height - field.height).abs() <= 1.5 && (attach.top - field.top).abs() <= 1.5,
-        "{width} px: the attachment button and the field are not on one line: {attach:?} vs {field:?}"
+        (attach_middle - field_middle).abs() <= 1.5,
+        "{width} px: the attachment button is not centred on the field: {attach:?} vs {field:?}"
+    );
+    assert!(
+        attach.top >= field.top - 1.5 && attach.bottom <= field.bottom + 1.5,
+        "{width} px: the attachment button overhangs the field: {attach:?} vs {field:?}"
     );
     assert!(
         attach.right < field.left,
