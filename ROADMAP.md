@@ -5,7 +5,7 @@ what is not done or not verified.
 
 ## Verified / unverified
 
-- ✅ `agent-core`: 827 unit tests and 5 integration tests (protocol, HTTP, manifest
+- ✅ `agent-core`: 828 unit tests and 5 integration tests (protocol, HTTP, manifest
   validation, driver conversion, capability filtering, auth, hot reload, the agent loop,
   shell and script, the file tools, sched, SSE streams, a streamed request body)
 - ✅ Simulator end to end: the PowerShell smoke gate; `scripts/smoke.sh` is the Unix
@@ -32,8 +32,9 @@ what is not done or not verified.
 - ⚠️ Storage/runtime validation remains: transcript and workspace already use LittleFS on
   `storage` (`0xbf0000` = 12,517,376 bytes = 11.9375 MiB); configuration and secrets remain
   in 24 KiB NVS. Host tests cover bounded parsing/admission and refused restores. Ordinary
-  configuration writes acknowledge queue admission; workspace writes wait for publication
-  receipt. Neither is a board power-cut measurement. See [storage guarantees](docs/storage.md)
+  configuration and file-tool replies acknowledge queue admission, not storage completion;
+  workspace saved hashes advance only from completed publication receipts. Neither is a
+  board power-cut measurement. See [storage guarantees](docs/storage.md)
 - ⚠️ Historical media bench (2026-11-12, recorded in `e7a9623`): `POST /audio/pcm` and `POST /av`
   played on the board; a 30.00 s clip
   with 362 frames completed in 30.19 s with the sound judged correct by ear, and its audio

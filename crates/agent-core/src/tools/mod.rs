@@ -529,7 +529,7 @@ pub fn agent_extra_specs() -> Value {
             "type": "function",
             "function": {
                 "name": "write",
-                "description": format!("Create or overwrite a UTF-8 text file in the board workspace. Parent directories are created. A file is limited to {} bytes and the workspace to {} bytes of text in total.", fs::MAX_FILE_BYTES, crate::app::WORKSPACE_TOTAL_MAX),
+                "description": format!("Create or overwrite a UTF-8 text file in the board workspace. Parent directories are created. A file is limited to {} bytes and the workspace to {} bytes of text in total. Success reports queue admission, not storage completion.", fs::MAX_FILE_BYTES, crate::app::WORKSPACE_TOTAL_MAX),
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -545,7 +545,7 @@ pub fn agent_extra_specs() -> Value {
             "type": "function",
             "function": {
                 "name": "edit",
-                "description": "Replace exactly one occurrence of `find` in a file. Fails when it occurs zero or several times, so an ambiguous edit never rewrites the wrong place.",
+                "description": "Replace exactly one occurrence of `find` in a file. Fails when it occurs zero or several times, so an ambiguous edit never rewrites the wrong place. Success reports queue admission, not storage completion.",
                 "parameters": {
                     "type": "object",
                     "properties": {

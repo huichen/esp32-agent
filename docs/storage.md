@@ -50,6 +50,19 @@ persistence depends on the host OS and filesystem.
 
 ## Workspace publication and rollback
 
+Successful file-mutating tool replies include `queued: true`, `saved: false` and a
+`persistence_note`: they confirm a RAM edit and queue admission, **not completed
+publication**. This applies through MCP, the internal agent, aliases, shell file
+commands/redirections and scripts. A later command error can still follow an earlier
+admitted edit; its error reports that partial workspace effect. Reads serve the RAM
+workspace and do not acquire save-acknowledgement fields.
+
+The caller does not explicitly wait for a publication receipt while holding the App
+mutex; that could block the writer from acquiring its queue handle. Queue/backend lock
+contention can still block admission, as noted above. Generation receipts determine later
+saved-hash bookkeeping and failures in the `store` object from `GET /api/status`.
+A response never infers durable storage from an admitted queue entry.
+
 A workspace save admits its changed file values, index and cleanup as one bounded
 queue request. If admission fails, no part of that replacement request is queued:
 the preceding pending generation remains intact. Unchanged pending text buffers are
@@ -125,7 +138,8 @@ formula and ENOSPC-at-2.1-MB readings were **SPIFFS** observations. They do not 
 LittleFS performance or capacity.
 
 These dependency facts and host regression tests do not verify flash power-cut
-behavior. **Firmware not built/verified for these changes.** Board checks still needed:
+behavior. A release build is separate evidence, not board runtime verification.
+Board checks still needed:
 read then replace/remove the same key; interrupt a save before/after rename; recover
 legacy `.old` with and without a published value; verify ENOSPC preserves the old value.
 

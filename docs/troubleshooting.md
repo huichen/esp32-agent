@@ -350,8 +350,8 @@ number in it has one source:
 A filesystem reports no entries at all, so its JSON has none - `free_entries: 0` read as "full" on
 a partition with megabytes left, which is why the key is absent rather than zero.
 
-**That measurement is historical.** It was taken on SPIFFS, which reserves two spare blocks and
-the lookup pages and reports 11 498 561 of a 12 517 376-byte partition; creating a 2.1 MB file then
+**The earlier conflicting capacity measurement was SPIFFS.** It reserves two spare blocks and
+the lookup pages and reported 11 498 561 of a 12 517 376-byte partition; creating a 2.1 MB file then
 returned `ENOSPC` while `free` read 9.38 MB, because SPIFFS needs somewhere to move live pages while
 it writes a new file and reports no figure for that. Runtime now mounts LittleFS even though the
 CSV subtype is `spiffs`. Historical timing report in `bc48400` (2026-11-13): a 1 KB create
@@ -367,9 +367,10 @@ Historical report in `abf3946` (2026-11-13): 14 s at 0.25 MB, growing to 277 s a
 index; legacy document/chunk formats remain readable. Limits are 256 KiB per UTF-8 text file,
 4 MiB aggregate text, 1,024 files and separate path/metadata caps.
 
-Workspace writes wait for publication receipt, not merely queue admission. The index is
-published only after required values succeed, and cleanup follows successful index
-publication. Physical keys are
+File-tool replies confirm the RAM edit and queue admission with `queued: true` /
+`saved: false`, not completed publication. Saved hashes advance only from completed
+publication receipts. The index is published only after required values succeed, and
+cleanup follows successful index publication. Physical keys are
 path-addressed: replacing an existing file can change what an older index reads before a
 later publication failure. This is not an all-files transaction, a complete rollback or a
 power-cut guarantee. Refused restores are preserved and workspace mutations blocked; see
@@ -381,8 +382,9 @@ power-cut guarantee. Refused restores are preserved and workspace mutations bloc
 refusal returns an error immediately. For ordinary queued configuration/transcript writes,
 a later backend refusal can leave RAM newer than storage after the caller was told the
 change was accepted; a successful `set` acknowledges admission, not flash completion.
-Workspace writes differ: their successful response waits for publication receipt. Check
-`pending` and the failure details, and distinguish these two acknowledgement contracts.
+File-tool replies likewise report `queued: true` / `saved: false`; a later backend refusal
+can leave their RAM edit unsaved. Check `pending` and the failure details rather than
+treating admission or an immediate RAM read as storage acknowledgement.
 
 Historical capture from firmware `17a9358` (2026-11-12), 195 s after boot:
 `{"written": 4, "failed": 23}` — 23 changes that image believed it had saved. Counters

@@ -354,6 +354,9 @@ pub struct App {
     /// Only the latest admitted workspace generation. Its receipt, not queue admission,
     /// decides when hashes can suppress a later write.
     workspace_pending: Option<WorkspaceSave>,
+    /// Monotonic admissions let nested tool routers describe their own file effects without
+    /// waiting for a flash writer while the caller holds the App mutex.
+    workspace_admissions: u64,
     /// Values potentially left by a refused publication/cleanup, retained for a later
     /// successful index publication. Bounded with the queue's key budget before admission.
     workspace_stale_keys: std::collections::BTreeSet<String>,
@@ -504,6 +507,7 @@ impl App {
             store_queue: queue,
             store_writer: StoreWriter::default(),
             workspace_pending: None,
+            workspace_admissions: 0,
             workspace_stale_keys: Default::default(),
         };
         app.log.info(
@@ -1808,7 +1812,38 @@ impl App {
         Ok(())
     }
 
+    fn workspace_admission_reply(mut value: Value) -> Value {
+        if !value.is_object() {
+            value = json!({ "result": value });
+        }
+        value["saved"] = json!(false);
+        value["queued"] = json!(true);
+        value["persistence_note"] = json!("applied in RAM; queue admission is not storage acknowledgement. This call did not wait for publication; check the store object in GET /api/status for outcomes");
+        value
+    }
+
     pub fn call_tool(&mut self, name: &str, args: &Value) -> Result<Value> {
+        let before = self.workspace_admissions;
+        let result = self.call_tool_inner(name, args);
+        if self.workspace_admissions == before {
+            return result;
+        }
+        match result {
+            Ok(value) => Ok(Self::workspace_admission_reply(value)),
+            Err(mut error) => {
+                // A later command failing does not roll back an earlier admitted write.
+                // Preserve the original error/data and make that partial effect observable.
+                let data = error.data.get_or_insert_with(|| json!({}));
+                if !data.is_object() {
+                    *data = json!({ "original_data": data.take() });
+                }
+                data["workspace_admission"] = Self::workspace_admission_reply(json!({}));
+                Err(error)
+            }
+        }
+    }
+
+    fn call_tool_inner(&mut self, name: &str, args: &Value) -> Result<Value> {
         self.ensure_enabled(name)?;
         if !args.is_object() {
             return Err(McpError::invalid_params("tool arguments must be an object"));
@@ -2744,6 +2779,7 @@ impl App {
             self.log.error("agent", why.clone());
             return Err(why);
         };
+        self.workspace_admissions = self.workspace_admissions.wrapping_add(1);
         let previous = self.workspace_pending.replace(WorkspaceSave { receipt, hashes, changed, cleanup });
         // Admission waited for any in-flight drain. Its older receipt is now completed or
         // confirmed superseded; settle that generation without acknowledging the new one.
@@ -4725,6 +4761,28 @@ impl App {
 
     /// The `fs_*` and `net_*` handlers by name, shared by the tool host and `shell`.
     fn fs_or_net_call(&mut self, name: &str, arguments: &Value) -> std::result::Result<String, String> {
+        let before = self.workspace_admissions;
+        let result = self.fs_or_net_call_inner(name, arguments);
+        if self.workspace_admissions == before {
+            return result;
+        }
+        match result {
+            Ok(text) => {
+                let value = serde_json::from_str(&text).unwrap_or_else(|_| json!({ "text": text }));
+                Ok(Self::workspace_admission_reply(value).to_string())
+            }
+            Err(mut error) => {
+                const NOTE: &str = "Earlier workspace edits remain in RAM and were queued; queue admission is not storage acknowledgement. Check the store object in GET /api/status for outcomes.";
+                if !error.contains(NOTE) {
+                    error.push('\n');
+                    error.push_str(NOTE);
+                }
+                Err(error)
+            }
+        }
+    }
+
+    fn fs_or_net_call_inner(&mut self, name: &str, arguments: &Value) -> std::result::Result<String, String> {
         self.ensure_enabled(name).map_err(|e| e.message)?;
         if !arguments.is_object() {
             return Err("tool arguments must be an object".to_string());
@@ -4735,9 +4793,8 @@ impl App {
                     .ok_or_else(|| format!("`{name}` starts with fs_ but no such file tool exists"))?
             };
             let text = if matches!(name, "fs_write" | "fs_edit" | "fs_rm" | "fs_cp" | "fs_mv") {
-                // A tool that changes a file answers only once the change is stored, or not at
-                // all: a `write` that said ok and lost the file at the next boot is the failure
-                // this branch is here to prevent.
+                // Refused RAM edits/queue admission roll back here. A successful call must
+                // report queued=true/saved=false, not imply that the writer has completed.
                 self.workspace_edit(call)?
             } else {
                 call(&mut self.workspace)?
@@ -12104,6 +12161,53 @@ mod tests {
             assert_eq!(backend.inner.get(&key).as_deref(), Some(next));
             assert_eq!(app_lock(&shared).workspace.saved.get("/a"), Some(&crate::keys::fnv1a(next)));
         }
+    }
+
+    #[test]
+    fn workspace_tools_acknowledge_admission_without_waiting_for_the_writer() {
+        let backend = WorkspaceWriteStore::new();
+        let mut app = backend.app();
+        let key = crate::keys::workspace_file("/admission.txt");
+        *backend.refuse.lock().unwrap() = Some(key.clone());
+        let write = app.call_tool("write", &json!({ "path": "/admission.txt", "text": "one" })).unwrap();
+        assert_eq!(write["queued"], true, "{write}");
+        assert_eq!(write["saved"], false, "{write}");
+        assert!(write["persistence_note"].as_str().unwrap().contains("not storage acknowledgement"));
+        assert!(backend.inner.get(&key).is_none(), "an acknowledgement must not imply a backend write");
+        assert!(app.flush_store("refusing-test-writer").failed > 0);
+        assert_eq!(fs_tools::Workspace::read(&app.workspace, "/admission.txt").unwrap(), "one");
+        assert!(backend.inner.get(&key).is_none());
+        *backend.refuse.lock().unwrap() = None;
+
+        for (tool, arguments) in [
+            ("fs_edit", json!({ "path": "/admission.txt", "find": "one", "replace": "two" })),
+            ("shell", json!({ "command": "echo three > /redirect.txt" })),
+            ("shell", json!({ "command": "touch /touch.txt" })),
+            ("shell", json!({ "command": "echo four | tee /tee.txt" })),
+            ("shell", json!({ "command": "base64enc /admission.txt -o /encoded.txt" })),
+            ("script", json!({ "source": "tool(\"write\", {path: \"/script.txt\", text: \"five\"}); 42" })),
+        ] {
+            let text = ToolHost::call_tool(&mut app, tool, &arguments).unwrap();
+            let result: Value = serde_json::from_str(&text).unwrap();
+            assert_eq!(result["queued"], true, "{tool}: {result}");
+            assert_eq!(result["saved"], false, "{tool}: {result}");
+        }
+        let read = app.call_tool("read", &json!({ "path": "/admission.txt" })).unwrap();
+        assert!(read.get("queued").is_none() && read.get("saved").is_none(), "reads are not save requests");
+        let error = app
+            .call_tool("shell", &json!({ "command": "echo six > /partial.txt; cat /missing-after-write" }))
+            .unwrap_err();
+        assert_eq!(error.data.as_ref().unwrap()["workspace_admission"]["queued"], true);
+        assert_eq!(fs_tools::Workspace::read(&app.workspace, "/partial.txt").unwrap().trim_end(), "six");
+        let error = ToolHost::call_tool(
+            &mut app,
+            "shell",
+            &json!({ "command": "echo seven > /partial.txt; cat /missing-after-write" }),
+        )
+        .unwrap_err();
+        assert!(error.contains("Earlier workspace edits remain in RAM"), "{error}");
+        drain_store(&mut app);
+        assert_eq!(backend.inner.get(&key).as_deref(), Some("two"));
     }
 
     #[test]

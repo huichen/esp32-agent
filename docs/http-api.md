@@ -129,7 +129,11 @@ The console loads no external asset dependencies.
 Configuration POST responses distinguish `saved` from `queued`. On the firmware's queued
 backend, `queued: true` / `saved: false` means the change was admitted, not that flash
 has completed. Inspect `store.pending`, `failed` and `last_failure` for later outcomes;
-an accepted configuration response is not a durability acknowledgement.
+an accepted configuration response is not a durability acknowledgement. Successful
+file-mutating tool results likewise carry `queued: true`, `saved: false` and a
+`persistence_note`; they apply the RAM edit without waiting for the writer. A later
+command failing does not undo an earlier admitted edit, and its error reports that
+partial effect. See [storage](storage.md#workspace-publication-and-rollback).
 
 ### Agent and orchestration
 
