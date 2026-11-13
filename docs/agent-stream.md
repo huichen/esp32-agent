@@ -19,11 +19,18 @@ Server-Sent Events, `Content-Type: text/event-stream`, `Cache-Control: no-cache`
   and `kind` so a browser `EventSource` can use them;
 - a comment heart-beat `: ping` every 15 s;
 - **bounded**: the stream closes itself after 30 s with no new event, or after 120 s in
-  total, whichever comes first. `EventSource` reconnects on its own with `after=<last id>`;
-  the portal relies on that and does not resend anything;
+  total, whichever comes first. The portal closes the failed `EventSource` and reconnects
+  explicitly with `after=<last seq>` while a run is busy. This server reads `after`, not
+  `Last-Event-ID`; a generic SSE client must update the query on reconnect;
 - at most **2** concurrent streams; a third gets `503 {"error":"too many event streams"}`.
-  The board serves HTTP from a pool of 6 connections and the portal must never be starved;
-- no pin/token gate on reading (the transcript endpoint has none either).
+  ordinary requests share one accept thread, and these streams use separate threads.
+  `MAX_CONNECTIONS = 6` caps spawned response streams, not all open TCP sockets; parked
+  sockets have a separate limit. A journal-gate refusal carries `Retry-After: 5`;
+- the stream, polling journal and transcript require the portal credential when
+  `auth.portal_pin` is configured. `EventSource` can use `?token=<minted portal token>`
+  with the value URL-encoded; this accepts an issued, unexpired read token, not a raw PIN.
+  The portal adds it when
+  reconnecting. See [security](security.md).
 
 ## 2. `tool_progress`
 
@@ -44,9 +51,11 @@ cannot hold a connection open.
 ## 3. `agent.tick_ms`
 
 `GET /api/agent/config` reports `tick_ms`; `POST` accepts `{"tick_ms":500}`, clamped to
-`200..=5000`, default `1000`. It is the interval of the platform's scheduler tick and
-therefore the queue-drain latency. The firmware loop reads it each tick, so a portal edit
-takes effect on the next tick, not on reboot.
+`200..=5000`, default `1000`. It is the platform loop's sleep interval, not a maximum
+queue-drain latency during a long model/tool call. Simulator and firmware ticks evaluate
+the schedule and run a queued asynchronous script job before driving the pending agent
+turn. The firmware reads the interval each tick, so an edit takes effect on a following
+tick, not on reboot; a busy loop may reach that tick later.
 
 ## 4. What must not change
 

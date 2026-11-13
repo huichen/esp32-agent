@@ -45,7 +45,7 @@ phone / model → TCP:80
     /mcp POST → auth (optional Bearer) → allocate or reuse Mcp-Session-Id
               → protocol.rs parses JSON-RPC (batches included)
               → dispatch: initialize / tools/list / tools/call / resources/*
-              → tools/call: look up the registry → filter visibility → ToolCtx → handler
+              → tools/call: resolve the name → execution checks → ToolCtx → handler
               → wrap the result as content[] + structuredContent
     /api/*    → the REST surface the console uses (status, devices, tools, manifest, logs,
                 WiFi, agent)
@@ -53,10 +53,11 @@ phone / model → TCP:80
                  rebuild the tool table when needed
 ```
 
-One `App` behind one lock, because the hardware really is singular (one I2C bus, one
-panel). Serialising tool calls costs nothing real and removes a whole class of
-concurrency bugs. HTTP connections are still served by several threads; they queue only
-when they enter `App`.
+One `App` behind one lock, because hardware resources are shared. Tool calls are
+serialized under that lock, so a blocking hardware call delays other callers. Ordinary
+HTTP requests run on one accept thread; only long-lived event responses get separate
+threads. Streaming media releases the `App` lock between pieces/records, but occupies the
+accept thread for the upload.
 
 The one place that had to be relaxed is the agent loop: a model call takes seconds, so it
 runs **outside** the lock. `Agent::begin` computes the request under the lock,
@@ -76,10 +77,11 @@ keeps a many-peripheral board from eating the context window.
 
 One predicate answers both questions — offered, and why not — and every view reads it: the
 model's tool array, `/mcp tools/list`, `/api/tools` and `/api/status`. They used to be
-three separate constructions, and they disagreed by six tools for months. A tool outside
+three separate constructions, and they disagreed by six tools. A tool outside
 the registry (`shell`, `script`, `read`/`write`/`edit`, `image_read`) is filtered by the
-same rule, so "this board has no camera" reaches the model, the MCP client and the portal
-at once; `/api/tools` and `/api/status` carry the sentence, not only the flag.
+same rule; `/api/tools` and `/api/status` carry the actual unmet precondition, not only
+the flag. `image_read` uses an attachment and a configured vision model, not a camera,
+so absence of a camera alone does not hide it.
 
 ## 4. Hot reload: what takes effect immediately
 
@@ -90,7 +92,7 @@ at once; `/api/tools` and `/api/status` carry the sentence, not only the flag.
 | Bus pins, board profile | rebuild and re-probe | ✅ `restart_required: true` |
 | WiFi credentials | `wifi_connect` reconnects at once | ❌ |
 | MCP port | the main loop notices and restarts only the HTTP server | no full reboot |
-| The firmware itself | OTA / serial | yes |
+| The firmware itself | serial flashing; OTA is not implemented | yes |
 
 A driver that has already opened its bus cannot change pins in place, so a pin or profile
 change reports `restart_required: true` rather than quietly keeping the old wiring.
@@ -100,12 +102,15 @@ change reports `restart_required: true` rather than quietly keeping the old wiri
 - **Blocking HTTP, no async**: ESP-IDF's std networking is enough; MCP request volume is
   low and a single tool call is serial anyway.
 - **One stack, not one thread per connection**: a request is answered on the accept
-  thread — 20 KB of stack on the board, 256 KB on the host, because it carries the
+  thread — 16 KiB of stack on the board, 256 KiB on the host, because it carries the
   heaviest handler (`/api/tools` serialises every tool descriptor). Only a streaming
-  response gets a thread of its own (6 KB on the board, 512 KB on the host), because it
-  outlives the request. At most six connections are open at once, and a parked keep-alive
-  socket costs a descriptor rather than a stack (see `cfg` in `http.rs`). The board figures
-  are dictated by internal RAM, which PSRAM cannot supply for stacks.
+  response gets a thread of its own (6 KiB on the board, 512 KiB on the host), because it
+  outlives the request. `MAX_CONNECTIONS = 6` caps spawned response-stream threads,
+  not all open TCP sockets; the journal has a separate two-stream gate. Up to eight
+  plaintext/keep-alive sockets are parked for 30 s without a stack. The firmware
+  keeps flash-writing/cache-off-sensitive task stacks in internal RAM. PSRAM stacks are
+  allowed for suitably constrained tasks: the DNS responder uses one. They are not a
+  general replacement for internal stacks.
 - **Manifests are validated on the board**: the schema is a manual for the model; what
   actually rejects a call is `check_args` plus `safety`.
 - **SSE only where it pays**: `GET /mcp` still answers 405, which the spec allows. The

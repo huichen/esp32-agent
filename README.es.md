@@ -16,7 +16,7 @@ marcha.
 
 | Qué | En detalle |
 |---|---|
-| Un modelo se ejecuta en la placa | El bucle, las herramientas, la memoria y la transcripción son firmware; el modelo es cualquier endpoint compatible con OpenAI o de Anthropic. [Cómo darle un modelo](docs/model.md) |
+| Un agente se ejecuta en la placa | El bucle, las herramientas, la memoria y la transcripción son firmware; el modelo es cualquier endpoint compatible con OpenAI o de Anthropic. [Cómo darle un modelo](docs/model.md) |
 | El conjunto de herramientas es un documento | `manifest` (`command: apply`) valida un manifiesto JSON, lo compila en herramientas y está activo en el mismo turno. [Manifiesto](docs/manifest.md) |
 | Encuentra su propio hardware | I2C, 1-Wire y los pines declarados se sondean al arrancar; solo lo que responde obtiene herramientas. [Capacidades](docs/capabilities.md) |
 | Un conjunto de herramientas, dos invocadores | El endpoint MCP y el agente de la placa ven las mismas herramientas, desde una sola descripción. [API HTTP y MCP](docs/http-api.md) |
@@ -25,14 +25,22 @@ marcha.
 | Un shell y un lenguaje de script | `shell` con 57 comandos con nombres de NuttX, y un intérprete para bucles sobre llamadas a herramientas. [Shell](docs/shell.md) · [Script](docs/scripting.md) |
 | Recuerda lo que se le dijo | Órdenes permanentes, `/AGENTS.md`, un índice `/MEMORY.md` y habilidades, ensamblados en el prompt en cada turno. [Lo que el modelo ve en cada turno](docs/context.md) |
 | Habilidades incluidas | Una sola rutina viene en el firmware, `create-skill`, con la cabecera estándar `---`, y enseña el resto: qué es una habilidad y cómo escribir una. Aterriza en `/skills` en el primer arranque, y tu edición se queda. [Habilidades](docs/agent-skills.md) |
-| La placa es el servidor | HTTPS desde la placa, un certificado que genera ella misma, un PIN para tres invocadores. [Autenticación](docs/security.md) |
+| La placa es el servidor | HTTPS desde la placa, un certificado que genera ella misma, un PIN de consola y un token MCP independiente. [Autenticación](docs/security.md) |
 | Comprobable sin hardware | El simulador ejecuta el mismo `agent-core` contra una placa virtual. [Simulador](docs/simulator.md) |
 
 ## Grabar y conectar
 
+Compila desde el código fuente; no se publica una imagen de versión precompilada. El objetivo
+predeterminado es un ESP32-S3 N16R8 con 16 MiB de flash y 8 MiB de PSRAM octal. Instala las
+herramientas de [Grabación](docs/flashing.md) y ejecuta:
+
 ```bash
-espflash write-bin --chip esp32s3 --flash-size 16mb 0x0 esp32-agent-vX.Y.Z.bin
+bash scripts/build-firmware.sh --flash --port /dev/ttyACM0
 ```
+
+En Windows, usa `powershell -File scripts/build-firmware.ps1 -Flash -Port COM3`. Los scripts
+compilan antes de grabar y pasan explícitamente la tabla de particiones y la partición de
+aplicación `factory`.
 
 La placa no tiene credenciales WiFi, así que levanta un punto de acceso llamado
 `esp32-agent-setup`. Únete, abre `http://192.168.4.1/`, escribe el nombre de la red y la
@@ -54,7 +62,8 @@ valores por defecto, y los límites. Un agente que sepa pedir una URL no necesit
 ## Dale un modelo
 
 Abre `http://<board>/`, panel **Agent**, escribe el endpoint, el id del modelo y la clave, y
-guarda. La clave es de solo escritura: va a NVS y se relee como `__set__`. El mismo panel tiene
+guarda. La clave es de solo escritura: va a NVS y las lecturas muestran `api_key_set`, no la clave.
+El mismo panel tiene
 `protocol` (`chat`, `responses` o `anthropic`), `reasoning`, `context_tokens` y
 `max_output_tokens`.
 
@@ -72,13 +81,15 @@ instrucción sirve para cada placa que pueda alcanzar. Sin ninguna clave, `base_
 ## Notas de seguridad
 
 - **Las credenciales se quedan en la placa.** El WiFi va a NVS por `provision`, nunca a la
-  imagen; `api_key` es de solo escritura y se relee como `__set__`.
-- **Pon un PIN antes de que la placa salga de tu mesa.** `auth.portal_pin` protege todas las
-  escrituras y las lecturas que exponen el transcript, el prompt, la configuración y los registros.
+  imagen; `api_key` es de solo escritura y las lecturas solo muestran `api_key_set`.
+- **Configura ambas credenciales antes de que la placa salga de tu mesa.** `auth.portal_pin`
+  protege las escrituras REST y las lecturas de configuración, programación, transcripción, prompt, espacio
+  de trabajo, adjuntos, registros, diario de ejecución y resultados de scripts. MCP usa
+  `auth.mcp_token`; si no está configurado, recurre a la credencial de la consola.
 - **Compara el certificado.** El de la placa es autofirmado; su huella está en `GET /api/tls`.
   El puerto 80 sigue abierto por defecto: un certificado malo cuesta una URL, no la placa; `mcp.plain_http: false` lo cierra, y entonces el cable USB es la única vuelta atrás.
 - **`shell`, `script` y las herramientas del manifiesto mueven pines.** Ese es el objetivo de la
-  placa; el PIN separa al agente haciendo su trabajo de un transeúnte haciéndolo.
+  placa; configura la credencial de cada interfaz para distinguir a los invocadores autorizados de los transeúntes.
 
 [Security](docs/security.md) dice qué no se defiende a propósito.
 
@@ -88,12 +99,14 @@ instrucción sirve para cada placa que pueda alcanzar. Sin ninguna clave, `base_
 |---|---|
 | `agent-core` | 827 pruebas unitarias y 5 de integración pasan; `scripts/smoke.ps1` pasa de extremo a extremo |
 | Simulador | la consola, MCP y el bucle de agente funcionan de extremo a extremo |
-| Firmware | grabado en una ESP32-S3-DevKitC-1 N16R8 (IDF v5.5.2): 42 herramientas, OLED 128×32, micrófono y amplificador I²S, WS2812, consola TLS, turnos del modelo por HTTPS |
-| No implementado | OTA, tarjeta SD, DHT11/22, cámara. Ver `ROADMAP.md` |
+| Firmware | firmware histórico del banco en una ESP32-S3-DevKitC-1 N16R8 (IDF v5.5.2): 42 herramientas, OLED 128×32, micrófono y amplificador I²S, WS2812, consola TLS, turnos del modelo por HTTPS; cambios de la auditoría no verificados en la placa |
+| No implementado / no verificado | OTA y captura DVP del firmware no implementados. Los drivers SD de sectores sin procesar y DHT11/22 tienen pruebas en el host, no verificación en la placa. Ver `ROADMAP.md` |
 
-Números del banco: un turno con cuatro herramientas en 13.7 s; consola por TLS en 0.55 s;
-escaneo I²C estable en 8 ejecuciones; SRAM interna 5–6 kB libres tras una página TLS, la
-restricción más ajustada aquí.
+Números históricos del banco: un turno con cuatro herramientas en 13.7 s; consola por TLS en 0.55 s;
+escaneo I²C estable en 8 ejecuciones. La lectura antigua de 5–6 kB de SRAM interna libre tras una página TLS
+es anterior a las correcciones del asignador (`10b16dd`) y no es un límite actual. Las mediciones posteriores
+por pool y su procedencia están en [Solución de problemas](docs/troubleshooting.md#how-much-memory-the-board-has).
+El firmware de la auditoría no se ha grabado ni probado en la placa.
 
 ## Documentación
 
