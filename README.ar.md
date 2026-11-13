@@ -1,6 +1,6 @@
 # esp32-agent
 
-**العربية** · [English](README.md) · [简体中文](README.zh.md) · [Français](README.fr.md) · [Español](README.es.md) · [Русский](README.ru.md)
+[English](README.md) · [简体中文](README.zh.md) · [Français](README.fr.md) · [Español](README.es.md) · [Русский](README.ru.md) · **العربية** · [日本語](README.ja.md) · [한국어](README.ko.md)
 
 برنامج ثابت لـ ESP32 يشغّل حلقة وكيل خاصة به ويقدّم نقطة نهاية MCP، فيستطيع نموذج واحد قيادة
 اللوحة مباشرة، ويستطيع أي وكيل خارجي استخدام الأدوات نفسها عبر HTTP.
