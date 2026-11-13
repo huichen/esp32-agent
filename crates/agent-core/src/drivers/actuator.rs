@@ -196,7 +196,7 @@ impl Device for RgbLed {
         let id = self.id.clone();
         let blink = id.clone();
         vec![
-            ToolDef::new("led_set", "Set the LED colour (#rrggbb)")
+            ToolDef::new("led_set", "Set the LED colour (#rrggbb); nothing reads it back")
                 .title("LED colour")
                 .category("gpio")
                 .requires(&["led"])

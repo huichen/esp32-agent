@@ -437,7 +437,11 @@ pub fn system_tools() -> Vec<ToolDef> {
                         every_s,
                         at_hhmm,
                         enabled: j::opt_bool(args, "enabled").unwrap_or(true),
-                        last_run_ms: 0,
+                        // The clock starts now. `due()` compares this with the wall clock in
+                        // milliseconds, so a fresh task carrying 0 is 1970 - `since_last` is
+                        // 1.79e12 and it fires during the very turn that created it (measured:
+                        // `schedule add {every_s:120}`, then the LED changed before the answer).
+                        last_run_ms: crate::app::now_ms(),
                     });
                     ctx.runtime.sched_dirty = true;
                     ctx.log.info("agent", format!("schedule: task `{id}` added from a tool call"));
@@ -461,7 +465,11 @@ pub fn system_tools() -> Vec<ToolDef> {
                 ))),
             }
         }),
-        ToolDef::new("devices_probe", "Re-scan the buses and rebuild the tool list")
+        ToolDef::new(
+            "devices_probe",
+            "Re-scan the buses and rebuild the tool list; the call returns when the scan is done, \
+             so there is nothing to wait for",
+        )
             .title("Re-probe devices")
             .category("system")
             .core()
