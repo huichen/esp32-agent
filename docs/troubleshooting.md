@@ -339,10 +339,17 @@ a partition with megabytes left, which is why the key is absent rather than zero
 
 **What `free_bytes` is not:** a promise that one allocation of that size will succeed. Measured on
 this board: creating a 2.1 MB file returned `ENOSPC` while `free` read 9.38 MB, because SPIFFS
-needs somewhere to move live pages while it writes a new file, and reports no figure for that. A
-workspace save needs a second copy of the whole document, so the practical ceiling is roughly half
-of `free_bytes` - about 4.6 MB on an empty partition, less once the filesystem has been rewritten
-many times. At 2.1 MB the save was refused outright.
+needs somewhere to move live pages while it writes a new file, and reports no figure for that. The
+practical ceiling for a *single* allocation is roughly half of `free_bytes` - about 4.6 MB on an
+empty partition, less once the filesystem has been rewritten many times.
+
+**The workspace no longer depends on that.** It used to be one document under `ws`, rewritten in
+full on every save: a 2.1 MB workspace needed a second 2.1 MB copy on flash while saving and was
+refused outright, and each save cost O(workspace) - measured 14 s at 0.25 MB growing to 277 s at
+2 MB. It is now one value per file (`wf` plus twelve hex digits of the path's fnv-1a hash) named by
+an index under `wsmap`, written last as the commit point. A save rewrites only the files that
+changed: one file plus the index, measured as two store writes. The older document and chunked
+layouts are still read, and are rewritten as per-file on the first boot that loads them.
 
 ## A store write was refused
 
