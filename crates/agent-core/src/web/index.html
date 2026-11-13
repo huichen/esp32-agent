@@ -73,6 +73,13 @@
     <button role="tab" data-panel="settings">Settings</button>
   </nav>
   <div class="sheet-body">
+    <!-- One loader for whichever tab is fetching: the panels render from the board, and a slow
+         answer used to look like an empty tab. Absolute inside the body so it cannot be
+         scrolled out of sight. -->
+    <div id="panel-loading" class="panel-loading" role="status" aria-live="polite" hidden>
+      <span class="spinner" aria-hidden="true"></span>
+      <span id="panel-loading-label">Loading…</span>
+    </div>
 
     <div id="panel-devices" class="panel">
       <div class="card">
