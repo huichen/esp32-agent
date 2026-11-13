@@ -529,7 +529,7 @@ pub fn agent_extra_specs() -> Value {
             "type": "function",
             "function": {
                 "name": "write",
-                "description": "Create or overwrite a text file in the board workspace. Parent directories are created. A file is limited to 2048 bytes and the workspace to 8 KB.",
+                "description": format!("Create or overwrite a UTF-8 text file in the board workspace. Parent directories are created. A file is limited to {} bytes and the workspace to {} bytes of text in total.", fs::MAX_FILE_BYTES, crate::app::WORKSPACE_TOTAL_MAX),
                 "parameters": {
                     "type": "object",
                     "properties": {

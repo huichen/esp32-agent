@@ -119,7 +119,7 @@ pub struct LlmConfig {
     /// Ceiling on the reply, in tokens; sent as `max_tokens` on all three protocols.
     /// Also part of the compaction reserve.
     ///
-    /// The board still truncates a reply at [`MAX_REPLY_BYTES`] (8 KB) to keep it out of
+    /// The board still truncates a reply at [`MAX_REPLY_BYTES`] (32 KiB) to keep it out of
     /// the portal's way, so a 32K ceiling is a provider-side limit rather than a promise
     /// of a longer answer here.
     pub max_output_tokens: u32,

@@ -73,15 +73,10 @@ pub const NVS_KEY_RUN_IN_FLIGHT: &str = crate::keys::RUN_IN_FLIGHT;
 /// asked for.
 pub const RESUME_SOURCE: &str = "resume";
 
-/// The file tools write into a RAM map that is persisted as one JSON blob, so the whole
-/// workspace has to be small enough to serialise next to everything else.
-///
-/// Both numbers used to be 2 KB and 8 KB because the blob was spread over five NVS values.
-/// It is a file on `storage` now, so the ceiling is the partition rather than a value: a
-/// single file may be 256 KB and the workspace 4 MB, which is what makes `write` a real
-/// editor instead of a note pad. The map still lives in RAM between writes, so this is also
-/// a heap budget; 4 MB of text is PSRAM the board has.
-pub const WORKSPACE_FILE_MAX: usize = 256 * 1024;
+/// The file tools write into a RAM map with a filesystem value per published file and a
+/// separate index. Per-file admission shares the file tools' limit; the aggregate cap is
+/// a text-payload budget, not a measurement of the RAM needed by the map and request copies.
+pub const WORKSPACE_FILE_MAX: usize = crate::tools::fs::MAX_FILE_BYTES;
 pub const WORKSPACE_TOTAL_MAX: usize = 4 * 1024 * 1024;
 /// How the workspace blob is spread over the store.
 ///
@@ -9803,6 +9798,17 @@ mod tests {
                 "`{token}` is a deprecated alias and must not be advertised in the prompt"
             );
         }
+
+        let specs = ToolHost::tool_specs(&app);
+        let write_spec = specs.as_array().unwrap().iter().find(|t| t["function"]["name"] == "write").unwrap();
+        let description = write_spec["function"]["description"].as_str().unwrap();
+        for limit in [WORKSPACE_FILE_MAX, WORKSPACE_TOTAL_MAX] {
+            assert!(
+                description.contains(&format!("{limit} bytes")),
+                "the model gets the live budget: {description}"
+            );
+        }
+        assert!(!description.contains("2048 bytes"), "the obsolete file budget must not be advertised");
 
         // Reverse proof, without touching the build: one invented name is caught.
         let mut injected = prompt.clone();
