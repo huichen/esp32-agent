@@ -1,9 +1,9 @@
 //! The application: config + manifest + devices + tools + sessions, the MCP
 //! dispatcher, and the HTTP routes for the MCP endpoint and the HTML portal.
 //!
-//! One `App` lives behind a single mutex because hardware resources are shared
-//! (one I2C bus, one display). Tool calls are serialised, but the two cheap public
-//! status reads can use a published snapshot instead of waiting for a long call.
+//! One `App` lives behind a single mutex. The hardware is inherently shared (one
+//! I2C bus, one display), so serialising tool calls costs nothing real and
+//! removes a whole class of concurrency bugs.
 
 use crate::agent::{Agent, AgentStep, ToolHost};
 use crate::boards::{self, BoardProfile};
@@ -28,104 +28,10 @@ use crate::tools::family::Family;
 use crate::tools::{fs as fs_tools, net as net_tools};
 use crate::web;
 use serde_json::{json, Value};
-use std::sync::{Arc, Mutex, TryLockError, Weak};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub type Shared = Arc<Mutex<App>>;
-
-/// Only these public GETs may answer without the live app. No protected route or
-/// mutating method passes through this classifier.
-#[derive(Clone, Copy)]
-enum StatusEndpoint {
-    Status,
-    Health,
-}
-
-impl StatusEndpoint {
-    fn for_request(req: &Request) -> Option<Self> {
-        match (req.method.as_str(), req.path.as_str()) {
-            ("GET", "/api/status") => Some(Self::Status),
-            ("GET", "/healthz") => Some(Self::Health),
-            _ => None,
-        }
-    }
-
-    fn path(self) -> &'static str {
-        match self {
-            Self::Status => "/api/status",
-            Self::Health => "/healthz",
-        }
-    }
-}
-
-/// One immutable view, built by `status_json`; health is a projection of it, not
-/// a second source for device count or uptime.
-struct StatusSnapshot {
-    status: Value,
-    boot_ms: u64,
-    sampled_ms: u64,
-    sampled_at: Instant,
-    mcp_cors: bool,
-}
-
-impl StatusSnapshot {
-    fn response(&self, endpoint: StatusEndpoint, stale: bool) -> Response {
-        // The configurable MCP path takes precedence in the live router. Preserve
-        // that even on the cached path rather than turning an MCP GET into status.
-        if self.status["mcp"]["path"] == endpoint.path() {
-            let resp = Response::error_json(
-                405,
-                "this endpoint uses the POST-only Streamable HTTP transport; open / for the config page",
-            );
-            return if self.mcp_cors {
-                resp.with_header("Access-Control-Allow-Origin", "*")
-                    .with_header("Access-Control-Expose-Headers", "Mcp-Session-Id")
-            } else {
-                resp
-            };
-        }
-        let age_ms = self.sampled_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
-        // Hardware::millis needs &mut hardware behind the App lock. Pair its last
-        // reading with Instant so uptime advances during contention without SNTP
-        // or another hardware read. Preserve sub-second time and saturating math.
-        let uptime_s = self.sampled_ms.saturating_add(age_ms).saturating_sub(self.boot_ms) / 1000;
-        let mut body = match endpoint {
-            StatusEndpoint::Status => self.status.clone(),
-            StatusEndpoint::Health => json!({ "ok": true, "devices": self.status["devices"]["count"] }),
-        };
-        body["uptime_s"] = json!(uptime_s);
-        body["stale"] = json!(stale);
-        body["age_ms"] = json!(age_ms);
-        Response::json(&body).with_header("Cache-Control", "no-store")
-    }
-}
-
-/// The snapshot lock protects only an Arc swap/clone. Building, copying JSON,
-/// serialising and dropping the previous view all happen outside it, and a tool
-/// never holds it while doing work. Readers need no live App or hardware borrow.
-#[derive(Clone, Default)]
-struct StatusSnapshots(Arc<Mutex<Option<Arc<StatusSnapshot>>>>);
-
-impl StatusSnapshots {
-    fn current(&self) -> Arc<StatusSnapshot> {
-        let guard = match self.0.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        guard.as_ref().expect("App::new publishes its initial status").clone()
-    }
-
-    fn publish(&self, snapshot: Arc<StatusSnapshot>) {
-        let previous = {
-            let mut guard = match self.0.lock() {
-                Ok(guard) => guard,
-                Err(poisoned) => poisoned.into_inner(),
-            };
-            guard.replace(snapshot)
-        };
-        drop(previous);
-    }
-}
 
 /// NVS keys the agent owns. Separate keys keep a write that fails on one of them
 /// from taking the others down with it.
@@ -390,12 +296,6 @@ pub struct App {
     pub tls: TlsInfo,
     /// The on-board agent: transcript, the one-slot queue and the last error.
     pub agent: Agent,
-    /// The phase-entry view while `with_agent` moves the agent into the tool host.
-    /// Publishing a tool result must not mistake that temporary empty Agent for
-    /// a cleared transcript. Refreshed from the restored agent at each phase end.
-    borrowed_agent_status: Option<Value>,
-    /// Published independently of the live mutex, shared with the HTTP handler.
-    status_snapshots: StatusSnapshots,
     /// Where the model lives and how far one run may go. `api_key` is kept in
     /// NVS but never echoed back by the portal API.
     pub llm: LlmConfig,
@@ -605,8 +505,6 @@ impl App {
             active_attachments: None,
             tls: TlsInfo::default(),
             agent: Agent::new(),
-            borrowed_agent_status: None,
-            status_snapshots: StatusSnapshots::default(),
             llm: LlmConfig::default(),
             tasks: Vec::new(),
             rules: Vec::new(),
@@ -642,7 +540,6 @@ impl App {
         // the default config. Both belong to the same moment: the three skills the
         // firmware carries are installed here, and in `seed_default_skills`'s other caller.
         app.seed_default_skills();
-        app.publish_status();
         app
     }
 
@@ -666,7 +563,6 @@ impl App {
     pub fn agent_thread_running(&mut self) {
         self.agent_thread = AgentThread::Running;
         self.log.info("agent", "agent thread up");
-        self.publish_status();
     }
 
     /// The platform could not start its agent loop.
@@ -678,7 +574,6 @@ impl App {
         let why = why.into();
         self.log.error("agent", format!("agent thread did not start: {why}"));
         self.agent_thread = AgentThread::Failed(why);
-        self.publish_status();
     }
 
     /// What `/api/status` reports as `agent.thread`, for tests and for the portal.
@@ -715,7 +610,6 @@ impl App {
             );
         }
         self.store_writer = StoreWriter { name, internal_stack: Some(internal_stack) };
-        self.publish_status();
     }
 
     /// What `/api/status` reports as `store`.
@@ -777,7 +671,6 @@ impl App {
                 format!("wrote {} store value(s) from `{who}`: {}", report.written, report.keys.join(", ")),
             );
         }
-        self.publish_status();
     }
 
     /// Re-run board resolution, manifest device instantiation, detection and the
@@ -1473,7 +1366,17 @@ impl App {
                 "last_probe_ms": self.probe.duration_ms,
             },
             "counters": self.runtime.counters_json(),
-            "agent": self.status_agent_json(),
+            "agent": {
+                "runs": self.agent.runs,
+                "history": self.agent.history.len(),
+                "pending": self.agent.pending.is_some(),
+                "last_error": self.agent.last_error,
+                "configured": !self.llm.base_url.is_empty() && !self.llm.model.is_empty(),
+                "model": self.llm.model,
+                // The one field that says whether the board's own loop exists. A dead
+                // thread and a quiet board are otherwise indistinguishable from here.
+                "thread": self.agent_thread.as_str(),
+            },
             "sched": {
                 "tasks": self.tasks.len(),
                 "rules": self.rules.len(),
@@ -1499,41 +1402,6 @@ impl App {
             },
             "pins": self.cfg.pins,
         })
-    }
-
-    fn status_agent_json(&self) -> Value {
-        let mut value = self.borrowed_agent_status.clone().unwrap_or_else(|| {
-            json!({
-                "runs": self.agent.runs,
-                "history": self.agent.history.len(),
-                "pending": self.agent.pending.is_some(),
-                "last_error": self.agent.last_error,
-            })
-        });
-        value["configured"] = json!(!self.llm.base_url.is_empty() && !self.llm.model.is_empty());
-        value["model"] = json!(self.llm.model);
-        // A dead thread and a quiet board are otherwise indistinguishable here.
-        value["thread"] = json!(self.agent_thread.as_str());
-        value
-    }
-
-    /// One builder for live reads, construction and every state publication. The
-    /// clock sample retains milliseconds; storing uptime_s alone would lose the
-    /// remainder and make a cached health check freeze or tick late.
-    fn publish_status(&mut self) -> Arc<StatusSnapshot> {
-        let mut status = self.status_json();
-        let sampled_ms = self.hw.millis();
-        let sampled_at = Instant::now();
-        status["uptime_s"] = json!(self.runtime.uptime_s(sampled_ms));
-        let snapshot = Arc::new(StatusSnapshot {
-            status,
-            boot_ms: self.runtime.boot_ms,
-            sampled_ms,
-            sampled_at,
-            mcp_cors: self.cfg.mcp.cors,
-        });
-        self.status_snapshots.publish(snapshot.clone());
-        snapshot
     }
 
     /// The tasks the platform can enumerate, each with the stack it has left at its
@@ -2018,9 +1886,6 @@ impl App {
         // The outer deadline comes back whatever the result was, or a refused call would
         // leave the next one with a budget that has already been spent.
         self.tool_deadline = outer;
-        // Errors can follow a successful earlier stage, so publish on every exit,
-        // not only success. The agent's fs/net fast path publishes separately.
-        self.publish_status();
         if self.workspace_admissions == before {
             return result;
         }
@@ -2915,7 +2780,6 @@ impl App {
             self.persist_transcript();
             self.clear_pending_message();
         }
-        self.publish_status();
         step
     }
 
@@ -2934,7 +2798,6 @@ impl App {
         // Every step, not only the last one: a tool result that landed is worth more after
         // a power cut than the reply that never arrived.
         self.persist_transcript();
-        self.publish_status();
         step
     }
 
@@ -2942,12 +2805,9 @@ impl App {
     /// itself as the tool host. It goes back afterwards, which is why the portal still
     /// sees the transcript between phases.
     fn with_agent<R>(&mut self, run: impl FnOnce(&mut Agent, &mut App) -> R) -> R {
-        let agent_status = self.status_agent_json();
-        let previous_status = self.borrowed_agent_status.replace(agent_status);
         let mut agent = std::mem::replace(&mut self.agent, Agent::new());
         let out = run(&mut agent, self);
         self.agent = agent;
-        self.borrowed_agent_status = previous_status;
         out
     }
 
@@ -3935,7 +3795,6 @@ impl App {
             Ok(_) => self.log.info("agent", "run done with no text"),
             Err(e) => self.log.warn("agent", format!("run failed: {}", clip(e, 160))),
         }
-        self.publish_status();
         out
     }
 
@@ -4194,17 +4053,8 @@ impl App {
 
     pub fn route(&mut self, req: &Request) -> Response {
         self.runtime.counters.http_requests += 1;
-        if let Some(endpoint) = StatusEndpoint::for_request(req) {
-            // MCP owns its configured path before the public REST match. All other
-            // requests still enter route_inner and its existing credential gates.
-            if req.path != self.cfg.mcp.path {
-                self.settle();
-                return self.publish_status().response(endpoint, false);
-            }
-        }
         let resp = self.route_inner(req);
         self.settle();
-        self.publish_status();
         resp
     }
 
@@ -4268,10 +4118,18 @@ impl App {
             ("GET", "/assets/app.js") => Response::js(web::APP_JS),
             ("GET", "/assets/style.css") => Response::css(web::STYLE_CSS),
             ("GET", "/favicon.ico") => Response::empty(204),
+            ("GET", "/healthz") => {
+                let up = self.runtime.uptime_s(self.hw.millis());
+                Response::json(&json!({ "ok": true, "uptime_s": up, "devices": self.devices.len() }))
+            }
             // The map an external agent reads before it touches anything. Two paths so a
             // client that guesses either name finds it.
             ("GET", "/agent.json") | ("GET", "/sitemap.json") => Response::json(&self.sitemap_json(req)),
             ("GET", "/api/tls") => Response::json(&self.tls.json()),
+            ("GET", "/api/status") => {
+                let v = self.status_json();
+                Response::json(&v)
+            }
             // The heap, pool by pool. `/api/status` carries the one number that decides
             // whether a socket or a handshake fits; this carries the split, so a change
             // that claims to free internal RAM can be checked against the pool it moved.
@@ -5073,11 +4931,7 @@ impl ToolHost for App {
     }
 
     fn call_tool(&mut self, name: &str, arguments: &Value) -> std::result::Result<String, String> {
-        let result = self.fs_or_net_call(name, arguments);
-        // fs_* and net_* return before App::call_tool; they change workspace/store
-        // state too, including partial effects followed by an error.
-        self.publish_status();
-        result
+        self.fs_or_net_call(name, arguments)
     }
 }
 
@@ -7736,13 +7590,6 @@ pub fn make_handler(app: Shared) -> Handler {
     // The stream endpoint polls its own journal after the request has returned, so
     // it needs the handle it lives in. Weak, so this cannot become a cycle.
     App::attach_shared(&app);
-    let snapshots = {
-        let mut state = app_lock(&app);
-        // Include platform setup performed since App::new before any request can
-        // need the initial cached answer. This is server construction, not a read.
-        state.publish_status();
-        state.status_snapshots.clone()
-    };
     Arc::new(move |req: &Request| {
         // The self-test model is answered *before* taking the lock. The agent thread
         // holds that lock for the whole model round trip, so an endpoint that needed
@@ -7758,14 +7605,11 @@ pub fn make_handler(app: Shared) -> Handler {
                 &json!({ "ok": true, "service": "selftest-net", "purpose": "lock-free target for net_get" }),
             );
         }
-        if let Some(endpoint) = StatusEndpoint::for_request(req) {
-            return match app.try_lock() {
-                Ok(mut guard) => guard.route(req),
-                Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner().route(req),
-                Err(TryLockError::WouldBlock) => snapshots.current().response(endpoint, true),
-            };
-        }
-        app_lock(&app).route(req)
+        let mut guard = match app.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard.route(req)
     })
 }
 
@@ -9948,341 +9792,6 @@ mod tests {
     fn body_json(resp: &Response) -> Value {
         serde_json::from_slice(&resp.body)
             .unwrap_or_else(|e| panic!("not JSON ({e}): {}", String::from_utf8_lossy(&resp.body)))
-    }
-
-    // ---- public status snapshots ----
-
-    /// Release the worker's lock even if a request times out and the test panics.
-    /// The old blocking handler then unwinds too instead of hanging the suite.
-    struct HeldAppLock {
-        release: std::sync::mpsc::Sender<()>,
-        worker: Option<std::thread::JoinHandle<()>>,
-    }
-
-    impl Drop for HeldAppLock {
-        fn drop(&mut self) {
-            let _ = self.release.send(());
-            self.worker.take().unwrap().join().expect("lock-holder panicked");
-        }
-    }
-
-    fn hold_app_lock(shared: &Shared) -> HeldAppLock {
-        let shared = shared.clone();
-        let (held_tx, held_rx) = std::sync::mpsc::channel();
-        let (release, release_rx) = std::sync::mpsc::channel();
-        let worker = std::thread::spawn(move || {
-            let _guard = app_lock(&shared);
-            let _ = held_tx.send(());
-            let _ = release_rx.recv();
-        });
-        held_rx.recv_timeout(Duration::from_secs(1)).expect("worker did not acquire App");
-        HeldAppLock { release, worker: Some(worker) }
-    }
-
-    fn status_request_with_timeout(handler: &Handler, req: Request) -> Response {
-        let handler = handler.clone();
-        let (tx, rx) = std::sync::mpsc::channel();
-        let worker = std::thread::spawn(move || {
-            let _ = tx.send(handler(&req));
-        });
-        // Never join a blocked request before the deadline: a regression is a
-        // failing test in one second, not an indefinitely stalled test process.
-        let response = rx.recv_timeout(Duration::from_secs(1)).expect("status handler waited for App");
-        worker.join().expect("request worker panicked");
-        response
-    }
-
-    fn stable_status(mut value: Value) -> Value {
-        let object = value.as_object_mut().expect("status object");
-        for field in ["time", "uptime_s", "stale", "age_ms"] {
-            object.remove(field);
-        }
-        value
-    }
-
-    #[test]
-    fn status_snapshot_answers_while_a_worker_holds_the_app_lock() {
-        let shared: Shared = Arc::new(Mutex::new(test_app()));
-        assert!(
-            app_lock(&shared).status_snapshots.current().status["devices"]["count"].as_u64().unwrap() >= 3,
-            "construction must publish without a priming status request"
-        );
-        let started = Instant::now();
-        let handler = make_handler(shared.clone());
-        let expected = stable_status(app_lock(&shared).status_json());
-        let _held = hold_app_lock(&shared);
-        std::thread::sleep(Duration::from_millis(30));
-        let response = status_request_with_timeout(&handler, get("/api/status"));
-        assert_eq!(response.status, 200);
-        let body = body_json(&response);
-        assert_eq!(body["stale"], true, "contention must not look current: {body}");
-        let age = body["age_ms"].as_u64().expect("age in milliseconds");
-        assert!(age >= 30, "a 30 ms old snapshot reported age {age}");
-        assert!(age <= started.elapsed().as_millis() as u64, "implausible age {age}");
-        assert_eq!(stable_status(body), expected, "all existing fields survive the cached path");
-    }
-
-    #[test]
-    fn status_snapshot_refreshes_without_contention_and_matches_live_status() {
-        let shared: Shared = Arc::new(Mutex::new(test_app()));
-        let handler = make_handler(shared.clone());
-        let started = Instant::now();
-        let response = status_request_with_timeout(&handler, get("/api/status"));
-        assert_eq!(response.status, 200);
-        let body = body_json(&response);
-        assert_eq!(body["stale"], false);
-        assert!(body["age_ms"].as_u64().unwrap() <= started.elapsed().as_millis() as u64);
-        assert_eq!(stable_status(body), stable_status(app_lock(&shared).status_json()));
-        let health = body_json(&status_request_with_timeout(&handler, get("/healthz")));
-        assert_eq!(health["stale"], false);
-        assert_eq!(health["ok"], true);
-        assert_eq!(health["devices"], app_lock(&shared).devices.len());
-        assert_eq!(health.as_object().unwrap().len(), 5, "health's three fields plus stale/age_ms");
-    }
-
-    #[test]
-    fn status_snapshot_publishes_route_mutations_before_another_read() {
-        let shared: Shared = Arc::new(Mutex::new(test_app()));
-        let handler = make_handler(shared.clone());
-        let response = app_lock(&shared).route(&post("/api/config", r#"{"device_name":"changed-by-route"}"#));
-        assert_eq!(response.status, 200);
-        {
-            let _held = hold_app_lock(&shared);
-            let body = body_json(&status_request_with_timeout(&handler, get("/api/status")));
-            assert_eq!(body["stale"], true);
-            assert_eq!(body["device_name"], "changed-by-route", "read must not have to refresh first");
-        }
-        let body = body_json(&status_request_with_timeout(&handler, get("/api/status")));
-        assert_eq!(body["stale"], false);
-        assert_eq!(body["device_name"], "changed-by-route");
-    }
-
-    #[test]
-    fn status_snapshot_publishes_both_tool_paths_and_partial_errors() {
-        let shared: Shared = Arc::new(Mutex::new(test_app()));
-        let handler = make_handler(shared.clone());
-        drain_store(&mut app_lock(&shared));
-        for (agent_path, name) in [(false, "direct-tool"), (true, "agent-tool")] {
-            let args = json!({ "patch": { "device_name": name } });
-            {
-                let mut app = app_lock(&shared);
-                if agent_path {
-                    ToolHost::call_tool(&mut *app, "config_set", &args).expect("agent config mutation");
-                } else {
-                    app.call_tool("config_set", &args).expect("direct config mutation");
-                }
-            }
-            let _held = hold_app_lock(&shared);
-            let body = body_json(&status_request_with_timeout(&handler, get("/api/status")));
-            assert_eq!(body["stale"], true);
-            assert_eq!(body["device_name"], name);
-        }
-        // The agent's fs_* fast path does not enter App::call_tool at all.
-        let pending = {
-            let mut app = app_lock(&shared);
-            let before = app.store_queue.pending();
-            ToolHost::call_tool(&mut *app, "fs_write", &json!({ "path": "/snapshot.txt", "text": "one" }))
-                .expect("agent file mutation");
-            assert!(app.store_queue.pending() > before);
-            app.store_queue.pending()
-        };
-        {
-            let _held = hold_app_lock(&shared);
-            let body = body_json(&status_request_with_timeout(&handler, get("/api/status")));
-            assert_eq!(body["store"]["pending"], pending, "fs fast path must publish too");
-        }
-        // A failed later stage still publishes the earlier state change/counters.
-        let expected = {
-            let mut app = app_lock(&shared);
-            app.call_tool("shell", &json!({ "command": "echo two > /partial-snapshot.txt; cat /not-here" }))
-                .expect_err("the later command fails");
-            assert!(app.workspace.to_json()["files"]["/partial-snapshot.txt"].is_string());
-            stable_status(app.status_json())
-        };
-        let _held = hold_app_lock(&shared);
-        let body = body_json(&status_request_with_timeout(&handler, get("/api/status")));
-        assert!(body["store"]["pending"].as_u64().unwrap() > pending as u64);
-        assert_eq!(stable_status(body), expected);
-    }
-
-    #[test]
-    fn status_snapshot_health_uses_request_time_uptime_without_hardware_access() {
-        use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-
-        struct Clock {
-            reading: Arc<AtomicU64>,
-            reads: Arc<AtomicU32>,
-        }
-        impl Hardware for Clock {
-            fn board_info(&mut self) -> crate::hardware::BoardInfo {
-                crate::hardware::BoardInfo::default()
-            }
-            fn millis(&mut self) -> u64 {
-                self.reads.fetch_add(1, Ordering::Relaxed);
-                self.reading.load(Ordering::Relaxed)
-            }
-        }
-        let reading = Arc::new(AtomicU64::new(5_000));
-        let reads = Arc::new(AtomicU32::new(0));
-        let app = App::new(
-            Box::new(Clock { reading: reading.clone(), reads: reads.clone() }),
-            Box::new(MemoryStore::new()),
-            LogBuf::new(32),
-            FwMeta::default(),
-        );
-        let shared: Shared = Arc::new(Mutex::new(app));
-        let handler = make_handler(shared.clone());
-        reading.store(5_970, Ordering::Relaxed);
-        let published = app_lock(&shared).publish_status();
-        assert_eq!(published.boot_ms, 5_000);
-        assert_eq!(published.status["uptime_s"], 0);
-        let before = reads.load(Ordering::Relaxed);
-        let _held = hold_app_lock(&shared);
-        let first = body_json(&status_request_with_timeout(&handler, get("/healthz")));
-        std::thread::sleep(Duration::from_millis(30));
-        let second = body_json(&status_request_with_timeout(&handler, get("/healthz")));
-        for body in [&first, &second] {
-            assert_eq!(body["stale"], true);
-            assert_eq!(body["ok"], true);
-            assert_eq!(body["devices"], published.status["devices"]["count"]);
-            let age = body["age_ms"].as_u64().unwrap();
-            assert_eq!(body["uptime_s"], (5_970 + age - 5_000) / 1000, "{body}");
-        }
-        assert!(second["age_ms"].as_u64().unwrap() >= first["age_ms"].as_u64().unwrap() + 30);
-        assert!(second["uptime_s"].as_u64().unwrap() >= 1, "uptime must not freeze at published zero");
-        let status = body_json(&status_request_with_timeout(&handler, get("/api/status")));
-        assert_eq!(status["uptime_s"], (5_970 + status["age_ms"].as_u64().unwrap() - 5_000) / 1000);
-        assert_eq!(reads.load(Ordering::Relaxed), before, "cached reads never borrow hardware");
-    }
-
-    #[test]
-    fn status_snapshot_keeps_public_gets_and_existing_credential_gates() {
-        let shared: Shared = Arc::new(Mutex::new(test_app()));
-        app_lock(&shared).cfg.auth.portal_pin = "1234".into();
-        let handler = make_handler(shared.clone());
-        for path in ["/api/status", "/healthz"] {
-            assert_eq!(status_request_with_timeout(&handler, get(path)).status, 200, "public GET");
-            let _held = hold_app_lock(&shared);
-            let response = status_request_with_timeout(&handler, get(path));
-            assert_eq!(response.status, 200);
-            assert_eq!(body_json(&response)["stale"], true);
-        }
-        for req in [get("/api/config"), get("/api/agent/history"), post("/api/config", "{}")] {
-            assert_eq!(handler(&req).status, 401, "protected routes keep the credential check");
-        }
-        assert_eq!(handler(&post("/api/status", "{}")).status, 404, "no mutating shortcut");
-        assert_eq!(handler(&post("/healthz", "{}")).status, 302, "no mutating shortcut");
-        // A configurable MCP path can shadow either public route. Its GET refusal,
-        // CORS and POST credential gate must survive both the live and cached path.
-        for (path, cors) in [("/api/status", true), ("/healthz", false)] {
-            let mut req = post("/api/config", &json!({ "mcp": { "path": path, "cors": cors } }).to_string());
-            req.headers.insert("x-portal-pin".into(), "1234".into());
-            assert_eq!(handler(&req).status, 200);
-            assert_eq!(handler(&post(path, r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#)).status, 401);
-            let live = status_request_with_timeout(&handler, get(path));
-            assert_eq!(live.status, 405);
-            let _held = hold_app_lock(&shared);
-            let cached = status_request_with_timeout(&handler, get(path));
-            assert_eq!(cached.status, live.status);
-            assert_eq!(cached.body, live.body);
-            assert_eq!(cached.headers, live.headers);
-        }
-    }
-
-    #[test]
-    fn status_snapshot_preserves_the_agent_while_tools_borrow_the_host() {
-        use std::sync::atomic::{AtomicBool, Ordering};
-
-        struct InspectDuringNet {
-            handler: Handler,
-            agent: Value,
-            inspected: Arc<AtomicBool>,
-        }
-        impl ChatTransport for InspectDuringNet {
-            fn post_json(
-                &mut self,
-                _: &str,
-                _: &[(&str, &str)],
-                _: &str,
-            ) -> std::result::Result<String, String> {
-                let response = status_request_with_timeout(&self.handler, get("/api/status"));
-                assert_eq!(response.status, 200);
-                let body = body_json(&response);
-                assert_eq!(body["stale"], true);
-                assert_eq!(body["device_name"], "during-tools", "previous tool published its mutation");
-                assert_eq!(body["agent"], self.agent, "the borrowed Agent is not a cleared transcript");
-                self.inspected.store(true, Ordering::Relaxed);
-                Ok("{}".into())
-            }
-            fn request(
-                &mut self,
-                method: &str,
-                url: &str,
-                headers: &[(&str, &str)],
-                body: &str,
-            ) -> std::result::Result<String, String> {
-                assert_eq!(method, "GET");
-                self.post_json(url, headers, body)
-            }
-        }
-        let shared: Shared = Arc::new(Mutex::new(test_app()));
-        let handler = make_handler(shared.clone());
-        let inspected = Arc::new(AtomicBool::new(false));
-        let final_agent = {
-            let mut app = app_lock(&shared);
-            app.queue_user("keep this transcript visible", "test", now_ms());
-            assert!(matches!(app.agent_begin(), Some(AgentStep::Ask { .. })));
-            let phase_entry = app.status_agent_json();
-            assert!(phase_entry["history"].as_u64().unwrap() > 0);
-            app.attach_tool_transport(Box::new(InspectDuringNet {
-                handler: handler.clone(),
-                agent: phase_entry.clone(),
-                inspected: inspected.clone(),
-            }));
-            let reply = llm::ModelReply {
-                tool_calls: vec![
-                    llm::ToolCall {
-                        id: "cfg".into(),
-                        name: "config_set".into(),
-                        arguments: json!({ "patch": { "device_name": "during-tools" } }),
-                    },
-                    llm::ToolCall {
-                        id: "net".into(),
-                        name: "net_get".into(),
-                        arguments: json!({ "url": "http://192.0.2.42/inspect" }),
-                    },
-                ],
-                ..Default::default()
-            };
-            assert!(matches!(app.agent_reply(Ok(reply)), AgentStep::Ask { .. }));
-            let restored = app.status_agent_json();
-            assert!(restored["history"].as_u64().unwrap() > phase_entry["history"].as_u64().unwrap());
-            restored
-        };
-        assert!(inspected.load(Ordering::Relaxed), "the net tool must actually run");
-        let _held = hold_app_lock(&shared);
-        let body = body_json(&status_request_with_timeout(&handler, get("/api/status")));
-        assert_eq!(body["agent"], final_agent, "the restored phase must publish too");
-    }
-
-    #[test]
-    fn status_snapshot_keeps_the_poisoned_app_lock_fallback() {
-        let shared: Shared = Arc::new(Mutex::new(test_app()));
-        let handler = make_handler(shared.clone());
-        let poison = shared.clone();
-        assert!(std::thread::spawn(move || {
-            let _guard = app_lock(&poison);
-            panic!("intentional test poison");
-        })
-        .join()
-        .is_err());
-        let response = status_request_with_timeout(&handler, get("/api/status"));
-        assert_eq!(response.status, 200);
-        assert_eq!(body_json(&response)["stale"], false, "a poisoned but available lock still refreshes");
-        let _held = hold_app_lock(&shared);
-        let response = status_request_with_timeout(&handler, get("/healthz"));
-        assert_eq!(response.status, 200);
-        assert_eq!(body_json(&response)["stale"], true);
     }
 
     /// The portal has to carry the agent panel: a panel whose buttons call an

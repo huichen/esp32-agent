@@ -5,7 +5,7 @@ what is not done or not verified.
 
 ## Verified / unverified
 
-- ✅ `agent-core`: 861 unit tests and 5 integration tests (protocol, HTTP, manifest
+- ✅ `agent-core`: 853 unit tests and 5 integration tests (protocol, HTTP, manifest
   validation, driver conversion, capability filtering, auth, hot reload, the agent loop,
   shell and script, the file tools, sched, SSE streams, a streamed request body)
 - ✅ Simulator end to end: the PowerShell smoke gate; `scripts/smoke.sh` is the Unix
@@ -22,11 +22,6 @@ what is not done or not verified.
   This does not verify arbitrary power cuts, and it predates today's flash
 - ✅ Model latency is outside the `App` lock: a turn in flight no longer queues the
   portal (historical bench: `/api/status` ≤ 253 ms while a 2.5 s model call runs)
-- ✅ Host-tested public status snapshots: `GET /api/status` and `GET /healthz` answer
-  while a worker holds `App`, with `stale` / `age_ms` and request-time monotonic uptime.
-  Firmware not built/verified for this change; bench latency and heap cost remain
-  unmeasured. Other routes and work occupying the HTTP accept thread still wait;
-  splitting the live mutex and moving long work off that thread are not implemented
 - ✅ Live journal over SSE (`/api/agent/stream`), `tool_progress`, `agent.tick_ms`
 - ✅ Bench board flashed on 2026-11-13 (`built_at 2026-11-13T15:20:17Z`) and running the image
   from that tree: 3,007,840-byte app = 71.71% of the 4 MiB `factory` slot; 35 warnings, 20
