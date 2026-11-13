@@ -54,7 +54,7 @@ pub fn board_tools() -> Vec<ToolDef> {
         }),
         ToolDef::new(
             "board_status",
-            "Board status: chip, firmware, uptime, temperature, heap, WiFi, detected device count, tool counters",
+            "Board status: chip, firmware, uptime, die temperature, heap and internal RAM, WiFi, detected device count, tool counters, and what the store still owes — `pending`, `failed`, `last_failure`. The first call on an unfamiliar board",
         )
         .title("Board status")
         .category("board")
@@ -141,7 +141,7 @@ pub fn board_tools() -> Vec<ToolDef> {
                 "board_extra": ctx.hw.inventory_extra(),
             }))
         }),
-        ToolDef::new("devices_list", "List the peripherals this board detected, with their capabilities")
+        ToolDef::new("devices_list", "Every peripheral this board detected, with the tools each one answers to, its pins, its bus and its address")
             .title("Devices")
             .category("board")
             .core()
@@ -333,7 +333,7 @@ pub fn board_tools() -> Vec<ToolDef> {
                 ctx.hw.delay_us(ms * 1000);
                 Ok(json!({ "ok": true, "ms": ms }))
             }),
-        ToolDef::new("logs_tail", "Read the board's recent log lines (boot and tool history)")
+        ToolDef::new("logs_tail", "The board's ring log, newest last: level, target, sequence number and the message, for boot and for every tool that failed")
             .title("Logs")
             .category("system")
             .core()
@@ -512,7 +512,7 @@ pub fn agent_extra_specs() -> Value {
             "type": "function",
             "function": {
                 "name": "read",
-                "description": "Read a text file from the board workspace. `/` is the root.",
+                "description": "Read one UTF-8 text file from the board workspace, which is its own filesystem: `/` holds `MEMORY.md`, `notes/`, `skills/` and `memory/`. `shell` with `ls /` lists a directory; this tool reads a file.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -527,7 +527,7 @@ pub fn agent_extra_specs() -> Value {
             "type": "function",
             "function": {
                 "name": "write",
-                "description": format!("Create or overwrite a UTF-8 text file in the board workspace. Parent directories are created. A file is limited to {} bytes and the workspace to {} bytes of text in total. Success reports queue admission, not storage completion.", fs::MAX_FILE_BYTES, crate::app::WORKSPACE_TOTAL_MAX),
+                "description": format!("Create or overwrite a UTF-8 text file in the board workspace, creating parent directories. Overwrites whatever is there: use `edit` to change one place. A file is limited to {} bytes and the workspace to {} bytes of text in total. The answer is queue admission, not storage: `board status` reports the store's `pending`/`failed` for the outcome.", fs::MAX_FILE_BYTES, crate::app::WORKSPACE_TOTAL_MAX),
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -543,7 +543,7 @@ pub fn agent_extra_specs() -> Value {
             "type": "function",
             "function": {
                 "name": "edit",
-                "description": "Replace exactly one occurrence of `find` in a file. Fails when it occurs zero or several times, so an ambiguous edit never rewrites the wrong place. Success reports queue admission, not storage completion.",
+                "description": "Replace exactly one occurrence of `find` in a file. Fails when it occurs zero times or several, so an ambiguous edit never rewrites the wrong place. The answer is queue admission, not storage: `board status` reports the store's `pending`/`failed` for the outcome.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -579,7 +579,7 @@ pub fn script_specs() -> Value {
         "type": "function",
         "function": {
             "name": "script",
-            "description": "Run a small script on the board — the way to write a loop or a condition the fixed tools cannot express: `let`, assignment, `if`/`else`, `while` with `break`, numbers, strings, bools, nil, lists, maps, and `tool(name, args)` to call any other board tool. `args` is optional: a map, or a list of words, and the program reads it back as the globals `args` and `argv`, so one script can be run with different values without being rewritten. `{\"help\": true}` (or `section`: overview|builtins|examples) returns the syntax reference; `{\"lint\": true}` checks `source` without running it. Bounded by 30 s and 5 000 000 steps.",
+            "description": "Run a small script on the board — the way to write a loop or a condition the fixed tools cannot express: `let`, assignment, `if`/`else`, `while` with `break`, `for`, `fn`, numbers, strings, bools, nil, lists, maps, and `tool(name, args)` to call any other board tool. The program's result is the value of its last expression (a map is returned as a map), and `return` ends it early. `args` is optional: a map, or a list of words, and the program reads it back as the globals `args` and `argv`, so one script can be run with different values without being rewritten. `{\"help\": true}` (or `section`: overview|builtins|examples) returns the syntax reference; `{\"lint\": true}` checks `source` without running it. Bounded by 30 s and 5 000 000 steps.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -611,6 +611,28 @@ pub fn script_specs() -> Value {
     }]))
 }
 
+/// What a device family is for, in one sentence.
+///
+/// A family is declared by the drivers that join it (`display`, `indicators`, `audio`), so the
+/// sentence lives here rather than in `DeviceInfo`: the family is the board's own vocabulary,
+/// and "display: 6 commands" told a caller that had never seen this board nothing it could act
+/// on. A family without a sentence keeps the count, which is at least true.
+pub fn family_summary(family: &str) -> Option<&'static str> {
+    Some(match family {
+        "display" => {
+            "The OLED panel: draw text, a rectangle or a whole 1-bpp bitmap, read back what is \
+             there, set contrast. `oled_read` returns text rows, not pixels: a bitmap reads back \
+             as `?`"
+        }
+        "indicators" => "The LED and the buttons: set or blink the LED, read the buttons or wait for a press",
+        "audio" => {
+            "The microphone and the speaker: measure the mic level, record it into a WAV result, \
+             or play a tone or a short melody through the amplifier"
+        }
+        _ => return None,
+    })
+}
+
 /// Every tool that needs no device at all.
 pub fn always_tools() -> Vec<ToolDef> {
     let mut v = board_tools();
@@ -625,7 +647,7 @@ pub fn always_tools() -> Vec<ToolDef> {
 fn device_invoke_tool() -> ToolDef {
     ToolDef::new(
         "device_invoke",
-        "Call a tool of a detected device by id (use devices_list to see ids and tool names)",
+        "Call a tool of a detected device by id — `devices_list` names the ids and the tools under them",
     )
     .title("Invoke device tool")
     .category("manifest")
@@ -716,7 +738,7 @@ const BUS_COMMANDS: &[&str] = &[
 pub fn bus_family() -> ToolDef {
     Family::new(
         "bus",
-        "Raw access to the pins and buses: I2C scan/read/write/identify, GPIO mode/read/write, one ADC pin. For chips without a driver; `command: help` gives each one's arguments",
+        "Raw pins and buses, for a chip that has no driver: I2C scan/read/write/identify, GPIO mode/read/write, and one ADC pin in millivolts; `command: help` lists each one's arguments",
         bus_commands(),
     )
     .into_tool()

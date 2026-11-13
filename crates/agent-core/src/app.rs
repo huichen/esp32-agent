@@ -889,7 +889,9 @@ impl App {
             }
         }
         for (family, subs) in families {
-            let summary = format!("{family}: {} commands", subs.len());
+            let summary = board_tools::family_summary(family)
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("{family}: {} commands", subs.len()));
             tools.register(Family::new(family, summary, subs).into_tool().device_tool());
         }
         self.family_members = members;
