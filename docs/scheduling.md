@@ -13,10 +13,16 @@ curl -sS -X POST http://<board>/api/sched -H 'Content-Type: application/json' -d
 
 | Field | Meaning |
 |---|---|
+| `after_s` | fire once, this many seconds after the task was created, then remove the task. Use it alone: a one-shot is not combined with `every_s` or `at_hhmm` |
 | `every_s` | interval in seconds |
 | `at_hhmm` | `"07:30"`, in UTC unless the firmware was built with `MCP_TZ_OFFSET_H` (`MCP_TZ_OFFSET_H=8` shifts it to UTC+8); used when `every_s` is 0 |
 | `script` | a script to run instead of asking the model — costs no tokens and no call |
 | `enabled` | default true |
+
+A task has exactly one trigger. `after_s` is the one-shot: the scheduler removes the task in
+the same tick that fires it, so "remind me in twenty minutes" is one call and nothing to
+clean up afterwards. The agent can name its own task (`id`) when it adds one, which makes a
+second add of the same name a refusal instead of a task nobody can address.
 
 When both `prompt` and `script` are set the script wins and the prompt stays as the record of
 what the task is for. A task with neither is refused: a task that fires on schedule and does

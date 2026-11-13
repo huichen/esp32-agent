@@ -66,6 +66,13 @@ pub struct Runtime {
     pub manifest_dirty: bool,
     /// Set when the schedule changed; `settle` writes it to NVS.
     pub sched_dirty: bool,
+    /// What the store writer owes and what it has refused, sampled in `App::settle`.
+    ///
+    /// The tools answer a write with "queued", and the reading that says whether it reached
+    /// flash used to exist only on the portal route `/api/status` — an agent that drives this
+    /// board over MCP alone could not check it, and was told to try. `board status` reports
+    /// this.
+    pub store_stats: Value,
     /// Portal tokens minted by `POST /api/auth`: `(token, expires_at_ms)`. They live in
     /// RAM, so a reboot revokes every one of them — which is the right default for a
     /// device whose PIN can be changed from the same page.
