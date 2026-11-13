@@ -385,7 +385,7 @@ pub fn system_tools() -> Vec<ToolDef> {
         }),
         ToolDef::new(
             "schedule",
-            "Manage the board's own schedule: `action` is list, add, remove, enable or disable. A task re-runs a prompt every `every_s` seconds or daily at `at_hhmm`, and fires into the same queue a user message uses — the board works on its own",
+            "Manage the board's own schedule: `action` is list, add, remove, enable or disable. A task re-runs a prompt every `every_s` seconds or daily at `at_hhmm`, and fires into the same queue a user message uses — the board works on its own. Every task is recurring: there is no \"run once in N seconds\", so a request for a one-off belongs in `script` or a direct tool call, and a task created for one is one the caller has to remove afterwards.",
         )
         .title("Schedule")
         .category("system")
@@ -586,7 +586,7 @@ pub fn script_specs() -> Value {
         "type": "function",
         "function": {
             "name": "script",
-            "description": "Run a small script on the board — the way to write a loop or a condition the fixed tools cannot express: `let`, assignment, `if`/`else`, `while` with `break`, numbers, strings, bools, nil, lists, maps, and `tool(name, args)` to call any other board tool. `{\"help\": true}` (or `section`: overview|builtins|examples) returns the syntax reference; `{\"lint\": true}` checks `source` without running it. Bounded by 30 s and 5 000 000 steps.",
+            "description": "Run a small script on the board — the way to write a loop or a condition the fixed tools cannot express: `let`, assignment, `if`/`else`, `while` with `break`, numbers, strings, bools, nil, lists, maps, and `tool(name, args)` to call any other board tool. `args` is optional: a map, or a list of words, and the program reads it back as the globals `args` and `argv`, so one script can be run with different values without being rewritten. `{\"help\": true}` (or `section`: overview|builtins|examples) returns the syntax reference; `{\"lint\": true}` checks `source` without running it. Bounded by 30 s and 5 000 000 steps.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -597,6 +597,10 @@ pub fn script_specs() -> Value {
                     "lint": {
                         "type": "boolean",
                         "description": "check the syntax and unknown function names without running anything"
+                    },
+                    "args": {
+                        "type": ["object", "array"],
+                        "description": "optional: a map, or a list of words; the program reads it as `args` and `argv`"
                     },
                     "help": {
                         "type": "boolean",

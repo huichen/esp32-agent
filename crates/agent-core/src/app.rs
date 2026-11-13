@@ -762,7 +762,7 @@ impl App {
                 // One tool is not a family: the declaration would cost more than the tool.
                 continue;
             }
-            let summary = format!("{family} on this board, in {} commands", subs.len());
+            let summary = format!("{family}: {} commands", subs.len());
             for name in subs.iter().map(|d| d.spec.name.clone()).collect::<Vec<String>>() {
                 self.family_members.insert(name.clone(), format!("{family} {name}"));
             }
@@ -10596,6 +10596,26 @@ mod tests {
     /// grouped: one declaration plus one `help` reply must be no larger than the
     /// declarations it replaced, so even a run that stops after a single step is not worse
     /// off. Past that, the saving the family made would leak back out of the help text.
+    /// The tool takes `args`, because the interpreter always did.
+    ///
+    /// `App::run_script` reads `{"source":…, "args":…}` and puts it in the program's `args` and
+    /// `argv` globals (`docs/scripting.md` documents both). The schema never declared the field,
+    /// so a model asked to run a script *with* arguments answered that the tool "takes only
+    /// `source`" - measured on the board.
+    #[test]
+    fn the_script_tool_declares_the_arguments_it_always_accepted() {
+        let specs = super::board_tools::script_specs();
+        let params = &specs[0]["function"]["parameters"]["properties"];
+        assert!(params.get("args").is_some(), "the schema hides `args`: {params}");
+        // And the handler passes it through, which is what a script reads as `args`.
+        let mut app = test_app();
+        let out = app
+            .call_tool("script", &json!({ "source": "args.pin + 1", "args": { "pin": 41 } }))
+            .expect("a script with arguments");
+        assert_eq!(out["result"], 42, "{out}");
+    }
+
+    /// A tool with arguments that were never named cannot be written down.
     #[test]
     fn a_family_declares_helps_and_dispatches_the_same_commands() {
         let mut app = test_app();
@@ -12287,6 +12307,14 @@ mod tests {
                 assert!(
                     description.contains(&format!("{command}(")),
                     "`{family}` names `{command}` without its arguments: {description}"
+                );
+            }
+            // And where an argument has a shape, the shape is in the line: a type is not a
+            // format, and `color: string` is true of `"green"`, which the board refuses.
+            if family == "indicators" {
+                assert!(
+                    description.contains("#rrggbb"),
+                    "`indicators` does not say what a colour looks like: {description}"
                 );
             }
             assert!(
