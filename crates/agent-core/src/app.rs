@@ -4668,19 +4668,19 @@ impl App {
         let count = files.map(|f| f.len()).unwrap_or(0);
         let bytes: usize =
             files.map(|f| f.values().filter_map(|v| v.as_str()).map(|v| v.len()).sum()).unwrap_or(0);
+        // What the store behind these files can take. It was three NVS numbers (a 3 500-byte
+        // chunk, five of them) and that stopped describing anything when the workspace moved to
+        // a filesystem: the ceiling is the partition's free space now, and it is the number a
+        // refused write is about.
+        let space = self.store.space();
         serde_json::json!({
             "files": count,
             "bytes": bytes,
             "file_limit_bytes": crate::tools::fs::MAX_FILE_BYTES,
             "workspace_limit_bytes": WORKSPACE_TOTAL_MAX,
             "free_bytes": WORKSPACE_TOTAL_MAX.saturating_sub(bytes),
-            // The ceiling the storage is responsible for, next to the one the tools are: text
-            // is what `write` counts, and the stored JSON is bigger than the text it holds,
-            // so a workspace within one of these numbers is not automatically within the
-            // other.
-            "stored_limit_bytes": WORKSPACE_PLAN.capacity(),
-            "stored_value_bytes": WORKSPACE_PLAN.chunk_bytes,
-            "stored_values": WORKSPACE_PLAN.chunks_max,
+            "store_total_bytes": space.and_then(|s| s.total_bytes),
+            "store_used_bytes": space.and_then(|s| s.used_bytes),
         })
         .to_string()
     }
