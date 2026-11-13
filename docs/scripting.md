@@ -90,6 +90,8 @@ first_positive([-2, 0, 7])
 `tool(name, args)` is the only way out of the interpreter. It uses the same execution
 checks as MCP, including `mcp.disabled_tools`; listing profiles do not revoke an enabled
 legacy name. `tool("script", …)` is refused to prevent recursion through the tool layer.
+Use the argument names in the tool's description: `(required)` marks required fields and
+`?` marks optional ones. A failed call with a parameter error lists the available arguments.
 
 ## Bounds
 

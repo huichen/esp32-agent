@@ -1641,7 +1641,9 @@ impl App {
                     return Err("a script may not call `script`".into());
                 }
                 // `App::call_tool` already returns the tool's JSON value.
-                self.app.call_tool(name, arguments).map_err(|e| e.message)
+                self.app
+                    .call_tool(name, arguments)
+                    .map_err(|e| crate::script::tool_error_with_arguments(self.app, name, e))
             }
         }
         // Arguments for the script: `{"source": …, "args": {"pin": 12}}`. They land in the
