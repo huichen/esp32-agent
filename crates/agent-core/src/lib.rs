@@ -20,6 +20,7 @@ pub mod agent;
 pub mod app;
 pub mod boards;
 pub mod capability;
+pub mod clips;
 pub mod config;
 pub mod device;
 pub mod drivers;

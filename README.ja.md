@@ -95,7 +95,7 @@ Windows では `powershell -File scripts/build-firmware.ps1 -Flash -Port COM3` �
 
 | 部分 | 状態 |
 |---|---|
-| `agent-core` | 886 個の単体テストと 5 個の統合テストが成功。`scripts/smoke.ps1` もエンドツーエンドで成功 |
+| `agent-core` | 899 個の単体テストと 5 個の統合テストが成功。`scripts/smoke.ps1` もエンドツーエンドで成功 |
 | シミュレーター | コンソール、MCP、エージェントループがエンドツーエンドで動作 |
 | ファームウェア | ESP32-S3-DevKitC-1 N16R8（IDF v5.5.2）に 2026-11-13 書き込み済み：42 個のツール、OLED 128×32、I²S マイクとアンプ、WS2812、TLS コンソール、HTTPS 経由のモデルターン。この書き込みで検証していない項目は `ROADMAP.md` にあります |
 | 未実装 / 未検証 | ファームウェアの DVP カメラキャプチャは未実装。SD の生セクターと DHT11/22 のドライバーはホストテスト済みですが、実機では未検証です。`ROADMAP.md` を参照 |

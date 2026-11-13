@@ -751,6 +751,24 @@ impl Hardware for EspHw {
         }
     }
 
+    /// PSRAM only, deliberately: a clip must not take the internal RAM that stacks, DMA and a
+    /// flash write need. A refusal is the honest answer, and the caller reports the largest
+    /// block it could see.
+    fn media_buffer(&mut self, len: usize) -> Option<(Vec<u8>, &'static str)> {
+        use esp_idf_svc::sys;
+        if len == 0 {
+            return Some((Vec::new(), "psram"));
+        }
+        let caps = sys::MALLOC_CAP_SPIRAM | sys::MALLOC_CAP_8BIT;
+        let raw = unsafe { sys::heap_caps_malloc(len, caps) } as *mut u8;
+        if raw.is_null() {
+            return None;
+        }
+        // `heap_caps_malloc` and Rust's global allocator are the same heap in ESP-IDF, so a
+        // `Vec` built from these parts frees the way every other `Vec` does.
+        Some((unsafe { Vec::from_raw_parts(raw, 0, len) }, "psram"))
+    }
+
     /// One tick, so the idle task on this core can run and reset the watchdog.
     ///
     /// `taskYIELD` is not enough: it hands the CPU to a task of equal priority, and the idle task

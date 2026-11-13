@@ -5,7 +5,7 @@ what is not done or not verified.
 
 ## Verified / unverified
 
-- ✅ `agent-core`: 886 unit tests and 5 integration tests (protocol, HTTP, manifest
+- ✅ `agent-core`: 899 unit tests and 5 integration tests (protocol, HTTP, manifest
   validation, driver conversion, capability filtering, auth, hot reload, the agent loop,
   shell and script, the file tools, sched, SSE streams, a streamed request body)
 - ✅ Simulator end to end: the PowerShell smoke gate; `scripts/smoke.sh` is the Unix
@@ -51,6 +51,14 @@ what is not done or not verified.
   configuration and file-tool replies acknowledge queue admission, not storage completion;
   workspace saved hashes advance only from completed publication receipts. Neither is a
   board power-cut measurement. See [storage guarantees](docs/storage.md)
+- ✅ Clips on the bench (2026-11-14): `clip_new {bytes: 1048576}` reported `pool: psram` and
+  moved the `spiram` pool's free from 7520 kB to 6495 kB while `internal_8bit` stayed at
+  151 kB, so the bytes landed where the design says they do. A 1 s 24 kHz tone appended as
+  PCM played with `played_ms: 1000` and `write_ms: 949`; a 1 s `clip_record` stored 32,000
+  bytes at 16 kHz and played back `resampled: true, played_ms: 1000`; two bitmap frames
+  played `frames_drawn: 2` in 1001 ms at 2 fps; `clip_drop` returned the pool to 7519 kB.
+  `tools/list` showed 24 tools, the 6 clip ones with generated `args:` suffixes. The sound
+  was not judged by ear and nothing was played longer than 1 s
 - ⚠️ Historical media bench (2026-11-12, recorded in `e7a9623`): `POST /audio/pcm` and `POST /av`
   played on the board; a 30.00 s clip
   with 362 frames completed in 30.19 s with the sound judged correct by ear, and its audio
@@ -78,9 +86,11 @@ what is not done or not verified.
 ## Medium term
 
 6. **Audio beyond the current bounded calls**: change the I2S TX rate at runtime (only
-   24000 Hz is wired), permit overlapping uploads, add long microphone file recording or
-   a background score/media worker. None is implemented. `media_play` paces a bounded
-   score and OLED frames in one synchronous call; it is not background playback.
+   24000 Hz is wired), permit overlapping uploads, add a background score/media worker.
+   Clips (below) remove the *result-size* wall — a take lives in PSRAM and plays in one
+   call — but playback is still synchronous, so nothing plays while the board does
+   something else, and nothing is recorded longer than one tool budget. `media_play` paces
+   a bounded score and OLED frames in one synchronous call; it is not background playback.
    On-board Opus/ADPCM encoding is
    deferred pending an actual build and measurements; the old 5–6 kB SRAM reading is not
    evidence that a codec cannot fit. See [audio](docs/audio.md).

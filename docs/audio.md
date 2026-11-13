@@ -365,7 +365,63 @@ seeking, looping or overlaying means a second body. And the panel's row count is
 the top half of a taller buffer, which is the same thing the register setup already got
 wrong (see `docs/adding-a-device.md`, or set `pins: {"oled.height": 32}`).
 
-## 9. How to check these numbers again
+## 9. Clips: media that does not fit one tool result
+
+The two routes above carry the bytes themselves, and both are bounded by the same wall: a
+tool result is capped at 64 KiB, so a 20 s recording or a 30-frame animation cannot travel
+through the conversation, and each piece that does travel is re-sent with the transcript on
+every later turn. A **clip** is the other way round: bytes go into PSRAM now, stay out of the
+transcript, and one later call says "/play/ it".
+
+| | Value |
+|---|---|
+| Per clip | 2 MiB (`CLIP_MAX_BYTES`) = 43 s of 24 kHz mono PCM, or 4096 frames of 128×32 (512 bytes each) |
+| All clips | 4 MiB (`CLIPS_TOTAL_MAX`), counted by *reserved* capacity, not content |
+| How many | 6 (`CLIPS_MAX`) |
+| One `clip_append` | 48 KiB decoded (`CLIP_APPEND_MAX`); growth is in 8 KiB steps |
+| Recording | 16 kHz (`MIC_RATE_HZ`), 100 ms – 60 s per call |
+
+**Where the bytes live is a fact, not a wish.** A clip is allocated through
+`Hardware::media_buffer`, whose firmware implementation asks for
+`MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT` and returns `None` rather than falling back to internal
+RAM — stacks, DMA descriptors and every flash-safe allocation come from there, and quietly
+spending it on a 2 MB clip is how a board loses the RAM it needs to answer. Every reply
+carries `pool`, and `/api/status.clips` repeats it. Growth re-allocates through the same
+call, so a clip that grew is still where it started.
+
+| Tool | What it does |
+|---|---|
+| `clip_new {name, kind, bytes?, rate_hz?, fps?}` | Opens or resets a clip. `kind` is `pcm` (16-bit LE mono at `rate_hz`, default 24000) or `bitmap` (whole framebuffer-sized frames, played at `fps`, default 8) |
+| `clip_append {name, data_b64}` | Appends samples or whole frames; refuses over the per-clip, per-call and pool ceilings *before* copying |
+| `clip_record {name, ms}` | Records the microphone into a clip, in 1 s pieces, stripping the WAV container |
+| `clip_play {name, volume?, loops?}` | PCM → 4096-sample writes to the speaker; bitmap → frames drawn on the OLED at `fps` |
+| `clip_list`, `clip_drop {name?}` | What is held and where; free one clip or all of them |
+
+Three consequences worth stating plainly:
+
+- **A recording is not at the amplifier's rate.** The microphone runs at 16 kHz and the
+  amplifier at 24 kHz, so `clip_play` resamples (linear interpolation) on the way out and
+  reports `resampled: true`. Without that step a recording plays 1.5× fast, which sounds like
+  a hardware fault and is not one. Recording into a clip that already holds another rate is
+  refused instead of mixing two clocks in one buffer.
+- **Playback is synchronous.** `clip_play` holds the caller until the sound is out or the
+  frames are drawn; there is no media worker and no background queue. The default tool budget
+  is 30 s, so a clip longer than that cannot play to its end in one call at the default
+  setting — raise `agent.tool_timeout_s` (max 300) or keep takes shorter. The result reports
+  `played_ms` and the timeout error reports how much did play.
+- **Clips are lost on reboot.** They are not in the workspace, not in NVS and not in the
+  transcript, so nothing about them survives a power cut. Write a recording you want to keep
+  into the workspace instead.
+
+### Checking it on a board
+
+`GET /api/status` → `clips` (and `clip_list`) report `pool`, `bytes`, `reserved`, `ms`,
+`frames` and the totals. To check the pool itself rather than the report: read
+`memory.pools` before and after `clip_new {bytes: 1048576}`, and the `spiram` pool's `free`
+should drop by ~1 MiB while `internal_8bit` does not move — a clip that lands in internal RAM
+is the bug this whole section exists to prevent.
+
+## 10. How to check these numbers again
 
 - Flash: `espflash flash --partition-table firmware/partitions.csv --target-app-partition
   factory <elf>` prints `App size … (N%)`; record bytes and percent against the current
