@@ -443,6 +443,9 @@ impl<S: Stream> BufferedReader<S> {
     fn line(&mut self, max: usize) -> std::io::Result<Option<String>> {
         loop {
             if let Some(idx) = find_crlf(&self.buf[self.pos..]) {
+                if idx > max {
+                    return Err(invalid_data("line too long"));
+                }
                 let end = self.pos + idx;
                 let line = String::from_utf8_lossy(&self.buf[self.pos..end]).to_string();
                 self.pos = end + 2;
@@ -452,43 +455,83 @@ impl<S: Stream> BufferedReader<S> {
                 return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "line too long"));
             }
             if self.fill()? == 0 {
+                if self.buf.len() != self.pos {
+                    return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "unfinished line"));
+                }
                 return Ok(None);
             }
         }
     }
 
+    fn required_line(&mut self, max: usize) -> std::io::Result<String> {
+        self.line(max)?
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "incomplete HTTP framing"))
+    }
+
     fn exact(&mut self, n: usize) -> std::io::Result<Vec<u8>> {
-        while self.buf.len() - self.pos < n {
-            if self.fill()? == 0 {
-                return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "short body"));
+        // Only the destination holds the full body. Keeping it in `self.buf` and then
+        // copying it doubled a large request's peak heap for no useful work.
+        let mut out = Vec::new();
+        out.try_reserve_exact(n).map_err(|_| invalid_data("not enough memory for the body"))?;
+        self.stream_exact(n, &mut |bytes| {
+            out.extend_from_slice(bytes);
+            Ok(())
+        })?;
+        Ok(out)
+    }
+
+    fn chunk_size(&mut self) -> std::io::Result<usize> {
+        let line = self.required_line(128)?;
+        let size = line.split(';').next().unwrap_or("");
+        if size.is_empty() || !size.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(invalid_data("bad chunk size"));
+        }
+        usize::from_str_radix(size, 16).map_err(|_| invalid_data("bad chunk size"))
+    }
+
+    fn chunk_end(&mut self) -> std::io::Result<()> {
+        if self.exact(2)? != b"\r\n" {
+            return Err(invalid_data("missing CRLF after chunk"));
+        }
+        Ok(())
+    }
+
+    fn trailers(&mut self) -> std::io::Result<()> {
+        let mut total = 0;
+        loop {
+            let line = self.required_line(1024)?;
+            total += line.len() + 2;
+            if total > MAX_HEADER_BYTES {
+                return Err(invalid_data("trailers too large"));
+            }
+            if line.is_empty() {
+                return Ok(());
             }
         }
-        let out = self.buf[self.pos..self.pos + n].to_vec();
-        self.pos += n;
-        Ok(out)
     }
 
     fn chunked(&mut self) -> std::io::Result<Vec<u8>> {
         let mut body = Vec::new();
         loop {
-            let line = self.line(128)?.unwrap_or_default();
-            let size_str = line.split(';').next().unwrap_or("").trim();
-            let size = usize::from_str_radix(size_str, 16).unwrap_or(0);
+            let size = self.chunk_size()?;
             if size == 0 {
-                // Trailer headers until an empty line.
-                while let Some(l) = self.line(1024)? {
-                    if l.is_empty() {
-                        break;
-                    }
-                }
+                self.trailers()?;
                 return Ok(body);
             }
-            if body.len() + size > MAX_BODY_BYTES {
-                return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "chunked body too large"));
+            if size > MAX_BODY_BYTES.saturating_sub(body.len()) {
+                return Err(invalid_data("chunked body too large"));
             }
-            body.reserve(size.min(MAX_BODY_BYTES));
-            body.extend_from_slice(&self.exact(size)?);
-            let _ = self.line(2)?; // trailing CRLF
+            let needed = body.len() + size;
+            if body.capacity() < needed {
+                let capacity = needed.max(body.capacity().saturating_mul(2)).min(MAX_BODY_BYTES);
+                body.try_reserve_exact(capacity - body.len())
+                    .map_err(|_| invalid_data("not enough memory for the body"))?;
+            }
+            self.stream_exact(size, &mut |bytes| {
+                body.extend_from_slice(bytes);
+                Ok(())
+            })?;
+            self.chunk_end()?;
         }
     }
 
@@ -530,20 +573,12 @@ impl<S: Stream> BufferedReader<S> {
             Framing::Empty => Ok(()),
             Framing::Fixed(len) => self.stream_exact(*len, sink),
             Framing::Chunked => loop {
-                let line = self.line(128)?.unwrap_or_default();
-                let size_str = line.split(';').next().unwrap_or("").trim();
-                let size = usize::from_str_radix(size_str, 16)
-                    .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "bad chunk size"))?;
+                let size = self.chunk_size()?;
                 if size == 0 {
-                    while let Some(l) = self.line(1024)? {
-                        if l.is_empty() {
-                            break;
-                        }
-                    }
-                    return Ok(());
+                    return self.trailers();
                 }
                 self.stream_exact(size, sink)?;
-                let _ = self.line(2)?; // trailing CRLF
+                self.chunk_end()?;
             },
         }
     }
@@ -576,13 +611,32 @@ enum Framing {
     Chunked,
 }
 
-fn framing_of(headers: &BTreeMap<String, String>) -> Framing {
-    if headers.get("transfer-encoding").map(|t| t.to_ascii_lowercase().contains("chunked")).unwrap_or(false) {
-        return Framing::Chunked;
+fn invalid_data(message: &str) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::InvalidData, message)
+}
+
+fn is_token_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b)
+}
+
+fn framing_of(headers: &BTreeMap<String, String>) -> std::io::Result<Framing> {
+    if let Some(encoding) = headers.get("transfer-encoding") {
+        if headers.contains_key("content-length") {
+            return Err(invalid_data("ambiguous body framing"));
+        }
+        if !encoding.eq_ignore_ascii_case("chunked") {
+            return Err(invalid_data("unsupported transfer encoding"));
+        }
+        return Ok(Framing::Chunked);
     }
-    match headers.get("content-length").and_then(|v| v.parse().ok()).unwrap_or(0) {
-        0 => Framing::Empty,
-        len => Framing::Fixed(len),
+    let Some(length) = headers.get("content-length") else { return Ok(Framing::Empty) };
+    if length.is_empty() || !length.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(invalid_data("invalid content length"));
+    }
+    match length.parse::<usize>() {
+        Ok(0) => Ok(Framing::Empty),
+        Ok(len) => Ok(Framing::Fixed(len)),
+        Err(_) => Err(invalid_data("invalid content length")),
     }
 }
 
@@ -618,30 +672,46 @@ fn parse_with_line<S: Stream>(
 ) -> std::io::Result<Option<(Request, Framing)>> {
     let mut parts = request_line.split_whitespace();
     let method = parts.next().unwrap_or("").to_ascii_uppercase();
-    let target = parts.next().unwrap_or("/").to_string();
-    if method.is_empty() {
-        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "bad request line"));
+    let target = parts.next().unwrap_or("");
+    let version = parts.next().unwrap_or("");
+    if method.is_empty()
+        || !method.bytes().all(is_token_byte)
+        || target.is_empty()
+        || !matches!(version, "HTTP/1.1" | "HTTP/1.0")
+        || parts.next().is_some()
+    {
+        return Err(invalid_data("bad request line"));
     }
-    let (path, query) = split_target(&target);
+    let (path, query) = split_target(target);
 
     let mut headers = BTreeMap::new();
-    let mut total = 0usize;
-    while let Some(line) = conn.line(MAX_HEADER_BYTES)? {
+    let mut total = request_line.len() + 2;
+    loop {
+        let line = conn.required_line(MAX_HEADER_BYTES)?;
+        total += line.len() + 2;
+        if total > MAX_HEADER_BYTES {
+            return Err(invalid_data("headers too large"));
+        }
         if line.is_empty() {
             break;
         }
-        total += line.len();
-        if total > MAX_HEADER_BYTES {
-            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "headers too large"));
+        let (k, v) = line.split_once(':').ok_or_else(|| invalid_data("bad header"))?;
+        if k.is_empty()
+            || !k.bytes().all(is_token_byte)
+            || v.bytes().any(|b| (b < b' ' && b != b'\t') || b == 0x7f)
+        {
+            return Err(invalid_data("bad header"));
         }
-        if let Some((k, v)) = line.split_once(':') {
-            headers.insert(k.trim().to_ascii_lowercase(), v.trim().to_string());
+        let name = k.to_ascii_lowercase();
+        if matches!(name.as_str(), "content-length" | "transfer-encoding") && headers.contains_key(&name) {
+            return Err(invalid_data("duplicate body framing header"));
         }
+        headers.insert(name, v.trim().to_string());
     }
 
     // 100-continue and the body are both left to the caller: it is the only place that
     // knows whether this route wants the bytes buffered or streamed (`BodyRoute`).
-    let framing = framing_of(&headers);
+    let framing = framing_of(&headers)?;
     Ok(Some((
         Request { method, path, query, headers, body: Vec::new(), peer: peer.to_string(), scheme },
         framing,
@@ -1432,6 +1502,99 @@ mod tests {
         drop(server);
     }
 
+    struct Fixture {
+        input: std::io::Cursor<Vec<u8>>,
+        output: Vec<u8>,
+    }
+
+    impl Read for Fixture {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.input.read(buf)
+        }
+    }
+    impl Write for Fixture {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.output.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    impl Stream for Fixture {
+        fn set_read_timeout(&self, _: Option<Duration>) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn set_write_timeout(&self, _: Option<Duration>) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn set_nodelay(&self, _: bool) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn fixture(raw: &str) -> BufferedReader<Fixture> {
+        BufferedReader::with_prefix(
+            Fixture { input: std::io::Cursor::new(raw.as_bytes().to_vec()), output: Vec::new() },
+            Vec::new(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn ambiguous_or_incomplete_request_headers_are_refused() {
+        for raw in [
+            "POST / HTTP/1.1\r\nContent-Length: 1\r\nContent-Length: 2\r\n\r\n",
+            "POST / HTTP/1.1\r\nContent-Length: 1\r\nTransfer-Encoding: chunked\r\n\r\n",
+            "POST / HTTP/1.1\r\nContent-Length: nope\r\n\r\n",
+            "POST / HTTP/1.1\r\nTransfer-Encoding: notchunked\r\n\r\n",
+            "POST / HTTP/1.1\r\nTransfer-Encoding: gzip, chunked\r\n\r\n",
+            "POST / HTTP/1.1\r\nContent-Length: 0\r\n",
+            "POST / HTTP/1.1\r\nHeader Without Colon\r\n\r\n",
+            "POST /\r\n\r\n",
+        ] {
+            assert!(parse_request(&mut fixture(raw), "test", "http").is_err(), "accepted {raw:?}");
+        }
+    }
+
+    #[test]
+    fn malformed_chunks_never_complete_buffered_or_streamed_uploads() {
+        for body in
+            ["not-hex\r\n\r\n", "1\r\nxXX0\r\n\r\n", "1\r\nx\r\n0\r\n", "1\r\nx\r\n", "ffffffffffffffff\r\n"]
+        {
+            assert!(fixture(body).read_body(&Framing::Chunked).is_err(), "buffer accepted {body:?}");
+            assert!(
+                fixture(body).stream_body(&Framing::Chunked, &mut |_| Ok(())).is_err(),
+                "stream accepted {body:?}"
+            );
+        }
+        let body = format!("0\r\nX-Trailer: {}\r\n\r\n", "x".repeat(MAX_HEADER_BYTES));
+        assert!(fixture(&body).read_body(&Framing::Chunked).is_err());
+        assert!(fixture(&body).stream_body(&Framing::Chunked, &mut |_| Ok(())).is_err());
+    }
+
+    #[test]
+    fn a_buffered_body_keeps_only_one_full_copy() {
+        let body = "x".repeat(MAX_BODY_BYTES);
+        for (raw, framing) in [
+            (body.clone(), Framing::Fixed(body.len())),
+            (format!("{:x}\r\n{body}\r\n0\r\n\r\n", body.len()), Framing::Chunked),
+        ] {
+            let mut reader = fixture(&raw);
+            let received = reader.read_body(&framing).unwrap();
+            assert_eq!(received, body.as_bytes());
+            assert!(reader.buf.len() <= 1024, "{} bytes of a duplicate body", reader.buf.len());
+            assert!(received.capacity() <= MAX_BODY_BYTES);
+        }
+    }
+
+    #[test]
+    fn a_complete_line_still_respects_its_limit() {
+        assert!(fixture("12345\r\n").line(4).is_err());
+        assert!(fixture("partial").line(16).is_err());
+        assert_eq!(fixture("1234\r\n").line(4).unwrap().as_deref(), Some("1234"));
+    }
+
     // ---- event streams ----
 
     /// One parsed `text/event-stream` frame.
@@ -1573,7 +1736,7 @@ mod tests {
 
     /// A body route is asked before a byte is read, and the bytes never become a `Vec`:
     /// that is the difference between buffering a song and playing it. The payload here is
-    /// three times `MAX_BODY_BYTES`, which the buffered path refuses outright.
+    /// over `MAX_BODY_BYTES`, which the buffered path refuses outright.
     #[test]
     fn a_body_route_streams_past_the_buffer_cap() {
         let log = LogBuf::new(64);
@@ -1600,7 +1763,7 @@ mod tests {
         });
         let server = Server::start("127.0.0.1:0", Routes::new(handler).with_body(router), log).expect("bind");
 
-        let payload = "x".repeat(300 * 1024);
+        let payload = "x".repeat(MAX_BODY_BYTES + 1024);
         let raw =
             format!("POST /upload HTTP/1.1\r\nHost: x\r\nContent-Length: {}\r\n\r\n{payload}", payload.len());
         let out = raw_request(server.local_addr(), &raw);
