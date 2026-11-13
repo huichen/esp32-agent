@@ -142,6 +142,7 @@ partial effect. See [storage](storage.md#workspace-publication-and-rollback).
 | POST | `/api/agent/message` | `{text}` — queue a user message; answers `202` with the queued count |
 | GET | `/api/agent/history?after=<n>` | Transcript entries after `n`, plus `usage`. Each tool call carries its `arguments`; past 1024 bytes they arrive as a string with `arguments_elided_bytes`, so a client can say what it is not showing |
 | POST | `/api/agent/reset` | Clear the conversation. `409` while a model turn is in flight: its question would be gone and its answer would arrive in a thread that no longer holds it |
+| POST | `/api/agent/cancel` | Ask the running turn to stop: `{cancelling, run_active}`. Cooperative — the loop stops between model calls and between tool calls, so an answer already on the wire is dropped rather than aborted; `run_end` follows either way. `cancelling: false` means there was nothing to interrupt |
 | GET | `/api/agent/config` | Model connection, `tick_ms`, `last_run`/`total` usage |
 | POST | `/api/agent/config` | Update model connection, `protocol`, `reasoning`, `vision`, `temperature`, `timeout_s`, context/output/step budgets and `tick_ms`; reads omit `api_key` and report `api_key_set` |
 | GET | `/api/agent/prompt` | The system prompt as the model receives it, memory and skills included ([context layers](context.md)) |

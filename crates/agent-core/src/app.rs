@@ -367,6 +367,12 @@ pub struct App {
     /// Whether a model turn is in flight, so clearing the transcript can refuse instead of
     /// deleting the question whose answer is about to arrive.
     run_active: bool,
+    /// Set by `POST /api/agent/cancel`, taken by the loop at the next boundary.
+    ///
+    /// Cooperative by construction: a socket already open cannot be withdrawn, so the turn
+    /// stops between model calls and between tool calls. `run_end` is emitted either way, so a
+    /// client sees the turn finish rather than wait for an answer that will not come.
+    cancel_requested: bool,
 }
 
 /// Whether the thread that runs the agent loop is up.
@@ -526,6 +532,7 @@ impl App {
             workspace_stale_keys: Default::default(),
             tool_deadline: None,
             run_active: false,
+            cancel_requested: false,
         };
         app.log.info(
             "boot",
@@ -1865,8 +1872,17 @@ impl App {
         // A call that starts after the budget is gone never reaches a driver: its caller has
         // already been written off as timed out, and starting hardware work now would be
         // doing it for nobody.
-        let result = match (self.remaining_tool_ms(), budget) {
-            (Some(0), Some(budget)) => {
+        let result = match (self.cancel_requested, self.remaining_tool_ms(), budget) {
+            (true, _, Some(budget)) => Err(McpError::timeout(format!(
+                "`{name}` did not run: the turn was interrupted"
+            ))
+            .with_data(json!({
+                "tool": name,
+                "timeout_ms": budget,
+                "interrupted": true,
+                "suggestion": "the turn was stopped from the console; ask again to continue",
+            }))),
+            (_, Some(0), Some(budget)) => {
                 // Quote the budget the call was given, not the zero that is left of it: the
                 // number a reader needs is how much time the whole call had.
                 let seconds = u64::from(self.cfg.agent.tool_timeout_s).max(1);
@@ -1919,6 +1935,11 @@ impl App {
     /// and the HTTP client use what is left instead of a fixed cap of their own, which is
     /// what makes one configured timeout enough.
     pub fn remaining_tool_ms(&self) -> Option<u64> {
+        // A cancelled turn gives its remaining tools no time at all: a script drawing 700
+        // frames must stop at the next call, not finish the frames nobody is waiting for.
+        if self.cancel_requested && self.tool_deadline.is_some() {
+            return Some(0);
+        }
         let deadline = self.tool_deadline?;
         let now = std::time::Instant::now();
         Some(if deadline <= now { 0 } else { (deadline - now).as_millis().min(u128::from(u64::MAX)) as u64 })
@@ -1941,6 +1962,21 @@ impl App {
                 ),
             )
         })
+    }
+
+    /// Ask the running turn to stop at its next boundary. Returns whether there was one.
+    pub fn request_cancel(&mut self) -> bool {
+        if !self.run_active {
+            return false;
+        }
+        self.cancel_requested = true;
+        self.log.info("agent", "cancel requested; the turn stops at its next boundary");
+        true
+    }
+
+    /// Take the request, so one cancel stops one turn and cannot poison the next.
+    pub fn take_cancel(&mut self) -> bool {
+        std::mem::take(&mut self.cancel_requested)
     }
 
     /// Say so when a call finished after its budget, without pretending it did nothing.
@@ -2793,6 +2829,9 @@ impl App {
         if matches!(&step, AgentStep::Done(_)) {
             self.active_attachments = None;
             self.run_active = false;
+            // A cancel that arrived after the final step has nothing left to stop, and must
+            // not carry into the next turn (whose first boundary would otherwise stop it).
+            self.cancel_requested = false;
             // The turn is over, so a reboot from here must not ask it again. Clearing the
             // marker before the final save means the worst case is a lost reply, never a
             // reply the board repeats.
@@ -4243,6 +4282,17 @@ impl App {
                     return r;
                 }
                 self.agent_message(req)
+            }
+            // Stop the turn that is running. Cooperative: the loop checks between model
+            // calls and between tool calls, because a request already on the wire cannot be
+            // withdrawn from here. `run_end` follows either way, so a console knows the turn
+            // is over instead of waiting for an answer that will not come.
+            ("POST", "/api/agent/cancel") => {
+                if let Err(r) = self.require_pin(req) {
+                    return r;
+                }
+                let cancelling = self.request_cancel();
+                Response::json(&json!({ "cancelling": cancelling, "run_active": self.run_active }))
             }
             ("POST", "/api/agent/reset") => {
                 if let Err(r) = self.require_pin(req) {
@@ -7512,6 +7562,14 @@ pub fn drive_agent(
     loop {
         match step {
             AgentStep::Ask { messages, tools } => {
+                // The boundary a cancel lands on: the last answer (if any) is in, and nobody
+                // is waiting on a socket yet. A cancel that arrives during the call below is
+                // taken here on the next pass.
+                if app_lock(app).take_cancel() {
+                    step = app_lock(app)
+                        .agent_reply(Err("interrupted by the user; the turn was stopped".into()));
+                    continue;
+                }
                 let cfg = app_lock(app).llm.clone();
                 // No lock held across this call: it is the one thing here that blocks.
                 let reply = llm::chat(transport, &cfg, &messages, &tools);
@@ -10918,6 +10976,62 @@ mod tests {
         assert_eq!(app.route(&post("/api/agent/forget", r#"{"keep":1}"#)).status, 409);
         app.run_active = false;
         assert_eq!(app.route(&post("/api/agent/reset", "{}")).status, 200);
+    }
+
+    /// A cancel that arrives before the first model call ends the turn there, and the model is
+    /// never asked: the user said stop, and a request already in flight is the only thing this
+    /// cannot withdraw.
+    #[test]
+    fn a_cancel_stops_the_turn_at_the_next_boundary_without_calling_the_model() {
+        let mut app = test_app();
+        app.queue_user("play something long", "http", 1_000);
+        app.run_active = true;
+        assert!(app.request_cancel(), "a running turn can be cancelled");
+        assert!(app.take_cancel(), "the flag is handed to the loop exactly once");
+        assert!(!app.take_cancel(), "and is gone after that");
+
+        let shared: Shared = Arc::new(Mutex::new(app));
+        let mut model = Scripted::new(vec![Scripted::answer("never asked")]);
+        // Re-arm inside the run: `drive_agent` takes the flag at the Ask boundary.
+        assert!(app_lock(&shared).request_cancel());
+        let out = drive_agent(&shared, &mut model).expect("the queued turn still ends");
+        let err = out.expect_err("a cancelled turn reports why it stopped");
+        assert!(err.contains("interrupted"), "{err}");
+        assert!(model.seen.lock().unwrap().is_empty(), "the model was called after the cancel");
+        let finished = app_lock(&shared);
+        assert!(!finished.run_active, "the turn is over");
+        assert!(!finished.cancel_requested, "the flag does not leak into the next turn");
+    }
+
+    /// Tools stop when the turn is cancelled: a script mid-flight must not keep drawing.
+    #[test]
+    fn a_cancelled_turn_refuses_further_tool_calls() {
+        let mut app = test_app();
+        app.tool_deadline = Some(std::time::Instant::now() + std::time::Duration::from_secs(30));
+        app.cancel_requested = true;
+        let err = app.call_tool("board_status", &json!({})).unwrap_err();
+        assert!(err.message.contains("interrupted"), "{}", err.message);
+        assert_eq!(err.data.as_ref().unwrap()["interrupted"], json!(true));
+        // The cancelled call installs no deadline of its own: the next turn starts clean.
+        app.cancel_requested = false;
+        assert!(app.call_tool("board_status", &json!({})).is_ok());
+    }
+
+    #[test]
+    fn cancel_is_only_accepted_while_a_turn_is_running() {
+        let mut app = test_app();
+        assert!(!app.request_cancel(), "nothing to interrupt");
+        app.run_active = true;
+        assert!(app.request_cancel());
+        // The route reports what it did, so a console can tell a no-op from a stop.
+        app.run_active = false;
+        app.cancel_requested = false;
+        let idle = body_json(&app.route(&post("/api/agent/cancel", "{}")));
+        assert_eq!(idle["cancelling"], json!(false), "{idle}");
+        app.run_active = true;
+        let busy = body_json(&app.route(&post("/api/agent/cancel", "{}")));
+        assert_eq!(busy["cancelling"], json!(true), "{busy}");
+        assert_eq!(busy["run_active"], json!(true), "{busy}");
     }
 
     #[test]
