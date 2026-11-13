@@ -54,24 +54,15 @@ phone / model → TCP:80
 ```
 
 One `App` behind one lock, because hardware resources are shared. Tool calls are
-serialized under that lock, so a blocking hardware call delays most other callers.
-`GET /api/status` and `GET /healthz` instead try the lock: if it is free they build and
-publish a fresh view; otherwise they serve the last published view with `stale: true`
-and its `age_ms`. One independent short mutex protects only the immutable snapshot's
-`Arc` swap/clone, never hardware work or JSON construction. Publication at construction
-and after routes/tools uses `status_json`; health is a projection of that same view.
-Uptime is computed per request from a paired hardware/monotonic clock sample, not frozen
-in the cache. See the [snapshot contract](http-api.md#2-web-and-configuration-rest).
+serialized under that lock, so a blocking hardware call delays other callers. Ordinary
+HTTP requests run on one accept thread; only long-lived event responses get separate
+threads. Streaming media releases the `App` lock between pieces/records, but occupies the
+accept thread for the upload.
 
-Ordinary HTTP requests run on one accept thread; only long-lived event responses get
-separate threads. The snapshot shortcut bypasses a worker's live app lock, not a long
-call occupying the accept thread itself. Streaming media releases the `App` lock between
-pieces/records, but occupies the accept thread for the upload. The remaining live-lock
-split is not implemented.
-
-Model calls also run **outside** the lock: a model call takes seconds, so `Agent::begin`
-computes the request under the lock, `Agent::apply` consumes the reply under the lock,
-and the network wait in between holds nothing.
+The one place that had to be relaxed is the agent loop: a model call takes seconds, so it
+runs **outside** the lock. `Agent::begin` computes the request under the lock,
+`Agent::apply` consumes the reply under the lock, and the network wait in between holds
+nothing.
 
 ## 3. Capability filtering: the tool list is "what this board has"
 
