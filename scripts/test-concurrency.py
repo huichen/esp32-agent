@@ -28,9 +28,11 @@ def main():
         p.error('--soak-only cannot be combined with --agent')
     host = args.host.rstrip('/')
     latencies = []
+    handler_latencies = []
+    slowest_control = {}
     checks = 0
 
-    def request(path, body=None, timeout=40):
+    def request(path, body=None, timeout=40, timing=False):
         nonlocal checks
         data = None if body is None else json.dumps(body).encode()
         headers = {'Content-Type': 'application/json', 'Connection': 'close'}
@@ -39,14 +41,25 @@ def main():
         req = urllib.request.Request(host + path, data=data, headers=headers)
         with urllib.request.urlopen(req, timeout=timeout) as response:
             raw = response.read()
+            server_timing = response.headers.get('Server-Timing', '')
         checks += 1
-        return json.loads(raw)
+        result = json.loads(raw)
+        if timing:
+            duration = server_timing.partition('handler;dur=')[2].split(',')[0].split(';')[0].strip()
+            assert duration.isdigit(), ('Missing handler timing', server_timing)
+            return result, int(duration)
+        return result
 
     def control(path='/api/status'):
+        nonlocal slowest_control
         start = time.monotonic()
-        result = request(path, timeout=args.max_ms / 1000 + 1)
+        result, handler_ms = request(path, timeout=args.max_ms / 1000 + 1, timing=True)
         elapsed = (time.monotonic() - start) * 1000
         latencies.append(elapsed)
+        handler_latencies.append(handler_ms)
+        if elapsed > slowest_control.get('client_ms', -1):
+            slowest_control = {'path': path, 'client_ms': round(elapsed,1),
+                               'handler_ms': handler_ms, 'snapshot_age_ms': result.get('age_ms')}
         assert elapsed < args.max_ms, (path, elapsed)
         assert result.get('snapshot') is True, result
         return result
@@ -198,7 +211,8 @@ def main():
     print(json.dumps({'firmware': firmware, 'checks': checks, 'control_reads': len(samples),
         'median_ms': round(statistics.median(samples),1),
         'p95_ms': round(samples[int((len(samples)-1)*0.95)],1),
-        'max_ms': round(max(samples),1), 'uptime_s': final['uptime_s'],
+        'max_ms': round(max(samples),1), 'handler_max_ms': max(handler_latencies),
+        'slowest_control': slowest_control, 'uptime_s': final['uptime_s'],
         'soak_s': args.soak, 'soak_tool_calls': soak_calls,
         'task_set_stable': final_tasks == initial_tasks, 'task_count': len(final_tasks),
         'memory': {p['pool']: {k: p[k] for k in ('free_kb', 'largest_kb', 'min_free_kb')}
