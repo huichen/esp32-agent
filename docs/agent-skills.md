@@ -40,7 +40,7 @@ write {"path":"/AGENTS.md","text":"GPIO12 is the pump relay, active low."}
 
 # a skill, written the same way
 write {"path":"/skills/pulse_pump.md",
-       "text":"# pulse_pump\ndescription: switch the pump for a measured pulse\n1. confirm the request names a duration\n2. bench_pulse {ms}\n3. read power_read before and after\n"}
+       "text":"---\nname: pulse_pump\ndescription: switch the pump for a measured pulse\n---\n# pulse_pump\n1. confirm the request names a duration\n2. bench_pulse {ms}\n3. read power_read before and after\n"}
 ```
 
 ## Skills
@@ -56,6 +56,8 @@ hand with `bus gpio_write` all belong to the procedure, and they are `read` away
 name: deploy
 description: roll the portal forward without losing the transcript
 ---
+# deploy
+
 1. Read `/AGENTS.md` and confirm no turn is running.
 2. `write` a note to `/notes/deploy-<date>.md` first.
 3. Build, flash, then `board status` and one `bme280_read`.
@@ -69,13 +71,38 @@ A skill that needs nothing else can be one file: `/skills/quick.md`. Both shapes
 indexed the same way; the index line carries the path, so the model does not have to
 guess which one it is looking at.
 
+### The header is the standard one
+
+Every `SKILL.md` opens with YAML front matter carrying `name` and `description`, the same
+block the host's skills use, and the closing `---` is followed by the body:
+
+```markdown
+---
+name: deploy
+description: roll the portal forward without losing the transcript
+---
+# deploy
+
+1. Read `/AGENTS.md` and confirm no turn is running.
+```
+
+`name` repeats the directory, `description` is the one line the prompt shows, and both are
+required. The board ships one seeded skill (`create-skill`) written that way, and its own
+text teaches the format, so a skill the agent writes and a skill written in an editor come
+out the same shape.
+
+A file without front matter is still indexed — a `description:` line is used, and failing
+that the first prose line — because the index is how the model finds a skill at all, and a
+useful procedure with a sloppy header is better than an invisible one. The forgiving path is
+a fallback, not the format.
+
 Rules, such as they are:
 
 - The **name is the directory** (`deploy`), and it must be `a-z A-Z 0-9 _ -`, at most 32
   characters. It is what appears in the prompt and what the model asks for.
-- `description:` comes from YAML front matter (`---` block), from a `description:` line,
-  or from the first prose line — in that order. With none of those the skill is still
-  indexed, with an empty description.
+- `description:` comes from YAML front matter (`---` block, the standard and the shipped
+  shape), then from a `description:` line, then from the first prose line — in that order.
+  With none of those the skill is still indexed, with an empty description.
 - Any other file in that directory is the skill's own material. It is not indexed and not
   injected; the procedure tells the model when to read it.
 - The index carries at most 12 skills. The rest are on the workspace but unnamed.

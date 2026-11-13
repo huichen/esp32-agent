@@ -24,7 +24,7 @@ marcha.
 | Actúa sin nadie delante | Prompts temporizados y reglas de sensores que lanzan un prompt cuando una lectura cruza un umbral. [Trabajo programado](docs/scheduling.md) |
 | Un shell y un lenguaje de script | `shell` con 57 comandos con nombres de NuttX, y un intérprete para bucles sobre llamadas a herramientas. [Shell](docs/shell.md) · [Script](docs/scripting.md) |
 | Recuerda lo que se le dijo | Órdenes permanentes, `/AGENTS.md`, un índice `/MEMORY.md` y habilidades, ensamblados en el prompt en cada turno. [Lo que el modelo ve en cada turno](docs/context.md) |
-| Llega con habilidades | Tres procedimientos en el firmware — escribir una habilidad, levantar el cableado, recuperar una placa que parece rota — que aparecen en `/skills` al primer arranque; lo que edites queda tuyo. [Skills](docs/agent-skills.md) |
+| Habilidades incluidas | Una sola rutina viene en el firmware, `create-skill`, con la cabecera estándar `---`, y enseña el resto: qué es una habilidad y cómo escribir una. Aterriza en `/skills` en el primer arranque, y tu edición se queda. [Habilidades](docs/agent-skills.md) |
 | La placa es el servidor | HTTPS desde la placa, un certificado que genera ella misma, un PIN para tres invocadores. [Autenticación](docs/security.md) |
 | Comprobable sin hardware | El simulador ejecuta el mismo `agent-core` contra una placa virtual. [Simulador](docs/simulator.md) |
 
@@ -49,7 +49,7 @@ poner el PIN.
 con su método, cuerpo y autenticación, la superficie MCP, la tabla de ajustes con tipos y
 valores por defecto, y los límites. Un agente que sepa pedir una URL no necesita nada más.
 
-**Una placa nueva ya sabe tres cosas.** `/skills/create-skill` dice cómo el agente escribe su siguiente procedimiento, `/skills/pinout` cómo averiguar el cableado y anotarlo en `/MEMORY.md`, `/skills/recover-board` qué hacer cuando la placa parece rota. Son archivos normales del espacio de trabajo, instalados en el primer arranque donde la ruta esté vacía; un restablecimiento de fábrica los repone y `skills.seed_defaults=false` lo impide. La primera frase útil para una placa recién flasheada puede ser «apunta tu cableado».
+**Una placa nueva ya sabe aprender.** `/skills/create-skill` es la única rutina incluida: dice qué es una habilidad, la cabecera `---` que debe llevar y cómo escribir una que la próxima sesión encuentre. Todo lo demás —el cableado de tu mesa, qué hacer cuando una placa parece muerta— es una habilidad que el agente escribe y conserva. Es un archivo normal del espacio de trabajo, instalado en el primer arranque donde la ruta esté vacía; un restablecimiento de fábrica lo repone y `skills.seed_defaults=false` lo impide. La primera frase útil para una placa recién flasheada puede ser «apunta tu cableado».
 
 ## Dale un modelo
 
@@ -86,7 +86,7 @@ instrucción sirve para cada placa que pueda alcanzar. Sin ninguna clave, `base_
 
 | Parte | Estado |
 |---|---|
-| `agent-core` | 749 pruebas unitarias y 5 de integración pasan; `scripts/smoke.ps1` pasa de extremo a extremo |
+| `agent-core` | 750 pruebas unitarias y 5 de integración pasan; `scripts/smoke.ps1` pasa de extremo a extremo |
 | Simulador | la consola, MCP y el bucle de agente funcionan de extremo a extremo |
 | Firmware | grabado en una ESP32-S3-DevKitC-1 N16R8 (IDF v5.5.2): 42 herramientas, OLED 128×32, micrófono y amplificador I²S, WS2812, consola TLS, turnos del modelo por HTTPS |
 | No implementado | OTA, tarjeta SD, DHT11/22, cámara. Ver `ROADMAP.md` |
