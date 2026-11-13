@@ -735,6 +735,38 @@ impl Hardware for EspHw {
         ))
     }
 
+    /// Whether *this* thread can write flash itself: its stack has to be in internal RAM.
+    ///
+    /// `spi_flash` runs with both caches disabled, and the CPU cannot then fetch from PSRAM, so
+    /// ESP-IDF asserts that the calling task's stack is internal. A thread given a PSRAM stack
+    /// (the DNS one) would abort instead. Asking is one instruction and the answer is exact.
+    fn stack_is_internal(&self) -> bool {
+        use esp_idf_svc::sys;
+        let marker = 0u8;
+        let here = &marker as *const u8 as *const core::ffi::c_void;
+        !unsafe { sys::esp_ptr_external_ram(here) }
+    }
+
+    /// The largest single allocation PSRAM can satisfy, in bytes: the number a buffer has to
+    /// fit in, as opposed to the total that `free_heap_kb` reports.
+    fn psram_largest_free(&mut self) -> Option<usize> {
+        use esp_idf_svc::sys;
+        let block = unsafe { sys::heap_caps_get_largest_free_block(sys::MALLOC_CAP_SPIRAM) };
+        if block == 0 {
+            None
+        } else {
+            Some(block)
+        }
+    }
+
+    /// One tick, so the idle task on this core can run and reset the watchdog.
+    ///
+    /// `taskYIELD` is not enough: it hands the CPU to a task of equal priority, and the idle task
+    /// is below every other one here. A delayed tick is what actually lets it run.
+    fn let_others_run(&mut self) {
+        esp_idf_svc::hal::delay::FreeRtos::delay_ms(1);
+    }
+
     /// The heap, split the way ESP-IDF splits it: one row per set of capability flags.
     ///
     /// `heap_caps_get_info` answers a pool by walking every heap region that satisfies the
