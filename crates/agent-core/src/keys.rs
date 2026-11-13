@@ -58,19 +58,22 @@ pub fn workspace_chunk(index: usize) -> String {
 
 /// The workspace's index: one JSON object, `path -> key`, for every stored file.
 ///
-/// It starts with `ws` on purpose: `SplitStore` routes anything with that prefix to the file
-/// system, and the index has to live next to the values it names.
-pub const WORKSPACE_INDEX: &str = "wsmap";
+/// Under `ws.` on purpose: the firmware's `SplitStore` routes `ws` and `ws.*` to the file
+/// system by name, and the index has to live next to the values it names. Measured the other
+/// way: with the index and the file values on keys of their own (`wsmap`, `wf...`) both went to
+/// the 24 KB NVS, and five 256 KB writes were refused while the filesystem sat empty.
+pub const WORKSPACE_INDEX: &str = "ws.index";
 
-/// The key one workspace file's text lives under: `wf` plus twelve hex digits.
+/// The key one workspace file's text lives under: `ws.` plus twelve hex digits.
 ///
-/// Fourteen bytes, under NVS's fifteen-byte ceiling, because the store may be either backend
-/// and a key that only fits one of them is a bug waiting for a different build. A path is
-/// unbounded, so it is hashed (fnv-1a 64, truncated to 48 bits) rather than spelled out. Two
-/// paths that collide share a value; the index keeps the winner and the load says so, which is
-/// the same trade the transcript makes when a checksum fails.
+/// Fifteen bytes, the NVS ceiling, because the store may be either backend and a key that only
+/// fits one of them is a bug waiting for a different build. A path is unbounded, so it is
+/// hashed (fnv-1a 64, truncated to 48 bits) rather than spelled out. Two paths that collide
+/// share a value; the index keeps the winner and the load says so, which is the same trade the
+/// transcript makes when a checksum fails. The twelve hex digits cannot be mistaken for a chunk
+/// number, so the `ws.1`..`ws.N` cleanup cannot remove a file by accident.
 pub fn workspace_file(path: &str) -> String {
-    format!("wf{:012x}", fnv1a(path) & 0xffff_ffff_ffff)
+    format!("ws.{:012x}", fnv1a(path) & 0xffff_ffff_ffff)
 }
 
 /// fnv-1a, 64 bit: a hash for deciding whether two strings are the same, nothing more.
@@ -112,6 +115,8 @@ pub fn all() -> Vec<String> {
         keys.push(workspace_chunk(index));
         keys.push(transcript(index));
     }
+    // A workspace file's own key: `ws.` plus the widest hash the formatter can produce.
+    keys.push(workspace_file("/a path whose hash is ffffffffffff"));
     keys
 }
 
@@ -119,6 +124,29 @@ pub fn all() -> Vec<String> {
 mod tests {
     use super::*;
     use crate::store::KEY_MAX;
+
+    /// Every workspace key sits under the prefix the firmware routes to the filesystem.
+    ///
+    /// `SplitStore::is_file_key` matches `ws` and `ws.*` by name. A workspace key outside that
+    /// prefix goes to the 24 KB NVS instead, silently: measured on the board, five successive
+    /// 256 KB file writes were refused while the filesystem reported 9.5 KB used and megabytes
+    /// free. The routing rule lives in the firmware, so the contract is asserted here where the
+    /// keys are generated.
+    #[test]
+    fn every_workspace_key_is_routed_to_the_filesystem() {
+        for key in [
+            WORKSPACE.to_string(),
+            WORKSPACE_INDEX.to_string(),
+            workspace_file("/MEMORY.md"),
+            workspace_file("/skills/create-skill/SKILL.md"),
+        ] {
+            assert!(
+                key == "ws" || key.starts_with("ws."),
+                "`{key}` does not start with `ws.`, so the firmware would send it to NVS"
+            );
+            assert!(key.len() <= KEY_MAX, "`{key}` is {} bytes", key.len());
+        }
+    }
 
     /// The invariant, on the host: no name NVS has to hold is longer than it keeps.
     ///
