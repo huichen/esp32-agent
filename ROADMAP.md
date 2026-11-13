@@ -23,13 +23,15 @@ what is not done or not verified.
 - ✅ Model latency is outside the `App` lock: a turn in flight no longer queues the
   portal (historical bench: `/api/status` ≤ 253 ms while a 2.5 s model call runs)
 - ✅ Live journal over SSE (`/api/agent/stream`), `tool_progress`, `agent.tick_ms`
-- ✅ Bench board flashed on 2026-11-13 with the current tree and running it: commit
-  `d5d8927`, built `2026-11-13T15:03:23Z` (3,954,112-byte ELF; 3,004,848-byte app =
-  71.64% of the 4 MiB `factory` slot; 35 warnings, 20 duplicates, so the build is not
+- ✅ Bench board flashed on 2026-11-13 and running this tree: image built
+  `2026-11-13T15:10:52Z` from `84a85fe` (3,954,112-byte ELF; 3,004,848-byte app = 71.64%
+  of the 4 MiB `factory` slot; 35 warnings, 20 duplicates, so the build is not
   warning-free). Written over COM3 with `firmware/partitions.csv` passed explicitly.
-  `/api/status` answers from the board naming that commit, `agent.thread` is `running`,
-  station and setup AP are both up at 192.168.3.7. Idle pools: internal 149 kB free /
-  78 kB largest, DMA 142/78, PSRAM 7,813 kB free / 7,680 kB largest
+  `/api/status` names `84a85fe`, `agent.thread` is `running`, station and setup AP are both
+  up at 192.168.3.7, and the image lives in flash rather than in this checkout — so a
+  documentation-only commit after `84a85fe` changes the tree without changing the image,
+  and `/api/status` naming `84a85fe` is expected instead of a stale flash. Idle pools:
+  internal 149 kB free / 78 kB largest, DMA 142/78, PSRAM 7,813 kB free / 7,680 largest
 - ✅ On the board, after that flash: `shell time echo hi` returned the command's own answer
   plus `ms`, and `shell sleep 1` reported the 29,998 ms left of `agent.tool_timeout_s` —
   the configured budget reaches the device. Two calls are a smoke check, not a soak test

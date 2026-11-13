@@ -99,7 +99,7 @@ instrucción sirve para cada placa que pueda alcanzar. Sin ninguna clave, `base_
 |---|---|
 | `agent-core` | 840 pruebas unitarias y 5 de integración pasan; `scripts/smoke.ps1` pasa de extremo a extremo |
 | Simulador | la consola, MCP y el bucle de agente funcionan de extremo a extremo |
-| Firmware | firmware del banco grabado en una ESP32-S3-DevKitC-1 N16R8 (IDF v5.5.2) en el commit `d5d8927` (2026-11-13): 42 herramientas, OLED 128×32, micrófono y amplificador I²S, WS2812, consola TLS, turnos del modelo por HTTPS; lo que ese grabado no verificó está en `ROADMAP.md` |
+| Firmware | firmware del banco grabado en una ESP32-S3-DevKitC-1 N16R8 (IDF v5.5.2) desde el árbol `84a85fe` (2026-11-13): 42 herramientas, OLED 128×32, micrófono y amplificador I²S, WS2812, consola TLS, turnos del modelo por HTTPS; lo que ese grabado no verificó está en `ROADMAP.md` |
 | No implementado / no verificado | La captura DVP del firmware no está implementada. Los drivers SD de sectores sin procesar y DHT11/22 tienen pruebas en el host, no verificación en la placa. Ver `ROADMAP.md` |
 
 Números históricos del banco: un turno con cuatro herramientas en 13.7 s; consola por TLS en 0.55 s;
