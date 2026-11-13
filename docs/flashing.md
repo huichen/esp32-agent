@@ -75,6 +75,27 @@ Another chip: pass `-Mcpu esp32c3 -Target riscv32imc-esp-espidf` (`--mcpu esp32c
 `firmware/.cargo/config.toml` to match. `firmware/sdkconfig.defaults` is hand-edited (for
 example drop the PSRAM settings on a part without it).
 
+### Adding a component needs the esp-idf-sys build directory gone
+
+The storage partition is LittleFS, which arrives as an ESP component through
+`package.metadata.esp-idf-sys.extra_components` in `firmware/Cargo.toml`. esp-idf-sys generates
+its Rust bindings once per build directory, and a build directory that predates the component has
+bindings without it - so the symptom is a compile error, not a fetch:
+
+```
+error[E0433]: cannot find `littlefs` in `sys`
+```
+
+Delete the cached build and let it regenerate (the first build after this refetches the component
+and takes a few minutes):
+
+```bash
+rm -rf target/xtensa-esp32s3-espidf/release/build/esp-idf-sys-* \
+       target/xtensa-esp32s3-espidf/release/.fingerprint/esp-idf-sys-*
+```
+
+`firmware/components_esp32s3.lock` pins the component version, so the rebuild is reproducible.
+
 ### Do not let the flasher generate its own partition table
 
 Without `--partition-table`, `espflash flash <elf>` builds **its own single-partition
