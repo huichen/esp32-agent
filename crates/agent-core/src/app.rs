@@ -2864,6 +2864,7 @@ impl App {
     /// Returns the sources that were queued, in order.
     pub fn sched_tick(&mut self, at_ms: u64, minute_of_day: u32) -> Vec<String> {
         let mut fired = Vec::new();
+        let mut spent: Vec<String> = Vec::new();
         let mut dirty = false;
         for i in 0..self.tasks.len() {
             if !self.tasks[i].enabled || !crate::sched::due(&self.tasks[i], at_ms, minute_of_day) {
@@ -2872,6 +2873,13 @@ impl App {
             let source = format!("schedule:{}", self.tasks[i].id);
             let prompt = self.tasks[i].prompt.clone();
             let script = self.tasks[i].script.clone();
+            // A one-shot is done the moment it fires: "in ten seconds" is not a task the
+            // caller should have to remember to remove, and a task left behind would fire
+            // again on its next interval. Removed after the loop, because the loop is walking
+            // these indices.
+            if self.tasks[i].after_s > 0 {
+                spent.push(self.tasks[i].id.clone());
+            }
             self.tasks[i].last_run_ms = at_ms;
             dirty = true;
             if source.len() >= 64 {
@@ -2889,6 +2897,12 @@ impl App {
                 self.queue_user(&prompt, &source, at_ms);
                 self.log.info("agent", format!("queued {source}"));
                 fired.push(source);
+            }
+        }
+        if !spent.is_empty() {
+            self.tasks.retain(|t| !spent.contains(&t.id));
+            for id in &spent {
+                self.log.info("agent", format!("schedule: one-shot `{id}` fired and was removed"));
             }
         }
         let mut due_rules: Vec<(usize, String, String)> = Vec::new();
@@ -6607,6 +6621,7 @@ fn task_json(t: &ScheduledTask) -> Value {
         "id": t.id,
         "prompt": t.prompt,
         "script": t.script,
+        "after_s": t.after_s,
         "every_s": t.every_s,
         "at_hhmm": t.at_hhmm,
         "enabled": t.enabled,
@@ -6647,10 +6662,12 @@ fn schedule_string_fields(v: &Value, names: &[&str]) -> Result<()> {
 pub(crate) fn task_from_api(v: &Value, fallback_id: &str) -> Result<ScheduledTask> {
     schedule_string_fields(v, &["id", "prompt", "script", "at_hhmm"])?;
     let every_s = crate::json::optional_ranged_i64(v, "every_s", 0, 86_400)?.unwrap_or(0) as u32;
+    let after_s = crate::json::optional_ranged_i64(v, "after_s", 0, 86_400)?.unwrap_or(0) as u32;
     crate::json::optional_ranged_u64(v, "last_run_ms", 0, u64::MAX)?;
     let mut task = task_from(v, fallback_id)
         .ok_or_else(|| McpError::invalid_params("a task requires `prompt` or `script`"))?;
     task.every_s = every_s;
+    task.after_s = after_s;
     if let Some(why) = task_problem(&task) {
         return Err(McpError::invalid_params(why));
     }
@@ -6688,6 +6705,7 @@ fn task_from(v: &Value, fallback_id: &str) -> Option<ScheduledTask> {
     Some(ScheduledTask {
         id,
         prompt,
+        after_s: v.get("after_s").and_then(|a| a.as_u64()).unwrap_or(0).min(u32::MAX as u64) as u32,
         every_s: v.get("every_s").and_then(|e| e.as_u64()).unwrap_or(0).min(u32::MAX as u64) as u32,
         at_hhmm: v.get("at_hhmm").and_then(|a| a.as_str()).unwrap_or("").trim().to_string(),
         script: v.get("script").and_then(|s| s.as_str()).unwrap_or("").to_string(),
@@ -6706,8 +6724,19 @@ fn task_from(v: &Value, fallback_id: &str) -> Option<ScheduledTask> {
 /// What makes an edited task unusable, if anything. The scheduler needs exactly
 /// one trigger, and `at_hhmm` has to be a time a clock can reach.
 fn task_problem(t: &ScheduledTask) -> Option<String> {
+    if t.after_s > 0 {
+        // "in ten seconds" and "every ten seconds" are different requests; picking one
+        // silently is how a one-shot turns into a task that fires every ten seconds forever.
+        if t.every_s > 0 || !t.at_hhmm.is_empty() {
+            return Some(
+                "a one-shot task takes `after_s` alone: drop `every_s` and `at_hhmm` for a task that fires once"
+                    .to_string(),
+            );
+        }
+        return None;
+    }
     if t.every_s == 0 && t.at_hhmm.is_empty() {
-        return Some("a task needs `every_s` > 0 or `at_hhmm` (\"07:30\")".to_string());
+        return Some("a task needs `after_s` > 0, `every_s` > 0 or `at_hhmm` (\"07:30\")".to_string());
     }
     if !t.at_hhmm.is_empty() && !valid_hhmm(&t.at_hhmm) {
         return Some(format!("`at_hhmm` must be \"HH:MM\" between 00:00 and 23:59, got \"{}\"", t.at_hhmm));
@@ -11612,6 +11641,45 @@ mod tests {
             app.tasks.iter().map(|t| &t.id).collect::<std::collections::BTreeSet<_>>().len(),
             MAX_TASKS
         );
+    }
+
+    /// A one-shot task: the caller names it, it fires once on its own clock and then it is gone
+    /// — and a caller that asks for "in ten seconds" and "every ten seconds" at once is told
+    /// to pick one instead of silently getting a task that repeats forever.
+    #[test]
+    fn a_one_shot_task_fires_once_and_removes_itself() {
+        let mut app = test_app();
+        let added = app
+            .call_tool("schedule", &json!({"action":"add","id":"later","prompt":"say hi","after_s":5}))
+            .unwrap();
+        assert_eq!(added["id"], json!("later"), "the caller's id was not kept: {added}");
+        assert_eq!(added["one_shot"], json!(true), "{added}");
+
+        // The tool stamps the task's clock now, so a tick at the current instant must not fire it.
+        let now = crate::app::now_ms();
+        assert!(app.sched_tick(now, 0).is_empty(), "fired in the turn that created it");
+        let fired = app.sched_tick(now + 6_000, 0);
+        assert_eq!(fired, vec!["schedule:later".to_string()]);
+        assert!(
+            app.tasks.iter().all(|t| t.id != "later"),
+            "a one-shot task stayed behind and would fire again: {:?}",
+            app.tasks.iter().map(|t| t.id.clone()).collect::<Vec<_>>()
+        );
+
+        // Refusals: a duplicate id, a one-shot combined with a repeat, and an unaddressable id.
+        app.call_tool("schedule", &json!({"action":"add","id":"taken","prompt":"x","every_s":60})).unwrap();
+        for bad in [
+            json!({"action":"add","id":"taken","prompt":"y","every_s":60}),
+            json!({"action":"add","prompt":"y","after_s":30,"every_s":60}),
+            json!({"action":"add","prompt":"y","after_s":30,"at_hhmm":"07:30"}),
+            json!({"action":"add","prompt":"y","after_s":0}),
+            json!({"action":"add","id":"two words","prompt":"y","every_s":60}),
+        ] {
+            let before = app.tasks.clone();
+            let err = app.call_tool("schedule", &bad).unwrap_err();
+            assert_eq!(err.code, code::INVALID_PARAMS, "{bad}: {err:?}");
+            assert_eq!(app.tasks, before, "{bad} mutated the schedule");
+        }
     }
 
     #[test]

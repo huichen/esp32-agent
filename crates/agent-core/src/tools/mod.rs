@@ -380,7 +380,11 @@ pub fn system_tools() -> Vec<ToolDef> {
         }),
         ToolDef::new(
             "schedule",
-            "Manage the board's own schedule: `action` is list, add, remove, enable or disable. A task re-runs a prompt every `every_s` seconds or daily at `at_hhmm`, and fires into the same queue a user message uses — the board works on its own. Every task is recurring: there is no \"run once in N seconds\", so a request for a one-off belongs in `script` or a direct tool call, and a task created for one is one the caller has to remove afterwards.",
+            "The board's own calendar, run without a host: `action` is list, add, remove, enable or disable. \
+             A task either repeats (`every_s`), runs daily at a wall-clock time (`at_hhmm`, UTC), or fires \
+             once and removes itself (`after_s`). What it does is a prompt for the board's model or a small \
+             `script` that costs no tokens. A fired task lands in the same queue as a user message, so the \
+             board works on its own and its answer arrives in the transcript.",
         )
         .title("Schedule")
         .category("system")
@@ -389,8 +393,13 @@ pub fn system_tools() -> Vec<ToolDef> {
         .schema(object_schema(
             &[
                 ("action", enumeration(&["list", "add", "remove", "enable", "disable"], "what to do")),
-                ("id", string("task id (remove/enable/disable)")),
-                ("prompt", string("what to ask when it fires")),
+                (
+                    "id",
+                    string("task id: `add` uses it when given (else one is derived), the others require it"),
+                ),
+                ("prompt", string("what to ask the board's model when it fires")),
+                ("script", string("a board script to run instead of asking the model; costs no tokens")),
+                ("after_s", integer(1, 86_400, "fire once this many seconds from now, then remove the task")),
                 ("every_s", integer(0, 86_400, "repeat every N s; 0 = use at_hhmm")),
                 ("at_hhmm", string("daily \"07:30\" (UTC)")),
                 ("enabled", boolean("default true")),
@@ -404,6 +413,8 @@ pub fn system_tools() -> Vec<ToolDef> {
                     "tasks": ctx.tasks.iter().map(|t| json!({
                         "id": t.id,
                         "prompt": t.prompt,
+                        "script": t.script,
+                        "after_s": t.after_s,
                         "every_s": t.every_s,
                         "at_hhmm": t.at_hhmm,
                         "enabled": t.enabled,
@@ -414,18 +425,37 @@ pub fn system_tools() -> Vec<ToolDef> {
                     if ctx.tasks.len() >= crate::app::MAX_TASKS {
                         return Err(McpError::invalid_params(format!("at most {} scheduled tasks", crate::app::MAX_TASKS)));
                     }
-                    // The id is derived, not asked for, and remains unique after removals.
-                    let id = crate::app::next_schedule_task_id(ctx.tasks);
+                    // A caller that names the task keeps that name: it can then `remove` or
+                    // `enable` it without reading this response first, and adding it twice is a
+                    // refusal instead of a second task nobody can address. Without a name the
+                    // id is derived, and stays unique after removals.
+                    let id = match j::opt_str(args, "id").map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) {
+                        Some(id) => {
+                            if id.len() > 32 || id.chars().any(|c| c.is_whitespace() || c.is_control()) {
+                                return Err(McpError::invalid_params(
+                                    "`id` is at most 32 characters and holds no spaces",
+                                ));
+                            }
+                            if ctx.tasks.iter().any(|t| t.id == id) {
+                                return Err(McpError::invalid_params(format!(
+                                    "task `{id}` already exists: use `remove`, or `add` with another id"
+                                )));
+                            }
+                            id
+                        }
+                        None => crate::app::next_schedule_task_id(ctx.tasks),
+                    };
                     let mut input = args.clone();
                     input["id"] = json!(id);
                     // The tool creates a new task, so its clock always starts now. An
                     // existing REST edit/replacement may instead preserve its old clock.
                     input["last_run_ms"] = json!(crate::app::now_ms());
                     let task = crate::app::task_from_api(&input, &id)?;
+                    let one_shot = task.after_s > 0;
                     ctx.tasks.push(task);
                     ctx.runtime.sched_dirty = true;
                     ctx.log.info("agent", format!("schedule: task `{id}` added from a tool call"));
-                    Ok(json!({ "ok": true, "id": id, "count": ctx.tasks.len() }))
+                    Ok(json!({ "ok": true, "id": id, "count": ctx.tasks.len(), "one_shot": one_shot }))
                 }
                 "remove" | "enable" | "disable" => {
                     let id = j::opt_str(args, "id").unwrap_or_default();

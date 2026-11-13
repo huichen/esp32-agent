@@ -21,7 +21,9 @@ use serde_json::Value;
 
 /// A prompt that the scheduler pushes into the agent queue on a timer.
 ///
-/// `every_s > 0` wins over `at_hhmm`; with both empty/zero the task never fires.
+/// A task has exactly one trigger: `after_s` (fire once, then the task is gone), `every_s`
+/// (repeat) or `at_hhmm` (once a day). With none of them the task never fires, and the API
+/// edge refuses it rather than storing a task that will never run.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq)]
 #[serde(default)]
 pub struct ScheduledTask {
@@ -34,6 +36,11 @@ pub struct ScheduledTask {
     /// relay every five minutes can be scheduled without paying for a chat turn. When both
     /// are set the script wins, and the prompt is kept as documentation of the intent.
     pub script: String,
+    /// Fire once, this many seconds after the task was created (or last edited), then remove
+    /// it. `0` = not a one-shot. Takes the place of `every_s`/`at_hhmm` rather than
+    /// combining with them: "in ten seconds" and "every ten seconds" are different requests,
+    /// and a task that carried both would have to pick one silently.
+    pub after_s: u32,
     /// Interval in seconds; `0` = use `at_hhmm`.
     pub every_s: u32,
     /// Local daily time, `"07:30"` or `""`.
@@ -51,6 +58,7 @@ impl Default for ScheduledTask {
             id: String::new(),
             prompt: String::new(),
             script: String::new(),
+            after_s: 0,
             every_s: 0,
             at_hhmm: String::new(),
             enabled: true,
@@ -119,6 +127,8 @@ pub fn parse_hhmm(at: &str) -> Option<u32> {
 /// Should `task` run now?
 ///
 /// * disabled, or no schedule at all -> never;
+/// * `after_s > 0` -> once, `after_s` seconds after the task's clock started; the scheduler
+///   tick removes the task as it fires, so this returns true only for that one tick;
 /// * `every_s > 0` -> at least `every_s` seconds since the last run;
 /// * otherwise `at_hhmm` -> once per day, on that minute, at least a minute after
 ///   the previous run.
@@ -127,6 +137,9 @@ pub fn due(task: &ScheduledTask, now_ms: u64, now_min_of_day: u32) -> bool {
         return false;
     }
     let since_last = now_ms.saturating_sub(task.last_run_ms);
+    if task.after_s > 0 {
+        return since_last >= (task.after_s as u64).saturating_mul(1000);
+    }
     if task.every_s > 0 {
         let interval = (task.every_s as u64).saturating_mul(1000);
         return since_last >= interval;
@@ -242,6 +255,9 @@ mod tests {
             id: "t1".into(),
             prompt: "report temperature".into(),
             script: String::new(),
+            // The trigger under test is the argument; a case that wants a one-shot sets
+            // `after_s` itself (see `a_one_shot_task_fires_once_after_its_interval`).
+            after_s: 0,
             every_s,
             at_hhmm: at_hhmm.into(),
             enabled: true,
@@ -331,6 +347,24 @@ mod tests {
         let empty = task(0, "", 0);
         assert!(!due(&empty, 10_000_000, 450));
         assert!(!due(&task(0, "7:30", 0), 10_000_000, 449));
+    }
+
+    #[test]
+    fn a_one_shot_task_fires_once_after_its_interval() {
+        // Stamped at creation by `task_from`, so "in ten seconds" means ten seconds after the
+        // task was made, not ten seconds after boot.
+        let created = 5_000;
+        let once = ScheduledTask { after_s: 10, prompt: "ping".into(), ..task(0, "", created) };
+        assert!(!due(&once, created, 0), "fired in the turn that created it");
+        assert!(!due(&once, created + 9_999, 0), "fired a millisecond early");
+        assert!(due(&once, created + 10_000, 0));
+
+        // The tick removes a one-shot as it fires, so this is the only tick that sees it.
+        // What still matters here is that a one-shot is not a daily task: no minute of the
+        // day makes it due, and `every_s`/`at_hhmm` are refused at the API edge when
+        // `after_s` is set (`task_problem`), so this is the hole a bug would leave.
+        let disabled = ScheduledTask { enabled: false, ..once.clone() };
+        assert!(!due(&disabled, created + 60_000, 0));
     }
 
     #[test]
