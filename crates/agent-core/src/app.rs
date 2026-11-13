@@ -3055,6 +3055,9 @@ impl App {
     /// connection outlives this call. The app lock is taken per poll, never for the
     /// life of the stream - that is the property the whole design is for.
     fn agent_stream(&mut self, req: &Request) -> Response {
+        if let Err(r) = self.require_read(req) {
+            return r;
+        }
         let after = req.query_get("after").and_then(|v| v.trim().parse().ok()).unwrap_or(0u64);
         let resp = self.agent_stream_from(after, StreamLimits::default());
         if resp.is_stream() {
@@ -3664,6 +3667,9 @@ impl App {
                     "this endpoint uses the POST-only Streamable HTTP transport; open / for the config page",
                 ),
                 "DELETE" => {
+                    if let Err(r) = self.require_mcp(req) {
+                        return self.with_cors(r);
+                    }
                     let sid = req.header("mcp-session-id").unwrap_or("");
                     self.runtime.sessions.retain(|s| s.id != sid);
                     Response::empty(204)
@@ -3786,6 +3792,9 @@ impl App {
             // The run journal, with the host agent's event names. A client polls it
             // with `?after=<seq>` exactly like the transcript.
             ("GET", "/api/agent/events") => {
+                if let Err(r) = self.require_read(req) {
+                    return r;
+                }
                 let after = req.query_get("after").and_then(|v| v.parse().ok()).unwrap_or(0u64);
                 Response::json(&self.agent.events_json(after))
             }
@@ -3950,6 +3959,9 @@ impl App {
                 Response::json(&out)
             }
             ("GET", path) if path.starts_with("/api/script/") => {
+                if let Err(r) = self.require_read(req) {
+                    return r;
+                }
                 let id = &path["/api/script/".len()..];
                 match self.script_job(id) {
                     Some(job) => Response::json(&json!({
@@ -4008,6 +4020,9 @@ impl App {
                 Response::json(&json!({ "ok": true, "note": "credentials cleared" }))
             }
             ("GET", "/api/logs") => {
+                if let Err(r) = self.require_read(req) {
+                    return r;
+                }
                 let n = req.query_get("n").and_then(|v| v.parse().ok()).unwrap_or(80usize);
                 let since = req.query_get("since").and_then(|v| v.parse().ok()).unwrap_or(0u64);
                 let mut v = self.log.to_json(n.min(400), since);
@@ -4171,7 +4186,10 @@ impl App {
             .map(|v| v.trim().to_string())
             .unwrap_or_default();
         if bearer.is_empty() {
-            return false;
+            // EventSource cannot set Authorization. Only a minted short-lived portal
+            // token is accepted in the URL, and only for a non-mutating read.
+            return matches!(req.method.as_str(), "GET" | "HEAD")
+                && req.query_get("token").is_some_and(|token| self.runtime.token_valid(token, now_ms()));
         }
         if bearer == pin {
             return true;
@@ -4194,25 +4212,31 @@ impl App {
         Err(Response::json_status(401, &json!({ "error": "PIN required", "pin_required": true })))
     }
 
-    fn handle_mcp_post(&mut self, req: &Request) -> Response {
+    /// POST and DELETE share both the service switch and the bearer requirement.
+    fn require_mcp(&mut self, req: &Request) -> std::result::Result<(), Response> {
         if !self.cfg.mcp.enabled {
-            return Response::error_json(503, "MCP service is disabled in the configuration");
+            return Err(Response::error_json(503, "MCP service is disabled in the configuration"));
         }
-        if !self.cfg.auth.mcp_token.is_empty() {
-            let ok = req
-                .header("authorization")
-                .map(|a| {
-                    a.trim_start_matches("Bearer ").trim_start_matches("bearer ").trim()
-                        == self.cfg.auth.mcp_token
-                })
-                .unwrap_or(false);
-            if !ok {
-                self.runtime.counters.auth_failures += 1;
-                return Response::json_status(401, &json!({ "error": "missing or wrong bearer token" }))
-                    .with_header("WWW-Authenticate", "Bearer");
-            }
+        if self.cfg.auth.mcp_token.is_empty() {
+            return self.require_pin(req);
         }
+        let ok = req.header("authorization").and_then(|a| a.trim().split_once(' ')).is_some_and(
+            |(scheme, token)| {
+                scheme.eq_ignore_ascii_case("Bearer") && token.trim() == self.cfg.auth.mcp_token
+            },
+        );
+        if ok {
+            return Ok(());
+        }
+        self.runtime.counters.auth_failures += 1;
+        Err(Response::json_status(401, &json!({ "error": "missing or wrong bearer token" }))
+            .with_header("WWW-Authenticate", "Bearer"))
+    }
 
+    fn handle_mcp_post(&mut self, req: &Request) -> Response {
+        if let Err(r) = self.require_mcp(req) {
+            return r;
+        }
         let body = req.body_str();
         if body.trim().is_empty() {
             return Response::error_json(400, "empty body: send a JSON-RPC request");
@@ -9869,7 +9893,7 @@ mod tests {
     fn the_stream_route_answers_text_event_stream_without_a_pin() {
         let shared = shared_app();
         let resp = shared.lock().unwrap().route(&get("/api/agent/stream?after=0"));
-        assert_eq!(resp.status, 200, "no pin gate, like the transcript");
+        assert_eq!(resp.status, 200, "a board without a PIN keeps the stream open");
         assert!(resp.is_stream(), "the body is written after the headers");
         let header = |name: &str| {
             resp.headers.iter().find(|(k, _)| k == name).map(|(_, v)| v.clone()).unwrap_or_default()
@@ -9880,6 +9904,19 @@ mod tests {
         // Dropping the response without running the body still frees the slot.
         drop(resp);
         assert_eq!(shared.lock().unwrap().active_event_streams(), 0);
+        let mut app = shared.lock().unwrap();
+        app.cfg.auth.portal_pin = "1234".into();
+        assert_eq!(app.route(&get("/api/agent/stream")).status, 401);
+        assert_eq!(app.active_event_streams(), 0, "a refusal must not acquire a stream slot");
+        let token = body_json(&app.route(&post("/api/auth", r#"{"pin":"1234"}"#)))["token"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let mut req = get("/api/agent/stream");
+        req.query.insert("token".into(), token);
+        assert_eq!(app.route(&req).status, 200, "EventSource can use a minted portal token");
+        req.query.insert("token".into(), "1234".into());
+        assert_eq!(app.route(&req).status, 401, "the token parameter must not accept a raw PIN");
     }
 
     #[test]
@@ -10136,6 +10173,14 @@ mod tests {
         assert_eq!(app.route(&get("/api/agent/history")).status, 401);
         assert_eq!(app.route(&get("/api/config")).status, 401);
         assert_eq!(app.route(&get("/api/agent/prompt")).status, 401);
+        for path in ["/api/agent/events", "/api/agent/stream", "/api/logs", "/api/script/missing"] {
+            assert_eq!(app.route(&get(path)).status, 401, "{path} exposes conversation or script output");
+        }
+        assert_eq!(
+            app.route(&post("/mcp", r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#)).status,
+            401,
+            "an unset MCP token must not bypass the configured portal PIN"
+        );
         assert_eq!(app.route(&get("/api/sched")).status, 200);
         assert!(app.tasks.is_empty(), "an unauthorised write got through");
         assert!(app.agent.history.is_empty());
@@ -10163,6 +10208,23 @@ mod tests {
         let mut read = get("/api/config");
         read.headers.insert("authorization".into(), format!("Bearer {token}"));
         assert_eq!(app.route(&read).status, 200, "and a read that needs the credential");
+        for path in ["/api/agent/events", "/api/logs"] {
+            read.path = path.into();
+            assert_eq!(app.route(&read).status, 200, "{path}");
+        }
+        let mut mcp = post("/mcp", r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#);
+        mcp.headers.insert("authorization".into(), format!("Bearer {token}"));
+        assert_eq!(
+            app.route(&mcp).status,
+            200,
+            "a portal credential works when no dedicated MCP token is set"
+        );
+        read = get("/api/config");
+        read.query.insert("token".into(), token.clone());
+        assert_eq!(app.route(&read).status, 200);
+        let mut query_write = post("/api/agent/reset", "{}");
+        query_write.query.insert("token".into(), token);
+        assert_eq!(app.route(&query_write).status, 401, "URL tokens authorize reads only");
 
         let mut forged = get("/api/config");
         forged.headers.insert("authorization".into(), "Bearer 0000000000000000".into());
@@ -13248,7 +13310,23 @@ mod tests {
         req.headers.insert("authorization".into(), "Bearer tok".into());
         let resp = app.route(&req);
         assert_eq!(resp.status, 200);
-        assert!(resp.headers.iter().any(|(k, _)| k == "Mcp-Session-Id"));
+        let sid = resp.headers.iter().find(|(k, _)| k == "Mcp-Session-Id").unwrap().1.clone();
+        req.method = "DELETE".into();
+        req.body.clear();
+        req.headers.insert("mcp-session-id".into(), sid.clone());
+        for credential in [None, Some("tok"), Some("Basic tok"), Some("Bearer wrong")] {
+            req.headers.remove("authorization");
+            if let Some(value) = credential {
+                req.headers.insert("authorization".into(), value.into());
+            }
+            assert_eq!(app.route(&req).status, 401, "{credential:?} bypassed session deletion auth");
+            assert!(app.runtime.sessions.iter().any(|s| s.id == sid));
+        }
+        req.headers.insert("authorization".into(), "bearer tok".into());
+        assert_eq!(app.route(&req).status, 204);
+        assert!(!app.runtime.sessions.iter().any(|s| s.id == sid));
+        app.cfg.mcp.enabled = false;
+        assert_eq!(app.route(&req).status, 503, "disabled MCP must refuse every mutating method");
     }
 
     #[test]
