@@ -3,7 +3,7 @@
 //!
 //! The storage itself is not this module's business. [`Workspace`] is the whole
 //! surface the tools need, so the same tools run against the in-RAM map that the
-//! firmware persists in NVS today and against a flash filesystem later.
+//! firmware persists as one LittleFS value per file.
 //!
 //! Paths are absolute-ish: `/` is the root, `/notes/a.txt` is a file in it, and a
 //! path without a leading `/` is read as if it had one (`notes/a.txt` ==
@@ -16,9 +16,8 @@
 
 use serde_json::{json, Value};
 
-/// Largest file this layer accepts. The board keeps the whole workspace in RAM
-/// (<= 8 KB), so a single file may take a quarter of it.
-/// The most text one workspace file may hold.
+/// The most text one workspace file may hold. The workspace still lives in RAM,
+/// even though its persistent copy lives on LittleFS.
 ///
 /// It was 2048 because the whole workspace was a 17.5 KB blob over five NVS values. The
 /// workspace is a file on a 12 MB filesystem now, so this is the number a person would expect
@@ -152,7 +151,7 @@ pub fn specs() -> Value {
         ),
         function(
             "fs_write",
-            "Create or overwrite a text file in the board workspace. Parent directories are created implicitly. Files are limited to 2048 bytes.",
+            &format!("Create or overwrite a text file in the board workspace. Parent directories are created implicitly. Files are limited to {MAX_FILE_BYTES} bytes."),
             params(
                 json!({
                     "path": { "type": "string", "description": "file path to write" },

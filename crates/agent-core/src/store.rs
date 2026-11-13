@@ -478,11 +478,10 @@ pub struct Refusal {
 /// **Where each number comes from**, because a reader has to be able to tell a measured figure
 /// from a derived one:
 ///
-/// * `Bytes.total` and `Bytes.used` are what the backend reports: on SPIFFS,
-///   `esp_spiffs_info()`, which is `SPIFFS_info()`. Its `total` is not the partition size - it is
-///   `(blocks - 2) * (pages_per_block - lookup_pages) + 1` data pages times the data page size,
-///   i.e. the 12 517 376-byte partition minus two spare blocks and the object-lookup pages. On
-///   this board that is 45 811 * 251 = 11 498 561, which is what `/api/status` shows.
+/// * `Bytes.total` and `Bytes.used` are what the filesystem backend reports. The firmware
+///   uses `esp_littlefs_info()`: configured block count * block size for total and
+///   `lfs_fs_size()` * block size for used. The former SPIFFS data-page capacity formula
+///   does not describe LittleFS; see `docs/storage.md` for the dependency evidence.
 /// * `Bytes.free` and `Entries.free_bytes` are **computed here** as `total - used`. No backend
 ///   reports a "free" number; saying so is the point of this note.
 /// * `Entries.used/free/total` are `nvs_get_stats()`'s `nvs_stats_t`, counted in 32-byte entries.
@@ -992,6 +991,60 @@ impl std::io::Read for QueueReader<'_> {
     }
 }
 
+/// A retained file handle for sequential reads. A mutation must invalidate it
+/// before rename or unlink: ESP LittleFS refuses those operations on open paths.
+#[derive(Debug, Default)]
+pub struct FileReadCache(std::cell::RefCell<Option<(PathBuf, std::fs::File)>>);
+
+impl FileReadCache {
+    pub fn invalidate(&self, path: &std::path::Path) {
+        let mut slot = self.0.borrow_mut();
+        if matches!(&*slot, Some((open, _)) if open == path) {
+            *slot = None;
+        }
+    }
+
+    pub fn read_at(&self, path: &std::path::Path, offset: usize, buf: &mut [u8]) -> std::io::Result<usize> {
+        use std::io::{Read, Seek, SeekFrom};
+        let mut slot = self.0.borrow_mut();
+        if !matches!(&*slot, Some((open, _)) if open == path) {
+            *slot = None;
+            *slot = Some((path.to_path_buf(), std::fs::File::open(path)?));
+        }
+        let (_, file) = slot.as_mut().expect("the file was just opened");
+        file.seek(SeekFrom::Start(offset as u64))?;
+        file.read(buf)
+    }
+}
+
+/// Recover the backup made by older filesystem stores. An existing published
+/// value always wins; only a genuinely missing value may be restored. Metadata
+/// errors are not treated as absence, and failed cleanup preserves the backup.
+pub fn recover_file_backup(path: &std::path::Path, backup: &std::path::Path) -> std::io::Result<bool> {
+    match path.metadata() {
+        Ok(_) => {
+            std::fs::remove_file(backup)?;
+            Ok(false)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::rename(backup, path)?;
+            Ok(true)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// File-backed keys are single, short names, never paths or recovery suffixes.
+pub fn is_file_store_key(key: &str) -> bool {
+    !key.is_empty()
+        && key.len() <= KEY_MAX
+        && key != "."
+        && key != ".."
+        && !key.ends_with(".tmp")
+        && !key.ends_with(".old")
+        && key.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+}
+
 /// In-memory store: used by tests and by a simulator run started without a
 /// state file.
 #[derive(Debug, Default)]
@@ -1244,6 +1297,53 @@ mod tests {
         assert_eq!(s.get("a").as_deref(), Some("1"));
         assert!(s.remove("a"));
         assert_eq!(s.get("a"), None);
+    }
+
+    #[test]
+    fn a_file_read_cache_is_invalidated_before_replace_or_remove() {
+        let dir = std::env::temp_dir().join(format!("store-cache-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("ws");
+        let tmp = dir.join("ws.tmp");
+        std::fs::write(&path, b"old").unwrap();
+        let cache = FileReadCache::default();
+        let mut buf = [0u8; 3];
+        assert_eq!(cache.read_at(&path, 0, &mut buf).unwrap(), 3);
+        assert_eq!(&buf, b"old");
+        cache.invalidate(&path);
+        std::fs::write(&tmp, b"new").unwrap();
+        std::fs::rename(&tmp, &path).unwrap();
+        assert_eq!(cache.read_at(&path, 0, &mut buf).unwrap(), 3);
+        assert_eq!(&buf, b"new");
+        cache.invalidate(&path);
+        std::fs::remove_file(&path).unwrap();
+        assert!(cache.read_at(&path, 0, &mut buf).is_err());
+        for key in crate::keys::all() {
+            assert!(is_file_store_key(&key), "{key}");
+        }
+        for bad in ["", ".", "..", "../ws", "ws/../x", "C:ws", "ws.tmp", "ws.old", "x\0y"] {
+            assert!(!is_file_store_key(bad), "{bad:?}");
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn recovery_never_overwrites_a_published_value_with_its_backup() {
+        let dir = std::env::temp_dir().join(format!("store-recovery-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("ws");
+        let old = dir.join("ws.old");
+        std::fs::write(&path, b"new").unwrap();
+        std::fs::write(&old, b"old").unwrap();
+        assert!(!recover_file_backup(&path, &old).unwrap());
+        assert_eq!(std::fs::read(&path).unwrap(), b"new");
+        assert!(!old.exists());
+        std::fs::remove_file(&path).unwrap();
+        std::fs::write(&old, b"old").unwrap();
+        assert!(recover_file_backup(&path, &old).unwrap());
+        assert_eq!(std::fs::read(&path).unwrap(), b"old");
+        assert!(!old.exists());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
