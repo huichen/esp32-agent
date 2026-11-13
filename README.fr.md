@@ -62,8 +62,8 @@ n'a besoin de rien d'autre.
 ## Donnez-lui un modèle
 
 Ouvrez `http://<board>/`, panneau **Agent**, saisissez le point d'entrée, l'identifiant du
-modèle et la clé, enregistrez. La clé est en écriture seule : elle va en NVS et se relit
-`__set__`. Le même panneau porte `protocol` (`chat`, `responses` ou `anthropic`), `reasoning`,
+modèle et la clé, enregistrez. La clé est en écriture seule : elle va en NVS et les lectures
+indiquent `api_key_set`, pas la clé. Le même panneau porte `protocol` (`chat`, `responses` ou `anthropic`), `reasoning`,
 `context_tokens` et `max_output_tokens`.
 
 **Ou laissez un agent le faire.** Une fois qu'un agent a récupéré `agent.json`, il connaît ces
@@ -80,11 +80,11 @@ pour chaque carte qu'il peut joindre. Sans aucune clé, `base_url` sur
 ## Notes de sécurité
 
 - **Les identifiants restent sur la carte.** Le WiFi passe en NVS par `provision`, jamais dans
-  l’image ; `api_key` est en écriture seule et se relit `__set__`.
+  l’image ; `api_key` est en écriture seule et les lectures indiquent seulement `api_key_set`.
 - **Définissez les deux identifiants avant que la carte ne quitte votre bureau.** `auth.portal_pin`
-  protège les écritures REST et les lectures de la configuration, du transcript, du prompt,
-  de l’espace de travail et des pièces jointes. Les journaux et le journal d’exécution restent
-  actuellement ouverts. MCP utilise son propre `auth.mcp_token`, pas le PIN de la console.
+  protège les écritures REST et les lectures de la configuration, de la planification, du transcript, du prompt,
+  de l’espace de travail, des pièces jointes, des journaux, du journal d’exécution et des résultats
+  de scripts. MCP utilise `auth.mcp_token` ; s’il n’est pas défini, l’identifiant de la console s’applique.
 - **Comparez le certificat.** Celui de la carte est auto-signé ; son empreinte est sur
   `GET /api/tls`. Le port 80 est ouvert par défaut : un mauvais certificat coûte une URL, pas la carte ; `mcp.plain_http: false` le ferme, et le câble USB devient alors la seule voie de retour.
 - **`shell`, `script` et les outils du manifeste bougent des broches.** C’est le but de la carte ;

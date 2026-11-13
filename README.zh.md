@@ -55,7 +55,7 @@ Windows 上使用 `powershell -File scripts/build-firmware.ps1 -Flash -Port COM3
 ## 给它一个模型
 
 打开 `http://<board>/`，进 **Agent** 面板，填端点、模型 id 和密钥，保存。密钥只写：进 NVS，
-读回来是 `__set__`。同一个面板里有 `protocol`（`chat`、`responses` 或 `anthropic`）、
+读操作返回 `api_key_set`，不返回密钥。同一个面板里有 `protocol`（`chat`、`responses` 或 `anthropic`）、
 `reasoning`、`context_tokens` 和 `max_output_tokens`。
 
 **或者交给 agent 去做。** agent 取过 `agent.json` 之后就知道这些设置项、它们的类型和默认值，
@@ -70,10 +70,10 @@ agent 用 `POST /api/agent/config` 写进去——和面板发的是同一个调
 
 ## 安全须知
 
-- **凭据只留在板上。** WiFi 通过 `provision` 写进 NVS，不烧进镜像；`api_key` 只写，读回来是 `__set__`。
-- **板子离开你的桌子之前设好两种凭据。** `auth.portal_pin` 守住 REST 写操作，以及配置、会话记录、
-  提示词、工作区与附件的读操作。日志和运行事件目前仍可公开读取。MCP 使用独立的 `auth.mcp_token`，
-  不使用控制台 PIN。
+- **凭据只留在板上。** WiFi 通过 `provision` 写进 NVS，不烧进镜像；`api_key` 只写，读操作只报告 `api_key_set`。
+- **板子离开你的桌子之前设好两种凭据。** `auth.portal_pin` 守住 REST 写操作，以及配置、调度、会话记录、
+  提示词、工作区、附件、日志、运行事件和脚本结果的读操作。MCP 使用 `auth.mcp_token`；未设置时，
+  回退到控制台凭据。
 - **核对证书。** 板子的 TLS 证书是自签的，指纹在 `GET /api/tls`。80 端口默认保持开着，证书坏了只损失一个 URL，不是整块板；把 `mcp.plain_http` 设为 false 就关掉它，那时唯一的退路是 USB 线。
 - **`shell`、`script` 与清单工具会动引脚。** 这正是这块板的意义；为每种接口配置对应的凭据，才能区分授权调用方与路人。
 

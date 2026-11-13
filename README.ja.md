@@ -58,7 +58,8 @@ Windows では `powershell -File scripts/build-firmware.ps1 -Flash -Port COM3` �
 ## モデルを設定する
 
 `http://<board>/` を開き、**Agent** を選び、エンドポイント、モデル id、キーを入力して保存します。
-キーは書き込み専用です。NVS に保存され、読み出すと `__set__` が返ります。同じパネルで
+キーは書き込み専用です。NVS に保存され、読み出すとキーではなく `api_key_set` が返ります。
+同じパネルで
 `protocol`（`chat`、`responses`、`anthropic` のいずれか）、`reasoning`、`context_tokens`、
 `max_output_tokens` も設定できます。
 
@@ -76,11 +77,11 @@ Windows では `powershell -File scripts/build-firmware.ps1 -Flash -Port COM3` �
 ## 安全上の注意
 
 - **認証情報はボード上に留まります。** WiFi の認証情報は `provision` を通じて NVS に保存され、
-  イメージには入りません。`api_key` は書き込み専用で、読み出すと `__set__` が返ります。
+  イメージには入りません。`api_key` は書き込み専用で、読み出しでは `api_key_set` のみを返します。
 - **ボードを手元から離す前に両方の認証情報を設定してください。** `auth.portal_pin` は REST の
-  書き込みと、設定、会話記録、プロンプト、ワークスペース、添付ファイルの読み出しを保護します。
-  ログと実行ジャーナルは現在、認証なしで読めます。MCP はコンソールの PIN ではなく、専用の
-  `auth.mcp_token` を使います。
+  書き込みと、設定、スケジュール、会話記録、プロンプト、ワークスペース、添付ファイル、ログ、実行ジャーナル、
+  スクリプト結果の読み出しを保護します。MCP は `auth.mcp_token` を使い、未設定なら
+  コンソールの認証情報にフォールバックします。
 - **証明書を照合してください。** ボードの TLS 証明書は自己署名で、フィンガープリントは
   `GET /api/tls` で確認できます。ポート 80 は既定で開いたままなので、証明書に問題があっても
   失うのは一つの URL であって、ボードへのアクセスそのものではありません。`mcp.plain_http: false`
