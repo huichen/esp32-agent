@@ -43,6 +43,38 @@ pub struct ToolCtx<'a> {
     pub rules: &'a mut Vec<crate::sched::SensorRule>,
 }
 
+/// The explicit disable that applies to a name, including supported legacy aliases.
+/// Listing profiles and generic/family folding are not execution permissions.
+pub fn disabled_tool<'a>(cfg: &'a Config, name: &str) -> Option<&'a str> {
+    let command = name.strip_prefix("shell_").unwrap_or(name);
+    let aliases: &[&str] = match command {
+        "read" | "fs_read" => &["read", "fs_read"],
+        "write" | "fs_write" => &["write", "fs_write"],
+        "edit" | "fs_edit" => &["edit", "fs_edit"],
+        "nslookup" | "net_dns" => &["nslookup", "net_dns"],
+        "nc" | "net_tcp" => &["nc", "net_tcp"],
+        "net_get" => &["net_get", "curl"],
+        "net_post" => &["net_post", "curl"],
+        _ => &[],
+    };
+    cfg.mcp
+        .disabled_tools
+        .iter()
+        .find(|disabled| {
+            disabled.as_str() == name || disabled.as_str() == command || aliases.contains(&disabled.as_str())
+        })
+        .map(String::as_str)
+}
+
+pub fn ensure_tool_enabled(cfg: &Config, name: &str) -> Result<()> {
+    match disabled_tool(cfg, name) {
+        Some(disabled) => Err(crate::error::McpError::forbidden(format!(
+            "tool `{name}` is disabled by `{disabled}` in `mcp.disabled_tools`"
+        ))),
+        None => Ok(()),
+    }
+}
+
 pub type ToolHandler = Box<dyn for<'a> Fn(&mut ToolCtx<'a>, &Value) -> Result<Value> + Send + Sync>;
 
 #[derive(Clone)]
