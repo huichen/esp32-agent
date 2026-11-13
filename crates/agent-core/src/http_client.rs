@@ -7,7 +7,7 @@
 
 use std::io::{BufRead, BufReader, Read};
 use std::net::{TcpStream, ToSocketAddrs};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 pub const MAX_HEADER_BYTES: usize = 16 * 1024;
 pub const MAX_BODY_BYTES: usize = 64 * 1024;
@@ -77,14 +77,20 @@ impl Target {
         }
     }
 
-    /// Resolve once, then try each candidate with a bounded connect wait.
+    /// Resolve once, then share a bounded connect budget across all candidates.
+    /// Name resolution itself is controlled by the platform's resolver.
     pub fn connect(&self, timeout: Duration) -> Result<TcpStream, String> {
+        let started = Instant::now();
         let addrs = (self.host.as_str(), self.port)
             .to_socket_addrs()
             .map_err(|e| format!("could not resolve `{}`: {e}", self.host_header()))?;
         let mut last = format!("`{}` resolved to no address", self.host_header());
         for addr in addrs {
-            match TcpStream::connect_timeout(&addr, timeout) {
+            let remaining = timeout.saturating_sub(started.elapsed());
+            if remaining.is_zero() {
+                return Err(format!("connecting to `{}` timed out", self.host_header()));
+            }
+            match TcpStream::connect_timeout(&addr, remaining) {
                 Ok(stream) => return Ok(stream),
                 Err(e) => last = format!("connecting to {addr} failed: {e}"),
             }

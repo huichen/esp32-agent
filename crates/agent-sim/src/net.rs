@@ -14,7 +14,7 @@ use esp32_agent_core::llm::{http_error, ChatTransport};
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// One `POST` to an OpenAI-compatible endpoint, over plain TCP or TLS.
 pub struct HostTransport {
@@ -38,8 +38,44 @@ pub fn install_crypto_provider() {
 
 /// A connection that may or may not be encrypted; nothing above it needs to know.
 enum Conn {
-    Plain(TcpStream),
-    Tls(Box<rustls::StreamOwned<rustls::ClientConnection, TcpStream>>),
+    Plain(TimedTcp),
+    Tls(Box<rustls::StreamOwned<rustls::ClientConnection, TimedTcp>>),
+}
+
+/// One deadline for connecting, writing, the TLS handshake and the whole reply.
+/// A peer trickling a byte before each idle timeout cannot keep a model call alive.
+struct TimedTcp {
+    socket: TcpStream,
+    deadline: Instant,
+}
+
+impl TimedTcp {
+    fn remaining(&self) -> std::io::Result<Duration> {
+        let remaining = self.deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "model request deadline expired"));
+        }
+        Ok(remaining)
+    }
+}
+
+impl Read for TimedTcp {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.socket.set_read_timeout(Some(self.remaining()?))?;
+        self.socket.read(buf)
+    }
+}
+
+impl Write for TimedTcp {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.socket.set_write_timeout(Some(self.remaining()?))?;
+        self.socket.write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.socket.set_write_timeout(Some(self.remaining()?))?;
+        self.socket.flush()
+    }
 }
 
 impl Read for Conn {
@@ -67,7 +103,7 @@ impl Write for Conn {
     }
 }
 
-fn tls(stream: TcpStream, host: &str) -> Result<Conn, String> {
+fn tls(stream: TimedTcp, host: &str) -> Result<Conn, String> {
     let mut roots = rustls::RootCertStore::empty();
     roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
     let config = rustls::ClientConfig::builder().with_root_certificates(roots).with_no_client_auth();
@@ -79,6 +115,10 @@ fn tls(stream: TcpStream, host: &str) -> Result<Conn, String> {
 }
 
 impl ChatTransport for HostTransport {
+    fn set_timeout(&mut self, timeout: Duration) {
+        self.timeout = timeout;
+    }
+
     fn post_json(&mut self, url: &str, headers: &[(&str, &str)], body: &str) -> Result<String, String> {
         self.request("POST", url, headers, body)
     }
@@ -93,10 +133,10 @@ impl ChatTransport for HostTransport {
         let target = Target::parse(url)?;
         let body = if method.eq_ignore_ascii_case("GET") { "" } else { body };
         let head = http_client::request_head(method, &target, headers, body.len())?;
-        let stream = target.connect(self.timeout)?;
-        stream.set_read_timeout(Some(self.timeout)).map_err(|e| format!("read timeout: {e}"))?;
-        stream.set_write_timeout(Some(self.timeout)).map_err(|e| format!("write timeout: {e}"))?;
-        stream.set_nodelay(true).ok();
+        let deadline = Instant::now() + self.timeout;
+        let socket = target.connect(self.timeout)?;
+        socket.set_nodelay(true).ok();
+        let stream = TimedTcp { socket, deadline };
         let mut conn = if target.tls { tls(stream, &target.host)? } else { Conn::Plain(stream) };
         conn.write_all(head.as_bytes()).map_err(|e| format!("write failed: {e}"))?;
         if !body.is_empty() {
@@ -147,6 +187,29 @@ mod tests {
         );
         assert_eq!(local_reply(raw.as_bytes()).unwrap(), body);
         assert!(local_reply(b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nshort").is_err());
+
+        // Every byte arrives before the old per-read timeout. Only a shared deadline
+        // can stop this header from occupying the model thread indefinitely.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let peer = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket.set_write_timeout(Some(Duration::from_secs(2))).unwrap();
+            for byte in b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok" {
+                if socket.write_all(&[*byte]).is_err() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(40));
+            }
+        });
+        let started = Instant::now();
+        let mut transport = HostTransport::new(Duration::from_secs(3));
+        transport.set_timeout(Duration::from_millis(160));
+        let result = transport.request("GET", &format!("http://{address}/"), &[], "");
+        let elapsed = started.elapsed();
+        peer.join().unwrap();
+        assert!(result.is_err(), "a trickling response completed past its deadline: {elapsed:?}");
+        assert!(elapsed < Duration::from_secs(1), "per-read timeouts restarted the deadline: {elapsed:?}");
     }
 
     #[test]

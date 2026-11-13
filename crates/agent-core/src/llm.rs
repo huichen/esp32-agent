@@ -36,6 +36,10 @@ pub const ARGS_ERROR_KEY: &str = "__llm_arguments_error";
 /// must return non-2xx responses as `Err` built with [`http_error`], so the
 /// status and the body prefix survive to the log without a second channel.
 pub trait ChatTransport {
+    /// Apply the current model call's timeout before any socket work. Stub transports
+    /// may ignore it; real transports must not keep a stale boot-time setting.
+    fn set_timeout(&mut self, _timeout: std::time::Duration) {}
+
     /// POST `body` to `url` with `headers`; return the response body.
     ///
     /// `url` is `http://` or `https://`; the scheme is the implementation's business
@@ -372,6 +376,7 @@ fn send_once(
     tools: &Value,
     url: &str,
 ) -> Result<ModelReply, String> {
+    transport.set_timeout(std::time::Duration::from_secs(u64::from(cfg.timeout_s.clamp(5, 180))));
     match Protocol::parse(&cfg.protocol) {
         Protocol::Chat => chat_completions(transport, cfg, messages, tools, url),
         Protocol::Responses => responses(transport, cfg, messages, tools, url),
@@ -1139,16 +1144,27 @@ mod tests {
         urls: Vec<String>,
         headers: Vec<Vec<(String, String)>>,
         bodies: Vec<String>,
+        timeouts: Vec<std::time::Duration>,
         reply: Result<String, String>,
     }
 
     impl Default for StubTransport {
         fn default() -> Self {
-            Self { urls: Vec::new(), headers: Vec::new(), bodies: Vec::new(), reply: Ok(String::new()) }
+            Self {
+                urls: Vec::new(),
+                headers: Vec::new(),
+                bodies: Vec::new(),
+                timeouts: Vec::new(),
+                reply: Ok(String::new()),
+            }
         }
     }
 
     impl ChatTransport for StubTransport {
+        fn set_timeout(&mut self, timeout: std::time::Duration) {
+            self.timeouts.push(timeout);
+        }
+
         fn post_json(&mut self, url: &str, headers: &[(&str, &str)], body: &str) -> Result<String, String> {
             self.urls.push(url.to_string());
             self.headers.push(headers.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect());
@@ -1220,6 +1236,15 @@ mod tests {
         assert!((temperature - 1.0).abs() < 1e-6, "temperature is {temperature}");
         assert_eq!(body["messages"], messages());
         assert_eq!(body["tools"], tools());
+        assert_eq!(t.timeouts, vec![std::time::Duration::from_secs(45)]);
+        // A live config change must reach the next socket, not just the portal.
+        for (configured, expected) in [(7, 7), (0, 5), (u32::MAX, 180)] {
+            let mut updated = cfg();
+            updated.timeout_s = configured;
+            chat(&mut t, &updated, &messages(), &tools()).expect("reply after timeout change");
+            assert_eq!(t.timeouts.last(), Some(&std::time::Duration::from_secs(expected)));
+            assert_eq!(t.timeouts.len(), t.bodies.len(), "set before every request");
+        }
     }
 
     #[test]
