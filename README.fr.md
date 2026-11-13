@@ -1,6 +1,6 @@
 # esp32-agent
 
-**Français** · [English](README.md) · [简体中文](README.zh.md) · [Español](README.es.md) · [Русский](README.ru.md) · [العربية](README.ar.md)
+[English](README.md) · [简体中文](README.zh.md) · **Français** · [Español](README.es.md) · [Русский](README.ru.md) · [العربية](README.ar.md) · [日本語](README.ja.md) · [한국어](README.ko.md)
 
 Firmware pour un ESP32 qui exécute sa propre boucle d’agent et expose un point de terminaison
 MCP : un seul modèle peut ainsi piloter la carte directement, et tout agent externe peut
