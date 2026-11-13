@@ -67,7 +67,7 @@ impl Family {
             .map(|d| {
                 (
                     Self::command_word(&d.spec.name, name),
-                    first_sentence(&d.spec.description),
+                    first_sentence(d.spec.prose_description()),
                     arguments_of(&d.spec.input_schema),
                 )
             })
