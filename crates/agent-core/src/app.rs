@@ -1072,9 +1072,12 @@ impl App {
             {
                 Some("no camera or image attachment on this board".to_string())
             }
-            // A clip is ordinary memory, so opening, filling, listing and dropping one
-            // needs nothing. Only playing it needs a medium.
-            "clip_play" if !self.caps.contains("speaker") && !self.caps.contains("display") => {
+            // Buffer-only operations need no peripheral. Record/play are offered
+            // only when their detected microphone or playback target is present.
+            "clip_record" if !self.caps.contains("mic") => {
+                Some("no detected I2S microphone to record a clip".to_string())
+            }
+            "clip_play" if !self.caps.contains("speaker") && !self.caps.contains("oled") => {
                 Some("no speaker or display to play a clip on".to_string())
             }
             _ => None,
@@ -3624,6 +3627,16 @@ impl App {
             self.log.info("script", format!("{source} ran a script on demand: {}", job.id));
             out["kind"] = json!("script");
             out["job"] = json!(job.id);
+            // submit_script has already finished. There is no retired REST job
+            // poll endpoint to recover this result from, so return it now.
+            out["state"] = json!(job.state);
+            out["result"] = job.result;
+            out["output"] = json!(job.output);
+            out["steps"] = json!(job.steps);
+            out["ms"] = json!(job.ms);
+            if !job.error.is_empty() {
+                out["error"] = json!(job.error);
+            }
         } else if !prompt.trim().is_empty() {
             self.queue_user(&prompt, &source, at_ms);
             self.log.info("sched", format!("{source} queued on demand"));
@@ -8163,6 +8176,42 @@ mod tests {
         assert_eq!(handler(&get("/healthz")).status, 405);
         assert_eq!(handler(&get("/api/status")).status, 200);
         drop(held);
+    }
+
+    #[test]
+    fn clip_advertisement_matches_detected_recording_and_playback_targets() {
+        let mut app = test_app();
+        assert!(app.caps.contains("oled"));
+        assert!(!app.caps.contains("mic"));
+        assert!(app.extra_why_hidden("clip_play").is_none());
+        assert!(app.extra_why_hidden("clip_record").is_some());
+        app.caps = CapSet::new();
+        assert!(app.extra_why_hidden("clip_play").is_some());
+        app.caps.insert("mic");
+        assert!(app.extra_why_hidden("clip_record").is_none());
+        assert!(app.extra_why_hidden("clip_play").is_some());
+        app.caps.insert("speaker");
+        assert!(app.extra_why_hidden("clip_play").is_none());
+    }
+
+    #[test]
+    fn manual_script_schedule_returns_its_finished_result_and_failures() {
+        let mut app = test_app();
+        app.tasks.push(ScheduledTask {
+            id: "result-probe".into(),
+            script: "print(\"scheduled\")\n1 + 2".into(),
+            ..Default::default()
+        });
+        let done = app.sched_run_now("result-probe").unwrap();
+        assert_eq!(done["state"], "done");
+        assert_eq!(done["result"], 3);
+        assert_eq!(done["output"], json!(["scheduled"]));
+        assert!(done["steps"].as_u64().unwrap() > 0);
+        app.tasks[0].script = "unknown_function()".into();
+        let failed = app.sched_run_now("result-probe").unwrap();
+        assert_eq!(failed["state"], "failed");
+        assert!(failed["result"].is_null());
+        assert!(failed["error"].as_str().unwrap().contains("unknown"));
     }
 
     #[test]

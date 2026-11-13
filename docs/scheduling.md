@@ -32,6 +32,14 @@ Every answer lands in the transcript tagged `source: "schedule:t1"`, so the orig
 is never a guess. The agent can schedule itself with
 `schedule {"action":"add","prompt":"…","every_s":300}` (`list`, `remove`, `enable`, `disable`).
 
+### Run a task now
+
+`POST /api/sched/run` with `{"id":"t1"}` does not move the task's scheduled clock.
+A prompt task returns `queued: true`. A script runs inline and returns `job`, `state`,
+`result`, `output`, `steps`, and `ms`; a failed script also returns `error` with
+`state: "failed"`. The job ID is a correlation label, not a future poll URL:
+`GET /api/script/<job>` remains a retired route (404).
+
 ## Rules
 
 ```bash
