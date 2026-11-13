@@ -11,7 +11,7 @@ extra model call, and nothing that needs a host.
 
 ```text
 /MEMORY.md              the index: one line per memory, each pointing at a file
-/memory/<topic>.md      the memory itself, at most 2 KB (the workspace file limit)
+/memory/<topic>.md      the memory itself, at most 256 KB (the workspace file limit)
 ```
 
 The **index** is what reaches the system prompt, every run, capped at 24 lines / 2 KB:

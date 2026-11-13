@@ -10,7 +10,9 @@
 //! `store-writer` task in `main.rs`. That is why this type is a `KvStore` like any other and not
 //! a second code path: the queue in front of it does not care which filesystem answers.
 
-use esp32_agent_core::store::{KvStore, StoreError, StoreSpace};
+use esp32_agent_core::store::{
+    is_file_store_key, recover_file_backup, FileReadCache, KvStore, StoreError, StoreSpace,
+};
 use esp_idf_svc::sys;
 use std::path::{Path, PathBuf};
 
@@ -18,10 +20,8 @@ use std::path::{Path, PathBuf};
 const MOUNT: &str = "/storage";
 /// One file per key, directly under the mount point.
 ///
-/// LittleFS in ESP-IDF has no directories: `esp_files.c`'s `vfs_files_mkdir` returns `ENOTSUP`
-/// (measured on this board: `Error: Not supported (os error 134)` after a 38 s format, which is
-/// the format doing its job and the `mkdir` right after it failing). A flat namespace is also
-/// what LittleFS is: the key names are already unique and short.
+/// A flat namespace is our layout choice, not a LittleFS restriction: the installed
+/// component implements `mkdir` through `lfs_mkdir`. Keys are already unique and short.
 const KV_DIR: &str = "/storage";
 
 pub struct FileStore {
@@ -29,7 +29,7 @@ pub struct FileStore {
     last_error: Option<StoreError>,
     /// The file a sequential read is pulling from, kept open: reopening per chunk cost more than
     /// the read did.
-    open: std::cell::RefCell<Option<(String, std::fs::File)>>,
+    open: FileReadCache,
 }
 
 fn error_of(code: i32, context: &str) -> StoreError {
@@ -48,9 +48,8 @@ fn error_of(code: i32, context: &str) -> StoreError {
 /// Mount `storage`.
 ///
 /// `format_if_mount_failed` is on: the partition is empty on a board that has just been given
-/// this table, and a board that refuses to boot because a filesystem was not formatted yet is
-/// worse than one that formats it once. That first format is slow - 38 s for 11.9 MB, measured
-/// on this board - so a freshly flashed board takes that long before its first packet.
+/// this table. It also permits reformatting an unreadable volume, not just an empty one;
+/// see `docs/storage.md`. The old 38 s format measurement was SPIFFS, not LittleFS.
 pub fn mount() -> anyhow::Result<FileStore> {
     let label = c"storage";
     let path = c"/storage";
@@ -60,10 +59,9 @@ pub fn mount() -> anyhow::Result<FileStore> {
         partition: std::ptr::null(),
         ..Default::default()
     };
-    // Formatting is allowed only because this partition may hold the format a previous build
-    // wrote: LittleFS and LittleFS cannot read each other. That is a one-time cost on the first
-    // boot after the change, and it is the reason the release note says the transcript and the
-    // workspace start empty once.
+    // SPIFFS and LittleFS cannot read each other, so migration requires formatting.
+    // This policy also formats any other unmountable volume; it is not restricted
+    // to migration or first boot. See docs/storage.md for the recovery boundary.
     conf.set_format_if_mount_failed(1);
     conf.set_read_only(0);
     conf.set_dont_mount(0);
@@ -73,10 +71,7 @@ pub fn mount() -> anyhow::Result<FileStore> {
         // `ESP_ERR_INVALID_STATE` means it is already mounted (a restart of the app without a
         // reboot), which is not an error worth failing the boot over.
         if rc != sys::ESP_ERR_INVALID_STATE {
-            return Err(anyhow::anyhow!(
-                "esp_vfs_littlefs_register: {}",
-                error_of(rc, "mount").name
-            ));
+            return Err(anyhow::anyhow!("esp_vfs_littlefs_register: {}", error_of(rc, "mount").name));
         }
     }
     let (total, used) = capacity();
@@ -87,18 +82,19 @@ pub fn mount() -> anyhow::Result<FileStore> {
     let mut restored = 0;
     let mut dropped = 0;
     if let Ok(entries) = std::fs::read_dir(MOUNT) {
-        let names: Vec<String> = entries
-            .flatten()
-            .filter_map(|e| e.file_name().into_string().ok())
-            .collect();
+        let names: Vec<String> = entries.flatten().filter_map(|e| e.file_name().into_string().ok()).collect();
         for name in &names {
             if name.ends_with(".tmp") {
-                let _ = std::fs::remove_file(format!("{MOUNT}/{name}"));
-                dropped += 1;
+                if std::fs::remove_file(format!("{MOUNT}/{name}")).is_ok() {
+                    dropped += 1;
+                }
             } else if let Some(key) = name.strip_suffix(".old") {
                 let value = format!("{MOUNT}/{key}");
-                if std::fs::rename(format!("{MOUNT}/{name}"), &value).is_ok() {
-                    restored += 1;
+                let backup = format!("{MOUNT}/{name}");
+                match recover_file_backup(Path::new(&value), Path::new(&backup)) {
+                    Ok(true) => restored += 1,
+                    Ok(false) => {}
+                    Err(e) => log::warn!("storage: could not recover `{name}`: {e}"),
                 }
             }
         }
@@ -110,11 +106,7 @@ pub fn mount() -> anyhow::Result<FileStore> {
         log::warn!("storage: put back {restored} value(s) an interrupted save had moved aside");
     }
     log::info!("storage: LittleFS on `storage`, mounted at {MOUNT}, {used} of {total} bytes used");
-    Ok(FileStore {
-        dir: PathBuf::from(KV_DIR),
-        last_error: None,
-        open: std::cell::RefCell::new(None),
-    })
+    Ok(FileStore { dir: PathBuf::from(KV_DIR), last_error: None, open: FileReadCache::default() })
 }
 
 /// The partition's size and what it holds, in bytes. `(0, 0)` if it cannot be asked.
@@ -130,17 +122,21 @@ fn capacity() -> (usize, usize) {
 }
 
 impl FileStore {
-    fn path(&self, key: &str) -> PathBuf {
-        self.dir.join(key)
+    fn path(&self, key: &str) -> std::io::Result<PathBuf> {
+        if !is_file_store_key(key) {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid file-store key"));
+        }
+        Ok(self.dir.join(key))
     }
 
     /// Where a value is written before it is published.
     ///
     /// The suffix marks it as not-a-key, so a value left behind by a power cut is never read
-    /// back as one. Keys are at most 15 bytes (`store::KEY_MAX`) and a LittleFS name is 32, so
+    /// back as one. Keys are at most 15 bytes (`store::KEY_MAX`), so
     /// `transcript.tmp` fits with room to spare.
-    fn temp_path(&self, key: &str) -> PathBuf {
-        self.dir.join(format!("{key}.tmp"))
+    fn temp_path(&self, key: &str) -> std::io::Result<PathBuf> {
+        self.path(key)?;
+        Ok(self.dir.join(format!("{key}.tmp")))
     }
 
     /// Replace the value under `key`, or leave the old one exactly as it was.
@@ -157,7 +153,8 @@ impl FileStore {
     /// implements both (`CONFIG_VFS_SUPPORT_DIR` is on), and a rename is a directory-level
     /// operation that leaves the old file readable until it completes.
     fn replace(&self, key: &str, value: &str) -> std::io::Result<()> {
-        let tmp = self.temp_path(key);
+        let tmp = self.temp_path(key)?;
+        self.open.invalidate(&self.path(key)?);
         let written = (|| {
             let mut file = std::fs::File::create(&tmp)?;
             std::io::Write::write_all(&mut file, value.as_bytes())?;
@@ -173,36 +170,19 @@ impl FileStore {
 
     /// Put the file at `tmp` in place of `key`'s value, keeping the old one until it lands.
     ///
-    /// LittleFS refuses to rename onto a name that exists (`LittleFS_ERR_CONFLICTING_NAME`, which
-    /// ESP-IDF maps to EIO - measured here: the temporary file wrote and synced, the rename
-    /// failed with `I/O error (os error 5)`), which is why the old value is moved aside first
-    /// and put back if the publish fails. The name is empty for the length of one rename, and
-    /// `mount` restores a `.old` it finds without its value beside it.
+    /// LittleFS 1.23.1 permits replacement through `lfs_rename`. Its VFS rejects
+    /// either path while open, so the read cache is closed before the single rename.
+    /// The old two-rename SPIFFS workaround created an unnecessary missing-value window.
     fn publish(&self, key: &str, tmp: &Path) -> std::io::Result<()> {
-        let path = self.path(key);
-        let old = self.old_path(key);
-        let _ = std::fs::remove_file(&old);
-        let displaced = std::fs::rename(&path, &old).is_ok();
+        let path = self.path(key)?;
+        self.open.invalidate(&path);
         match std::fs::rename(tmp, &path) {
-            Ok(()) => {
-                if displaced {
-                    let _ = std::fs::remove_file(&old);
-                }
-                Ok(())
-            }
+            Ok(()) => Ok(()),
             Err(e) => {
-                if displaced {
-                    let _ = std::fs::rename(&old, &path);
-                }
                 let _ = std::fs::remove_file(tmp);
                 Err(e)
             }
         }
-    }
-
-    /// Where the previous value waits while a new one is published.
-    fn old_path(&self, key: &str) -> PathBuf {
-        self.dir.join(format!("{key}.old"))
     }
 
     /// Bytes this partition can still take, which is the honest ceiling for one value.
@@ -214,7 +194,7 @@ impl FileStore {
 
 impl KvStore for FileStore {
     fn get(&self, key: &str) -> Option<String> {
-        match std::fs::read_to_string(self.path(key)) {
+        match self.path(key).and_then(std::fs::read_to_string) {
             Ok(text) => Some(text),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
             Err(e) => {
@@ -242,7 +222,11 @@ impl KvStore for FileStore {
 
     fn remove(&mut self, key: &str) -> bool {
         self.last_error = None;
-        match std::fs::remove_file(self.path(key)) {
+        let removed = self.path(key).and_then(|path| {
+            self.open.invalidate(&path);
+            std::fs::remove_file(path)
+        });
+        match removed {
             Ok(()) => true,
             // Not there is not a failure: the queue counts a removal it did not have to make
             // as accepted (`NvsStore::remove` says the same).
@@ -269,7 +253,17 @@ impl KvStore for FileStore {
         fill: &mut dyn FnMut(&mut dyn std::io::Write) -> std::io::Result<()>,
     ) -> bool {
         self.last_error = None;
-        let tmp = self.temp_path(key);
+        let tmp = match self.temp_path(key) {
+            Ok(tmp) => tmp,
+            Err(e) => {
+                self.last_error =
+                    Some(StoreError { code: e.raw_os_error().unwrap_or(0), name: e.to_string() });
+                return false;
+            }
+        };
+        if let Ok(path) = self.path(key) {
+            self.open.invalidate(&path);
+        }
         let written = (|| -> std::io::Result<()> {
             let file = std::fs::File::create(&tmp)?;
             let mut buffered = std::io::BufWriter::with_capacity(4096, file);
@@ -281,7 +275,7 @@ impl KvStore for FileStore {
         if let Err(e) = written {
             let _ = std::fs::remove_file(&tmp);
             log::error!(
-                "files stream `{key}` refused: {e}; esp_files_info total_bytes {} used_bytes {} free_bytes {}",
+                "files stream `{key}` refused: {e}; esp_littlefs_info total_bytes {} used_bytes {} free_bytes {}",
                 capacity().0,
                 capacity().1,
                 capacity().0.saturating_sub(capacity().1)
@@ -293,7 +287,7 @@ impl KvStore for FileStore {
             Ok(()) => true,
             Err(e) => {
                 log::error!(
-                    "files publish `{key}` refused: {e}; esp_files_info total_bytes {} used_bytes {} free_bytes {}",
+                    "files publish `{key}` refused: {e}; esp_littlefs_info total_bytes {} used_bytes {} free_bytes {}",
                     capacity().0,
                     capacity().1,
                     capacity().0.saturating_sub(capacity().1)
@@ -311,16 +305,8 @@ impl KvStore for FileStore {
     /// every chunk made a 1.75 MB load slow enough to trip the task watchdog. One tick per chunk
     /// lets the scheduler run - the same watchdog, from the other side.
     fn read_at(&self, key: &str, offset: usize, buf: &mut [u8]) -> Option<usize> {
-        use std::io::{Read, Seek, SeekFrom};
-        let mut slot = self.open.borrow_mut();
-        let reuse = matches!(&*slot, Some((k, _)) if k == key);
-        if !reuse {
-            let file = std::fs::File::open(self.path(key)).ok()?;
-            *slot = Some((key.to_string(), file));
-        }
-        let (_, file) = slot.as_mut()?;
-        file.seek(SeekFrom::Start(offset as u64)).ok()?;
-        let read = file.read(buf).ok();
+        let path = self.path(key).ok()?;
+        let read = self.open.read_at(&path, offset, buf).ok();
         esp_idf_svc::hal::delay::FreeRtos::delay_ms(1);
         read
     }
@@ -339,18 +325,10 @@ impl KvStore for FileStore {
         self.last_error.clone()
     }
 
-    /// What `esp_files_info()` reports, in bytes.
-    ///
-    /// `total` is LittleFS' own capacity figure, not the partition size: it is
-    /// `(blocks - 2) * (pages_per_block - lookup_pages) + 1` data pages times the data page size,
-    /// so the 12 517 376-byte partition minus two spare blocks and the object-lookup pages. On
-    /// this board that is 45 811 * 251 = 11 498 561. `used` is the pages it has written. No
-    /// "free" comes from here - `StoreSpace` computes it, because the backend does not report
-    /// one.
-    ///
-    /// Neither number promises that one allocation of that size fits: a 2.1 MB file was refused
-    /// with `ENOSPC` while `free` read 9.38 MB, because LittleFS needs somewhere to move live pages
-    /// while it writes a new file and reports no figure for that.
+    /// What `esp_littlefs_info()` reports, in bytes: configured block count times block
+    /// size for total; `lfs_fs_size()` times block size for used. `StoreSpace` computes
+    /// free as total minus used. Replacement needs both old and temporary file space;
+    /// neither number guarantees one allocation. SPIFFS measurements are not LittleFS budgets.
     fn space(&self) -> Option<StoreSpace> {
         let (total, used) = capacity();
         if total == 0 {
@@ -407,11 +385,12 @@ pub struct SplitStore {
     files: FileStore,
     /// Configuration, manifest, the scheduler, the in-flight marker.
     nvs: crate::nvs_store::NvsStore,
+    last_error: Option<StoreError>,
 }
 
 impl SplitStore {
     pub fn new(files: FileStore, nvs: crate::nvs_store::NvsStore) -> Self {
-        Self { files, nvs }
+        Self { files, nvs, last_error: None }
     }
 
     /// Which backend owns a key.
@@ -419,10 +398,7 @@ impl SplitStore {
     /// By name, and deliberately: these are the two keys whose size is a function of how long
     /// somebody talks to the board. Everything else has a size the board chose.
     fn is_file_key(key: &str) -> bool {
-        key == "transcript"
-            || key.starts_with("transcript.")
-            || key == "ws"
-            || key.starts_with("ws.")
+        key == "transcript" || key.starts_with("transcript.") || key == "ws" || key.starts_with("ws.")
     }
 
     fn backend(&self, key: &str) -> &dyn KvStore {
@@ -448,11 +424,17 @@ impl KvStore for SplitStore {
     }
 
     fn set(&mut self, key: &str, value: &str) -> bool {
-        self.backend_mut(key).set(key, value)
+        let backend = self.backend_mut(key);
+        let ok = backend.set(key, value);
+        self.last_error = backend.last_error();
+        ok
     }
 
     fn remove(&mut self, key: &str) -> bool {
-        self.backend_mut(key).remove(key)
+        let backend = self.backend_mut(key);
+        let ok = backend.remove(key);
+        self.last_error = backend.last_error();
+        ok
     }
 
     /// Forwarded by key: without this the trait default runs, which materialises the whole
@@ -471,10 +453,10 @@ impl KvStore for SplitStore {
         key: &str,
         fill: &mut dyn FnMut(&mut dyn std::io::Write) -> std::io::Result<()>,
     ) -> bool {
-        if !Self::is_file_key(key) {
-            return self.nvs.set_stream(key, fill);
-        }
-        self.files.set_stream(key, fill)
+        let backend = self.backend_mut(key);
+        let ok = backend.set_stream(key, fill);
+        self.last_error = backend.last_error();
+        ok
     }
 
     fn keys(&self) -> Vec<String> {
@@ -484,7 +466,7 @@ impl KvStore for SplitStore {
     }
 
     fn last_error(&self) -> Option<StoreError> {
-        self.nvs.last_error().or_else(|| self.files.last_error())
+        self.last_error.clone()
     }
 
     /// The filesystem's numbers: it holds the things that grow, so "is the store full?" is a
