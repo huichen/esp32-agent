@@ -73,6 +73,63 @@ firmware instead validates the string and invokes `nvs_set_str` followed by
 entry before deleting the old one. This preserves the old value on a no-space refusal;
 it does not make every possible flash or commit error a rollback guarantee.
 
+## Workspace admission and recovery
+
+The RAM workspace and its version-1 document/index loaders share these limits:
+
+| Budget | Limit |
+|---|---:|
+| Text per file | 256 KiB (262,144 bytes) |
+| Aggregate file text | 4 MiB (4,194,304 bytes) |
+| Files, including empty files | 1,024 |
+| Canonical logical path | 256 UTF-8 bytes, including the leading `/` |
+| Aggregate canonical filenames | 128 KiB (131,072 bytes) |
+| Raw logical path, before normalization | 1,024 UTF-8 bytes |
+
+Logical paths use the same normalization as the file tools: trim surrounding
+whitespace, add the leading `/`, and discard empty/`.` components. `..`, backslashes
+and control-containing components are rejected. `/` remains a directory, never a
+file. Restores reject duplicate canonical paths, file/directory conflicts and
+physical-key collisions instead of silently choosing a winner. Overwriting an
+existing file does not consume an extra filename or file-count slot.
+
+The document shape is `{"version":1,"files":{"/path":"text"}}`. For compatibility,
+omitted `version` means version 1 and omitted `files` means an empty map. Other
+versions, unknown/duplicate fields, non-object file maps and non-string contents
+are refused. The index remains the plain `path -> physical key` JSON object; each
+key must exactly equal `keys::workspace_file(canonical_path)`. The complete index
+is validated before any referenced content is fetched.
+
+Streaming JSON is decoded into bounded strings, not an unrestricted serde string
+buffer or a full `Value`. Decoded bytes are checked before appending, including
+Unicode escapes and surrogate pairs. Aggregate text is enforced entry by entry.
+Encoded input, including whitespace, is capped at **31,490,176 bytes** for a
+document and **6,391,810 bytes** for an index. These generous ceilings cover six-byte
+JSON escapes and redundant raw path syntax without raising the decoded budgets.
+Indexed text reads reject an over-limit suffix rather than accepting truncation.
+Historical `ws1` headers/chunks are staged within their original NVS-value limits
+before checksum validation and bounded document parsing.
+
+A restore is adopted only when the complete workspace passes validation. An
+unreadable, missing-content or over-policy indexed/document/chunked workspace is
+**preserved on storage**, not removed. Mutations are blocked for that load so
+boot-time skill seeding cannot publish an empty/partial replacement. Repair the
+stored data and reboot, or explicitly reset storage, to permit writes again.
+Absence detection relies on the backend's key enumeration: `KvStore` does not
+provide a typed absent-versus-I/O-error result for `read_at`.
+
+`bytes()` still reports text size. `ram_bytes()` estimates allocated string
+capacities in the file and saved-hash maps plus a 192-byte bookkeeping allowance
+per map entry. The change guard asks for twice that estimate plus 64 KiB of free
+PSRAM. This is an estimate, not a measured allocator footprint or a guarantee
+against fragmentation. Fallible string reservations return errors; tree-node and
+fixed reader-buffer allocations remain standard Rust allocations. Backends that
+use `get` or the default `read_at` may materialize their value before the decoder;
+the firmware filesystem's `read_at` streams without that full-value copy.
+
+These are host-tested parser/admission guarantees. Firmware runtime behavior and
+board heap measurements remain unverified.
+
 ## Bounded readers
 
 - Chunked `ws1` blobs reject oversized header totals before allocation, limit checksum
