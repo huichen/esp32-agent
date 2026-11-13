@@ -5995,7 +5995,14 @@ fn task_from(v: &Value, fallback_id: &str) -> Option<ScheduledTask> {
         at_hhmm: v.get("at_hhmm").and_then(|a| a.as_str()).unwrap_or("").trim().to_string(),
         script: v.get("script").and_then(|s| s.as_str()).unwrap_or("").to_string(),
         enabled: v.get("enabled").and_then(|e| e.as_bool()).unwrap_or(true),
-        last_run_ms: v.get("last_run_ms").and_then(|l| l.as_u64()).unwrap_or(0),
+        // A task that has never run starts its clock now, not at the epoch.
+        //
+        // `due()` compares against the wall clock in milliseconds, and a fresh task used to carry
+        // `last_run_ms: 0` - that is 1970, so `since_last` was 1.79e12 and the task fired the
+        // moment it was created (measured: asked to schedule an LED change every 120 s, the board
+        // changed the LED during the same turn). Stamping the creation time makes the documented
+        // promise - a task that has never run waits one full interval - true.
+        last_run_ms: v.get("last_run_ms").and_then(|l| l.as_u64()).unwrap_or_else(now_ms),
     })
 }
 
@@ -7649,8 +7656,8 @@ mod tests {
         let mut app = test_app();
         // One call per task, in the shape the route documents: `kind` + `op` + `task`.
         for body in [
-            r#"{"kind":"task","op":"add","task":{"id":"t1","prompt":"say hi","every_s":60}}"#,
-            r#"{"kind":"task","op":"add","task":{"id":"t2","script":"1 + 1","every_s":60}}"#,
+            r#"{"kind":"task","op":"add","task":{"id":"t1","prompt":"say hi","every_s":60,"last_run_ms":0}}"#,
+            r#"{"kind":"task","op":"add","task":{"id":"t2","script":"1 + 1","every_s":60,"last_run_ms":0}}"#,
         ] {
             let resp = app.route(&post("/api/sched", body));
             assert_eq!(resp.status, 200, "{:?}", body_json(&resp));
@@ -7687,7 +7694,7 @@ mod tests {
         let writes_before = store.writes();
         let resp = app.route(&post(
             "/api/sched",
-            r#"{"kind":"task","op":"add","task":{"id":"t1","prompt":"say hi","every_s":60}}"#,
+            r#"{"kind":"task","op":"add","task":{"id":"t1","prompt":"say hi","every_s":60,"last_run_ms":0}}"#,
         ));
         assert_eq!(resp.status, 200, "{:?}", body_json(&resp));
         assert_eq!(store.writes(), writes_before, "accepting a task must not write flash either");
@@ -8247,6 +8254,26 @@ mod tests {
         assert!(!app.tasks[0].enabled);
         app.call_tool("schedule", &json!({"action":"remove","id":"t1"})).expect("remove");
         assert!(app.tasks.is_empty());
+    }
+
+    /// A fresh task waits its interval; it does not fire the moment it is created.
+    ///
+    /// `due()` compares `last_run_ms` with the wall clock, and a new task used to carry 0 - 1970.
+    /// Against an epoch of 1.79e12 that is "due since forever", so the board did the work during
+    /// the same turn that scheduled it (measured on the board: `schedule add {every_s:120}` was
+    /// followed by `indicators led_set #ff0000` before the model finished answering).
+    #[test]
+    fn a_new_task_waits_a_full_interval() {
+        let mut app = test_app();
+        app.call_tool("schedule", &json!({"action":"add","id":"t1","prompt":"tick","every_s":120}))
+            .expect("add");
+        let task = app.tasks[0].clone();
+        // The clock the scheduler really uses: milliseconds since the epoch, not uptime.
+        let now = crate::app::now_ms();
+        assert!(task.last_run_ms > 1_000_000_000_000, "stamped with the epoch, got {}", task.last_run_ms);
+        assert!(!crate::sched::due(&task, now, 0), "fired in the turn that created it");
+        assert!(!crate::sched::due(&task, now + 119_000, 0), "fired a second early");
+        assert!(crate::sched::due(&task, now + 121_000, 0), "never fires after its interval");
     }
 
     /// Manual discovery: the drivers probe, nothing is adopted, and the board's own agent
