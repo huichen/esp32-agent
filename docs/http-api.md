@@ -89,7 +89,7 @@ CORS is on by default (`mcp.cors`), so a browser MCP client can connect directly
 | Method | Path | Purpose |
 |---|---|---|
 | GET | `/` | Console (embedded HTML/CSS/JS, no external links) |
-| GET | `/healthz` | `{ok, uptime_s, devices, stale, age_ms}`; `uptime_s` advances on a monotonic clock even before SNTP and while the live app is locked (snapshot contract below) |
+| GET | `/healthz` | `{ok, uptime_s, devices}`; `uptime_s` is seconds on the board's monotonic clock since boot, so it is right before SNTP has ever answered |
 | GET | `/agent.json` | The map for an external agent: every route, the MCP surface, conventions and limits (`/sitemap.json` is an alias) |
 | GET | `/api/status` | Board, memory, WiFi, MCP, device count, counters, `agent.thread` — `running`, `not started`, or `did not start: <why>` — `threads[]`, each task with the stack it has left at its deepest point (`high_water_kb`), and `store`: `{pending, written, failed}` plus `writer`, `last_failure` (`{key, op, err, err_name, at_ms}` or `null`), `refused_keys` (per-key counts), `refused_other` and `space` (`{used_bytes, free_bytes, total_bytes}`, or `{used_entries, free_entries, total_entries, used_bytes, free_bytes, total_bytes}` on NVS) - every number and where it comes from is in [what the store reports](troubleshooting.md#what-the-store-reports) — see [a store write was refused](troubleshooting.md#a-store-write-was-refused) |
 | GET | `/api/memory` | The heap pool by pool: `{available, pools: [{pool, note, total_kb, free_kb, largest_kb, min_free_kb}]}` for internal, DMA and PSRAM (a chip that registers no IRAM heap, like the S3, leaves that row out); `available: false` with a `why` on a platform with one heap |
@@ -121,32 +121,6 @@ CORS is on by default (`mcp.cors`), so a browser MCP client can connect directly
 | POST | `/api/auth` | `{pin}`, check the console PIN |
 | POST | `/api/reboot` | Reboot |
 | POST | `/api/factory-reset` | Clear configuration and manifest, then reboot |
-
-`GET /api/status` and `GET /healthz` use `try_lock`, never wait for the live `App`
-mutex, and add two fields without changing any existing field's shape:
-
-- `stale: false`: the request acquired the app and published a fresh view.
-- `stale: true`: the app was held by another caller; the response uses the last
-  published view. This can be true even with `age_ms: 0`.
-- `age_ms`: monotonic milliseconds since that view's publication, not a busy flag or
-  an HTTP cache age. Both responses carry `Cache-Control: no-store`.
-
-Construction, completed routes and tool calls (including errors with partial effects)
-publish through the same status builder. Agent phase completion and store-writer
-acknowledgements refresh it too. Health's device count comes from that same view. Cached
-reads do not mutate the live counters; measurements and counters in a stale response
-are last-known values, not evidence that the running tool has finished.
-
-Only `uptime_s` advances in a cached body. `Hardware::millis()` needs mutable hardware
-behind the app lock, so each publication pairs the boot reading and the latest hardware
-reading with a monotonic `Instant`. At request time uptime is
-`(sampled_ms + elapsed_ms - boot_ms) / 1000` (saturating arithmetic). This extrapolates
-the hardware clock during contention rather than freezing published whole seconds or
-using the SNTP wall clock; `time.unix_s` remains the published wall-clock reading.
-Both routes remain public with no PIN, other credential gates are unchanged, and a
-configured MCP path still takes precedence if it shadows either path. This removes
-waiting on another thread's app lock, not a long request already occupying the one
-HTTP accept thread, and does not split the rest of the live mutex.
 
 `/assets/app.js` and `/assets/style.css` are served separately from the console HTML.
 All three carry `Cache-Control: no-store` so old assets are not reused with new firmware.
