@@ -330,6 +330,7 @@ body {
 }
 
 .composer textarea {
+  box-sizing: border-box;
   flex: 1;
   resize: none;
   max-height: 132px;
@@ -360,7 +361,56 @@ body {
   font-weight: 700;
   flex: 0 0 auto;
 }
+
+/* The attachment button and the field are one row: same 42 px box, same bottom edge. It was
+   34 px against a 42 px field, both bottom-aligned, so the plus sat low and small. */
+.composer .attach {
+  appearance: none;
+  flex: 0 0 auto;
+  width: 42px;
+  height: 42px;
+  border-radius: 50%;
+  border: 1px solid var(--line);
+  background: var(--panel);
+  color: var(--muted);
+  font-size: 20px;
+  line-height: 1;
+  align-self: flex-end;
+}
+.composer .attach:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.composer .attach:active { transform: scale(0.96); }
 .send:disabled { opacity: 0.45; }
+
+/* A message the browser sent but did not get an answer for. The bubble stays where it was
+   typed, so the transcript does not silently lose a question, and it says so. */
+.row.user .bubble.failed { border: 1px solid var(--bad); }
+.row.user .bubble.failed::after {
+  content: "not delivered";
+  display: block;
+  margin-top: 6px;
+  font-size: 11px;
+  color: var(--bad);
+}
+
+/* Pulling past the last message offers a refresh instead of nothing happening. */
+#pull-hint {
+  position: fixed;
+  left: 50%;
+  bottom: 84px;
+  transform: translateX(-50%) translateY(18px);
+  padding: 6px 12px;
+  border-radius: 999px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  color: var(--muted);
+  font-size: 12px;
+  opacity: 0;
+  transition: opacity 120ms ease, transform 120ms ease;
+  pointer-events: none;
+  /* Above the toast (which sits at the same edge) but below dialogs. */
+  z-index: 16;
+}
+#pull-hint.show { opacity: 1; transform: translateX(-50%) translateY(0); }
 
 /* ---- sheets (menu, login) ------------------------------------------------ */
 
@@ -612,18 +662,6 @@ button.btn:active { transform: scale(0.98); }
 .trace-box.live > summary { border-color: var(--ok); color: var(--ok); }
 
 /* Attachment: one image per message, downscaled before it leaves the phone. */
-.composer .attach {
-  flex: 0 0 auto;
-  width: 34px;
-  height: 34px;
-  border-radius: 50%;
-  border: 1px solid var(--line);
-  background: var(--panel);
-  color: var(--muted);
-  font-size: 18px;
-  line-height: 1;
-  align-self: flex-end;
-}
 .attach-chip {
   flex: 1 0 100%;
   display: flex;
