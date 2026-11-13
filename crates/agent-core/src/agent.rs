@@ -6,12 +6,13 @@
 //! through [`ChatTransport`], and time is passed in as a `fn() -> u64` so the
 //! loop itself never reads a clock and stays testable on the host.
 //!
-//! Bounds, because the board has ~300 KB of usable heap: the history lives on the heap
-//! while it is in use, and a bounded tail of it lives in NVS between boots
-//! ([`MAX_SAVED_BYTES`]; [`transcript_jsonl`] and [`transcript_from_jsonl`] are the
-//! format, `App` owns the store side).
+//! Runtime history and request payloads use the heap, including PSRAM on the bench
+//! board; their limits are not a measurement of peak internal SRAM use. A bounded tail
+//! is persisted by `App` to filesystem storage between boots ([`MAX_SAVED_BYTES`];
+//! [`transcript_jsonl`] and [`transcript_from_jsonl`] define its format).
 //!
-//! * at most [`MAX_HISTORY_MESSAGES`] messages and [`MAX_HISTORY_BYTES`] of text;
+//! * history is trimmed against [`MAX_HISTORY_MESSAGES`] and [`MAX_HISTORY_BYTES`]
+//!   of retained payload, preserving the newest message;
 //! * a user message is cut to [`MAX_USER_BYTES`];
 //! * a tool result is cut to [`MAX_TOOL_RESULT_BYTES`] with `…(truncated)`;
 //! * an assistant text is cut to [`MAX_REPLY_BYTES`];
@@ -334,7 +335,7 @@ pub trait ToolHost {
 
     /// OpenAI `tools` array.
     fn tool_specs(&self) -> Value;
-    /// Run one tool call; the result is JSON text (<= 2 KB enforced here).
+    /// Run one tool call; the loop bounds its JSON text with [`MAX_TOOL_RESULT_BYTES`].
     fn call_tool(&mut self, name: &str, arguments: &Value) -> Result<String, String>;
 
     /// Project instructions that always apply, already bounded by the host.
@@ -782,7 +783,7 @@ impl Agent {
                 ev.phase = Some("end");
                 ev.elapsed_ms = Some(ended.saturating_sub(at));
             });
-            // `Message::tool_result` owns the 2 KB cut; the marker tells the model
+            // `Message::tool_result` owns the tool-result budget; the marker tells the model
             // the result it sees is incomplete.
             self.history.push(Message::tool_result(&call.id, &result, is_error, at));
             self.history_version += 1;
@@ -1109,6 +1110,7 @@ impl Agent {
 
     fn system_message(&self, host: &dyn ToolHost) -> String {
         let mut text = String::from(system_prompt());
+        text.push_str(&format!("\nThe reply text limit is {MAX_REPLY_BYTES} UTF-8 bytes."));
         // The owner's standing orders come before the machine-generated parts: they are
         // the reason this board exists, and a reader (or a model) should meet them first.
         if let Some(custom) = host.custom_prompt() {
@@ -1138,15 +1140,16 @@ impl Agent {
         // What earlier sessions wrote down. The index is all that goes in the prompt; a
         // memory is opened with `read` like any other file, so nothing is loaded twice
         // and nothing is spent on a topic this turn does not need.
-        text.push_str(
+        text.push_str(&format!(
             "\n\n## Memory (/MEMORY.md)\n\
              This is what you wrote down in earlier sessions, as an index. Open a topic with \
              `read` before relying on it; a fresh board has none.\n\
-             To remember something: write the fact to `/memory/<topic>.md` (2 KB is the file \
-             limit) and add **one line** to `/MEMORY.md` — `- [topic](path) — hook`. The line is a \
-             pointer, never the memory itself, and the index is kept under 24 lines; replace an \
+             To remember something: write a short, focused fact to `/memory/<topic>.md` \
+             and add **one line** to `/MEMORY.md` — `- [topic](path) — hook`. The line is a \
+             pointer, never the memory itself, and the index has at most {} lines; replace an \
              outdated entry instead of appending.\n",
-        );
+            crate::tools::knowledge::MEMORY_INDEX_MAX,
+        ));
         match host.memory_index() {
             Some(index) => text.push_str(&index),
             None => text.push_str("(nothing yet — write the first memory when something is worth keeping)\n"),
@@ -1192,7 +1195,7 @@ impl Agent {
 /// change with the firmware without rewriting NVS or the transcript.
 pub fn system_prompt() -> &'static str {
     "You are the agent running on an esp32-agent board over a small LAN.\n\
-     1. Answer the user's question in their language, briefly: replies are capped at 8 KB and shown on a small portal page.\n\
+     1. Answer the user's question in their language, briefly: replies are size-limited and shown on a small portal page.\n\
      2. When a fact about the board is needed, call a tool instead of guessing; one call at a time, then use its result.\n\
      3. Prefer the `board` tool's status command, then the narrower tool. Never repeat a call whose result you already have.\n\
      4. If a tool fails, say what failed and what you tried; do not invent readings.\n\
@@ -2638,6 +2641,13 @@ mod tests {
         let prompt = agent.system_message(&mut Remembering);
         assert!(prompt.contains("## Memory (/MEMORY.md)"), "{prompt}");
         assert!(prompt.contains("memory/pins.md"), "{prompt}");
+        assert!(prompt.contains(&format!("reply text limit is {MAX_REPLY_BYTES} UTF-8 bytes")), "{prompt}");
+        assert!(
+            prompt.contains(&format!("at most {} lines", crate::tools::knowledge::MEMORY_INDEX_MAX)),
+            "{prompt}"
+        );
+        assert!(!prompt.contains("2 KB is the file limit"), "the old storage limit must not reach the model");
+        assert!(!prompt.contains("capped at 8 KB"), "the old reply limit must not reach the model");
 
         let prompt = agent.system_message(&mut StubHost::returning("{}"));
         assert!(prompt.contains("nothing yet"), "a fresh board says so: {prompt}");

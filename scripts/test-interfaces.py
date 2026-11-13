@@ -523,6 +523,10 @@ def discovery(rec, sim, fake):
                            ("saved_transcript_bytes", 524288), ("workspace_file_bytes", 262144),
                            ("workspace_text_bytes", 4194304)]:
         rec.equal("discovered-limit:" + name, doc["conventions"]["limits"].get(name), expected)
+    tree = sim.get("/api/files/tree")
+    specs = sim.rpc("tools/list", {}).json()["result"]["tools"]
+    write_description = next(t["description"] for t in specs if t["name"] == "write")
+    rec.check("write-description-shares-file-budgets", all(str(tree[k]) + " bytes" in write_description for k in ["file_max", "total_max"]), write_description)
     job = sim.post("/api/script", {"source": "1 + 2"})
     sim.call("write", {"path": "/map-fixture.txt", "text": "discovery fixture"})
     sim.post("/api/agent/message", {"text": "attachment discovery fixture", "attachments": [
@@ -1118,6 +1122,8 @@ def agent(rec, sim, fake):
     rec.check("context-index-layers", all(t in prompt["system"] for t in ["audit standing orders", "second standing line", "audit project instruction", "memory pointer", "audit skill index"]))
     rec.check("context-does-not-inline-pointed-bodies", "DO-NOT-INLINE-BODY" not in prompt["system"] and "DO-NOT-INLINE-MEMORY" not in prompt["system"])
     rec.equal("prompt-byte-count", prompt["bytes"], len(prompt["system"].encode()))
+    limits = sim.get("/agent.json")["conventions"]["limits"]
+    rec.check("generated-prompt-shares-reply-budget", "reply text limit is " + str(limits["reply_bytes"]) + " UTF-8 bytes" in prompt["system"] and "2 KB is the file limit" not in prompt["system"], prompt["system"])
     sim.post("/api/agent/prompt", {"action": "clear"})
     rec.check("clear-standing-orders-only", "audit standing orders" not in sim.get("/api/agent/prompt")["system"] and "audit project instruction" in sim.get("/api/agent/prompt")["system"])
     http_case(rec, sim, "unknown-prompt-action", "POST", "/api/agent/prompt", {"action": "oops"}, 400)
