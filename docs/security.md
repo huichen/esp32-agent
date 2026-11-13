@@ -18,9 +18,9 @@ REST routes enforce the following when `auth.portal_pin` is nonempty:
 |---|---|
 | State-changing REST writes | Yes; `/api/auth` itself is the login route |
 | `GET /api/config`, `/api/agent/config`, `/api/sched`, `/api/agent/history`, `/api/agent/prompt` | Yes |
-| `GET /api/files`, `/api/files/tree`, `/api/files/read`, `/api/attachment/<name>` | Yes |
-| Status, memory, TLS identity, devices, tools, manifest/schema, sessions, clients and discovery | No |
-| `GET /api/logs`, `/api/agent/events`, `/api/agent/stream`, `/api/script/<id>` | Yes |
+| `GET /api/files/tree`, `/api/files/read`, `/api/attachment/<name>` | Yes |
+| Status, memory pools, TLS identity, devices, tools and discovery | No |
+| `GET /api/logs`, `/api/agent/events`, `/api/agent/stream` | Yes |
 
 MCP POST and DELETE share the `mcp.enabled` and credential gate: a disabled service returns
 `503`. A configured `auth.mcp_token` requires a real Bearer scheme and matching token;

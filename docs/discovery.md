@@ -38,7 +38,7 @@ configuration), the device simply is not live.
 
 ## The whole loop, measured
 
-On the bench board, after `manifest_reset` with `discovery = manual`:
+On the bench board, after `manifest {command: "reset"}` with `discovery = manual`:
 
 ```text
 1. empty the manifest:  devices: []                     tools: 38

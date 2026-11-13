@@ -2,7 +2,7 @@
 """Stub OpenAI-compatible chat endpoint for bench verification.
 
 The board's agent loop must be provable without credentials, so this speaks just
-enough of /v1/chat/completions: the first request answers with a `board_status`
+enough of /v1/chat/completions: the first request answers with a `board status`
 tool call, and once the board sends the tool result back it answers with a final
 text that quotes it. That exercises exactly the code path that matters - request
 build, tool dispatch, tool message, second request - on real hardware.
@@ -14,7 +14,8 @@ import argparse
 import json
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-TOOL_NAME = "board_status"
+TOOL_NAME = "board"
+TOOL_ARGUMENTS = '{"command": "status"}'
 
 
 def completion(message, finish):
@@ -76,7 +77,7 @@ class Handler(BaseHTTPRequestHandler):
                             {
                                 "id": "call_stub_1",
                                 "type": "function",
-                                "function": {"name": TOOL_NAME, "arguments": "{}"},
+                                "function": {"name": TOOL_NAME, "arguments": TOOL_ARGUMENTS},
                             }
                         ],
                     },

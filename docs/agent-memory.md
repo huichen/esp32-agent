@@ -69,7 +69,7 @@ summary:
 ```text
 ## Earlier in this conversation (compressed)
 - user: set the on-board LED blue, then read the temperature once
-- called: board_status({})
+- called: board {command: "status"}
 - result: {"board_name":"ESP32-S3 breadboard…","devices":6,…}
 - answer: the LED is blue, the temperature is 25.1 °C
 ```

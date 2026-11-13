@@ -5,7 +5,7 @@ what is not done or not verified.
 
 ## Verified / unverified
 
-- ✅ `agent-core`: 878 unit tests and 5 integration tests (protocol, HTTP, manifest
+- ✅ `agent-core`: 880 unit tests and 5 integration tests (protocol, HTTP, manifest
   validation, driver conversion, capability filtering, auth, hot reload, the agent loop,
   shell and script, the file tools, sched, SSE streams, a streamed request body)
 - ✅ Simulator end to end: the PowerShell smoke gate; `scripts/smoke.sh` is the Unix
@@ -16,7 +16,7 @@ what is not done or not verified.
   the 8 MiB PSRAM passes its memory test. Earlier boot logs enumerated the then-current
   seven-partition layout; the source now has four entries: `nvs`, `phy_init`, `factory`
   and `storage`
-- ✅ Historical on-board agent loop: `board_status`, the file tools (`write` then `read`
+- ✅ Historical on-board agent loop: `board {command: "status"}`, the file tools (`write` then `read`
   then `grep`) and `net_get` (against a real external host) ran through the model loop;
   a 45 s scheduled task fired twice on its own and a saved history survived a reboot.
   This does not verify arbitrary power cuts, and it predates today's flash

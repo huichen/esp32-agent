@@ -242,7 +242,7 @@ pub trait Hardware: Send {
     ///
     /// Derived from [`Hardware::heap_pools`] by default: a board that can name its pools
     /// already knows this number, and two sources for it let the one a model reads (the
-    /// status tool) disagree with the one a person reads (`/api/memory`). A board with no
+    /// status tool) disagree with the one `memory.pools` reports. A board with no
     /// pools at all reports `None` rather than a zero somebody would take as "no RAM".
     fn heap_internal(&mut self) -> Option<(u32, u32)> {
         self.heap_pools()
@@ -301,10 +301,10 @@ pub trait Hardware: Send {
         Vec::new()
     }
 
-    /// Every heap pool the platform can describe, for `/api/memory`.
+    /// Every heap pool the platform can describe, for `memory.pools` in the status document.
     ///
     /// Empty means "one heap, which cannot be split": that is the truth on the host, and
-    /// the route says so rather than printing an empty table that reads like zero RAM.
+    /// the reading says so rather than printing an empty table that reads like zero RAM.
     fn heap_pools(&mut self) -> Vec<HeapPool> {
         Vec::new()
     }
