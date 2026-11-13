@@ -1243,7 +1243,39 @@ def agent(rec, sim, fake):
     newest = fake.requests("/agent-second")[-1]["body"]["messages"][-1]["content"]
     rec.check("new-text-message-no-stale-attachment", not isinstance(newest, list)
               or not any(p.get("type") == "image_url" for p in newest), short(newest))
-    # Low context budget makes compaction observable without a 2 MiB filler run.
+    # Compressing on request, between turns, with an explicit tail width. This runs at a
+    # window wide enough that the automatic trigger stays out of the way, so the numbers
+    # below are the manual pass's work and not the ring's.
+    url = fake.fixture("/compact-manual", [model_reply(text="manual answer")], dialect="chat")
+    sim.post("/api/agent/reset", {})
+    sim.post("/api/agent/config", {"base_url": url, "context_tokens": 262144, "max_output_tokens": 128})
+    for n in range(4):
+        run_turn(sim, "manual question " + str(n))
+    before = sim.get("/api/agent/history")["messages"]
+    rec.equal("no-compaction-below-the-budget", sim.get("/api/agent/prompt")["archive_lines"], 0)
+    manual = sim.post("/api/agent/compact", {"keep": 1})
+    rec.equal("manual-compact-ok", manual["ok"], True)
+    rec.equal("manual-compact-kept-turns", manual["kept_turns"], 1)
+    rec.equal("manual-compact-messages-before", manual["messages_before"], len(before))
+    rec.check("manual-compact-removed", manual["removed"] == len(before) - manual["messages_after"] > 0, short(manual))
+    rec.check("manual-compact-shrinks-bytes", manual["bytes_after"] < manual["bytes_before"], short(manual))
+    rec.check("manual-compact-shrinks-tokens", manual["tokens_after"] < manual["tokens_before"], short(manual))
+    rec.equal("manual-compact-stored", manual["stored"], True)
+    kept = sim.get("/api/agent/history")["messages"]
+    rec.equal("manual-compact-keeps-one-exchange", len(kept), 2)
+    rec.check("manual-compact-pairing", paired(kept))
+    rec.check("manual-compact-archive-follows", sim.get("/api/agent/prompt")["archive_lines"] >= 1)
+    rec.equal("manual-compact-idempotent", sim.post("/api/agent/compact", {})["removed"], 0)
+    rec.equal("manual-compact-invalid-keep", sim.request("POST", "/api/agent/compact", {"keep": "x"}).status, 400)
+    # A turn in flight is answering a question compaction would drop from under it.
+    slow = fake.fixture("/compact-in-flight", [model_reply(text="slow answer")], dialect="chat", delay=1.2)
+    sim.post("/api/agent/config", {"base_url": slow})
+    rec.equal("compaction-in-flight-queued", sim.request("POST", "/api/agent/message", {"text": "hold this"}).status, 202)
+    wait_for(lambda: fake.requests("/compact-in-flight"), bool)
+    rec.equal("compaction-refused-mid-turn", sim.request("POST", "/api/agent/compact", {}).status, 409)
+    wait_for(lambda: not sim.get("/api/status")["agent"]["run_active"], bool)
+    rec.check("compaction-after-run-pairing", paired(sim.get("/api/agent/history")["messages"]))
+    # Low context budget makes the automatic trigger observable without a 2 MiB filler run.
     url = fake.fixture("/compact", [model_reply(text="answer " + "界" * 220)], dialect="chat")
     sim.post("/api/agent/reset", {})
     sim.post("/api/agent/config", {"base_url": url, "context_tokens": 512, "max_output_tokens": 64})
