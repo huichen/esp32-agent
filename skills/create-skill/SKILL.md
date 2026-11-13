@@ -50,5 +50,5 @@ write {"path":"/skills/blink/SKILL.md","text":"---\nname: blink\ndescription: bl
 - Imperative sentences, one step per line; the reader is an agent.
 - Name every tool the procedure uses, with the exact call in a fenced block.
 - No secrets: no passwords, no tokens, no keys.
-- Under 2 KB. A larger file cannot be written at all.
+- Under 256 KB. A larger file is refused, and the whole workspace is 4 MB.
 - Supporting material goes beside it (`/skills/blink/pins.md`); say when to read it.

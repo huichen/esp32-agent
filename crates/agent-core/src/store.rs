@@ -162,18 +162,24 @@ pub fn write_blob(
     blob: &str,
     plan: Plan,
 ) -> std::result::Result<usize, String> {
-    let chunks = split(blob, plan.chunk_bytes);
-    if chunks.len() > plan.chunks_max {
+    // A store that holds more than one plan chunk does not need the plan: a filesystem takes
+    // the whole blob as one value, which is also one file instead of a hundred. NVS keeps the
+    // chunked path, and [`Plan::capacity`] keeps the ceiling it was written for.
+    let max_value = store.whole_value_bytes();
+    let (chunk_bytes, capacity) = match max_value {
+        Some(bytes) => (bytes.max(1), bytes),
+        None => (plan.chunk_bytes, plan.capacity()),
+    };
+    let chunks = split(blob, chunk_bytes);
+    if blob.len() > capacity {
         return Err(format!(
-            "it is {} bytes, one stored value holds at most {} bytes and the store keeps {} of them ({} bytes in total), so it needs {} values; nothing was written",
+            "it is {} bytes and the store keeps at most {} bytes, so it needs {} values; nothing was written",
             blob.len(),
-            plan.chunk_bytes,
-            plan.chunks_max,
-            plan.capacity(),
+            capacity,
             chunks.len()
         ));
     }
-    if plan.chunk_bytes > VALUE_MAX {
+    if chunk_bytes > VALUE_MAX && max_value.is_none() {
         // A plan, not a caller, decides this; the check is here so a future plan cannot
         // quietly reintroduce a chunk the board refuses.
         return Err(format!(
@@ -332,6 +338,19 @@ pub trait KvStore: Send {
     fn space(&self) -> Option<StoreSpace> {
         None
     }
+
+    /// The longest value this backend accepts *as one value*, when that is more than an NVS
+    /// value and worth using.
+    ///
+    /// [`VALUE_MAX`] is NVS's ceiling and the only one the chunking was designed around. A
+    /// filesystem-backed store has no such idea — a file is as long as the partition allows —
+    /// so it answers `Some(bytes)` and a blob goes in as one value instead of a hundred.
+    ///
+    /// `None` is the default, and it means "chunk it the way the plan says", which keeps a
+    /// backend that forgets this correct rather than clever.
+    fn whole_value_bytes(&self) -> Option<usize> {
+        None
+    }
 }
 
 /// One reason a store gave for refusing an operation: the platform's numeric code and the
@@ -373,13 +392,21 @@ pub struct Refusal {
     pub at_ms: u64,
 }
 
-/// Room left in the backing store, in the units the backend thinks in — NVS entries, which
-/// are 32 bytes each and 126 per 4 KB page.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Room left in the backing store.
+///
+/// Two units, because two backends answer the question differently. NVS thinks in entries
+/// (32 bytes each, 126 per 4 KB page), and a blob is spread over them by [`write_blob`], so
+/// `free_entries` is what says whether the next chunk fits. A filesystem thinks in bytes and
+/// has no such idea, so it fills `total_bytes`/`used_bytes` instead. A reader that wants
+/// "is it full?" wants the bytes; a reader debugging chunking wants the entries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct StoreSpace {
     pub used_entries: usize,
     pub free_entries: usize,
     pub total_entries: usize,
+    /// Set by a backend that has a byte budget (SPIFFS, a filesystem), `None` on NVS.
+    pub total_bytes: Option<usize>,
+    pub used_bytes: Option<usize>,
 }
 
 /// One queued operation: `Some` is a write, `None` is a removal.
@@ -614,6 +641,16 @@ impl StoreQueue {
         report
     }
 
+    /// What the backend takes as one value, asked through the queue: the App decides how to
+    /// store a blob before it enqueues anything, so the answer has to come from the store the
+    /// queue writes to and not from the queue itself.
+    pub fn whole_value_bytes(&self) -> Option<usize> {
+        match self.inner.lock() {
+            Ok(store) => store.whole_value_bytes(),
+            Err(poisoned) => poisoned.into_inner().whole_value_bytes(),
+        }
+    }
+
     /// How many writes are queued and waiting for the writer.
     pub fn pending(&self) -> usize {
         match self.pending.lock() {
@@ -728,6 +765,12 @@ impl KvStore for QueuedStore {
 
     fn keys(&self) -> Vec<String> {
         self.queue.keys()
+    }
+
+    /// Forwarded, not defaulted: the App asks this before it decides whether a blob is one
+    /// value or a run of them, and `StoreQueue` is what it holds.
+    fn whole_value_bytes(&self) -> Option<usize> {
+        self.queue.whole_value_bytes()
     }
 }
 
@@ -928,11 +971,11 @@ mod tests {
 
         let too_big = "x".repeat(PLAN.capacity() + 1);
         let err = write_blob(&mut store, "ws", &too_big, PLAN).expect_err("one byte over the ceiling");
-        // The message names what the caller has to change: the ceiling, the chunk size and
-        // the size that broke it.
+        // The message names what the caller has to change: the ceiling and the size that
+        // broke it. NVS also says how it is chunked; a store that takes whole values does not
+        // need to.
         assert!(err.contains("17501 bytes"), "{err}");
-        assert!(err.contains("holds at most 3500 bytes"), "{err}");
-        assert!(err.contains("17500 bytes in total"), "{err}");
+        assert!(err.contains("17500 bytes"), "{err}");
         assert!(err.contains("nothing was written"), "{err}");
         let after: Vec<(String, String)> = store.map.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
         assert_eq!(before, after, "a refused write must not touch any key");
