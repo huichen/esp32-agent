@@ -91,25 +91,25 @@ suspicious. The bench board and the exact flash command are described in
 
 ## 6. Translations
 
-`README.md` is the source. Five translations sit beside it (`README.zh.md`, `README.fr.md`,
-`README.es.md`, `README.ru.md`, `README.ar.md`) and are updated **in the same commit** as the
-English. The README does not say this; this file does.
+`README.md` is the source. Seven translations sit beside it (`README.zh.md`, `README.fr.md`,
+`README.es.md`, `README.ru.md`, `README.ar.md`, `README.ja.md`, `README.ko.md`) and are updated
+**in the same commit** as the English. The README does not say this; this file does.
 
 - **The switcher is one line, third in the file.** The current language is bold and not a
-  link; the other five are links. A translated file must not also link to itself, or the
+  link; the other seven are links. A translated file must not also link to itself, or the
   language appears twice.
 - **In-page anchors are translated.** `(#manifest)` in English is `(#清单)` in Chinese,
   pointing at the translated heading's GitHub slug. Do not carry English anchors over with
   HTML `<a name>` elements: the translations must stay plain Markdown. The cost is that
-  renaming an English heading means fixing five link targets in the same commit.
+  renaming an English heading means fixing seven link targets in the same commit.
 - **Code, commands, JSON, paths, tool names and identifiers are not translated.** Numbers in
   prose are the same in every language.
 - **A translation never fixes the English.** If the English is wrong, translate it as written
-  and report it; the fix lands in `README.md` and then in all five.
+  and report it; the fix lands in `README.md` and then in all seven.
 - Check mechanically, not by eye: same `##` heading count, same fenced-block count, same
   table-row count, and every in-page link resolves.
 - **The test count moves with the tests.** `README.md` and `ROADMAP.md` both state it, so
-  adding a test means updating six READMEs plus `ROADMAP.md` in the same commit. A stale
+  adding a test means updating eight READMEs plus `ROADMAP.md` in the same commit. A stale
   number is a false claim about the gate, not a rounding.
 
 ## 7. Do not
