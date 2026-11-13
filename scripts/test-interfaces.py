@@ -430,7 +430,17 @@ def valid_model_request(protocol, body):
     if protocol == "responses":
         return isinstance(body.get("input"), list) and "messages" not in body
     if protocol == "anthropic":
-        return isinstance(body.get("messages"), list) and isinstance(body.get("system"), str)
+        # Messages requires max_tokens, not system: a direct image_read has no
+        # system turn. Still reject Chat/Responses image parts rather than
+        # making a wrongly selected image adapter look successful.
+        messages = body.get("messages")
+        return (isinstance(messages, list) and bool(messages)
+                and ("system" not in body or isinstance(body["system"], (str, list)))
+                and type(body.get("max_tokens")) is int and body["max_tokens"] > 0
+                and all(isinstance(m, dict) and m.get("role") in {"user", "assistant"}
+                        and not any(isinstance(p, dict) and p.get("type") in {"image_url", "input_image", "input_text"}
+                                    for p in (m.get("content", []) if isinstance(m.get("content"), list) else []))
+                        for m in messages))
     return isinstance(body.get("messages"), list) and "input" not in body
 
 
@@ -1255,7 +1265,15 @@ def transport(rec, sim, fake):
         result = sim.call("image_read", {"name": "fixture.png", "prompt": "fixture OCR"})
         rec.check(protocol + ".image-read-dialect", result.get("isError") is False and content(result).get("text") == "image fixture", short(result))
         last = fake.requests(image_path)[-1]["body"]
-        rec.check(protocol + ".image-payload-present", "Zml4dHVyZQ==" in short(last, 60000), short(last))
+        if protocol == "anthropic":
+            images = [p.get("source", {}) for m in last.get("messages", [])
+                      for p in m.get("content", []) if isinstance(p, dict) and p.get("type") == "image"]
+            present = any(isinstance(source, dict) and source.get("type") == "base64"
+                          and source.get("media_type") == "image/png" and source.get("data") == "Zml4dHVyZQ=="
+                          for source in images)
+        else:
+            present = "Zml4dHVyZQ==" in short(last, 60000)
+        rec.check(protocol + ".image-payload-present", present, short(last))
     # Malformed arguments must be a paired tool error, never an execution with defaults.
     for protocol, raw_args in [("chat", "{bad"), ("responses", "{bad"), ("anthropic", []), ("chat", "[]")]:
         case = protocol + ("-array-args" if raw_args == "[]" or raw_args == [] else "-bad-args")
