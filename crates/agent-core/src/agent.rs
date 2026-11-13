@@ -861,15 +861,27 @@ impl Agent {
     /// The dropped part is not lost silently: :func:`compress` turns it into a
     /// deterministic index first, so the model still knows what it already tried.
     fn trim(&mut self) {
+        self.trim_to(MAX_HISTORY_MESSAGES, MAX_HISTORY_BYTES);
+    }
+
+    /// [`Agent::trim`] against an explicit pair of ceilings.
+    ///
+    /// The two numbers are a parameter rather than the constants so the ring's behaviour
+    /// can be *proved* with a budget a test can fill in memory (8 KB / 16 messages) instead
+    /// of by pushing two megabytes of filler through it. "The oldest goes first and no tool
+    /// result is left at the head" is a property of the algorithm; it is not a different
+    /// property at a smaller ceiling, and pricing one test on the production constants is
+    /// what turned a 5 s test into a 75 s one when #58 quadrupled them.
+    fn trim_to(&mut self, max_messages: usize, max_bytes: usize) {
         if self.needs_compaction() {
             let keep = self.turns_within(keep_recent_tokens(self.context_tokens, self.max_output_tokens));
             self.compress(keep);
         }
-        while self.history.len() > MAX_HISTORY_MESSAGES {
+        while self.history.len() > max_messages {
             self.history.remove(0);
             self.history_version += 1;
         }
-        while self.history_bytes() > MAX_HISTORY_BYTES && self.history.len() > 1 {
+        while self.history_bytes() > max_bytes && self.history.len() > 1 {
             let dropped = self.history.remove(0);
             self.history_version += 1;
             self.archive_message(&dropped);
@@ -1861,8 +1873,55 @@ mod tests {
         assert_eq!(agent.pending.as_ref().unwrap().source, "schedule:t1,http");
     }
 
+    /// The invariant every request depends on: no tool result leads the ring and none
+    /// answers a call that was trimmed away. A result whose call is gone is what every
+    /// provider rejects, so counting messages alone would not have shown the ring is safe.
+    ///
+    /// The head may legitimately be an assistant turn after a trim that lands mid-turn;
+    /// what it must never be is a result.
+    ///
+    /// Returns the calls still waiting for a result, which is legitimate mid-run (the tool
+    /// is executing) but never after one.
+    fn assert_transcript_valid(agent: &Agent) -> Vec<String> {
+        assert!(!agent.history.is_empty(), "the ring never empties");
+        assert!(
+            !matches!(agent.history[0].role, Role::Tool),
+            "the ring starts on a tool result, whose call is no longer in it"
+        );
+        let mut open: Vec<String> = Vec::new();
+        for message in &agent.history {
+            match message.role {
+                Role::Assistant => open.extend(message.tool_calls.iter().map(|c| c.id.clone())),
+                Role::Tool => {
+                    let id = message.tool_call_id.clone().unwrap_or_default();
+                    let at = open
+                        .iter()
+                        .position(|o| *o == id)
+                        .unwrap_or_else(|| panic!("tool result `{id}` has no call left in the ring"));
+                    open.remove(at);
+                }
+                Role::User | Role::System => {}
+            }
+        }
+        open
+    }
+
+    /// The ring ceilings used by the tests below: small on purpose.
+    ///
+    /// Both bounds are a parameter of `trim_to`, so the ring is proved against a budget a
+    /// test can fill in microseconds. Filling the *production* constants was the kind of
+    /// test that gets slower every time a policy number is raised — #58 took 512 KB / 256
+    /// to 2 MB / 1024 and turned 75 seconds of the suite into one test's runtime, for a
+    /// property that does not depend on the size.
+    const RING_MESSAGES: usize = 16;
+    const RING_BYTES: usize = 8 * 1024;
+
     #[test]
     fn history_keeps_the_ring_bounded_and_the_transcript_valid() {
+        // A real run, 40 turns deep, is the growth path: 80 messages arrive through the
+        // model and the tool loop. Nothing is dropped at this size, which is the point —
+        // trimming under an ordinary conversation is what would lose the question the
+        // answer belongs to.
         let mut agent = Agent::new();
         let mut host = StubHost::returning("{}");
         let replies: Vec<String> = (0..40).map(|i| answer_reply(&format!("answer {i}"))).collect();
@@ -1873,34 +1932,109 @@ mod tests {
             agent.run_pending(&mut host, &mut transport, &cfg(), clock).expect("answer");
         }
 
-        assert!(
-            agent.history.len() <= MAX_HISTORY_MESSAGES,
-            "history grew to {} messages",
-            agent.history.len()
-        );
-        // 80 messages fit inside the 1024-message cap, so this run drops nothing: the
-        // assertion above is the invariant, and the trimming below is what exercises the
-        // ceiling itself.
+        assert_eq!(agent.runs, 40);
+        assert_eq!(agent.history.len(), 80, "40 turns are 80 messages, none dropped");
         assert_eq!(agent.history[0].text, "question 0");
         assert_eq!(agent.history.last().map(|m| m.text.as_str()), Some("answer 39"));
-        assert!(agent.history_bytes() <= MAX_HISTORY_BYTES);
-        assert_eq!(agent.runs, 40);
+        assert!(assert_transcript_valid(&agent).is_empty(), "a finished turn has no open call");
 
-        // Fill past the message cap directly: the oldest turns must go, and what is left
-        // must still start at a user turn — a tool result at the head would be orphaned
-        // from the call it answers.
-        for i in 0..MAX_HISTORY_MESSAGES {
-            agent.history.push(Message::user(&format!("filler {i}"), "http", 100_000 + i as u64));
-            agent.history.push(Message::tool("c", "{}", 200_000 + i as u64));
-            agent.trim();
+        // The message ceiling, filled directly: the oldest turns must go, and what is left
+        // must start at a user turn because a whole number of turns is dropped.
+        let mut ring = Agent::new();
+        for i in 0..4 * RING_MESSAGES {
+            ring.history.push(Message::user(&format!("filler {i}"), "http", 100_000 + i as u64));
+            ring.history.push(Message::assistant(&format!("reply {i}"), Vec::new(), 200_000 + i as u64));
+            ring.trim_to(RING_MESSAGES, RING_BYTES);
+            assert!(
+                ring.history.len() <= RING_MESSAGES,
+                "the ring grew to {} messages at filler {i}",
+                ring.history.len()
+            );
+            assert!(ring.history_bytes() <= RING_BYTES, "the ring grew past its bytes at filler {i}");
+            assert_transcript_valid(&ring);
         }
-        assert!(
-            agent.history.len() <= MAX_HISTORY_MESSAGES,
-            "history grew to {} messages",
-            agent.history.len()
+        assert_eq!(ring.history.len(), RING_MESSAGES, "the ring sits at its ceiling");
+        assert_eq!(
+            ring.history[0].text,
+            format!("filler {}", 4 * RING_MESSAGES - RING_MESSAGES / 2),
+            "the oldest turns went, not the newest"
         );
-        assert_eq!(agent.history[0].role, Role::User);
-        assert_eq!(agent.history.last().map(|m| m.text.as_str()), Some("{}"));
+        assert_eq!(ring.history[0].role, Role::User);
+        assert_eq!(
+            ring.history.last().map(|m| m.text.as_str()),
+            Some(format!("reply {}", 4 * RING_MESSAGES - 1).as_str()),
+            "the newest turn is kept"
+        );
+
+        // The byte ceiling on its own, with the message ceiling out of the way: the oldest
+        // text has to go by size, until the newest fits.
+        let mut by_bytes = Agent::new();
+        let big = "x".repeat(200);
+        for i in 0..40u64 {
+            by_bytes.history.push(Message::user(&format!("{big} {i}"), "http", i));
+            by_bytes.history.push(Message::assistant(&big, Vec::new(), 100 + i));
+            by_bytes.trim_to(1_000, RING_BYTES);
+            assert!(
+                by_bytes.history_bytes() <= RING_BYTES,
+                "{} bytes at filler {i}, over the {RING_BYTES}-byte ceiling",
+                by_bytes.history_bytes()
+            );
+            assert_transcript_valid(&by_bytes);
+        }
+        assert!(by_bytes.history.len() < 80, "the byte ceiling dropped something");
+        assert!(by_bytes.history.len() > 2, "and kept more than one message: {}", by_bytes.history.len());
+        assert!(!by_bytes.history.iter().any(|m| m.text == format!("{big} 0")), "the oldest is gone");
+        assert_eq!(by_bytes.history.last().map(|m| m.text.as_str()), Some(big.as_str()));
+
+        // A result whose call is already gone must be dropped, not sent: this is the head
+        // `trim` is allowed to cut mid-turn into, and the loop that answers for it.
+        let mut head = Agent::new();
+        head.history.push(Message::tool("gone", "{}", 1));
+        head.history.push(Message::user("still here", "http", 2));
+        head.trim_to(RING_MESSAGES, RING_BYTES);
+        assert_eq!(head.history.len(), 1, "the orphaned result went, the question stayed");
+        assert_eq!(head.history[0].role, Role::User);
+    }
+
+    /// The policy half, without filling anything: the two ceilings price the same request,
+    /// so a change to either has to be a change to the pair.
+    ///
+    /// This is the test that reads the production constants. It is the only one, and it is
+    /// an arithmetic assertion rather than a 2 MB exercise.
+    #[test]
+    fn the_production_history_ceilings_are_one_budget() {
+        // Above ~1 KB a message the count binds before the bytes do; below it the byte
+        // ceiling cuts the ring in half and the message count is decoration. Today the pair
+        // is exactly 2 KB a message (2 MB / 1024).
+        assert!(
+            MAX_HISTORY_BYTES / MAX_HISTORY_MESSAGES >= 1024,
+            "{} bytes over {} messages is {} a message, which makes one ceiling decorative",
+            MAX_HISTORY_BYTES,
+            MAX_HISTORY_MESSAGES,
+            MAX_HISTORY_BYTES / MAX_HISTORY_MESSAGES
+        );
+        // Turns arrive in pairs, so an odd ceiling would drop half a turn.
+        assert_eq!(MAX_HISTORY_MESSAGES % 2, 0);
+        // `trim` keeps one message when even one is too big, so the byte ceiling has to
+        // hold the largest legal question and answer together.
+        assert!(
+            MAX_HISTORY_BYTES >= MAX_USER_BYTES + MAX_REPLY_BYTES,
+            "one maximal exchange ({MAX_USER_BYTES} + {MAX_REPLY_BYTES}) must fit inside {MAX_HISTORY_BYTES}"
+        );
+        // The ceiling has to cover the default window (4 ASCII characters a token), or the
+        // token trigger would never fire first and every turn would pay a byte trim.
+        let window_bytes = LlmConfig::default().context_tokens as usize * 4;
+        assert!(
+            MAX_HISTORY_BYTES >= window_bytes,
+            "{MAX_HISTORY_BYTES} has to cover the {window_bytes}-byte default window"
+        );
+        // Twice the cap exists at once (transcript plus request body) beside the tool
+        // schemas, and that peak is what the board's PSRAM has to hold.
+        assert!(
+            2 * MAX_HISTORY_BYTES + 32 * 1024 < 8 * 1024 * 1024,
+            "the peak of {} is beyond the 8 MB of PSRAM",
+            2 * MAX_HISTORY_BYTES + 32 * 1024
+        );
     }
 
     #[test]
@@ -2088,18 +2222,7 @@ mod tests {
         agent.compress(1);
 
         assert_eq!(agent.history[0].role, Role::User, "compression never starts on a tool result");
-        let mut open: Vec<String> = Vec::new();
-        for message in &agent.history {
-            match message.role {
-                Role::Assistant => open.extend(message.tool_calls.iter().map(|c| c.id.clone())),
-                Role::Tool => {
-                    let id = message.tool_call_id.clone().unwrap_or_default();
-                    let at = open.iter().position(|o| *o == id).expect("a result for an opened call");
-                    open.remove(at);
-                }
-                _ => {}
-            }
-        }
+        let open = assert_transcript_valid(&agent);
         assert!(open.is_empty(), "every tool call kept its result: {open:?}");
 
         // And the run continues with the index in the prompt.
