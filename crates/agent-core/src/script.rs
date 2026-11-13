@@ -68,6 +68,41 @@ pub trait ScriptHost {
     fn call_tool(&mut self, name: &str, arguments: &Value) -> Result<Value, String>;
 }
 
+/// The app's script host still has the error code here, before it becomes interpreter
+/// text. Only parameter failures need argument discovery; permissions, missing hardware
+/// and deadlines must keep their original messages and must not invite a retry.
+pub(crate) fn tool_error_with_arguments(
+    app: &crate::app::App,
+    name: &str,
+    error: crate::error::McpError,
+) -> String {
+    if error.code != crate::error::code::INVALID_PARAMS {
+        return error.message;
+    }
+    let available = if let Some(def) = app.tools.get(name) {
+        crate::tool::argument_names(&def.spec.input_schema)
+    } else {
+        // The app-owned tools and legacy file/network names have schemas too. Read
+        // their declarations rather than maintaining a second list of accepted fields.
+        let tools = match name {
+            "shell" => json!([crate::tools::shell::openai_spec()]),
+            name if name.starts_with("fs_") => crate::tools::fs::specs(),
+            name if name.starts_with("net_") => crate::tools::net::specs(),
+            _ => crate::tools::agent_extra_specs(),
+        };
+        tools
+            .as_array()
+            .and_then(|entries| entries.iter().find(|entry| entry["function"]["name"].as_str() == Some(name)))
+            .map(|entry| crate::tool::argument_names(&entry["function"]["parameters"]))
+            .unwrap_or_default()
+    };
+    if available.is_empty() {
+        error.message
+    } else {
+        format!("{}; available: {available}", error.message)
+    }
+}
+
 /// The reference the model reads before writing a script.
 ///
 /// A tool description is one paragraph, and a language needs more than that: the first
@@ -1653,6 +1688,115 @@ fn num_op(a: Val, b: Val, op: &str, f: fn(f64, f64) -> f64) -> Result<Val, Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_board() -> crate::app::App {
+        crate::app::App::new(
+            Box::new(crate::virtual_board::VirtualBoard::new()),
+            Box::new(crate::store::MemoryStore::new()),
+            crate::logbuf::LogBuf::new(64),
+            crate::app::FwMeta::default(),
+        )
+    }
+
+    #[test]
+    fn led_argument_errors_name_the_missing_field_and_available_arguments() {
+        let mut app = test_board();
+        for (tool, source, available) in [
+            ("led_set", r##"tool("led_set", {rgb: "#00ff00"})"##, "available: color (required)"),
+            (
+                "led_blink",
+                r##"tool("led_blink", {rgb: "#00ff00"})"##,
+                "available: color (required), ms?, times?",
+            ),
+        ] {
+            let direct = app.call_tool(tool, &json!({"rgb": "#00ff00"})).unwrap_err();
+            let error = app.call_tool("script", &json!({"source": source})).unwrap_err();
+            assert_eq!(direct.code, crate::error::code::INVALID_PARAMS);
+            assert_eq!(error.code, direct.code, "the hint must not change the error code");
+            assert!(error.message.contains("`color` (colour) is required"), "{tool}: {}", error.message);
+            assert!(error.message.contains(available), "{tool}: {}", error.message);
+            assert!(!error.message.contains("rgb?"), "{tool} invented an accepted spelling");
+        }
+        let outcome = app
+            .call_tool("script", &json!({"source": r##"tool("led_set", {color: "#00ff00"})"##}))
+            .expect("the named argument succeeds");
+        assert_eq!(outcome["result"]["color"], "#00ff00");
+    }
+
+    #[test]
+    fn oled_argument_errors_name_the_missing_field_and_available_arguments() {
+        let mut app = test_board();
+        let direct = app.call_tool("oled_text", &json!({"value": "HI"})).unwrap_err();
+        let error =
+            app.call_tool("script", &json!({"source": r#"tool("oled_text", {value: "HI"})"#})).unwrap_err();
+        assert_eq!(direct.code, crate::error::code::INVALID_PARAMS);
+        assert_eq!(error.code, direct.code, "the hint must not change the error code");
+        assert!(error.message.contains("`text` (string) is required"), "{}", error.message);
+        assert!(error.message.contains("available: text (required), clear?, line?, x?"), "{}", error.message);
+        assert!(!error.message.contains("value?"), "oled_text invented an accepted spelling");
+        let outcome = app
+            .call_tool("script", &json!({"source": r#"tool("oled_text", {text: "HI"})"#}))
+            .expect("the named argument succeeds");
+        assert_eq!(outcome["result"]["ok"], true);
+    }
+
+    #[test]
+    fn app_owned_and_legacy_tool_errors_also_list_their_schema_arguments() {
+        struct NoNetwork;
+        impl crate::llm::ChatTransport for NoNetwork {
+            fn post_json(
+                &mut self,
+                _url: &str,
+                _headers: &[(&str, &str)],
+                _body: &str,
+            ) -> Result<String, String> {
+                panic!("malformed arguments must fail before an HTTP request");
+            }
+        }
+        let mut app = test_board();
+        app.tool_transport = Some(Box::new(NoNetwork));
+        for (source, missing, available) in [
+            (r#"tool("read", {file: "/missing"})"#, "`path`", "available: path (required), help?"),
+            (r#"tool("fs_read", {file: "/missing"})"#, "`path`", "available: path (required)"),
+            (r#"tool("net_dns", {hostname: "example.test"})"#, "`host`", "available: host (required), port?"),
+            (r#"tool("shell", {command: 1})"#, "command", "available: command?, help?"),
+        ] {
+            let error = app.call_tool("script", &json!({"source": source})).unwrap_err();
+            assert!(error.message.contains(missing), "{source}: {}", error.message);
+            assert!(error.message.contains(available), "{source}: {}", error.message);
+        }
+    }
+
+    #[test]
+    fn argument_hints_leave_non_parameter_and_propertyless_errors_unchanged() {
+        use crate::error::{code, McpError};
+        let mut app = test_board();
+        for code in [
+            code::FORBIDDEN,
+            code::HARDWARE,
+            code::UNSUPPORTED,
+            code::NOT_FOUND,
+            code::TIMEOUT,
+            code::INTERNAL_ERROR,
+        ] {
+            let error = McpError::new(code, "original failure");
+            assert_eq!(tool_error_with_arguments(&app, "led_set", error), "original failure");
+        }
+        for tool in ["board_status", "unknown_tool"] {
+            assert_eq!(
+                tool_error_with_arguments(&app, tool, McpError::invalid_params("bad input")),
+                "bad input"
+            );
+        }
+        app.cfg.mcp.disabled_tools = vec!["led_set".into()];
+        let direct = app.call_tool("led_set", &json!({"color": "#00ff00"})).unwrap_err();
+        assert_eq!(direct.code, code::FORBIDDEN);
+        let error = app
+            .call_tool("script", &json!({"source": r##"tool("led_set", {color: "#00ff00"})"##}))
+            .unwrap_err();
+        assert!(error.message.contains("disabled"), "{}", error.message);
+        assert!(!error.message.contains("available:"), "{}", error.message);
+    }
 
     /// The snippet `script("examples")` hands a model has to be a program this parser
     /// reads, or it teaches a call that fails with a syntax error at the third note.

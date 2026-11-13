@@ -7,6 +7,7 @@
 pub mod family;
 pub mod fs;
 pub mod knowledge;
+pub mod media;
 pub mod net;
 pub mod regex;
 pub mod shell;
@@ -499,7 +500,7 @@ pub fn agent_extra_specs() -> Value {
     // Reading, writing and editing a file are the three operations frequent enough to be
     // their own tools; everything else the shell does is behind `shell`, with one command
     // line as its argument.
-    json!([
+    crate::tool::with_argument_descriptions(json!([
         {
             "type": "function",
             "function": {
@@ -563,11 +564,11 @@ pub fn agent_extra_specs() -> Value {
                 },
             },
         },
-    ])
+    ]))
 }
 
 pub fn script_specs() -> Value {
-    json!([{
+    crate::tool::with_argument_descriptions(json!([{
         "type": "function",
         "function": {
             "name": "script",
@@ -600,7 +601,7 @@ pub fn script_specs() -> Value {
                 "additionalProperties": false
             }
         }
-    }])
+    }]))
 }
 
 /// Every tool that needs no device at all.
