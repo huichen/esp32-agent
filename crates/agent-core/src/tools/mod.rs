@@ -182,7 +182,7 @@ pub fn board_tools() -> Vec<ToolDef> {
             .requires(&[cap::I2C])
             .schema(object_schema(&[("bus", integer(0, 3, "bus index, default 0"))], &[]))
             .bind(|ctx, args| {
-                let bus = j::opt_i64(args, "bus").map(|b| b as u8).unwrap_or_else(|| default_bus(ctx));
+                let bus = j::optional_ranged_i64(args, "bus", 0, 3)?.map(|b| b as u8).unwrap_or_else(|| default_bus(ctx));
                 let addrs = ctx.hw.i2c_scan(bus)?;
                 Ok(json!({
                     "bus": bus,
@@ -207,10 +207,10 @@ pub fn board_tools() -> Vec<ToolDef> {
             &["addr"],
         ))
         .bind(|ctx, args| {
-            let addr = j::ranged_i64(args, "addr", 0, 1, 127)? as u8;
-            let len = j::ranged_i64(args, "length", 1, 1, 64)? as usize;
-            let reg = j::opt_i64(args, "reg").map(|r| r as u8);
-            let bus = j::opt_i64(args, "bus").map(|b| b as u8).unwrap_or_else(|| default_bus(ctx));
+            let addr = j::required_ranged_i64(args, "addr", 1, 127)? as u8;
+            let len = j::optional_ranged_u64(args, "length", 1, 64)?.unwrap_or(1) as usize;
+            let reg = j::optional_ranged_i64(args, "reg", 0, 255)?.map(|r| r as u8);
+            let bus = j::optional_ranged_i64(args, "bus", 0, 3)?.map(|b| b as u8).unwrap_or_else(|| default_bus(ctx));
             let mut buf = vec![0u8; len];
             ctx.hw.i2c_read(bus, addr, reg, &mut buf)?;
             Ok(json!({
@@ -236,14 +236,16 @@ pub fn board_tools() -> Vec<ToolDef> {
             ))
             .mutating()
             .bind(|ctx, args| {
-                let addr = j::ranged_i64(args, "addr", 0, 1, 127)? as u8;
-                let reg = j::opt_i64(args, "reg").map(|r| r as u8);
-                let bus = j::opt_i64(args, "bus").map(|b| b as u8).unwrap_or_else(|| default_bus(ctx));
+                let addr = j::required_ranged_i64(args, "addr", 1, 127)? as u8;
+                let reg = j::optional_ranged_i64(args, "reg", 0, 255)?.map(|r| r as u8);
+                let bus = j::optional_ranged_i64(args, "bus", 0, 3)?.map(|b| b as u8).unwrap_or_else(|| default_bus(ctx));
                 let data: Vec<u8> = j::arr(args, "data")
                     .ok_or_else(|| McpError::invalid_params("`data` must be an array of bytes"))?
                     .iter()
-                    .map(|v| v.as_u64().unwrap_or(0).min(255) as u8)
-                    .collect();
+                    .enumerate()
+                    .map(|(i, v)| v.as_u64().and_then(|n| u8::try_from(n).ok()).ok_or_else(||
+                        McpError::invalid_params(format!("`data[{i}]` must be an integer within 0..=255"))))
+                    .collect::<crate::error::Result<_>>()?;
                 ctx.hw.i2c_write(bus, addr, reg, &data)?;
                 Ok(json!({ "ok": true, "addr": format!("0x{addr:02X}"), "bytes": data.len() }))
             }),
@@ -253,7 +255,7 @@ pub fn board_tools() -> Vec<ToolDef> {
             .requires(&[cap::GPIO])
             .schema(object_schema(&[("pin", integer(0, 48, "GPIO number"))], &["pin"]))
             .bind(|ctx, args| {
-                let pin = j::ranged_i64(args, "pin", 0, 0, 48)? as i32;
+                let pin = j::required_ranged_i64(args, "pin", 0, 48)? as i32;
                 ctx.hw.gpio_config(pin, PinMode::InputPullup)?;
                 let level = ctx.hw.gpio_read(pin)?;
                 Ok(json!({ "pin": pin, "level": if level { 1 } else { 0 }, "high": level }))
@@ -271,8 +273,8 @@ pub fn board_tools() -> Vec<ToolDef> {
             ))
             .mutating()
             .bind(|ctx, args| {
-                let pin = j::ranged_i64(args, "pin", 0, 0, 48)? as i32;
-                let level = j::ranged_i64(args, "level", 0, 0, 1)? != 0;
+                let pin = j::required_ranged_i64(args, "pin", 0, 48)? as i32;
+                let level = j::required_ranged_i64(args, "level", 0, 1)? != 0;
                 ctx.hw.gpio_config(pin, PinMode::Output)?;
                 ctx.hw.gpio_write(pin, level)?;
                 Ok(json!({ "ok": true, "pin": pin, "level": if level { 1 } else { 0 } }))
@@ -290,7 +292,7 @@ pub fn board_tools() -> Vec<ToolDef> {
             ))
             .mutating()
             .bind(|ctx, args| {
-                let pin = j::ranged_i64(args, "pin", 0, 0, 48)? as i32;
+                let pin = j::required_ranged_i64(args, "pin", 0, 48)? as i32;
                 let m = j::str_arg(args, "mode")?;
                 let mode = PinMode::parse(&m)
                     .ok_or_else(|| McpError::invalid_params(format!("unknown mode `{m}`")))?;
@@ -303,7 +305,7 @@ pub fn board_tools() -> Vec<ToolDef> {
             .requires(&[cap::ADC])
             .schema(object_schema(&[("pin", integer(0, 48, "ADC-capable GPIO"))], &["pin"]))
             .bind(|ctx, args| {
-                let pin = j::ranged_i64(args, "pin", 0, 0, 48)? as i32;
+                let pin = j::required_ranged_i64(args, "pin", 0, 48)? as i32;
                 let mv = ctx.hw.adc_mv(pin)?;
                 Ok(json!({ "pin": pin, "millivolts": mv, "volts": (mv as f32 / 1000.0 * 1000.0).round() / 1000.0 }))
             }),

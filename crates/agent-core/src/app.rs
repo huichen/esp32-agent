@@ -8652,6 +8652,107 @@ mod tests {
     /// The board's own agent can put work on the board's schedule: a task, on an interval
     /// or at a daily time, into the same queue a user message uses.
     #[test]
+    fn raw_board_arguments_refuse_before_hardware_access() {
+        use crate::hardware::{BoardInfo, PinMode};
+        struct NoRawAccess;
+        impl Hardware for NoRawAccess {
+            fn board_info(&mut self) -> BoardInfo {
+                BoardInfo::default()
+            }
+            fn gpio_config(&mut self, _: i32, _: PinMode) -> Result<()> {
+                panic!("GPIO configured before validation")
+            }
+            fn gpio_read(&mut self, _: i32) -> Result<bool> {
+                panic!("GPIO read before validation")
+            }
+            fn gpio_write(&mut self, _: i32, _: bool) -> Result<()> {
+                panic!("GPIO written before validation")
+            }
+            fn adc_mv(&mut self, _: i32) -> Result<u32> {
+                panic!("ADC read before validation")
+            }
+            fn i2c_scan(&mut self, _: u8) -> Result<Vec<u8>> {
+                panic!("I2C scanned before validation")
+            }
+            fn i2c_read(&mut self, _: u8, _: u8, _: Option<u8>, _: &mut [u8]) -> Result<()> {
+                panic!("I2C read before validation")
+            }
+            fn i2c_write(&mut self, _: u8, _: u8, _: Option<u8>, _: &[u8]) -> Result<()> {
+                panic!("I2C written before validation")
+            }
+        }
+        let mut app = test_app();
+        app.hw = Box::new(NoRawAccess);
+        let refused = |app: &mut App, name: &str, args: Value| {
+            let error = app.call_tool(name, &args).unwrap_err();
+            assert_eq!(error.code, code::INVALID_PARAMS, "{name} {args}: {}", error.message);
+        };
+        for name in ["gpio_read", "gpio_write", "gpio_mode", "adc_read"] {
+            let mut args = json!({"level":1,"mode":"output"});
+            refused(&mut app, name, args.clone());
+            for pin in [
+                json!(null),
+                json!(true),
+                json!(1.5),
+                json!(1.0),
+                json!("1.2"),
+                json!("bad"),
+                json!([]),
+                json!({}),
+                json!(-1),
+                json!(49),
+                json!(u64::MAX),
+            ] {
+                args["pin"] = pin;
+                refused(&mut app, name, args.clone());
+            }
+        }
+        refused(&mut app, "gpio_write", json!({"pin":12}));
+        for level in [json!(null), json!(false), json!(0.5), json!("bad"), json!({}), json!(-1), json!(2)] {
+            refused(&mut app, "gpio_write", json!({"pin":12,"level":level}));
+        }
+        refused(&mut app, "gpio_mode", json!({"pin":12}));
+        for name in ["i2c_read", "i2c_write"] {
+            refused(&mut app, name, json!({"data":[0]}));
+            for addr in [json!(null), json!(true), json!(1.5), json!("bad"), json!({}), json!(0), json!(128)]
+            {
+                refused(&mut app, name, json!({"addr":addr,"data":[0]}));
+            }
+            for field in ["bus", "reg"] {
+                for raw in [json!(null), json!(true), json!(1.5), json!("bad"), json!(-1), json!(256)] {
+                    let mut args = json!({"addr":60,"data":[0]});
+                    args[field] = raw;
+                    refused(&mut app, name, args);
+                }
+            }
+        }
+        for raw in [json!(null), json!(true), json!(1.5), json!("1"), json!("bad"), json!(0), json!(65)] {
+            refused(&mut app, "i2c_read", json!({"addr":60,"length":raw}));
+        }
+        for raw in [json!(null), json!(true), json!(1.5), json!("2"), json!(-1), json!(256)] {
+            refused(&mut app, "i2c_write", json!({"addr":60,"data":[0,raw]}));
+        }
+        refused(&mut app, "i2c_write", json!({"addr":60}));
+        refused(&mut app, "i2c_write", json!({"addr":60,"data":"bytes"}));
+        for bus in [json!(null), json!(true), json!(1.5), json!("bad"), json!(-1), json!(4)] {
+            refused(&mut app, "i2c_scan", json!({"bus":bus}));
+        }
+        // Numeric strings remain supported; absent optional fields keep the configured
+        // bus, one-byte read length and command-only register default.
+        app.hw = Box::new(VirtualBoard::new());
+        app.cfg.bus.i2c[0].bus = 2;
+        assert_eq!(app.call_tool("gpio_write", &json!({"pin":"12","level":"1"})).unwrap()["pin"], 12);
+        let read = app.call_tool("i2c_read", &json!({"addr":"118"})).unwrap();
+        assert_eq!(read["bus"], 2);
+        assert_eq!(read["bytes"].as_array().unwrap().len(), 1);
+        assert_eq!(read["reg"], Value::Null);
+        let read =
+            app.call_tool("i2c_read", &json!({"addr":"118","reg":"208","length":1,"bus":"0"})).unwrap();
+        assert_eq!(read["bytes"][0], 0x60);
+        assert!(app.call_tool("i2c_write", &json!({"addr":"60","data":[0,255]})).is_ok());
+    }
+
+    #[test]
     fn rpc_batches_keep_valid_peers_errors_and_array_responses() {
         let mut app = test_app();
         let reply = app.handle_rpc(r#"[{"jsonrpc":"2.0","id":1,"method":"ping"}]"#, None).unwrap();
