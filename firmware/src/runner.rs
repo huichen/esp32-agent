@@ -34,11 +34,9 @@
 //!   epoch, so `every_s` tasks work immediately while `at_hhmm` tasks only mean a
 //!   wall-clock time once the clock is real; the thread says which it is at boot.
 //!
-//! The blocks between the `===` markers (transport, one tick, the clock) depend
-//! deliberately on nothing but `std`, `log`, `esp32_agent_core` and 鈥?for the TLS
-//! handshake only 鈥?`esp_idf_svc::tls`, so the HTTP framing below is the same code on
-//! both sides: this crate cannot run `cargo test`, and an untested HTTP client is
-//! where the bench would lose a day.
+//! The platform carries sockets, TLS and the clock. HTTP request/reply framing lives
+//! in `esp32_agent_core::http_client`, shared with the simulator and exercised by host
+//! tests; no second parser here can silently drift away from what was tested.
 
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, MutexGuard};
@@ -46,6 +44,7 @@ use std::time::{Duration, Instant};
 
 use esp32_agent_core::app::{now_ms, App, Shared};
 use esp32_agent_core::config::clamp_tick_ms;
+use esp32_agent_core::http_client::{self, Target};
 use esp32_agent_core::llm::{self, ChatTransport};
 use esp32_agent_core::logbuf::LogBuf;
 
@@ -72,17 +71,10 @@ const CLOCK_SET_AFTER_S: u64 = 1_700_000_000;
 // ============================ transport (std + llm only) ============================
 
 use std::io::{ErrorKind, Read, Write};
-use std::net::{TcpStream, ToSocketAddrs};
+use std::net::TcpStream;
 
 /// esp-tls for `https://`: mbedTLS with the certificate bundle compiled into the image.
 use esp_idf_svc::tls::{Config as TlsConfig, EspTls, InternalSocket};
-
-/// Reply headers larger than this are refused instead of buffered.
-const MAX_HEADER_BYTES: usize = 16 * 1024;
-
-/// A reply body is read up to this much. The model reply is capped at 8 KB
-/// upstream in `esp32_agent_core::agent`, so this is head-room, not a target.
-const MAX_BODY_BYTES: usize = 64 * 1024;
 
 /// `LlmConfig::timeout_s` defaults to 45; the transport keeps the value inside
 /// these bounds so a misplaced config cannot make it refuse to read at all.
@@ -151,15 +143,18 @@ impl ChatTransport for EspHttpTransport {
         // A GET carries no body and no content headers; sending them is what made every
         // method-sensitive endpoint answer 405.
         let body = if method.eq_ignore_ascii_case("GET") { "" } else { body };
-        let request = request_bytes(method, &target, headers, body);
+        let head = http_client::request_head(method, &target, headers, body.len())?;
 
         let mut conn = if target.tls {
             Conn::connect_tls(&target, timeout)?
         } else {
             Conn::connect_plain(&target, timeout)?
         };
-        conn.write_all(&request)?;
-        let response = read_response(&mut conn, timeout)?;
+        conn.write_all(head.as_bytes())?;
+        if !body.is_empty() {
+            conn.write_all(body.as_bytes())?;
+        }
+        let response = http_client::read_response(ResponseReader { conn: &mut conn, timeout })?;
         if (200..300).contains(&response.status) {
             Ok(response.body)
         } else {
@@ -172,7 +167,7 @@ impl ChatTransport for EspHttpTransport {
 
 /// The socket a reply arrives on: plain TCP, or esp-tls when the endpoint is `https`.
 ///
-/// Both arms expose the same three operations, so [`read_response`] 鈥?the part with
+/// Both arms expose the same three operations, so [`http_client::read_response`] — the part with
 /// the framing rules in it 鈥?is written once and cannot drift between the two schemes.
 enum Conn {
     Plain { stream: TcpStream, opened: Instant },
@@ -221,7 +216,7 @@ impl Conn {
             format!(
                 "the TLS handshake with {} failed: {e} (board clock {}s{}; internal heap {} kB with a \
                  {} kB largest block)",
-                target.authority(),
+                target.host_header(),
                 unsafe { esp_idf_svc::sys::time(std::ptr::null_mut()) },
                 if unsafe { esp_idf_svc::sys::time(std::ptr::null_mut()) } < 1_700_000_000 {
                     " 鈥?SNTP has not synced"
@@ -278,16 +273,19 @@ impl Conn {
                     Err(e) => return Err(read_error(&e, timeout)),
                 }
             },
-            Conn::Tls { tls, .. } => tls.read(buf).map_err(|e| {
+            Conn::Tls { tls, .. } => tls.read(buf).or_else(|e| {
+                if e.code() == -0x7880 {
+                    return Ok(0); // an authenticated TLS close, not a failed body read
+                }
                 let opened = self.opened_for();
-                format!(
+                Err(format!(
                     "reading the reply over TLS failed: {e} (code {code}: {meaning}; the request \
                      had been open for {:.1} s, socket timeout {} s)",
                     opened.as_secs_f32(),
                     timeout.as_secs(),
                     code = e.code(),
                     meaning = tls_code_meaning(e.code()),
-                )
+                ))
             }),
         }
     }
@@ -318,255 +316,16 @@ fn tls_code_meaning(code: i32) -> &'static str {
     }
 }
 
-/// `http://host[:port]/path` or `https://host[:port]/path`, parsed out of the config
-/// string.
-#[derive(Debug)]
-struct Target {
-    tls: bool,
-    host: String,
-    port: u16,
-    path: String,
+/// Keep platform-specific TLS diagnostics while the core owns HTTP framing.
+struct ResponseReader<'a> {
+    conn: &'a mut Conn,
+    timeout: Duration,
 }
 
-impl Target {
-    fn parse(url: &str) -> Result<Self, String> {
-        let url = url.trim();
-        let lower = url.to_ascii_lowercase();
-        // Both schemes are supported; TLS is a property of this struct, not a
-        // separate code path above it.
-        let (tls, rest) = if lower.starts_with("https://") {
-            (true, &url["https://".len()..])
-        } else if lower.starts_with("http://") {
-            (false, &url["http://".len()..])
-        } else {
-            return Err(format!(
-                "the model endpoint must start with http:// or https://, got `{}`",
-                llm::body_prefix(url, 80)
-            ));
-        };
-        let default_port = if tls { 443u16 } else { 80u16 };
-        let (authority, path) = match rest.find('/') {
-            Some(index) => (&rest[..index], &rest[index..]),
-            None => (rest, "/"),
-        };
-        if authority.is_empty() {
-            return Err(format!("`{}` has no host part", llm::body_prefix(url, 80)));
-        }
-        if authority.starts_with('[') {
-            // getaddrinfo wants the bare `::1`, so a bracketed literal would have to
-            // be unwrapped here; a LAN address or a provider name is v4 or DNS, so say
-            // so instead of resolving something subtly wrong.
-            return Err("IPv6 literals are not supported; use an IPv4 address or a host name".to_string());
-        }
-        let (host, port) = match authority.rsplit_once(':') {
-            Some((host, port)) if !host.is_empty() && port.chars().all(|c| c.is_ascii_digit()) => {
-                let port = port.parse::<u16>().map_err(|_| format!("`{port}` is not a port number"))?;
-                (host, port)
-            }
-            _ => (authority, default_port),
-        };
-        if host.is_empty() {
-            return Err(format!("`{}` has no host part", llm::body_prefix(url, 80)));
-        }
-        Ok(Self { tls, host: host.to_string(), port, path: path.to_string() })
+impl Read for ResponseReader<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.conn.read(buf, self.timeout).map_err(std::io::Error::other)
     }
-
-    /// `host:port` for messages, and the `Host` header with the scheme's default port
-    /// left off.
-    fn authority(&self) -> String {
-        self.host_header()
-    }
-
-    fn host_header(&self) -> String {
-        let default_port = if self.tls { 443 } else { 80 };
-        if self.port == default_port {
-            self.host.clone()
-        } else {
-            format!("{}:{}", self.host, self.port)
-        }
-    }
-
-    /// Resolve, then connect to each candidate address, `timeout` per attempt.
-    fn connect(&self, timeout: Duration) -> Result<TcpStream, String> {
-        let addrs = (self.host.as_str(), self.port)
-            .to_socket_addrs()
-            .map_err(|e| format!("could not resolve `{}`: {e}", self.authority()))?;
-        let mut last_error = format!("`{}` resolved to no address", self.authority());
-        for addr in addrs {
-            match TcpStream::connect_timeout(&addr, timeout) {
-                Ok(stream) => return Ok(stream),
-                Err(e) => last_error = format!("connecting to {addr} failed: {e}"),
-            }
-        }
-        Err(last_error)
-    }
-}
-
-/// The request head plus body as one buffer, so a multi-byte UTF-8 body is never
-/// re-encoded on the way to the socket.
-fn request_bytes(method: &str, target: &Target, headers: &[(&str, &str)], body: &str) -> Vec<u8> {
-    let mut head = String::with_capacity(256 + body.len());
-    head.push_str(&format!("{method} {} HTTP/1.1\r\n", target.path));
-    head.push_str(&format!("Host: {}\r\n", target.authority()));
-    // One request per connection: the reply is delimited by the close as well as by
-    // its own framing, which is what lets the reader stay this small.
-    head.push_str("Connection: close\r\n");
-    head.push_str(&format!("Content-Length: {}\r\n", body.len()));
-    for (name, value) in headers {
-        let lower = name.to_ascii_lowercase();
-        // Never let a caller override the framing or duplicate the host.
-        if matches!(lower.as_str(), "host" | "connection" | "content-length" | "transfer-encoding") {
-            continue;
-        }
-        // A header carrying CR/LF would split the request in two; drop it rather
-        // than send something the endpoint reads as two requests.
-        if name.contains('\r') || name.contains('\n') || value.contains('\r') || value.contains('\n') {
-            continue;
-        }
-        head.push_str(&format!("{name}: {value}\r\n"));
-    }
-    head.push_str("\r\n");
-    let mut out = head.into_bytes();
-    out.extend_from_slice(body.as_bytes());
-    out
-}
-
-struct Response {
-    status: u16,
-    body: String,
-}
-
-fn read_response(conn: &mut Conn, timeout: Duration) -> Result<Response, String> {
-    let mut raw: Vec<u8> = Vec::with_capacity(2048);
-    let mut buf = [0u8; 512];
-    let header_end = loop {
-        if let Some(index) = find_bytes(&raw, b"\r\n\r\n") {
-            break index + 4;
-        }
-        if raw.len() > MAX_HEADER_BYTES {
-            return Err(format!("the reply headers exceed {MAX_HEADER_BYTES} bytes"));
-        }
-        match conn.read(&mut buf, timeout) {
-            Ok(0) => {
-                if raw.is_empty() {
-                    return Err("the server closed the connection without a reply".to_string());
-                }
-                return Err(format!(
-                    "the connection closed inside the reply headers: {}",
-                    llm::body_prefix(&String::from_utf8_lossy(&raw), 120)
-                ));
-            }
-            Ok(n) => raw.extend_from_slice(&buf[..n]),
-            Err(e) => return Err(e),
-        }
-    };
-
-    let head = String::from_utf8_lossy(&raw[..header_end]).to_string();
-    let mut lines = head.split("\r\n");
-    let status_line = lines.next().unwrap_or_default().to_string();
-    let status = parse_status(&status_line)
-        .ok_or_else(|| format!("unexpected HTTP status line: {}", llm::body_prefix(&status_line, 80)))?;
-
-    let mut content_length: Option<usize> = None;
-    let mut chunked = false;
-    for line in lines {
-        let Some((name, value)) = line.split_once(':') else { continue };
-        match name.trim().to_ascii_lowercase().as_str() {
-            "content-length" => content_length = value.trim().parse::<usize>().ok(),
-            "transfer-encoding" => chunked = value.to_ascii_lowercase().contains("chunked"),
-            _ => {}
-        }
-    }
-
-    let mut body = raw[header_end..].to_vec();
-    if chunked {
-        // `Connection: close` means the last chunk and the close agree: read to the
-        // end and decode afterwards, so a chunk split across reads costs nothing.
-        fill_to_end(conn, &mut body, timeout);
-        body = dechunk(&body);
-    } else if let Some(length) = content_length {
-        if body.len() < length {
-            fill_length(conn, &mut body, length, timeout)?;
-        }
-        body.truncate(length.min(body.len()));
-    } else {
-        fill_to_end(conn, &mut body, timeout);
-    }
-    if body.len() > MAX_BODY_BYTES {
-        body.truncate(MAX_BODY_BYTES);
-    }
-    Ok(Response { status, body: String::from_utf8_lossy(&body).to_string() })
-}
-
-/// Read until `body` holds `length` bytes. A close before that is an error: the
-/// caller asked for a specific body and a short one would parse as something else.
-fn fill_length(conn: &mut Conn, body: &mut Vec<u8>, length: usize, timeout: Duration) -> Result<(), String> {
-    let mut buf = [0u8; 512];
-    while body.len() < length && body.len() <= MAX_BODY_BYTES {
-        match conn.read(&mut buf, timeout) {
-            Ok(0) => return Err(format!("the reply ended after {} of {length} bytes", body.len())),
-            Ok(n) => body.extend_from_slice(&buf[..n]),
-            Err(e) => return Err(e),
-        }
-    }
-    Ok(())
-}
-
-/// Read to the close, bounded. A read error after the body started is tolerated:
-/// some endpoints close without a clean FIN, and what arrived is still useful.
-fn fill_to_end(conn: &mut Conn, body: &mut Vec<u8>, timeout: Duration) {
-    let mut buf = [0u8; 512];
-    while body.len() <= MAX_BODY_BYTES {
-        match conn.read(&mut buf, timeout) {
-            Ok(0) => break,
-            Ok(n) => body.extend_from_slice(&buf[..n]),
-            Err(e) => {
-                log::debug!("agent: body read stopped early: {e}");
-                break;
-            }
-        }
-    }
-}
-
-/// Decode `Transfer-Encoding: chunked`. A malformed tail keeps what was decoded so
-/// far rather than throwing the whole reply away.
-fn dechunk(mut data: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(data.len());
-    loop {
-        let Some(line_end) = find_bytes(data, b"\r\n") else { break };
-        let size_line = String::from_utf8_lossy(&data[..line_end]);
-        let size_text = size_line.split(';').next().unwrap_or_default().trim().to_string();
-        let Ok(size) = usize::from_str_radix(&size_text, 16) else { break };
-        data = &data[line_end + 2..];
-        if size == 0 || out.len() > MAX_BODY_BYTES {
-            break;
-        }
-        let take = size.min(data.len());
-        out.extend_from_slice(&data[..take]);
-        if take < size {
-            break;
-        }
-        data = &data[size..];
-        if data.starts_with(b"\r\n") {
-            data = &data[2..];
-        }
-    }
-    out
-}
-
-fn parse_status(line: &str) -> Option<u16> {
-    let mut parts = line.split_whitespace();
-    if !parts.next()?.to_ascii_uppercase().starts_with("HTTP/") {
-        return None;
-    }
-    parts.next()?.parse::<u16>().ok()
-}
-
-fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    if needle.is_empty() || haystack.len() < needle.len() {
-        return None;
-    }
-    haystack.windows(needle.len()).position(|window| window == needle)
 }
 
 fn read_error(e: &std::io::Error, timeout: Duration) -> String {
@@ -597,7 +356,11 @@ pub fn start(
 ) -> Result<(), String> {
     // The model transport lives on this thread, not in the `App`: a turn is run in phases
     // precisely so that the model call happens with the app lock released.
-    let spawn = |transport: EspHttpTransport, shared: &Shared, log: &Arc<LogBuf>, timeout_s: &Arc<AtomicU32>, caps: u32| {
+    let spawn = |transport: EspHttpTransport,
+                 shared: &Shared,
+                 log: &Arc<LogBuf>,
+                 timeout_s: &Arc<AtomicU32>,
+                 caps: u32| {
         let shared = shared.clone();
         let log = log.clone();
         let timeout_s = timeout_s.clone();
