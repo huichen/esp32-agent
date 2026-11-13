@@ -108,7 +108,15 @@ three public model settings at the **board's own** scripted endpoint, then resto
 them in `finally`; it never reads a credential file or sends the existing model key
 to a different host. Omit `--agent` when configuration must not change.
 
+Every HTTP response includes `Server-Timing: handler;dur=<milliseconds>`. This
+measures the route handler only; queueing, request parsing, socket writes, LAN and
+client scheduling are excluded. The regression records both client latency and
+handler duration, plus the slowest response's snapshot age. A slow client reading
+must not be described as App-lock contention without this distinction.
+
 The default responsiveness assertion is 1 second; measured latency, not that
-assertion, must be reported as board evidence. Warm serial resets, cold power cuts,
+assertion, must be reported as board evidence. `--max-ms 2000` explicitly selects
+a looser 2-second test bound; passing it does not establish the default 1-second
+target. Warm serial resets, cold power cuts,
 TLS stack headroom, real-provider cancellation and hardware sound/display quality
 are separate checks. Passing host concurrency tests does not establish them.

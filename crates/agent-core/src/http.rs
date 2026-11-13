@@ -1448,7 +1448,11 @@ fn serve_until_stream<S: Stream>(
             let head_only = req.method == "HEAD";
             let started = std::time::Instant::now();
             let mut resp = (routes.request)(&req);
-            if started.elapsed().as_millis() > 500 {
+            // Distinguish handler time from queueing, parsing, socket writes and
+            // LAN/client delay; end-to-end latency alone cannot diagnose App locks.
+            let handler_ms = started.elapsed().as_millis();
+            resp = resp.with_header("Server-Timing", &format!("handler;dur={handler_ms}"));
+            if handler_ms > 500 {
                 log.warn(
                     "http",
                     format!("{} {} took {} ms", req.method, req.path, started.elapsed().as_millis()),
@@ -1634,6 +1638,7 @@ mod tests {
                 &format!("GET {path} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"),
             );
             assert!(response.contains("reused"), "request {index} was lost");
+            assert!(response.contains("Server-Timing: handler;dur="), "handler timing is missing");
         }
         wait_until(|| server.budget.workers.load(Ordering::SeqCst) == 0);
         assert_eq!(
