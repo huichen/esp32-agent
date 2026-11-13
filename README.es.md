@@ -99,14 +99,14 @@ instrucción sirve para cada placa que pueda alcanzar. Sin ninguna clave, `base_
 |---|---|
 | `agent-core` | 840 pruebas unitarias y 5 de integración pasan; `scripts/smoke.ps1` pasa de extremo a extremo |
 | Simulador | la consola, MCP y el bucle de agente funcionan de extremo a extremo |
-| Firmware | firmware histórico del banco en una ESP32-S3-DevKitC-1 N16R8 (IDF v5.5.2): 42 herramientas, OLED 128×32, micrófono y amplificador I²S, WS2812, consola TLS, turnos del modelo por HTTPS; cambios de la auditoría no verificados en la placa |
+| Firmware | firmware del banco grabado en una ESP32-S3-DevKitC-1 N16R8 (IDF v5.5.2) en el commit `d5d8927` (2026-11-13): 42 herramientas, OLED 128×32, micrófono y amplificador I²S, WS2812, consola TLS, turnos del modelo por HTTPS; lo que ese grabado no verificó está en `ROADMAP.md` |
 | No implementado / no verificado | La captura DVP del firmware no está implementada. Los drivers SD de sectores sin procesar y DHT11/22 tienen pruebas en el host, no verificación en la placa. Ver `ROADMAP.md` |
 
 Números históricos del banco: un turno con cuatro herramientas en 13.7 s; consola por TLS en 0.55 s;
 escaneo I²C estable en 8 ejecuciones. La lectura antigua de 5–6 kB de SRAM interna libre tras una página TLS
 es anterior a las correcciones del asignador (`10b16dd`) y no es un límite actual. Las mediciones posteriores
 por pool y su procedencia están en [Solución de problemas](docs/troubleshooting.md#how-much-memory-the-board-has).
-El firmware de la auditoría no se ha grabado ni probado en la placa.
+El firmware actual está grabado y responde en la placa del banco; la durabilidad ante cortes de corriente, el comportamiento con ENOSPC y las rutas de audio y cámara siguen sin verificar, como dice `ROADMAP.md`.
 
 ## Documentación
 
