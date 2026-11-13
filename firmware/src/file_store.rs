@@ -165,7 +165,7 @@ impl FileStore {
             let _ = std::fs::remove_file(&tmp);
             return Err(e);
         }
-        self.publish(key, &tmp)
+        self.publish_file(key, &tmp)
     }
 
     /// Put the file at `tmp` in place of `key`'s value, keeping the old one until it lands.
@@ -173,7 +173,7 @@ impl FileStore {
     /// LittleFS 1.23.1 permits replacement through `lfs_rename`. Its VFS rejects
     /// either path while open, so the read cache is closed before the single rename.
     /// The old two-rename SPIFFS workaround created an unnecessary missing-value window.
-    fn publish(&self, key: &str, tmp: &Path) -> std::io::Result<()> {
+    fn publish_file(&self, key: &str, tmp: &Path) -> std::io::Result<()> {
         let path = self.path(key)?;
         self.open.invalidate(&path);
         match std::fs::rename(tmp, &path) {
@@ -283,7 +283,7 @@ impl KvStore for FileStore {
             self.last_error = Some(StoreError { code: e.raw_os_error().unwrap_or(0), name: format!("{e}") });
             return false;
         }
-        match self.publish(key, &tmp) {
+        match self.publish_file(key, &tmp) {
             Ok(()) => true,
             Err(e) => {
                 log::error!(
