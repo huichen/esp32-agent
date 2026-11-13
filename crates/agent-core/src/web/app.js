@@ -1430,6 +1430,26 @@ async function loadLogs() {
   }
 }
 
+/** Wait until the board reports a station address, then return the wifi object.
+ *
+ * "Save and join" used to print "the board is joining" and then a single status refresh four
+ * seconds later, which is often before the association finishes — so the address the person
+ * needs was the one thing the page never showed. Poll instead, and stop as soon as there is
+ * an address (or the deadline passes, which is a wrong password, not a slow network). */
+async function waitForStationIp(seconds) {
+  const deadline = Date.now() + seconds * 1000;
+  while (Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 1000));
+    try {
+      const d = await api("/api/status");
+      if (d && d.wifi && d.wifi.ip) return d.wifi;
+    } catch {
+      /* the board may be reconfiguring the radio: try again */
+    }
+  }
+  return null;
+}
+
 async function loadSettings() {
   try {
     const d = await api("/api/config");
@@ -1437,6 +1457,12 @@ async function loadSettings() {
     $("#wifi-gateway").value = d.wifi.gateway || "";
     $("#wifi-dns").value = d.wifi.dns || "";
     $("#wifi-password").value = "";
+    // Where the board is right now, not only where it is trying to go.
+    const s = await api("/api/status");
+    if (s && s.wifi && s.wifi.ip) {
+      const ap = s.wifi.state === "ap+sta" ? " \u00b7 setup AP still up" : "";
+      $("#wifi-result").textContent = "currently at http://" + s.wifi.ip + "/" + ap;
+    }
   } catch (e) {
     if (!String(e.message).includes("PIN")) toast(e.message);
   }
@@ -1655,7 +1681,19 @@ function init() {
         body: { ssid: $("#wifi-ssid").value.trim(), password: $("#wifi-password").value },
       });
       $("#wifi-result").textContent = "credentials queued; the board is joining";
-      setTimeout(loadStatus, 4000);
+      // The address arrives a second or two after the association, and it is the one thing a
+      // person needs from this screen: the portal they are reading it on is about to answer at
+      // a different address, and the setup AP is closed as soon as the station has one.
+      const joined = await waitForStationIp(25);
+      if (joined) {
+        const closed = joined.state === "connected" ? " \u00b7 setup AP closed" : "";
+        $("#wifi-result").textContent = "joined \u2014 board is at http://" + joined.ip + "/" + closed;
+        toast("board is at " + joined.ip);
+        loadStatus();
+      } else {
+        $("#wifi-result").textContent =
+          "no address yet \u2014 check the password, or reconnect to esp32-agent-setup";
+      }
     } catch (e) { $("#wifi-result").textContent = e.message; }
   };
   $("#wifi-scan").onclick = async () => {

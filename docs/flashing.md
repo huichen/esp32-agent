@@ -176,9 +176,11 @@ http: listening on http://0.0.0.0:80/
 2. Open `http://192.168.4.1:80/` (most phones open it automatically, because the captive
    DNS answers everything).
 3. Scan → pick the SSID → enter the password → "save and connect".
-4. The board writes it to NVS and reconnects — no reboot, no reflash. The access point
-   stays up so you can still change settings from it later; turn `wifi.ap_fallback` off if
-   you do not want that.
+4. The board writes it to NVS and reconnects — no reboot, no reflash. As soon as the
+   station has an address the access point is closed and the portal shows that address
+   (`Settings → WiFi` prints it, and the header line carries the hostname). Set
+   `wifi.keep_ap` if you want both networks up on purpose: a second SSID advertising the
+   board in the room is not something to leave on by accident.
 
 Credentials live only in NVS. **The firmware contains no password**, so moving networks
 costs nothing.
