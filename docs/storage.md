@@ -8,8 +8,9 @@ index `ws.index` maps each path to a short `ws.<12 hex digits>` key. The workspa
 still occupies RAM; a filesystem partition is not additional application heap.
 
 `QueuedStore::set` acknowledges **queue admission**, not a completed flash write.
-Admission is bounded to **2,304 pending keys** and **6 MiB of charged bytes** (value
-and key strings plus a 128-byte bookkeeping charge per operation). The budgets cover
+Admission is bounded to **2,304 pending key/metadata slots** and **6 MiB of charged
+bytes** (value/key strings, 128 bytes per operation and 256 bytes plus the index-key
+string per publication record). The budgets cover
 4 MiB of workspace text, 1,024 files, an escaped filename index, 512 KiB of transcript,
 obsolete-file removals and configuration metadata. They are not a heap-availability
 or backend-capacity guarantee. Budget checks happen before copying a value or
@@ -37,6 +38,40 @@ syncs the temporary file and then renames it. A failed save restores the previou
 in-memory value and reports an I/O error; a failed removal does not appear successful.
 This is not a claim of power-loss durability on every host filesystem: directory-entry
 persistence depends on the host OS and filesystem.
+
+## Workspace publication and rollback
+
+A workspace save admits its changed file values, index and cleanup as one bounded
+queue request. If admission fails, no part of that replacement request is queued:
+the preceding pending generation remains intact. Unchanged pending text buffers are
+shared when that generation is replaced, rather than copied again.
+
+The writer attempts required file values first. A file refusal or superseded
+dependency prevents the index write, records `STORE_DEPENDENCY`, and skips all cleanup.
+An index refusal also skips cleanup. Obsolete indexed files and historical `ws`/
+`ws.1`…`ws.5` values (including tails with gaps) are removed only after all required
+values and the index succeed. A cleanup refusal is reported but does not undo a
+confirmed index; its key is retained for a later explicit save to retry.
+
+Incremental saved hashes advance only from a completed generation-specific publication
+receipt. A failed publication invalidates hashes of values that may have been replaced,
+so a subsequent save or revert cannot incorrectly skip them. A not-yet-drained receipt
+that is replaced becomes superseded; it cannot acknowledge the newer generation.
+Backend failures are not automatically requeued. The RAM edit remains available, but
+only the successful publication confirms it as saved. Check the store diagnostics.
+
+The format remains the plain path-to-key index and one value per file. Physical keys
+are **path-addressed**, not content-addressed: successful replacements of existing
+values may already change what the previous index reads before a later dependency or
+index fails. Unpublished new values can remain as orphans. This is **not an all-files
+transaction**, a rollback of every replaced value, or a flash power-cut guarantee.
+Single-file replacement preservation is the backend guarantee described below.
+
+`workspace_edit` restores the complete RAM workspace if its closure partially mutates
+and then returns an error, or if publication admission is refused. Such an error does
+not leave partially changed RAM or a partially admitted replacement batch. A later
+asynchronous backend refusal is a different event: it is logged and counted, not
+returned as a synchronous edit error or silently treated as durable success.
 
 ## LittleFS replacement and recovery
 
@@ -141,9 +176,9 @@ provide a typed absent-versus-I/O-error result for `read_at`.
 capacities in the file and saved-hash maps plus a 192-byte bookkeeping allowance
 per map entry. The change guard asks for twice that estimate plus 64 KiB of free
 PSRAM. This is an estimate, not a measured allocator footprint or a guarantee
-against fragmentation. Fallible string reservations return errors; tree-node and
-fixed reader-buffer allocations remain standard Rust allocations. Backends that
-use `get` or the default `read_at` may materialize their value before the decoder;
+against fragmentation. Fallible string/vector reservations return errors; receipt,
+tree-node and other small metadata allocations remain standard Rust allocations.
+Backends that use `get` or the default `read_at` may materialize their value before the decoder;
 the firmware filesystem's `read_at` streams without that full-value copy.
 
 These are host-tested parser/admission guarantees. Firmware runtime behavior and

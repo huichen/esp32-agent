@@ -67,6 +67,8 @@ const PENDING_ENTRY_BYTES: usize = 128;
 /// Queue-local errors are deliberately negative, not ESP-IDF error numbers.
 pub const ERR_QUEUE_FULL: i32 = -1;
 pub const ERR_QUEUE_ALLOC: i32 = -2;
+pub const ERR_DEPENDENCY: i32 = -3;
+const PENDING_PUBLICATION_BYTES: usize = 256;
 
 /// How one blob is spread over values, and how to tell it from one written before it was
 /// chunked.
@@ -411,6 +413,38 @@ pub trait KvStore: Send {
         }
     }
 
+    /// Publish an index only after every supplied value succeeds, then remove obsolete keys.
+    /// A queued implementation admits the complete request atomically and returns a receipt
+    /// whose outcome is filled by the writer. `Some` alone does not establish durability.
+    /// The synchronous default preserves dependency order, not an all-values transaction.
+    fn publish(
+        &mut self,
+        index_key: &str,
+        index: &str,
+        writes: &[(&str, &str)],
+        cleanup: &[&str],
+    ) -> Option<PublicationReceipt> {
+        for (key, value) in writes {
+            if !self.set(key, value) {
+                return None;
+            }
+        }
+        if !self.set(index_key, index) {
+            return None;
+        }
+        let mut cleanup_failed = Vec::new();
+        for key in cleanup {
+            if !self.remove(key) && self.last_error().is_some() {
+                cleanup_failed.push((*key).to_string());
+            }
+        }
+        let receipt = PublicationReceipt::new(index_key);
+        receipt.with_state(|state| {
+            state.outcome = Some(PublicationOutcome::Finished { published: true, cleanup_failed });
+        });
+        Some(receipt)
+    }
+
     /// A reader over the stored value, when the backend can offer one without building it.
     ///
     /// A file can be read as it is; NVS has to assemble its values first, so it answers `None`
@@ -425,8 +459,8 @@ pub trait KvStore: Send {
     ///
     /// The primitive a streaming read is built on: the caller asks for the next few kilobytes
     /// instead of the whole value. The default materialises the value through [`KvStore::get`],
-    /// which is right for a backend whose values are small (NVS caps one at ~4 KB, the
-    /// simulator has no cap and no 4 MB workspace either). A file backend seeks.
+    /// which is suitable only for small values (NVS caps one at ~4 KB). Map and filesystem
+    /// backends override it to avoid a full-value copy for each small pull.
     fn read_at(&self, key: &str, offset: usize, buf: &mut [u8]) -> Option<usize> {
         let text = self.get(key)?;
         let bytes = text.as_bytes();
@@ -549,17 +583,139 @@ impl StoreSpace {
     }
 }
 
-/// One queued operation: `Some` is a write, `None` is a removal.
-type Pending = Vec<(String, Option<String>)>;
+/// A generation-specific acknowledgement, never inferred from a key's presence in a report.
+/// Replacing a not-yet-drained publication supersedes its receipt, not a newer generation's.
+#[derive(Clone, Debug)]
+pub struct PublicationReceipt(Arc<Publication>);
+
+#[derive(Debug)]
+struct Publication {
+    index_key: String,
+    state: Mutex<PublicationState>,
+}
+
+#[derive(Debug, Default)]
+struct PublicationState {
+    dependency_failed: bool,
+    index_processed: bool,
+    published: bool,
+    cleanup_failed: Vec<String>,
+    outcome: Option<PublicationOutcome>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PublicationOutcome {
+    /// The entire older request was replaced before any of its operations ran.
+    Superseded,
+    Finished {
+        published: bool,
+        cleanup_failed: Vec<String>,
+    },
+}
+
+impl PublicationReceipt {
+    fn new(index_key: &str) -> Self {
+        Self::from_key(index_key.to_string())
+    }
+
+    fn from_key(index_key: String) -> Self {
+        Self(Arc::new(Publication { index_key, state: Mutex::default() }))
+    }
+
+    fn with_state<R>(&self, f: impl FnOnce(&mut PublicationState) -> R) -> R {
+        match self.0.state.lock() {
+            Ok(mut state) => f(&mut state),
+            Err(poisoned) => f(&mut poisoned.into_inner()),
+        }
+    }
+
+    pub fn outcome(&self) -> Option<PublicationOutcome> {
+        self.with_state(|state| state.outcome.clone())
+    }
+
+    fn cost(&self) -> usize {
+        PENDING_PUBLICATION_BYTES.saturating_add(self.0.index_key.capacity())
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PublicationPhase {
+    Value,
+    Index,
+    Cleanup,
+}
+
+/// Shared value buffers let a replacement publication reuse unchanged pending text.
+/// `get` still returns an owned string; range reads never clone the shared value.
+struct QueuedOp {
+    key: String,
+    value: Option<Arc<String>>,
+    publication: Option<PublicationReceipt>,
+    phase: PublicationPhase,
+}
+
+impl QueuedOp {
+    fn cost(&self) -> usize {
+        PENDING_ENTRY_BYTES
+            .saturating_add(self.key.capacity())
+            .saturating_add(self.value.as_ref().map_or(0, |value| value.capacity()))
+    }
+
+    fn belongs_to(&self, index_key: &str) -> bool {
+        self.publication.as_ref().is_some_and(|receipt| receipt.0.index_key == index_key)
+    }
+}
+
+#[derive(Default)]
+struct Pending {
+    ops: Vec<QueuedOp>,
+    // Retained even if a normal write supersedes a group's index operation: that group
+    // still needs a failed acknowledgement, rather than a receipt left pending forever.
+    publications: Vec<PublicationReceipt>,
+}
+
+impl Pending {
+    fn find(&self, key: &str) -> Option<&QueuedOp> {
+        self.ops.iter().rev().find(|op| op.key == key)
+    }
+
+    fn len(&self) -> usize {
+        self.ops.len() + self.publications.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.ops.is_empty() && self.publications.is_empty()
+    }
+
+    fn bytes(&self) -> usize {
+        self.ops
+            .iter()
+            .map(QueuedOp::cost)
+            .sum::<usize>()
+            .saturating_add(self.publications.iter().map(PublicationReceipt::cost).sum::<usize>())
+    }
+
+    fn remove_key(&mut self, key: &str) {
+        self.ops.retain(|op| {
+            if op.key != key {
+                return true;
+            }
+            if op.phase != PublicationPhase::Cleanup {
+                if let Some(receipt) = &op.publication {
+                    receipt.with_state(|state| state.dependency_failed = true);
+                }
+            }
+            false
+        });
+    }
+}
+
+fn dependency_error() -> StoreError {
+    StoreError { code: ERR_DEPENDENCY, name: "STORE_DEPENDENCY: index not published because a required write failed or was superseded; cleanup skipped".into() }
+}
 
 fn request_cost(key: &str, value: Option<&str>) -> usize {
     PENDING_ENTRY_BYTES.saturating_add(key.len()).saturating_add(value.map_or(0, str::len))
-}
-
-fn pending_cost((key, value): &(String, Option<String>)) -> usize {
-    PENDING_ENTRY_BYTES
-        .saturating_add(key.capacity())
-        .saturating_add(value.as_ref().map_or(0, String::capacity))
 }
 
 fn copy_string(text: &str) -> std::result::Result<String, ()> {
@@ -585,7 +741,8 @@ pub struct FlushReport {
     /// will not take on the next tick either, and a queue that retried forever would fill
     /// the log and hide the one line that says what is wrong.
     pub failed: usize,
-    /// The keys involved, in the order they were applied.
+    /// The keys attempted (including dependency refusals), in execution order. Skipped
+    /// cleanup is not attempted. Unreasonably long invalid names are clipped for diagnostics.
     pub keys: Vec<String>,
     /// One entry per refusal, in the order they happened: the key, the operation and the
     /// backend's own reason. `failed` is the count of these; this is what makes the count
@@ -686,7 +843,7 @@ impl StoreQueue {
         let space = inner.space();
         Self {
             inner: Arc::new(Mutex::new(inner)),
-            pending: Arc::new(Mutex::new(Vec::new())),
+            pending: Arc::new(Mutex::new(Pending::default())),
             written: Arc::new(AtomicU32::new(0)),
             failed: Arc::new(AtomicU32::new(0)),
             stats: Arc::new(Mutex::new(StoreStats::new(space))),
@@ -701,10 +858,9 @@ impl StoreQueue {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         };
-        let previous = pending.iter().position(|(queued, _)| queued == key);
-        let keys = pending.len() + usize::from(previous.is_none());
-        let before = pending.iter().map(pending_cost).sum::<usize>();
-        let replaced = previous.map_or(0, |index| pending_cost(&pending[index]));
+        let (had_previous, replaced) = pending.find(key).map_or((false, 0), |op| (true, op.cost()));
+        let keys = pending.len() + usize::from(!had_previous);
+        let before = pending.bytes();
         let bytes = before.saturating_sub(replaced).saturating_add(request_cost(key, value));
         if keys > PENDING_KEYS_MAX || bytes > PENDING_BYTES_MAX {
             self.refuse(
@@ -722,12 +878,16 @@ impl StoreQueue {
         // No large value copy or vector growth happens until admission has passed. Allocate
         // fallibly before replacing anything, so even an allocation refusal keeps the old value.
         let allocated = (|| {
-            let key = copy_string(key)?;
-            let value = value.map(copy_string).transpose()?;
-            if previous.is_none() {
-                pending.try_reserve(1).map_err(|_| ())?;
+            let entry = QueuedOp {
+                key: copy_string(key)?,
+                value: value.map(|value| Self::copy_or_reuse(&pending, key, value)).transpose()?,
+                publication: None,
+                phase: PublicationPhase::Value,
+            };
+            if !had_previous {
+                pending.ops.try_reserve(1).map_err(|_| ())?;
             }
-            Ok::<_, ()>((key, value))
+            Ok::<_, ()>(entry)
         })();
         let Ok(entry) = allocated else {
             self.refuse(
@@ -740,12 +900,159 @@ impl StoreQueue {
             );
             return false;
         };
-        if let Some(index) = previous {
-            pending.remove(index);
-        }
-        pending.push(entry);
+        pending.remove_key(key);
+        pending.ops.push(entry);
         self.clear_error();
         true
+    }
+
+    fn copy_or_reuse(pending: &Pending, key: &str, text: &str) -> std::result::Result<Arc<String>, ()> {
+        if let Some(value) = pending.find(key).and_then(|op| op.value.as_ref()) {
+            if value.as_str() == text {
+                return Ok(value.clone());
+            }
+        }
+        copy_string(text).map(Arc::new)
+    }
+
+    /// Replace a complete publication, rather than admitting some of its files and then
+    /// refusing the index. Values from its previous pending generation may be shared.
+    fn enqueue_publication(
+        &self,
+        index_key: &str,
+        index: &str,
+        writes: &[(&str, &str)],
+        cleanup: &[&str],
+    ) -> Option<PublicationReceipt> {
+        let mut pending = match self.pending.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let requested = writes.len().saturating_add(cleanup.len()).saturating_add(2);
+        if requested > PENDING_KEYS_MAX {
+            self.refuse(index_key, StoreOp::Set, StoreError {
+                code: ERR_QUEUE_FULL,
+                name: format!("STORE_QUEUE_FULL: publication needs {requested} key/metadata slots; limit is {PENDING_KEYS_MAX}; previous queue unchanged"),
+            });
+            return None;
+        }
+        // Validate disjoint operations without allocating a second unbounded key map.
+        let duplicate = writes.iter().enumerate().any(|(at, (key, _))| {
+            *key == index_key
+                || writes[..at].iter().any(|(earlier, _)| earlier == key)
+                || cleanup.contains(key)
+        }) || cleanup
+            .iter()
+            .enumerate()
+            .any(|(at, key)| *key == index_key || cleanup[..at].contains(key));
+        if duplicate {
+            self.refuse(
+                index_key,
+                StoreOp::Set,
+                StoreError {
+                    code: ERR_DEPENDENCY,
+                    name: "STORE_DEPENDENCY: publication keys must be disjoint; previous queue unchanged"
+                        .into(),
+                },
+            );
+            return None;
+        }
+        let includes = |key: &str| {
+            key == index_key || writes.iter().any(|(write, _)| *write == key) || cleanup.contains(&key)
+        };
+        let keep = |op: &&QueuedOp| !op.belongs_to(index_key) && !includes(&op.key);
+        let kept_ops = pending.ops.iter().filter(keep).count();
+        let kept_publications =
+            pending.publications.iter().filter(|receipt| receipt.0.index_key != index_key).count();
+        let keys = kept_ops.saturating_add(kept_publications).saturating_add(requested);
+        let bytes = pending
+            .ops
+            .iter()
+            .filter(keep)
+            .map(QueuedOp::cost)
+            .sum::<usize>()
+            .saturating_add(
+                pending
+                    .publications
+                    .iter()
+                    .filter(|receipt| receipt.0.index_key != index_key)
+                    .map(PublicationReceipt::cost)
+                    .sum::<usize>(),
+            )
+            .saturating_add(PENDING_PUBLICATION_BYTES)
+            .saturating_add(index_key.len())
+            .saturating_add(request_cost(index_key, Some(index)))
+            .saturating_add(
+                writes
+                    .iter()
+                    .fold(0usize, |n, (key, value)| n.saturating_add(request_cost(key, Some(value)))),
+            )
+            .saturating_add(cleanup.iter().fold(0usize, |n, key| n.saturating_add(request_cost(key, None))));
+        if keys > PENDING_KEYS_MAX || bytes > PENDING_BYTES_MAX {
+            self.refuse(index_key, StoreOp::Set, StoreError {
+                code: ERR_QUEUE_FULL,
+                name: format!("STORE_QUEUE_FULL: publication needs {keys} keys / {bytes} charged bytes; limits are {PENDING_KEYS_MAX} / {PENDING_BYTES_MAX}; previous queue unchanged"),
+            });
+            return None;
+        }
+        let allocated = (|| {
+            let receipt = PublicationReceipt::from_key(copy_string(index_key)?);
+            let mut ops = Vec::new();
+            ops.try_reserve_exact(requested - 1).map_err(|_| ())?;
+            for (key, text) in writes {
+                ops.push(QueuedOp {
+                    key: copy_string(key)?,
+                    value: Some(Self::copy_or_reuse(&pending, key, text)?),
+                    publication: Some(receipt.clone()),
+                    phase: PublicationPhase::Value,
+                });
+            }
+            ops.push(QueuedOp {
+                key: copy_string(index_key)?,
+                value: Some(Self::copy_or_reuse(&pending, index_key, index)?),
+                publication: Some(receipt.clone()),
+                phase: PublicationPhase::Index,
+            });
+            for key in cleanup {
+                ops.push(QueuedOp {
+                    key: copy_string(key)?,
+                    value: None,
+                    publication: Some(receipt.clone()),
+                    phase: PublicationPhase::Cleanup,
+                });
+            }
+            let extra_ops = kept_ops.saturating_add(ops.len()).saturating_sub(pending.ops.len());
+            pending.ops.try_reserve(extra_ops).map_err(|_| ())?;
+            let extra_groups = kept_publications.saturating_add(1).saturating_sub(pending.publications.len());
+            pending.publications.try_reserve(extra_groups).map_err(|_| ())?;
+            Ok::<_, ()>((receipt, ops))
+        })();
+        let Ok((receipt, ops)) = allocated else {
+            self.refuse(
+                index_key,
+                StoreOp::Set,
+                StoreError {
+                    code: ERR_QUEUE_ALLOC,
+                    name: "STORE_QUEUE_ALLOC: previous queue unchanged".into(),
+                },
+            );
+            return None;
+        };
+        pending.ops.retain(|op| !op.belongs_to(index_key));
+        pending.publications.retain(|old| {
+            if old.0.index_key != index_key {
+                return true;
+            }
+            old.with_state(|state| state.outcome = Some(PublicationOutcome::Superseded));
+            false
+        });
+        for op in &ops {
+            pending.remove_key(&op.key);
+        }
+        pending.ops.extend(ops);
+        pending.publications.push(receipt.clone());
+        self.clear_error();
+        Some(receipt)
     }
 
     fn clear_error(&self) {
@@ -775,8 +1082,8 @@ impl StoreQueue {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         };
-        if let Some((_, value)) = pending.iter().rev().find(|(queued, _)| queued == key) {
-            return value.as_ref().map(|text| copy_range(text.as_bytes(), offset, out));
+        if let Some(op) = pending.find(key) {
+            return op.value.as_ref().map(|text| copy_range(text.as_bytes(), offset, out));
         }
         drop(pending);
         self.with_inner(|inner| inner.read_at(key, offset, out))
@@ -805,16 +1112,26 @@ impl StoreQueue {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         };
-        let ok = inner.set_stream(key, fill);
+        let mut fill_error = None;
+        let ok = inner.set_stream(key, &mut |out| {
+            let result = fill(out);
+            if let Err(error) = &result {
+                fill_error =
+                    Some(StoreError { code: error.raw_os_error().unwrap_or(0), name: error.to_string() });
+            }
+            result
+        });
         if ok {
-            pending.retain(|(queued, _)| queued != key);
+            pending.remove_key(key);
             self.written.fetch_add(1, Ordering::Relaxed);
             self.clear_error();
         } else {
             self.refuse(
                 key,
                 StoreOp::Set,
-                inner.last_error().unwrap_or_else(|| StoreError { code: 0, name: "refused".into() }),
+                fill_error
+                    .or_else(|| inner.last_error())
+                    .unwrap_or_else(|| StoreError { code: 0, name: "refused".into() }),
             );
         }
         match self.stats.lock() {
@@ -831,8 +1148,8 @@ impl StoreQueue {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         };
-        if let Some((_, queued)) = pending.iter().rev().find(|(queued, _)| queued == key) {
-            return queued.clone();
+        if let Some(op) = pending.find(key) {
+            return op.value.as_ref().map(|text| text.as_str().to_string());
         }
         drop(pending);
         match self.inner.lock() {
@@ -865,65 +1182,109 @@ impl StoreQueue {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         };
-        for (key, value) in pending.drain(..) {
-            let op = match &value {
-                Some(_) => StoreOp::Set,
-                None => StoreOp::Remove,
-            };
-            let refusal = if key.len() > KEY_MAX {
-                // A name the board cannot hold. Reported here, with the code the board
-                // would return, so it costs a log line instead of a flash round trip that
-                // ends in `false` with no reason.
-                Some(Refusal {
-                    key: key.clone(),
-                    op,
-                    code: ERR_KEY_TOO_LONG,
-                    name: ERR_KEY_TOO_LONG_NAME.to_string(),
-                    at_ms: stats.now_ms(),
-                })
-            } else {
-                let ok = match &value {
-                    Some(text) => inner.set(&key, text),
-                    // "It was not there" is not a failure: a removal that removes nothing is
-                    // what a second boot asks for. A removal the *backend* failed is, and
-                    // that is the difference `last_error` makes.
-                    None => {
-                        let removed = inner.remove(&key);
-                        removed || inner.last_error().is_none()
-                    }
-                };
-                if ok {
-                    None
-                } else {
-                    let why = inner.last_error();
-                    Some(Refusal {
-                        key: key.clone(),
-                        op,
-                        code: why.as_ref().map(|e| e.code).unwrap_or(0),
-                        name: why.map(|e| e.name).unwrap_or_else(|| "refused".to_string()),
-                        at_ms: stats.now_ms(),
-                    })
+        for queued in pending.ops.drain(..) {
+            let mut blocked = None;
+            if let Some(receipt) = &queued.publication {
+                let (dependency_failed, published) =
+                    receipt.with_state(|state| (state.dependency_failed, state.published));
+                if queued.phase == PublicationPhase::Cleanup && !published {
+                    continue; // No index publication: preserve previous files and legacy data.
                 }
-            };
-            match refusal {
-                Some(refusal) => {
-                    report.failed += 1;
-                    self.failed.fetch_add(1, Ordering::Relaxed);
-                    report.failures.push(refusal.clone());
-                    stats.note(refusal);
-                }
-                None => {
-                    report.written += 1;
-                    self.written.fetch_add(1, Ordering::Relaxed);
-                    stats.last_error = None;
+                if queued.phase == PublicationPhase::Index && dependency_failed {
+                    blocked = Some(dependency_error());
                 }
             }
-            report.keys.push(key);
+            let ok = self.apply_queued(&queued, blocked, inner.as_mut(), &mut stats, &mut report);
+            if let Some(receipt) = &queued.publication {
+                receipt.with_state(|state| match queued.phase {
+                    PublicationPhase::Value => state.dependency_failed |= !ok,
+                    PublicationPhase::Index => {
+                        state.index_processed = true;
+                        state.published = ok;
+                    }
+                    PublicationPhase::Cleanup if !ok => state.cleanup_failed.push(queued.key.clone()),
+                    PublicationPhase::Cleanup => {}
+                });
+            }
         }
-        // Re-read once per drain, not per operation: `nvs_get_stats` walks the pages, and
-        // the number is only interesting for what the drain just did to it.
+        for receipt in pending.publications.drain(..) {
+            if !receipt.with_state(|state| state.index_processed) {
+                // A normal write/stream superseded this group's index. A receipt must still
+                // finish as failed; it cannot falsely acknowledge that newer operation.
+                let refused = QueuedOp {
+                    key: receipt.0.index_key.clone(),
+                    value: Some(Arc::new(String::new())),
+                    publication: None,
+                    phase: PublicationPhase::Index,
+                };
+                self.apply_queued(
+                    &refused,
+                    Some(dependency_error()),
+                    inner.as_mut(),
+                    &mut stats,
+                    &mut report,
+                );
+            }
+            receipt.with_state(|state| {
+                state.outcome = Some(PublicationOutcome::Finished {
+                    published: state.published,
+                    cleanup_failed: std::mem::take(&mut state.cleanup_failed),
+                });
+            });
+        }
+        // Re-read once per drain, not per operation: `nvs_get_stats` walks the pages.
         stats.space = inner.space();
         report
+    }
+
+    fn apply_queued(
+        &self,
+        queued: &QueuedOp,
+        blocked: Option<StoreError>,
+        inner: &mut dyn KvStore,
+        stats: &mut StoreStats,
+        report: &mut FlushReport,
+    ) -> bool {
+        let op = if queued.value.is_some() { StoreOp::Set } else { StoreOp::Remove };
+        let error = if let Some(error) = blocked {
+            Some(error)
+        } else if queued.key.len() > KEY_MAX {
+            Some(StoreError { code: ERR_KEY_TOO_LONG, name: ERR_KEY_TOO_LONG_NAME.into() })
+        } else {
+            let ok = match &queued.value {
+                Some(text) => inner.set(&queued.key, text),
+                None => {
+                    let removed = inner.remove(&queued.key);
+                    removed || inner.last_error().is_none()
+                }
+            };
+            if ok {
+                None
+            } else {
+                Some(inner.last_error().unwrap_or_else(|| StoreError { code: 0, name: "refused".into() }))
+            }
+        };
+        let ok = error.is_none();
+        let diagnostic_key: String = queued.key.chars().take(128).collect();
+        if let Some(error) = error {
+            let refusal = Refusal {
+                key: diagnostic_key.clone(),
+                op,
+                code: error.code,
+                name: error.name,
+                at_ms: stats.now_ms(),
+            };
+            report.failed += 1;
+            self.failed.fetch_add(1, Ordering::Relaxed);
+            report.failures.push(refusal.clone());
+            stats.note(refusal);
+        } else {
+            report.written += 1;
+            self.written.fetch_add(1, Ordering::Relaxed);
+            stats.last_error = None;
+        }
+        report.keys.push(diagnostic_key);
+        ok
     }
 
     /// What the backend takes as one value, asked through the queue: the App decides how to
@@ -936,11 +1297,9 @@ impl StoreQueue {
         }
     }
 
-    /// Run `f` against the backend with the queue's lock held.
-    ///
-    /// Used by a caller that can write flash itself (its stack is in internal RAM) and wants
-    /// to stream a value instead of building it as one `String` first. Taking the same lock
-    /// the writer takes is what keeps the two from overlapping.
+    /// Run `f` under the backend mutex. This is raw backend access, not a publication or
+    /// reconciliation of pending values. Read/space helpers use it; writing callers should
+    /// use `QueuedStore::set_stream` so older pending operations cannot overwrite the result.
     pub fn with_inner<R>(&self, f: impl FnOnce(&mut dyn KvStore) -> R) -> R {
         match self.inner.lock() {
             Ok(mut store) => f(store.as_mut()),
@@ -948,19 +1307,21 @@ impl StoreQueue {
         }
     }
 
-    /// How many writes are queued and waiting for the writer.
+    /// How many operations await the writer. An invalidated publication with no remaining
+    /// operations still counts once: its failed acknowledgement is pending too.
     pub fn pending(&self) -> usize {
-        match self.pending.lock() {
-            Ok(guard) => guard.len(),
-            Err(poisoned) => poisoned.into_inner().len(),
-        }
+        let pending = match self.pending.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        pending.ops.len().max(usize::from(!pending.publications.is_empty()))
     }
 
     /// Charged pending bytes: values, names and per-operation metadata, not backend usage.
     pub fn pending_bytes(&self) -> usize {
         match self.pending.lock() {
-            Ok(guard) => guard.iter().map(pending_cost).sum(),
-            Err(poisoned) => poisoned.into_inner().iter().map(pending_cost).sum(),
+            Ok(guard) => guard.bytes(),
+            Err(poisoned) => poisoned.into_inner().bytes(),
         }
     }
 
@@ -1030,11 +1391,11 @@ impl StoreQueue {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         };
-        for (key, value) in pending.iter() {
-            match value {
-                Some(_) if !out.contains(key) => out.push(key.clone()),
+        for op in &pending.ops {
+            match &op.value {
+                Some(_) if !out.contains(&op.key) => out.push(op.key.clone()),
                 Some(_) => {}
-                None => out.retain(|stored| stored != key),
+                None => out.retain(|stored| stored != &op.key),
             }
         }
         out
@@ -1055,10 +1416,8 @@ impl QueuedStore {
         Self { queue }
     }
 
-    /// Run `f` against the backend with the queue's lock held.
-    ///
-    /// The reader below pulls through this, one chunk at a time: a value never has to exist as
-    /// one `String` on the way in *or* on the way out.
+    /// Raw backend access under its mutex, with the same pending-write caveat as
+    /// `StoreQueue::with_inner`. Normal readers use `read_at` to include queued changes.
     pub fn with_inner<R>(&self, f: impl FnOnce(&mut dyn KvStore) -> R) -> R {
         self.queue.with_inner(f)
     }
@@ -1094,6 +1453,16 @@ impl KvStore for QueuedStore {
     ) -> bool {
         self.queue.set_stream(key, fill)
     }
+    fn publish(
+        &mut self,
+        index_key: &str,
+        index: &str,
+        writes: &[(&str, &str)],
+        cleanup: &[&str],
+    ) -> Option<PublicationReceipt> {
+        self.queue.enqueue_publication(index_key, index, writes, cleanup)
+    }
+
     /// Whether the key exists *now*: a queued value counts, a queued removal does not.
     /// A refused removal leaves the queue untouched; `last_error` distinguishes that from absence.
     fn remove(&mut self, key: &str) -> bool {
@@ -1324,6 +1693,10 @@ impl FileStore {
 impl KvStore for FileStore {
     fn get(&self, key: &str) -> Option<String> {
         self.map.get(key).cloned()
+    }
+
+    fn read_at(&self, key: &str, offset: usize, out: &mut [u8]) -> Option<usize> {
+        Some(copy_range(self.map.get(key)?.as_bytes(), offset, out))
     }
 
     fn set(&mut self, key: &str, value: &str) -> bool {
@@ -1798,6 +2171,7 @@ mod tests {
         assert_eq!(store.get("ws").as_deref(), Some("still wanted"));
         assert_eq!(queue.failed(), 1, "synchronous streaming failures must not disappear");
         assert_eq!(queue.last_failure().unwrap().key, "ws");
+        assert_eq!(queue.last_failure().unwrap().name, "fill refused");
         assert_eq!(queue.flush().written, 1);
         assert_eq!(inner.get("ws").as_deref(), Some("still wanted"));
         assert!(queue.flush().is_empty(), "no infinite retry");
@@ -1868,6 +2242,116 @@ mod tests {
         assert!(queue.pending_bytes() <= PENDING_BYTES_MAX);
         assert!(queue.pending() <= PENDING_KEYS_MAX);
         assert_eq!(queue.flush().failed, 0);
+    }
+
+    #[test]
+    fn publication_dependencies_guard_the_index_and_cleanup() {
+        let queue = StoreQueue::new(Box::new(RefusingStore {
+            map: [
+                ("index".into(), "previous".into()),
+                ("obsolete".into(), "keep".into()),
+                ("ws".into(), "legacy".into()),
+            ]
+            .into(),
+            refuse: Some(("b".into(), 42, "test refusal")),
+            ..Default::default()
+        }));
+        let mut store = QueuedStore::new(queue.clone());
+        let receipt = store
+            .publish("index", "next", &[("a", "accepted"), ("b", "refused")], &["obsolete", "ws"])
+            .unwrap();
+        assert!(receipt.outcome().is_none(), "admission is not publication");
+        let report = queue.flush();
+        assert_eq!(report.keys, vec!["a", "b", "index"]);
+        assert_eq!(report.written, 1);
+        assert_eq!(report.failed, 2);
+        assert_eq!(report.failures[1].code, ERR_DEPENDENCY);
+        assert_eq!(store.get("index").as_deref(), Some("previous"));
+        assert_eq!(store.get("obsolete").as_deref(), Some("keep"));
+        assert_eq!(store.get("ws").as_deref(), Some("legacy"));
+        assert_eq!(store.get("a").as_deref(), Some("accepted"), "not an all-values transaction");
+        assert_eq!(
+            receipt.outcome(),
+            Some(PublicationOutcome::Finished { published: false, cleanup_failed: Vec::new() })
+        );
+        assert!(queue.flush().is_empty(), "no automatic retry");
+    }
+
+    #[test]
+    fn publication_replacement_shares_pending_text_and_supersedes_only_its_receipt() {
+        let queue = StoreQueue::new(Box::new(MemoryStore::new()));
+        let mut store = QueuedStore::new(queue.clone());
+        let text = "x".repeat(crate::app::WORKSPACE_FILE_MAX);
+        let first = store.publish("index", "first", &[("a", &text)], &[]).unwrap();
+        let first_buffer = queue.pending.lock().unwrap().find("a").unwrap().value.as_ref().unwrap().clone();
+        let second = store.publish("index", "second", &[("a", &text), ("b", "new")], &[]).unwrap();
+        let second_buffer = queue.pending.lock().unwrap().find("a").unwrap().value.as_ref().unwrap().clone();
+        assert!(Arc::ptr_eq(&first_buffer, &second_buffer), "unchanged pending file is not copied again");
+        assert_eq!(first.outcome(), Some(PublicationOutcome::Superseded));
+        assert!(second.outcome().is_none());
+        assert_eq!(queue.pending.lock().unwrap().publications.len(), 1);
+        assert_eq!(queue.flush().keys, vec!["a", "b", "index"]);
+        assert_eq!(first.outcome(), Some(PublicationOutcome::Superseded));
+        assert_eq!(
+            second.outcome(),
+            Some(PublicationOutcome::Finished { published: true, cleanup_failed: Vec::new() })
+        );
+    }
+
+    #[test]
+    fn a_refused_publication_admission_keeps_the_complete_previous_generation() {
+        let queue = StoreQueue::new(Box::new(MemoryStore::new()));
+        let mut store = QueuedStore::new(queue.clone());
+        let receipt = store.publish("index", "old", &[("a", "old")], &["legacy"]).unwrap();
+        let remaining = PENDING_BYTES_MAX - queue.pending_bytes() - request_cost("budget", None);
+        assert!(store.set("budget", &"x".repeat(remaining)));
+        let (before_keys, before_bytes) = (queue.pending(), queue.pending_bytes());
+        assert!(store.publish("index", "new", &[("a", "larger"), ("b", "new")], &["legacy"]).is_none());
+        assert_eq!(queue.pending(), before_keys);
+        assert_eq!(queue.pending_bytes(), before_bytes);
+        assert!(receipt.outcome().is_none(), "failed replacement did not supersede the old receipt");
+        assert_eq!(store.get("a").as_deref(), Some("old"));
+        assert_eq!(store.get("index").as_deref(), Some("old"));
+        assert!(store.get("b").is_none());
+        assert_eq!(store.last_error().unwrap().code, ERR_QUEUE_FULL);
+        assert!(store.remove("budget"));
+        assert_eq!(queue.flush().failed, 0);
+        assert_eq!(
+            receipt.outcome(),
+            Some(PublicationOutcome::Finished { published: true, cleanup_failed: Vec::new() })
+        );
+        // Duplicate/overlapping dependencies are rejected before any queue mutation too.
+        assert!(store.publish("index", "bad", &[("a", "first"), ("a", "second")], &[]).is_none());
+        assert!(store.publish("index", "bad", &[("a", "first")], &["a"]).is_none());
+        assert_eq!(queue.pending(), 0);
+    }
+
+    #[test]
+    fn a_superseded_publication_dependency_cannot_acknowledge_a_newer_write() {
+        for (index, streamed) in [(false, false), (false, true), (true, false), (true, true)] {
+            let inner = Shared::default();
+            inner.clone().set("index", "previous");
+            inner.clone().set("obsolete", "keep");
+            let queue = StoreQueue::new(Box::new(inner.clone()));
+            let mut store = QueuedStore::new(queue.clone());
+            let receipt =
+                store.publish("index", "older publication", &[("a", "older value")], &["obsolete"]).unwrap();
+            let key = if index { "index" } else { "a" };
+            if streamed {
+                assert!(store.set_stream(key, &mut |out| out.write_all(b"newer")));
+            } else {
+                assert!(store.set(key, "newer"));
+            }
+            let report = queue.flush();
+            assert_eq!(report.failed, 1, "{index} {streamed}: {report:?}");
+            assert_eq!(report.failures[0].code, ERR_DEPENDENCY);
+            assert_eq!(inner.get(key).as_deref(), Some("newer"));
+            assert_eq!(inner.get("obsolete").as_deref(), Some("keep"));
+            assert_eq!(
+                receipt.outcome(),
+                Some(PublicationOutcome::Finished { published: false, cleanup_failed: Vec::new() })
+            );
+        }
     }
 
     #[test]
