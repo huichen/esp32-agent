@@ -48,23 +48,59 @@ mod tests {
         );
     }
 
-    /// Clearing is available in the conversation itself, with both languages named and
-    /// an accessible status for cancellation/refusal feedback. It is not a settings reset.
+    /// The page speaks one language. A mixed page — a Chinese subtitle under an English
+    /// button, a bilingual dialog body — looked unfinished, and on a Chinese phone the
+    /// native `confirm()` drew Chinese buttons around the English text.
     #[test]
-    fn conversation_clearing_is_accessible_in_both_languages() {
+    fn the_portal_never_shows_chinese() {
+        fn first_non_latin(name: &str, text: &str) {
+            if let Some((at, ch)) = text.char_indices().find(|(_, c)| is_cjk(*c)) {
+                let line = text[..at].matches('\n').count() + 1;
+                panic!("{name}:{line} contains `{ch}` — the portal is English only");
+            }
+        }
+        for (name, text) in [("index.html", INDEX_HTML), ("app.js", APP_JS), ("style.css", STYLE_CSS)] {
+            first_non_latin(name, text);
+        }
+    }
+
+    /// CJK ideographs, kana, hangul and the full-width forms a Chinese or Japanese dialog
+    /// would bring with it. Punctuation blocks are included on purpose: `。` and `、` are as
+    /// out of place in an English page as a character is.
+    fn is_cjk(c: char) -> bool {
+        matches!(c as u32,
+            0x3000..=0x303F
+            | 0x3040..=0x30FF
+            | 0x31F0..=0x31FF
+            | 0x3400..=0x4DBF
+            | 0x4E00..=0x9FFF
+            | 0xAC00..=0xD7AF
+            | 0xF900..=0xFAFF
+            | 0xFE30..=0xFE4F
+            | 0xFF00..=0xFFEF)
+    }
+
+    /// Clearing is available in the conversation itself, in English, with an accessible
+    /// status for cancellation and refusal feedback. It is not a settings reset.
+    #[test]
+    fn conversation_clearing_is_english_only_and_accessible() {
         let header = INDEX_HTML.split("</header>").next().expect("the chat header");
         assert!(header.contains("id=\"clear-chat\""), "clearing must not require a sheet");
-        assert!(header.contains("type=\"button\" aria-label=\"Clear conversation / 清空会话\""));
-        assert!(header.contains("<span>Clear chat</span><span lang=\"zh\">清空会话</span>"));
+        assert!(header.contains("aria-label=\"Clear conversation\""), "the button needs its own name");
+        assert!(header.contains(">Clear chat</button>"), "one label, not two");
+        assert!(
+            INDEX_HTML.contains("id=\"confirm-dialog\""),
+            "the confirmation has to be ours: window.confirm() speaks the device language"
+        );
         assert!(INDEX_HTML.contains("role=\"status\" aria-live=\"polite\""));
         assert!(APP_JS.contains("changeConversation(\"/api/agent/reset\", {}, true)"));
         assert!(APP_JS.contains("changeConversation(\"/api/agent/forget\", { keep: 1 }, false)"));
-        assert!(APP_JS.contains("!confirm(CONVERSATION_TEXT.confirm)"));
+        assert!(!APP_JS.contains("confirm(CONVERSATION_TEXT.confirm)"), "the native dialog is gone");
+        assert!(APP_JS.contains("await askConfirm(\"Clear conversation\""));
         assert!(APP_JS.contains("Instructions, skills, files and model settings stay."));
-        assert!(APP_JS.contains("指令、技能、文件和模型设置会保留"));
         assert!(!APP_JS.contains("/api/factory-reset"), "clearing must not erase the workspace or config");
         assert!(STYLE_CSS.contains(".clear-chat:focus-visible"), "keyboard focus must be visible");
-        assert!(INDEX_HTML.contains("<html lang=\"en\">"), "the rest of the portal stays English");
+        assert!(INDEX_HTML.contains("<html lang=\"en\">"), "the page declares one language");
     }
 
     /// Five tabs, and only five: the conversation is the page, so everything else has to
