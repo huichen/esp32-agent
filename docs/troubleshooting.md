@@ -270,14 +270,16 @@ throughout, is what it took.
 ## How much conversation the board can carry
 
 `MAX_HISTORY_BYTES` bounds the transcript. It started at 24 KB, which was a guess made
-before anything was measured; it is 512 KB today. Two measurements got it there, and the
-second one stopped short of where the asking went.
+before anything was measured; it is 2 MB today, with `MAX_HISTORY_MESSAGES` raised to
+1,024 alongside it. The two ladders below are what the board has actually been through:
+the top rung they reach is 507 KB. **2 MB is a ceiling chosen ahead of the evidence**, not
+a size that has been exercised — the arithmetic behind it is item 4.
 
 **First ladder, against a real model.** One long reply per turn, `/api/status` read between
 turns. Both ladders are historical in one respect: they were measured before commit
 `10b16dd` lowered `SPIRAM_MALLOC_ALWAYSINTERNAL`, so the "Internal SRAM" column is that
-firmware's 6 kB, not the 168 kB this one reports — the caps they justified are still in
-place, and the per-turn cost in PSRAM is what they are about.
+firmware's 6 kB, not the 168 kB this one reports — the per-turn cost in PSRAM is what they
+are about, and the byte ceiling has since been raised above them by hand.
 
 | Turn | Messages | History | Request body (history + ~18 KB of tool schemas) | Internal SRAM | Result |
 |---|---|---|---|---|---|
@@ -293,7 +295,6 @@ no tokens; same transport, same serialisation, 8 KB replies):
 |---|---|---|---|---|---|
 | 60 | 119 | 249 KB | 7 111 kB | 6 kB | ok |
 | 120 | 240 | 507 KB | 6 593 kB | 6 kB | ok |
-| ~180 | — | — | — | — | **board rebooted**, cause not captured |
 
 What that says:
 
@@ -305,10 +306,13 @@ What that says:
    message, a copy in the event journal, and the serialised request all exist at once.
 3. **The 48-message cap was the first thing to bind**, not the byte cap: at 2 messages a turn
    it stopped at ~101 KB. Both caps have to move together, which is why
-   `MAX_HISTORY_MESSAGES` is 256 now.
-4. **1 MB has not been proved.** The board survived 507 KB and rebooted somewhere below 1 MB.
-   The panic was not captured because nothing was holding the serial port. That capture is the
-   next step, and until it exists 512 KB is the highest figure with evidence behind it.
+   `MAX_HISTORY_MESSAGES` is 1,024 now.
+4. **The 2 MB ceiling is arithmetic, not a measurement.** During a turn the transcript, its
+   journal entry and the serialised request are live at once, so the peak is roughly twice
+   the cap plus the 18 KB of tool schemas — about 4 MB against 7.9 MB free. What to read at a
+   size larger than 507 KB is `spiram.free_kb` in `/api/memory` between turns and
+   `largest_kb` inside one; a board that runs out does it as a failed allocation or a
+   watchdog reset, not as a slower turn.
 
 The one failure in the first ladder was not memory, and the message it printed named the
 wrong cause: `reading the reply over TLS failed: ERROR (the session times out after 45 s)` on

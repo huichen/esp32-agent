@@ -106,11 +106,11 @@ pub struct LlmConfig {
     /// room for the answer. Default 262144 (256K), the window the models this board is
     /// pointed at declare.
     ///
-    /// Note the interaction with [`MAX_HISTORY_BYTES`]: the board has kilobytes of RAM,
-    /// not megabytes, so the transcript is also capped at 24 KB of text. On a 256K window
-    /// that byte ceiling binds first and the token trigger may never fire — which is the
-    /// honest outcome, because a request large enough to need that window cannot be built
-    /// on this chip anyway.
+    /// Note the interaction with [`MAX_HISTORY_BYTES`]: the transcript is also capped at
+    /// 2 MB of text. On the default 256K window the token trigger fires first (80% is
+    /// ~209 000 tokens, roughly 840 KB of ASCII), so that byte cap is the ring's backstop
+    /// for text that tokenises cheaply rather than the usual limit. Both are ceilings on
+    /// one request, which is why they move together.
     pub context_tokens: u32,
     /// Ceiling on the reply, in tokens; sent as `max_tokens` on all three protocols.
     /// Also part of the compaction reserve.

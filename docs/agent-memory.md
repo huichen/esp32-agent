@@ -57,8 +57,8 @@ is checkable without a model in the loop.
 
 ## 2. Compression without a summary
 
-When the transcript passes 80% of `agent.context_tokens`, or either hard cap (256
-messages, 512 KB), the oldest exchanges are **not** handed to a model to summarise. They
+When the transcript passes 80% of `agent.context_tokens`, or either hard cap (1,024
+messages, 2 MB), the oldest exchanges are **not** handed to a model to summarise. They
 are replaced by one deterministic line per message, derived from the messages themselves:
 
 ```text
@@ -104,7 +104,7 @@ editing the conversation it is in the middle of).
 |---|---|
 | Memory index in the prompt | ≤ 2 KB, ≤ 24 lines |
 | Compressed index in the prompt | ≤ 40 lines, ~90 chars each |
-| Transcript kept verbatim | the last 4 exchanges, within 80% of `context_tokens` and the 512 KB / 256-message caps |
+| Transcript kept verbatim | the last 4 exchanges, within 80% of `context_tokens` and the 2 MB / 1,024-message caps |
 | Model calls added | none |
 
 ## Verifying it without a model
