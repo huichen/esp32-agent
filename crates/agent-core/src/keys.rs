@@ -56,6 +56,33 @@ pub fn workspace_chunk(index: usize) -> String {
     chunk(WORKSPACE, index)
 }
 
+/// The workspace's index: one JSON object, `path -> key`, for every stored file.
+///
+/// It starts with `ws` on purpose: `SplitStore` routes anything with that prefix to the file
+/// system, and the index has to live next to the values it names.
+pub const WORKSPACE_INDEX: &str = "wsmap";
+
+/// The key one workspace file's text lives under: `wf` plus twelve hex digits.
+///
+/// Fourteen bytes, under NVS's fifteen-byte ceiling, because the store may be either backend
+/// and a key that only fits one of them is a bug waiting for a different build. A path is
+/// unbounded, so it is hashed (fnv-1a 64, truncated to 48 bits) rather than spelled out. Two
+/// paths that collide share a value; the index keeps the winner and the load says so, which is
+/// the same trade the transcript makes when a checksum fails.
+pub fn workspace_file(path: &str) -> String {
+    format!("wf{:012x}", fnv1a(path) & 0xffff_ffff_ffff)
+}
+
+/// fnv-1a, 64 bit: a hash for deciding whether two strings are the same, nothing more.
+pub fn fnv1a(text: &str) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in text.as_bytes() {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
 /// A chunk of the transcript. Chunk 0 *is* the base key, because a blob's first value
 /// carries the header that says whether the other chunks belong together
 /// ([`store::write_blob`](crate::store::write_blob)).
@@ -76,10 +103,11 @@ pub fn transcript(index: usize) -> String {
 /// Nothing at runtime calls this; the assertion in `mod tests` and the plan-coverage test
 /// in `app.rs` do.
 pub fn all() -> Vec<String> {
-    let mut keys: Vec<String> = [CONFIG, MANIFEST, AGENT, SCHED, WORKSPACE, TRANSCRIPT, RUN_IN_FLIGHT]
-        .iter()
-        .map(|key| key.to_string())
-        .collect();
+    let mut keys: Vec<String> =
+        [CONFIG, MANIFEST, AGENT, SCHED, WORKSPACE, WORKSPACE_INDEX, TRANSCRIPT, RUN_IN_FLIGHT]
+            .iter()
+            .map(|key| key.to_string())
+            .collect();
     for index in 0..=99usize {
         keys.push(workspace_chunk(index));
         keys.push(transcript(index));

@@ -1967,9 +1967,13 @@ impl App {
     ///   workspace would come back as a file list no boot ever wrote, which is the same rule
     ///   the transcript follows.
     fn load_workspace(&mut self) {
-        // Two layouts live under this key. `ws1 ...` is the chunked one written while the store
-        // could only take values; a document that starts with `{` is the current one, and it is
-        // parsed as it is read, so a 4 MB workspace never exists as one `String`.
+        if self.load_workspace_files() {
+            return;
+        }
+        // Older layouts: one document (current shape) or the chunked one, each of which is
+        // migrated to one-value-per-file below, so a board that upgrades mid-life keeps its
+        // files. Two layouts live under this key. `ws1 ...` is the chunked one written while
+        // the store could only take values; a document that starts with `{` is the current one.
         let mut peek = [0u8; 4];
         let head = match self.store.read_at(NVS_KEY_WORKSPACE, 0, &mut peek) {
             Some(n) if n > 0 => n,
@@ -1979,12 +1983,12 @@ impl App {
             self.load_workspace_chunked();
             return;
         }
-        let reader = match self.store.reader(NVS_KEY_WORKSPACE) {
-            Some(reader) => reader,
-            None => return,
-        };
+        let Some(reader) = self.store.reader(NVS_KEY_WORKSPACE) else { return };
         match AppWorkspace::from_reader(reader) {
-            Ok(ws) => self.workspace = ws,
+            Ok(ws) => {
+                self.workspace = ws;
+                self.migrate_workspace("one document");
+            }
             Err(e) => {
                 // The value cannot be read by this build or any other, so leaving it in
                 // flash only costs the space and hides the fact from the next boot.
@@ -1995,6 +1999,62 @@ impl App {
                 store::clear_blob(self.store.as_mut(), NVS_KEY_WORKSPACE, WORKSPACE_PLAN);
             }
         }
+    }
+
+    /// Rewrite a workspace that was read from an older layout, and say how it went.
+    fn migrate_workspace(&mut self, from: &str) {
+        let (files, bytes) = (self.workspace.len(), self.workspace.bytes());
+        match self.persist_workspace() {
+            Ok(()) => self.log.info(
+                "agent",
+                format!(
+                    "migrated the stored workspace from {from} to one value per file: {files} file(s), {bytes} bytes"
+                ),
+            ),
+            // Not fatal: the old value is untouched until the new index lands, so the next boot
+            // reads it again and tries once more.
+            Err(e) => self.log.error(
+                "agent",
+                format!("the workspace was read from {from} but could not be re-written ({e})"),
+            ),
+        }
+    }
+
+    /// Read the workspace from its index and one value per file. `false` when there is no
+    /// index, which means this board still holds an older layout.
+    fn load_workspace_files(&mut self) -> bool {
+        let Some(doc) = self.store.get(crate::keys::WORKSPACE_INDEX) else { return false };
+        let index: std::collections::BTreeMap<String, String> = match serde_json::from_str(&doc) {
+            Ok(index) => index,
+            Err(e) => {
+                self.log
+                    .error("agent", format!("the workspace index is unreadable ({e}); no files were loaded"));
+                return true;
+            }
+        };
+        let mut ws = AppWorkspace::default();
+        let mut missing = 0usize;
+        let mut bytes = 0usize;
+        for (path, key) in &index {
+            match self.store.get(key) {
+                Some(text) => {
+                    bytes += text.len();
+                    ws.files.insert(path.clone(), text);
+                }
+                None => missing += 1,
+            }
+        }
+        if missing > 0 {
+            self.log.error(
+                "agent",
+                format!("{} workspace file(s) named by the index are missing from the store", missing),
+            );
+        }
+        self.log
+            .info("agent", format!("workspace: {} file(s), {bytes} bytes from the index", ws.files.len()));
+        ws.saved = ws.files.iter().map(|(path, text)| (path.clone(), crate::keys::fnv1a(text))).collect();
+        self.workspace = ws;
+        true
     }
 
     /// The chunked layout: a `ws1` header under `ws` and the document in `ws.1`, `ws.2`, ...
@@ -2026,21 +2086,7 @@ impl App {
             }
         }
         if legacy {
-            let (files, bytes) = (self.workspace.len(), self.workspace.bytes());
-            match self.persist_workspace() {
-                Ok(()) => self.log.info(
-                    "agent",
-                    format!(
-                        "migrated the stored workspace from one value to chunks: {files} file(s), {bytes} bytes"
-                    ),
-                ),
-                // Not fatal: the old value is still there, untouched, because the header was
-                // never written. The next boot reads it again and tries once more.
-                Err(e) => self.log.error(
-                    "agent",
-                    format!("the workspace was read from the old single value but could not be re-written ({e})"),
-                ),
-            }
+            self.migrate_workspace("one value");
         }
     }
 
@@ -2464,45 +2510,81 @@ impl App {
     ///
     /// The write itself is a request (see [`App::flush_store`]): this runs on whatever
     /// thread made the change, and on this board only the store writer may touch flash.
+    /// Write the workspace: one value per file, plus an index that names them.
+    ///
+    /// This used to write the whole document on every save. Two measurements made that
+    /// untenable: the time grew with the workspace (14 s at 0.25 MB, 277 s at 2 MB, because a
+    /// save rewrote all of it), and the save needed a second copy of the document on flash at
+    /// the same time, which SPIFFS refused at about 2 MB with `ENOSPC` while reporting 9 MB
+    /// free. Per file, a save costs one file, and nothing is ever duplicated on flash.
+    ///
+    /// The index goes last: a value written without an index entry is garbage the next save
+    /// overwrites, while an index entry whose value is missing loses one file, not the board.
     fn persist_workspace(&mut self) -> std::result::Result<(), String> {
-        // Two paths, same document. A thread whose stack is in internal RAM may write flash
-        // itself, and then the workspace is streamed straight out: no copy of it exists as one
-        // string, which is what a 1.25 MB workspace could not afford (it asked for a 1.64 MB
-        // contiguous block and the board rebooted). Any other thread queues it as before.
-        let direct = self.hw.stack_is_internal();
-        let saved = if direct {
-            // Streamed: the caller has a flash-safe stack, so the store can write while the
-            // document is being generated. Nothing holds the whole workspace as one string.
-            let workspace = &self.workspace;
-            self.store.set_stream(NVS_KEY_WORKSPACE, &mut |out| workspace.write_json(out))
-        } else {
-            // Queued: the writer task has that stack, this thread does not. The document is
-            // built once and moved into the queue (no second copy).
-            let mut bytes: Vec<u8> = Vec::new();
-            if let Err(e) = self.workspace.write_json(&mut bytes) {
-                return Err(format!("the file workspace was not saved: {e}"));
+        let mut index: std::collections::BTreeMap<String, String> = Default::default();
+        let mut written: std::collections::BTreeMap<String, u64> = Default::default();
+        let mut failed: Vec<String> = Vec::new();
+
+        for (path, text) in &self.workspace.files {
+            let key = crate::keys::workspace_file(path);
+            index.insert(path.clone(), key.clone());
+            let hash = crate::keys::fnv1a(text);
+            if self.workspace.saved.get(path) == Some(&hash) {
+                written.insert(path.clone(), hash);
+                continue;
             }
-            match String::from_utf8(bytes) {
-                Ok(text) => self.store.set(NVS_KEY_WORKSPACE, &text),
-                Err(e) => return Err(format!("the file workspace was not saved: {e}")),
+            if self.store.set(&key, text) {
+                written.insert(path.clone(), hash);
+            } else {
+                // The old bytes stay: the key is derived from the path, not from the content,
+                // and `publish` renames only once the new value is complete.
+                failed.push(path.clone());
             }
-        };
-        if saved {
-            // The chunked layout wrote `ws.1`..`ws.N`; a streamed save does not, and a leftover
-            // chunk next to a document is a second copy of half the workspace taking space. One
-            // read per index until the first gap keeps the usual case to a single lookup.
-            for index in 1..=WORKSPACE_PLAN.chunks_max {
-                let key = crate::keys::workspace_chunk(index);
+        }
+
+        // Values whose file is gone. Only the paths we wrote before, so a stale key from an
+        // interrupted session is left to the save that follows it.
+        for path in self.workspace.saved.keys() {
+            if !self.workspace.files.contains_key(path) {
+                self.store.remove(&crate::keys::workspace_file(path));
+            }
+        }
+
+        let doc = serde_json::to_string(&index)
+            .map_err(|e| format!("the workspace index could not be written: {e}"))?;
+        let committed = self.store.set(crate::keys::WORKSPACE_INDEX, &doc);
+        if committed {
+            // The layouts this one replaced, under keys nothing reads any more: the whole
+            // document (`ws`, or `ws1 ...` in its header) and its chunks. Asked for before
+            // removing, so the usual save leaves them alone entirely.
+            if self.store.get(NVS_KEY_WORKSPACE).is_some() {
+                self.store.remove(NVS_KEY_WORKSPACE);
+            }
+            for chunk in 1..=WORKSPACE_PLAN.chunks_max {
+                let key = crate::keys::workspace_chunk(chunk);
                 if self.store.get(&key).is_none() {
                     break;
                 }
                 self.store.remove(&key);
             }
-            return Ok(());
+            self.workspace.saved = written;
         }
-        let why = "the file workspace was not saved: the store refused it, see /api/status.store";
-        self.log.error("agent", why);
-        Err(why.to_string())
+
+        if !failed.is_empty() {
+            let why = format!(
+                "{} workspace file(s) were not saved ({}); the rest are",
+                failed.len(),
+                failed.join(", ")
+            );
+            self.log.error("agent", why.clone());
+            return Err(why);
+        }
+        if !committed {
+            let why = "the workspace index was refused by the store, see /api/status.store";
+            self.log.error("agent", why);
+            return Err(why.to_string());
+        }
+        Ok(())
     }
 
     /// One change to the workspace, durable or undone.
@@ -6104,6 +6186,11 @@ fn rule_problem(r: &SensorRule) -> Option<String> {
 #[derive(Default, Debug, Clone)]
 pub struct AppWorkspace {
     files: std::collections::BTreeMap<String, String>,
+    /// What was last written for each path, so a save rewrites only what changed.
+    ///
+    /// The hash is content-only: the key for a path never changes, so a failed write leaves the
+    /// previous bytes in place and the hash stays wrong until the next attempt, which retries.
+    saved: std::collections::BTreeMap<String, u64>,
 }
 
 /// Whether a change of `bytes` can be made with `free` bytes of PSRAM.
@@ -6166,7 +6253,7 @@ impl AppWorkspace {
         }
         let mut buffered = std::io::BufReader::with_capacity(8192, reader);
         let doc: Doc = serde_json::from_reader(&mut buffered)?;
-        Ok(Self { files: doc.files })
+        Ok(Self { files: doc.files, saved: Default::default() })
     }
 
     pub fn to_json(&self) -> Value {
@@ -7745,7 +7832,7 @@ mod tests {
         let report = app.flush_store("test-writer");
         assert_eq!(report.failed, 0, "{:?}", report.keys);
         assert!(report.written >= 3, "{:?}", report.keys);
-        for key in [crate::config::NVS_KEY_CONFIG, NVS_KEY_WORKSPACE, NVS_KEY_TRANSCRIPT] {
+        for key in [crate::config::NVS_KEY_CONFIG, crate::keys::WORKSPACE_INDEX, NVS_KEY_TRANSCRIPT] {
             assert!(
                 report.keys.iter().any(|queued| queued == key),
                 "`{key}` was never queued: {:?}",
@@ -10249,11 +10336,14 @@ mod tests {
         let read =
             ToolHost::call_tool(&mut app, "fs_read", &json!({ "path": "/notes/a.txt" })).expect("fs_read");
         assert!(read.contains("hello"), "got {read}");
-        // The workspace is persisted, so the file survives a reboot. It is one document under
-        // `ws` now - written as it is generated, so it never exists as one `String` first.
-        let blob = app.store.get(NVS_KEY_WORKSPACE).expect("the workspace was never saved");
-        assert!(blob.starts_with('{'), "not a document: {blob}");
-        assert!(blob.contains("/notes/a.txt"), "got {blob}");
+        // The workspace is persisted as one value per file, and an index names them, so a save
+        // rewrites only what changed (`persist_workspace`).
+        let key = crate::keys::workspace_file("/notes/a.txt");
+        let text = app.store.get(&key).expect("the file's value was never written");
+        assert_eq!(text, "hello");
+        let index = app.store.get(crate::keys::WORKSPACE_INDEX).expect("no index");
+        assert!(index.contains("/notes/a.txt"), "the index does not name the file: {index}");
+        assert!(app.store.get(NVS_KEY_WORKSPACE).is_none(), "the old document is still there");
     }
 
     // ------------------------------------------------- the workspace across a reboot
@@ -10351,7 +10441,8 @@ mod tests {
         }
 
         fn set(&mut self, key: &str, value: &str) -> bool {
-            if key == NVS_KEY_WORKSPACE || key.starts_with(&format!("{}.", NVS_KEY_WORKSPACE)) {
+            // Every key the workspace is made of: the per-file values and their index.
+            if key.starts_with("wf") || key == crate::keys::WORKSPACE_INDEX {
                 return false;
             }
             self.0.set(key, value)
@@ -10390,12 +10481,17 @@ mod tests {
         // What the writer task would have done before the reboot.
         drain_store(&mut app);
 
-        // One document under `ws`, written as it is generated: past the old 4000-byte
-        // single-value ceiling, and still one value because the store takes whole values.
-        let blob = store.get("ws").expect("the workspace was never saved");
-        assert!(blob.len() > store::VALUE_MAX, "{} bytes is one value", blob.len());
-        assert!(blob.starts_with('{'), "not a document: {}", &blob[..blob.len().min(40)]);
-        assert!(store.get("ws.1").is_none(), "a chunk means it was split");
+        // Three values, one per file, each past the old 4000-byte single-value ceiling, plus
+        // the index that names them. Nothing whole-document exists any more.
+        let mut total = 0;
+        for (path, _) in &written {
+            let key = crate::keys::workspace_file(path);
+            let text = store.get(&key).unwrap_or_else(|| panic!("{path} has no value"));
+            total += text.len();
+        }
+        assert!(total > store::VALUE_MAX, "{total} bytes across the files");
+        assert!(store.get("ws").is_none(), "the old document is still there");
+        assert!(store.get("wsmap").is_some(), "no index");
 
         // A reboot is a new App over the same keys.
         let rebooted = app_with(&store);
@@ -10418,8 +10514,8 @@ mod tests {
         app.store = Box::new(RefusingWorkspaceStore(store.clone()));
         let err = ToolHost::call_tool(&mut app, "fs_write", &json!({ "path": "/a.txt", "text": "second" }))
             .expect_err("a write that cannot be stored must not answer ok");
-        assert!(err.contains("was not saved"), "{err}");
-        assert!(err.contains("ws"), "the error names the value that failed: {err}");
+        assert!(err.contains("not saved"), "{err}");
+        assert!(err.contains("/a.txt"), "the error names the file that failed: {err}");
         assert!(err.contains("The change was dropped"), "{err}");
 
         // And `read` shows that: the file is what it was, not what the refused write carried.
@@ -10457,9 +10553,10 @@ mod tests {
         assert!(fs_tools::Workspace::read(&app.workspace, "/MEMORY.md").unwrap().contains("pins"));
         // The rewrite is queued like every other write; the writer makes it durable.
         drain_store(&mut app);
-        let rewritten = store.get("ws").unwrap();
-        assert!(rewritten.starts_with('{'), "not rewritten as a document: {rewritten}");
+        assert!(store.get("ws").is_none(), "the chunked layout is still there");
         assert!(store.get("ws.1").is_none(), "the old chunk is still there");
+        let index = store.get("wsmap").expect("no index after the migration");
+        assert!(index.contains("/memory/pins.md"), "{index}");
 
         // A second boot reads the document, so the rewrite was stored, not served from RAM once.
         let again = app_with(&store);
@@ -10477,11 +10574,18 @@ mod tests {
         }
         assert!(fs_tools::Workspace::read(&app.workspace, "/notes/a.md").unwrap().len() > 1000);
         drain_store(&mut app);
-        let whole = store.get("ws").expect("the document has to be on flash for this test");
+
+        // The older document layout by hand: this build writes one value per file, and the
+        // older layout is still read, so a torn one is exercised where it used to live.
+        let mut files = serde_json::Map::new();
+        files.insert("/notes/a.md".to_string(), json!(notes(1900)));
+        files.insert("/notes/b.md".to_string(), json!(notes(1900)));
+        let whole = json!({ "version": 1, "files": files }).to_string();
         assert!(whole.starts_with('{'));
 
-        // A power cut in the middle of a save leaves half a document.
+        // A power cut in the middle of a save leaves half a document, and no index.
         store.clone().set("ws", &whole[..whole.len() / 2]);
+        store.clone().remove(crate::keys::WORKSPACE_INDEX);
 
         let (rebooted, log) = app_with_log(&store);
         assert!(
@@ -10490,6 +10594,57 @@ mod tests {
         );
         assert!(
             log.tail(80, 0).iter().any(|l| l.level == "error" && l.message.contains("unreadable")),
+            "{:?}",
+            log.tail(80, 0).iter().map(|l| &l.message).collect::<Vec<_>>()
+        );
+    }
+
+    /// A save costs the files that changed, not the whole workspace.
+    ///
+    /// This is the measurement that made the layout change worth doing: the document layout
+    /// rewrote every byte on every save (14 s at 0.25 MB, 277 s at 2 MB on the board) and needed
+    /// a second copy of the whole document on flash at the same time, which SPIFFS refused at
+    /// about 2 MB with `ENOSPC` while reporting 9 MB free.
+    #[test]
+    fn a_save_rewrites_only_the_files_that_changed() {
+        let store = SharedStore::new();
+        let mut app = app_with(&store);
+        app.workspace = AppWorkspace::default();
+        for path in ["/a.md", "/b.md", "/c.md"] {
+            ToolHost::call_tool(&mut app, "fs_write", &json!({ "path": path, "text": "first" }))
+                .expect("a file");
+        }
+        drain_store(&mut app);
+
+        // One file changes: its value and the index, nothing else.
+        let before = store.writes();
+        ToolHost::call_tool(
+            &mut app,
+            "fs_write",
+            &json!({ "path": "/b.md", "text": "second and longer than before" }),
+        )
+        .expect("the change");
+        drain_store(&mut app);
+        let written = store.writes() - before;
+        assert_eq!(written, 2, "expected the changed file and the index, got {written} writes");
+
+        // And a file that did not change is untouched: its value is still the first text.
+        let key = crate::keys::workspace_file("/a.md");
+        assert_eq!(store.get(&key).as_deref(), Some("first"));
+    }
+
+    /// A torn index names nothing, and says so - the per-file layout's own torn value.
+    #[test]
+    fn a_torn_workspace_index_names_no_files_and_says_why() {
+        let store = SharedStore::new();
+        store.clone().set(crate::keys::WORKSPACE_INDEX, "{\"/a.md\":\"wf0123");
+        let (app, log) = app_with_log(&store);
+        assert!(
+            fs_tools::Workspace::read(&app.workspace, "/a.md").is_err(),
+            "a torn index must not come back as files"
+        );
+        assert!(
+            log.tail(80, 0).iter().any(|l| l.level == "error" && l.message.contains("index is unreadable")),
             "{:?}",
             log.tail(80, 0).iter().map(|l| &l.message).collect::<Vec<_>>()
         );
