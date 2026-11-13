@@ -38,7 +38,7 @@ fn function(name: &str, description: &str, parameters: Value) -> Value {
         "type": "function",
         "function": {
             "name": name,
-            "description": description,
+            "description": crate::tool::description_with_arguments(description, &parameters),
             "parameters": parameters,
         },
     })
