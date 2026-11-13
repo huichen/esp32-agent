@@ -105,13 +105,14 @@ impl KvStore for NvsStore {
             return None;
         }
         let stats = unsafe { stats.assume_init() };
-        Some(StoreSpace {
-            used_entries: stats.used_entries,
-            free_entries: stats.free_entries,
-            total_entries: stats.total_entries,
-            // NVS thinks in entries; the byte budget is the filesystem's answer.
-            total_bytes: None,
-            used_bytes: None,
+        Some(StoreSpace::Entries {
+            used: stats.used_entries,
+            free: stats.free_entries,
+            total: stats.total_entries,
+            // An entry is 32 bytes, so the byte answer is the entry answer times 32. Given
+            // both, a caller can ask "is there room?" of either backend with one expression.
+            used_bytes: stats.used_entries.saturating_mul(32),
+            total_bytes: stats.total_entries.saturating_mul(32),
         })
     }
 }

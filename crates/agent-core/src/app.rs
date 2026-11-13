@@ -1232,15 +1232,7 @@ impl App {
             refused.insert(key, json!(count));
         }
         let store_space = match self.store_queue.space() {
-            Some(space) => json!({
-                "used_entries": space.used_entries,
-                "free_entries": space.free_entries,
-                "total_entries": space.total_entries,
-                // A filesystem reports bytes and no entries; NVS the other way round. Both
-                // fields are present so a client need not know which backend answered.
-                "total_bytes": space.total_bytes,
-                "used_bytes": space.used_bytes,
-            }),
+            Some(space) => space.to_json(),
             None => Value::Null,
         };
         json!({
@@ -4749,14 +4741,21 @@ impl App {
         // a filesystem: the ceiling is the partition's free space now, and it is the number a
         // refused write is about.
         let space = self.store.space();
+        let (store_total, store_used) = match space {
+            Some(store::StoreSpace::Bytes { total, used }) => (Some(total), Some(used)),
+            Some(store::StoreSpace::Entries { total_bytes, used_bytes, .. }) => {
+                (Some(total_bytes), Some(used_bytes))
+            }
+            None => (None, None),
+        };
         serde_json::json!({
             "files": count,
             "bytes": bytes,
             "file_limit_bytes": crate::tools::fs::MAX_FILE_BYTES,
             "workspace_limit_bytes": WORKSPACE_TOTAL_MAX,
             "free_bytes": WORKSPACE_TOTAL_MAX.saturating_sub(bytes),
-            "store_total_bytes": space.and_then(|s| s.total_bytes),
-            "store_used_bytes": space.and_then(|s| s.used_bytes),
+            "store_total_bytes": store_total,
+            "store_used_bytes": store_used,
         })
         .to_string()
     }
@@ -7765,9 +7764,9 @@ mod tests {
             body_json(&app.route(&get("/api/status")))["store"]["writer"]["internal_stack"],
             Value::Null
         );
-        app.attach_store_writer("nvs-writer", true);
+        app.attach_store_writer("store-writer", true);
         let status = body_json(&app.route(&get("/api/status")));
-        assert_eq!(status["store"]["writer"]["task"], json!("nvs-writer"));
+        assert_eq!(status["store"]["writer"]["task"], json!("store-writer"));
         assert_eq!(status["store"]["writer"]["internal_stack"], json!(true));
     }
 
@@ -10271,6 +10270,48 @@ mod tests {
         assert!(err.contains("PSRAM"), "{err}");
         // A platform that cannot answer is not blocked: no measurement is not a refusal.
         assert!(super::workspace_fits(1_000_000, None).is_ok());
+    }
+
+    /// The space a backend reports has to say what that backend has, or the field lies.
+    ///
+    /// A filesystem has no entries. Reporting `free_entries: 0` for one - which is what this did
+    /// - reads as "full" on a partition with 11 MB free, and `/api/status.store` is what the
+    /// board's own agent reads when it wonders why a write was refused. So the assertion is
+    /// geometric: which keys exist, and whether the numbers add up.
+    #[test]
+    fn the_space_a_backend_reports_is_in_the_units_it_has() {
+        let fs = store::StoreSpace::Bytes { used: 107_177, total: 11_498_561 }.to_json();
+        for entry_key in ["used_entries", "free_entries", "total_entries"] {
+            assert!(fs.get(entry_key).is_none(), "a filesystem reported `{entry_key}`: \n{fs}");
+        }
+        assert_eq!(fs["total_bytes"], 11_498_561, "{fs}");
+        assert_eq!(fs["used_bytes"], 107_177, "{fs}");
+        assert_eq!(
+            fs["free_bytes"].as_u64(),
+            Some(11_498_561 - 107_177),
+            "free must be total minus used: {fs}"
+        );
+
+        let nvs = store::StoreSpace::Entries {
+            used: 534,
+            free: 222,
+            total: 756,
+            used_bytes: 534 * 32,
+            total_bytes: 756 * 32,
+        }
+        .to_json();
+        for entry_key in ["used_entries", "free_entries", "total_entries"] {
+            assert!(nvs.get(entry_key).is_some(), "NVS lost `{entry_key}`: {nvs}");
+        }
+        assert_eq!(nvs["free_entries"], 222, "{nvs}");
+        assert_eq!(nvs["free_bytes"], 222 * 32, "{nvs}");
+        assert_eq!(nvs["total_bytes"], 756 * 32, "{nvs}");
+        // The same relation holds in both units, so a caller can use either.
+        assert_eq!(
+            nvs["free_bytes"].as_u64(),
+            Some(nvs["total_bytes"].as_u64().unwrap() - nvs["used_bytes"].as_u64().unwrap()),
+            "{nvs}"
+        );
     }
 
     /// A store whose workspace writes always fail, which is what a full NVS looks like from

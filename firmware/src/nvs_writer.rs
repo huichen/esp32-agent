@@ -49,16 +49,20 @@ const PRIORITY: usize = 2;
 const PERIOD_MS: u32 = 100;
 
 /// The task's name, also what the log lines and `/api/status.store` say.
-const NAME: &str = "nvs-writer";
+///
+/// `nvs-writer` until the transcript and the workspace moved to the filesystem: it drains the
+/// queue into whichever backend owns a key, which is two of them now. The name has to say what
+/// the task does, or the next reader has to find out.
+const NAME: &str = "store-writer";
 
 /// Start the writer. Called once, before anything can queue a write.
 pub fn start(shared: Shared, log: Arc<LogBuf>) -> Result<(), String> {
     // The name, the 6 KB and the internal RAM are set around this one spawn by
     // `threads::spawn`, and the default config is put back afterwards. Doing it by hand was
     // the bug this replaces: the config outlived the spawn and the console, radio and agent
-    // threads came up as `nvs-writer` at priority 2.
+    // threads came up as `nvs-writer` (this task's name then) at priority 2.
     let spawned = crate::threads::spawn(
-        b"nvs-writer\0",
+        b"store-writer\0",
         STACK_BYTES,
         crate::threads::INTERNAL,
         Some(PRIORITY),
