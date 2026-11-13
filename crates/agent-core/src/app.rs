@@ -965,7 +965,7 @@ impl App {
     /// before they were all built from this predicate.
     pub fn why_hidden(&self, name: &str) -> Option<String> {
         let def = self.tools.get(name)?;
-        if self.cfg.mcp.disabled_tools.iter().any(|d| d == name) {
+        if self.ensure_enabled(name).is_err() {
             return Some("switched off in `mcp.disabled_tools`".to_string());
         }
         // A family took this name over. The handler still answers, so the sentence says
@@ -1002,7 +1002,7 @@ impl App {
     ///
     /// Same shape as [`why_hidden`](Self::why_hidden): `None` means "offered".
     fn extra_why_hidden(&self, name: &str) -> Option<String> {
-        if self.cfg.mcp.disabled_tools.iter().any(|d| d == name) {
+        if self.ensure_enabled(name).is_err() {
             return Some("switched off in `mcp.disabled_tools`".to_string());
         }
         match name {
@@ -1539,9 +1539,8 @@ impl App {
         let mut source = crate::json::opt_str(args, "source").unwrap_or_default();
         let path = crate::json::opt_str(args, "path").unwrap_or_default();
         if source.trim().is_empty() && !path.trim().is_empty() {
-            let read = fs_tools::call(&mut self.workspace, "fs_read", &json!({ "path": path }))
-                .ok_or_else(|| McpError::invalid_params(format!("no script at `{path}`")))?
-                .map_err(McpError::invalid_params)?;
+            let read =
+                self.fs_or_net_call("fs_read", &json!({ "path": path })).map_err(McpError::invalid_params)?;
             // `fs_read` answers with a JSON object (`{path, text, …}`), so the script is its
             // `text` field — feeding the whole object to the parser is what made a one-line
             // script fail with "unexpected token Colon".
@@ -1741,7 +1740,41 @@ impl App {
         .to_string())
     }
 
+    /// An explicit disable applies to aliases, family members and underlying file
+    /// operations too; a listing profile only changes how a tool is advertised.
+    fn ensure_enabled(&self, name: &str) -> Result<()> {
+        crate::tool::ensure_tool_enabled(&self.cfg, name)?;
+        if let Some(reached) = self.family_members.get(name) {
+            if let Some(family) = reached.split_whitespace().next() {
+                crate::tool::ensure_tool_enabled(&self.cfg, family)?;
+            }
+        }
+        let dependencies: &[&str] = match name {
+            "edit" | "fs_edit" | "fs_cp" => &["fs_read", "fs_write"],
+            "fs_mv" => &["fs_read", "fs_write", "fs_rm"],
+            "fs_grep" => &["fs_read"],
+            _ => &[],
+        };
+        for dependency in dependencies {
+            crate::tool::ensure_tool_enabled(&self.cfg, dependency)?;
+        }
+        Ok(())
+    }
+
     pub fn call_tool(&mut self, name: &str, args: &Value) -> Result<Value> {
+        self.ensure_enabled(name)?;
+        if !args.is_object() {
+            return Err(McpError::invalid_params("tool arguments must be an object"));
+        }
+        if name.starts_with("fs_") || name.starts_with("net_") {
+            let text = self.fs_or_net_call(name, args).map_err(McpError::invalid_params)?;
+            return Ok(serde_json::from_str(&text).unwrap_or_else(|_| json!({ "text": text })));
+        }
+        if name == "device_invoke" {
+            if let Some(target) = args.get("tool").and_then(Value::as_str) {
+                self.ensure_enabled(target)?;
+            }
+        }
         // The script tool is the one tool that needs the dispatcher itself: `tool()` inside
         // a script calls any other tool, so it cannot live in the registry where handlers
         // only see a `ToolCtx`.
@@ -1790,10 +1823,10 @@ impl App {
         if name == "image_read" {
             return self.image_read(args);
         }
-        // A name a family took over still answers. It is hidden from the listing, not
-        // removed from the board, so a script or a person who learned `manifest_apply`
-        // before the family existed keeps working — and the listing says where it went.
-        if !self.is_visible(name) && !self.family_members.contains_key(name) {
+        // Family aliases and generic/minimal folding change the listing, not whether
+        // a previously learned tool can execute. Only explicit disables and missing
+        // hardware are execution refusals (the former was checked before every fast path).
+        if Self::NEVER_OFFERED.contains(&name) || self.tools.get(name).is_none() {
             // A tool a person has and a model does not: the refusal has to be a sentence, not a
             // bare "no such tool". A stored script that calls `reboot` was written by somebody
             // who believed the model could restart the board; that person needs to be told
@@ -1816,6 +1849,18 @@ impl App {
                 missing.join(", ")
             ))
             .with_data(json!({ "missing_capabilities": missing })));
+        }
+        if let Some(def) = self.tools.get(name) {
+            if !def.spec.core && self.cfg.mcp.tools_mode != "all" {
+                let missing = self.caps.missing(&def.spec.requires);
+                if !missing.is_empty() {
+                    return Err(McpError::unsupported(format!(
+                        "tool `{name}` needs hardware that was not detected: {}",
+                        missing.join(", ")
+                    ))
+                    .with_data(json!({ "missing_capabilities": missing })));
+                }
+            }
         }
         let out = {
             let App {
@@ -3382,18 +3427,7 @@ impl App {
         let started = std::time::Instant::now();
         // The tools outside the registry go through `ToolHost`, which is the path the
         // board's own agent uses, so an MCP caller and the agent share one behaviour.
-        let result = if name.starts_with("fs_") || name.starts_with("net_") {
-            if self.cfg.mcp.disabled_tools.iter().any(|d| d == &name) {
-                Err(McpError::not_found(format!("tool `{name}` is disabled")))
-            } else {
-                match ToolHost::call_tool(self, &name, &args) {
-                    Ok(text) => Ok(text_result(&text)),
-                    Err(message) => Err(McpError::invalid_params(message)),
-                }
-            }
-        } else {
-            self.call_tool(&name, &args)
-        };
+        let result = self.call_tool(&name, &args);
         let ms = started.elapsed().as_millis();
         match result {
             Ok(v) => {
@@ -4417,6 +4451,10 @@ impl App {
 
     /// The `fs_*` and `net_*` handlers by name, shared by the tool host and `shell`.
     fn fs_or_net_call(&mut self, name: &str, arguments: &Value) -> std::result::Result<String, String> {
+        self.ensure_enabled(name).map_err(|e| e.message)?;
+        if !arguments.is_object() {
+            return Err("tool arguments must be an object".to_string());
+        }
         if name.starts_with("fs_") {
             let call = |ws: &mut AppWorkspace| {
                 fs_tools::call(ws, name, arguments)
@@ -4525,6 +4563,7 @@ impl App {
         args: &Value,
     ) -> std::result::Result<String, String> {
         let op = parsed.name.clone();
+        self.ensure_enabled(&op).map_err(|e| e.message)?;
         // A missing argument is a wrong command line like any other, so it answers with the
         // usage line too: `cp` with one word should not be the one error that stays silent
         // about how the command is written.
@@ -4554,6 +4593,7 @@ impl App {
     /// pipeline, because a pipeline must not be a second way round anything (the PIN, the
     /// workspace limit, the refusals).
     fn shell_dispatch(&mut self, tool: &str, inner: &Value) -> std::result::Result<String, String> {
+        self.ensure_enabled(tool).map_err(|e| e.message)?;
         match tool {
             "shell_zip" => self.shell_zip(inner),
             "shell_unzip" => self.shell_unzip(inner),
@@ -4635,6 +4675,7 @@ impl App {
                         crate::tools::shell::PIPE_USAGE
                     ));
                 }
+                self.ensure_enabled("fs_read").map_err(|e| e.message)?;
                 stdin = Some(fs_tools::Workspace::read(&self.workspace, path)?);
             }
             if index > 0 && stdio == crate::tools::shell::Stdio::Produces {
@@ -4699,6 +4740,10 @@ impl App {
     /// with no file copies its input, `grep` with no file filters what the pipe left, and
     /// `echo` is the producer a redirect is usually written for.
     fn pipe_stage(&mut self, op: &str, inner: &Value) -> std::result::Result<String, String> {
+        self.ensure_enabled(op).map_err(|e| e.message)?;
+        if let Some(tool) = crate::tools::shell::route(op) {
+            crate::tool::ensure_tool_enabled(&self.cfg, tool).map_err(|e| e.message)?;
+        }
         if op == "cat" {
             match inner.get("path").and_then(|v| v.as_str()) {
                 Some(path) if !path.is_empty() => {
@@ -4728,7 +4773,9 @@ impl App {
         target: &crate::tools::shell::Redirect,
         text: &str,
     ) -> std::result::Result<Value, String> {
+        self.ensure_enabled("fs_write").map_err(|e| e.message)?;
         let existing = if target.append {
+            self.ensure_enabled("fs_read").map_err(|e| e.message)?;
             fs_tools::Workspace::read(&self.workspace, &target.path).unwrap_or_default()
         } else {
             String::new()
@@ -4781,6 +4828,10 @@ impl App {
     /// `curl`: GET (with HTML reduced to text) or POST when `data` is given.
     /// `wget`: the same fetch, saved into the workspace under `path`.
     fn run_curl(&mut self, name: &str, args: &Value) -> std::result::Result<String, String> {
+        self.ensure_enabled(name).map_err(|e| e.message)?;
+        if name == "wget" {
+            self.ensure_enabled("fs_write").map_err(|e| e.message)?;
+        }
         let url = args.get("url").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
         if url.is_empty() {
             return Err("`url` is required".into());
@@ -5039,11 +5090,13 @@ impl App {
             let Some(target) = target else {
                 return Ok(serde_json::json!({ "text": decoded, "bytes": bytes.len() }).to_string());
             };
+            self.ensure_enabled("fs_write").map_err(|e| e.message)?;
             self.workspace_edit(|ws| fs_tools::Workspace::write(ws, &target, &decoded))?;
             return Ok(serde_json::json!({ "path": target, "bytes": bytes.len() }).to_string());
         }
         let encoded = crate::util::b64_encode(text.as_bytes());
         if let Some(target) = out_path {
+            self.ensure_enabled("fs_write").map_err(|e| e.message)?;
             self.workspace_edit(|ws| fs_tools::Workspace::write(ws, &target, &encoded))?;
             return Ok(serde_json::json!({ "path": target, "bytes": encoded.len() }).to_string());
         }
@@ -5086,6 +5139,7 @@ impl App {
         // `paths` packs files that are already in the workspace.
         if let Some(paths) = args.get("paths").and_then(|v| v.as_array()) {
             for path in paths.iter().filter_map(|p| p.as_str()) {
+                self.ensure_enabled("fs_read").map_err(|e| e.message)?;
                 match fs_tools::Workspace::read(&self.workspace, path) {
                     Ok(text) => entries.push((path.trim_start_matches('/').to_string(), text.into_bytes())),
                     Err(_) => return Err(format!("`{path}` is not in the workspace")),
@@ -5161,6 +5215,7 @@ impl App {
     fn shell_input(&self, args: &Value, op: &str) -> std::result::Result<(Value, String), String> {
         let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
         if !path.is_empty() {
+            self.ensure_enabled("fs_read").map_err(|e| e.message)?;
             let text = fs_tools::Workspace::read(&self.workspace, &path)?;
             return Ok((json!(path), text));
         }
@@ -5431,6 +5486,7 @@ impl App {
     /// `tee <path> [-i <text>]`: write the text and echo it. In a pipeline the text arrives
     /// on stdin; on its own it arrives as `-i`, because that is what a pipe would have been.
     fn shell_tee(&mut self, args: &Value) -> std::result::Result<String, String> {
+        self.ensure_enabled("fs_write").map_err(|e| e.message)?;
         let path = App::shell_path(args, "tee")?;
         let flag = args.get("input").and_then(|v| v.as_str()).unwrap_or("");
         let piped = args.get("stdin").and_then(|v| v.as_str());
@@ -5457,6 +5513,7 @@ impl App {
 
     /// `touch <path>`: create an empty file. There is no mtime to move, and it says so.
     fn shell_touch(&mut self, args: &Value) -> std::result::Result<String, String> {
+        self.ensure_enabled("fs_write").map_err(|e| e.message)?;
         let path = App::shell_path(args, "touch")?;
         let exists = fs_tools::Workspace::read(&self.workspace, &path).is_ok();
         if !exists {
@@ -5593,6 +5650,7 @@ impl App {
     /// `crc32 <path>`: the same CRC-32 the zip writer already uses, so there is one of it.
     fn shell_crc32(&mut self, args: &Value) -> std::result::Result<String, String> {
         let path = App::shell_path(args, "crc32")?;
+        self.ensure_enabled("fs_read").map_err(|e| e.message)?;
         let bytes = fs_tools::Workspace::read(&self.workspace, &path)?.into_bytes();
         let crc = crate::zlib::crc32(&bytes);
         Ok(json!({
@@ -5977,18 +6035,6 @@ fn tool_text(v: &Value) -> String {
         }
     }
     serde_json::to_string(v).unwrap_or_else(|_| "{}".to_string())
-}
-
-/// The reverse of [`tool_text`]: a tool that answers with JSON text, shaped as an MCP
-/// result so an external client sees the same envelope as the registry tools.
-fn text_result(text: &str) -> Value {
-    match serde_json::from_str::<Value>(text) {
-        Ok(value) => protocol::tool_json(&value),
-        Err(_) => json!({
-            "content": [{ "type": "text", "text": text }],
-            "isError": false,
-        }),
-    }
 }
 
 /// Accept either an OpenAI tool or an MCP tool definition from an extra tool group
@@ -11471,6 +11517,137 @@ mod tests {
         assert!(names.contains(&"board".to_string()));
         assert!(!names.contains(&"mpu6050_read".to_string()));
         assert!(!names.contains(&"lcd_text".to_string()));
+    }
+
+    #[test]
+    fn tool_disable_is_enforced_by_mcp_and_the_internal_agent() {
+        for name in ["script", "shell", "write", "board_status"] {
+            let mut app = test_app();
+            app.cfg.mcp.disabled_tools = vec![name.into()];
+            let args = match name {
+                "script" => json!({"source": "1"}),
+                "shell" => json!({"command": "echo hello"}),
+                "write" => json!({"path": "/blocked", "text": "no"}),
+                _ => json!({}),
+            };
+            let direct = app.call_tool(name, &args);
+            assert!(
+                direct.as_ref().is_err_and(|e| e.message.contains("disabled")),
+                "disabled {name} ran through App: {direct:?}"
+            );
+            let host = ToolHost::call_tool(&mut app, name, &args);
+            assert!(
+                host.as_ref().is_err_and(|e| e.contains("disabled")),
+                "disabled {name} ran through ToolHost: {host:?}"
+            );
+            let rpc = app
+                .handle_rpc(
+                    &json!({"jsonrpc": "2.0", "id": 1,
+                "method": "tools/call", "params": {"name": name, "arguments": args}})
+                    .to_string(),
+                    None,
+                )
+                .unwrap();
+            assert_eq!(rpc["result"]["isError"], true, "{name}: {rpc}");
+        }
+
+        let shared = Arc::new(Mutex::new(test_app()));
+        {
+            let mut app = shared.lock().unwrap();
+            point_at_the_stub(&mut app);
+            app.cfg.mcp.disabled_tools = vec!["write".into()];
+            app.agent.push_user("try the disabled write", "http", 1);
+        }
+        let mut model = Scripted::new(vec![
+            Scripted::tool_call("blocked", "write", r#"{"path":"/blocked","text":"no"}"#),
+            Scripted::answer("the write was refused"),
+        ]);
+        assert_eq!(run_turn(&shared, &mut model), "the write was refused");
+        let app = shared.lock().unwrap();
+        let result = app.agent.history.iter().find(|m| m.tool_call_id.as_deref() == Some("blocked")).unwrap();
+        assert!(result.text.contains("disabled"), "{}", result.text);
+        assert!(fs_tools::Workspace::read(&app.workspace, "/blocked").is_err());
+    }
+
+    #[test]
+    fn tool_disable_survives_alias_family_and_generic_dispatch() {
+        let mut app = test_app();
+        app.cfg.mcp.disabled_tools =
+            vec!["fs_write".into(), "board_status".into(), "oled_text".into(), "bme280_read".into()];
+        for (name, args) in [
+            ("write", json!({"path": "/blocked", "text": "no"})),
+            ("fs_write", json!({"path": "/blocked", "text": "no"})),
+            ("board", json!({"command": "status"})),
+            ("display", json!({"command": "oled_text", "arguments": {"text": "no"}})),
+            ("device_invoke", json!({"device": "bme280", "tool": "bme280_read"})),
+        ] {
+            assert!(app.call_tool(name, &args).is_err(), "{name} bypassed a disabled target");
+        }
+        assert!(!tool_names(&mut app).contains(&"write".into()), "the alias should not be offered");
+        app.cfg.mcp.disabled_tools = vec!["board".into(), "display".into()];
+        assert!(app.call_tool("board_status", &json!({})).is_err());
+        assert!(app.call_tool("oled_text", &json!({"text": "no"})).is_err());
+        assert!(app
+            .call_tool(
+                "device_invoke",
+                &json!({"device": "oled", "tool": "oled_text", "arguments": {"text": "no"}})
+            )
+            .is_err());
+        app.cfg.mcp.disabled_tools.clear();
+        app.cfg.mcp.tools_mode = "generic".into();
+        assert!(
+            app.call_tool("device_invoke", &json!({"device": "bme280", "tool": "bme280_read"})).is_ok(),
+            "generic visibility is not a disable"
+        );
+    }
+
+    #[test]
+    fn tool_disable_blocks_script_and_shell_file_bypasses() {
+        let mut app = test_app();
+        app.call_tool("write", &json!({"path": "/source", "text": "hello"})).unwrap();
+        app.cfg.mcp.disabled_tools = vec!["write".into()];
+        for command in [
+            "echo no > /blocked",
+            "echo no >> /blocked",
+            "echo no | tee /blocked",
+            "touch /blocked",
+            "base64enc /source -o /blocked",
+            "cp /source /blocked",
+            "mv /source /blocked --confirm",
+            "wget http://127.0.0.1/healthz -o /blocked",
+        ] {
+            let result = app.call_tool("shell", &json!({"command": command}));
+            assert!(
+                result.as_ref().is_err_and(|e| e.message.contains("disabled")),
+                "disabled write via {command}: {result:?}"
+            );
+            assert!(fs_tools::Workspace::read(&app.workspace, "/blocked").is_err());
+        }
+        let script = app.call_tool(
+            "script",
+            &json!({"source": "tool(\"fs_write\", {path: \"/blocked\", text: \"no\"})"}),
+        );
+        assert!(script.as_ref().is_err_and(|e| e.message.contains("disabled")), "{script:?}");
+        assert_eq!(fs_tools::Workspace::read(&app.workspace, "/source").unwrap(), "hello");
+        app.cfg.mcp.disabled_tools = vec!["read".into()];
+        for command in [
+            "cat /source",
+            "head /source",
+            "echo no < /source",
+            "base64enc /source",
+            "sha256sum /source",
+            "crc32 /source",
+            "zip a.zip /source",
+        ] {
+            let result = app.call_tool("shell", &json!({"command": command}));
+            assert!(
+                result.as_ref().is_err_and(|e| e.message.contains("disabled")),
+                "disabled read via {command}: {result:?}"
+            );
+        }
+        let script = app.call_tool("script", &json!({"path": "/source"}));
+        assert!(script.as_ref().is_err_and(|e| e.message.contains("disabled")), "{script:?}");
+        assert!(ToolHost::call_tool(&mut app, "fs_read", &json!({"path": "/source"})).is_err());
     }
 
     #[test]

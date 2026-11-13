@@ -136,7 +136,8 @@ pub struct McpCfg {
     /// `auto` = only tools whose hardware was detected, `all` = every built-in
     /// tool even without the hardware (useful while developing a driver).
     pub tools_mode: String,
-    /// Tool names the user switched off in the portal.
+    /// Explicit execution refusals, shared by MCP, the on-board agent, scripts,
+    /// aliases and family commands. Listing profiles do not impose this policy.
     pub disabled_tools: Vec<String>,
     /// `full` (default) or `minimal`.
     ///

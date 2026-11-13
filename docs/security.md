@@ -18,6 +18,20 @@ so monitoring does not need the secret.
 
 Tokens live in RAM: a reboot revokes every one of them.
 
+## Tool switches
+
+`mcp.disabled_tools` is enforced at execution, not just removed from `tools/list`.
+MCP and the on-board agent share the check; scripts, family commands and `device_invoke`
+check their targets too. A disabled family also refuses its legacy member names.
+`read`/`fs_read`, `write`/`fs_write` and `edit`/`fs_edit` share switches. File-content
+filters and script-file loading require read permission; editing, copying, moving,
+`wget`, `tee`, `touch`, base64 output and redirection require the underlying write
+permission. An explicit disable answers with an error rather than a successful empty result.
+
+`minimal` and `generic` are listing choices, not disables: an otherwise enabled legacy
+name remains callable. These switches govern tools, not the owner's PIN-authorized HTTP
+configuration routes. A caller that can change the configuration can change the switches.
+
 ## TLS
 
 Port 443 serves the same routes with a certificate the board generates on first boot (EC
