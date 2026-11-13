@@ -70,6 +70,14 @@ or interrupted upload is not a completed recording or playback. Buffered bodies 
 most 1 MB, held once rather than copied through another full-size receive buffer; `/audio/pcm`
 and `/av` stream through a small receive buffer and apply their own media limits.
 
+Outbound HTTP has one host-tested decoder in `http_client.rs`, used by the simulator and
+firmware transports. It handles fixed-length, chunked and close-delimited replies,
+including informational status lines, with 16 KB of headers and 64 KB of decoded body.
+An oversized or torn reply is an explicit error, not a partial JSON success. The request
+head is written separately from the borrowed body, avoiding a second large model-request
+buffer. Network tool results also reserve metadata and JSON escaping inside the 64 KB
+agent result budget, so their truncation marker remains inside valid JSON.
+
 CORS is on by default (`mcp.cors`), so a browser MCP client can connect directly.
 
 ## 2. Web and configuration REST
