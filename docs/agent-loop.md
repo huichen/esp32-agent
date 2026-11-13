@@ -28,7 +28,15 @@ works towards an objective on its own between turns.
 - **Bounded everything.** History ring (at most 1,024 messages / 2 MB), one user message
   32 KB, reasoning 4 KB, tool result 64 KB (cut with `...(truncated)`), model reply 32 KB,
   `agent.max_steps` model calls per turn (`0` = no limit, capped at 200 when set),
-  `agent.tick_ms` clamped to 200-5000 (default 1000).
+  `agent.tick_ms` clamped to 200-5000 (default 1000). The history byte budget includes
+  tool arguments, reasoning and image base64, not just visible text. The token trigger
+  and retained-turn selection use the same estimate for text, reasoning and tool
+  arguments; image token costs remain provider-dependent. Trimming and turn selection
+  scan the history linearly. The separate 96-entry journal stores only 512-byte text
+  excerpts (truncation marker included), and the compressed index keeps at most 40 lines.
+  Byte trimming deliberately keeps one oversized newest message; the payload ceiling
+  excludes allocator overhead, request copies and the archive index, so it is not a
+  measured peak-RAM guarantee.
 - **Storage is a filesystem.** The transcript and the file workspace are files on the 12 MB
   `storage` partition (LittleFS); NVS keeps the configuration and the secrets, and nothing
   that grows. A workspace file may be 256 KB and the whole workspace 4 MB. See section 4

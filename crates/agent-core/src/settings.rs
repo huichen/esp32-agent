@@ -45,13 +45,13 @@ const MODEL: &[Field] = &[
         "context_tokens",
         "integer",
         "262144",
-        "transcript budget in tokens; compaction fires at 80% of it (the board also caps text at 24 KB because of RAM)",
+        "transcript budget in tokens; compaction fires at 80% of it (history payload is also capped at 2 MiB / 1024 messages)",
     ),
     f(
         "max_output_tokens",
         "integer",
         "32768",
-        "reply ceiling in tokens; sent as max_tokens, and reserved out of the window (a reply is still cut at 8 KB on the board)",
+        "reply ceiling in tokens; max_tokens on chat/anthropic, max_output_tokens on responses; reserved out of the window (a reply is still cut at 32 KiB on the board)",
     ),
     f("temperature", "number", "1.0", "0.0 to 2.0"),
     f("timeout_s", "integer", "45", "5 to 180 seconds per model call"),
@@ -135,7 +135,7 @@ const BOARD: &[Field] = &[
         "agent.persist_transcript",
         "boolean",
         "true",
-        "keep the conversation in flash across a reboot; the stored tail is capped at 16 KB",
+        "keep the conversation in flash across a reboot; the stored tail is capped at 512 KiB",
     ),
     f(
         "skills.seed_defaults",
@@ -252,6 +252,12 @@ mod tests {
         let steps = model.fields.iter().find(|f| f.name == "max_steps").expect("max_steps");
         assert_eq!(steps.default, "0");
         assert!(steps.note.contains("no limit"), "{}", steps.note);
+        let context = model.fields.iter().find(|f| f.name == "context_tokens").expect("context_tokens");
+        assert!(context.note.contains("2 MiB / 1024 messages"));
+        assert_eq!(crate::agent::MAX_HISTORY_BYTES, 2 * 1024 * 1024);
+        let output = model.fields.iter().find(|f| f.name == "max_output_tokens").expect("max_output_tokens");
+        assert!(output.note.contains("32 KiB"));
+        assert_eq!(crate::agent::MAX_REPLY_BYTES, 32 * 1024);
     }
 
     #[test]
@@ -279,6 +285,8 @@ mod tests {
             .expect("agent.persist_transcript is documented");
         assert_eq!(field.kind, "boolean");
         assert_eq!(field.default, "true", "the feature is on unless a board says otherwise");
+        assert!(field.note.contains("512 KiB"));
+        assert_eq!(crate::agent::MAX_SAVED_BYTES, 512 * 1024);
     }
 
     #[test]

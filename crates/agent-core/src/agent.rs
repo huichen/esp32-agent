@@ -27,21 +27,21 @@ use serde_json::{json, Value};
 /// 512 KB), which makes the byte budget decorative; 2 MB of short turns is roughly a
 /// thousand messages.
 pub const MAX_HISTORY_MESSAGES: usize = 1_024;
-/// Oldest messages are dropped above this much text.
+/// Oldest messages are dropped above this much history payload.
 ///
 /// Not a physical limit of the chip: the transcript and the request built from it live
 /// in PSRAM (8 MB here), and the two ceilings that used to bind, the internal-RAM
-/// allocations and the mbedTLS buffers, were both moved off it. What this bounds is the
-/// *request body*: tools (about 18 KB of JSON), the system prompt, and this text all go
-/// out in one POST, and the board has to build and send that body while its internal
-/// SRAM is down to a few kilobytes after TLS.
+/// allocations and the mbedTLS buffers, were both moved off it. This counts text,
+/// reasoning, serialized tool arguments and attachments, not allocator overhead or
+/// request copies. Tools (about 18 KB of JSON), the system prompt and the archive index
+/// add separate costs when the board builds a POST.
 ///
-/// **2 MB is a chosen ceiling, not a measured one.** The bench ladder reached 507 KB with
+/// **2 MiB is a chosen ceiling, not a measured one.** The bench ladder reached 507 KB with
 /// ~6.6 MB of PSRAM still free (`docs/troubleshooting.md`); nothing above that has run on
-/// the board. What the arithmetic says: during a turn the transcript, its journal entry
-/// and the serialised request exist at once, so the peak is roughly twice the cap plus the
-/// 18 KB of tool schemas — about 4 MB here, against 7.9 MB free. Watch `spiram.free_kb`
-/// in `/api/memory` between turns rather than trusting the cap.
+/// the board. The transcript, request Values and serialized request coexist during a
+/// turn, so this payload ceiling is not proof of peak heap usage. One oversized newest
+/// message is deliberately retained. Watch `spiram.free_kb` in `/api/memory` between
+/// turns rather than trusting the cap.
 ///
 /// Note that 2 MB is above what the default 262 144-token window carries (~209 000 tokens
 /// is ~840 KB of ASCII), so in normal use the token trigger fires first and this is the
@@ -164,6 +164,8 @@ pub fn estimate_tokens(text: &str) -> u32 {
 /// The run journal is a ring: enough to render one run in the portal, small enough to
 /// live in RAM next to the transcript on a board with a few hundred KB of internal heap.
 pub const MAX_EVENTS: usize = 96;
+/// Journal excerpts include their truncation marker inside this byte ceiling.
+pub const MAX_EVENT_TEXT_BYTES: usize = 512;
 
 /// Who produced a message. Serialised as the OpenAI role name.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -231,6 +233,33 @@ pub struct Attachment {
 }
 
 impl Message {
+    /// Payload held by this message, including data that is not visible text.
+    fn payload_bytes(&self) -> usize {
+        self.text.len()
+            + self.reasoning.len()
+            + self.source.len()
+            + self.tool_call_id.as_ref().map_or(0, |id| id.len())
+            + self
+                .tool_calls
+                .iter()
+                .map(|call| call.id.len() + call.name.len() + json_bytes(&call.arguments))
+                .sum::<usize>()
+            + self.attachments.iter().map(|a| a.name.len() + a.mime.len() + a.data_b64.len()).sum::<usize>()
+    }
+
+    /// The same text classifier for the trigger and the retained-turn budget.
+    /// Image tokens depend on provider/geometry; their base64 still counts as bytes.
+    fn estimated_tokens(&self) -> u32 {
+        self.tool_calls.iter().fold(
+            estimate_tokens(&self.text).saturating_add(estimate_tokens(&self.reasoning)),
+            |tokens, call| {
+                tokens
+                    .saturating_add(estimate_tokens(&call.name))
+                    .saturating_add(estimate_tokens(&llm::arguments_request_json(call)))
+            },
+        )
+    }
+
     pub fn with_attachments(mut self, attachments: Vec<Attachment>) -> Self {
         self.attachments = attachments;
         self
@@ -476,7 +505,7 @@ impl Event {
         v.insert("event".into(), json!(self.kind));
         v.insert("at_ms".into(), json!(self.at_ms));
         if !self.text.is_empty() {
-            v.insert("text".into(), json!(llm::truncate_bytes(&self.text, 512)));
+            v.insert("text".into(), json!(llm::truncate_bytes(&self.text, MAX_EVENT_TEXT_BYTES)));
         }
         if let Some(id) = &self.tool_call_id {
             v.insert("tool_call_id".into(), json!(id));
@@ -821,6 +850,8 @@ impl Agent {
         policy: &llm::RetryPolicy,
         timer: &dyn llm::RetryTimer,
     ) -> Result<String, String> {
+        self.set_budget(cfg.context_tokens, cfg.max_output_tokens);
+        self.vision = cfg.vision;
         let mut step = match self.begin(host, now_ms, cfg.max_steps) {
             Some(step) => step,
             None => return Ok(String::new()),
@@ -842,6 +873,14 @@ impl Agent {
         let seq = self.event_seq;
         let mut event = Event::simple(seq, kind, at_ms);
         edit(&mut event);
+        // Bound the stored excerpt, not only its JSON view. Keeping whole tool
+        // results here used to leave a second, unbounded transcript beside the ring.
+        if event.text.len() > MAX_EVENT_TEXT_BYTES {
+            event.text = llm::truncate_bytes(
+                &event.text,
+                MAX_EVENT_TEXT_BYTES.saturating_sub(llm::TRUNCATED_MARK.len()),
+            );
+        }
         if self.events.len() >= MAX_EVENTS {
             self.events.pop_front();
         }
@@ -877,19 +916,24 @@ impl Agent {
             let keep = self.turns_within(keep_recent_tokens(self.context_tokens, self.max_output_tokens));
             self.compress(keep);
         }
-        while self.history.len() > max_messages {
-            self.history.remove(0);
-            self.history_version += 1;
+        // Price each message once and drain one prefix. Recounting the full
+        // payload after every remove(0) makes a byte trim quadratic at 1024 messages.
+        let sizes: Vec<usize> = self.history.iter().map(Message::payload_bytes).collect();
+        let mut cut = self.history.len().saturating_sub(max_messages);
+        let mut bytes: usize = sizes[cut..].iter().sum();
+        while bytes > max_bytes && cut + 1 < self.history.len() {
+            bytes -= sizes[cut];
+            cut += 1;
         }
-        while self.history_bytes() > max_bytes && self.history.len() > 1 {
-            let dropped = self.history.remove(0);
-            self.history_version += 1;
-            self.archive_message(&dropped);
+        while matches!(self.history.get(cut).map(|m| m.role), Some(Role::Tool)) {
+            cut += 1;
         }
-        while matches!(self.history.first().map(|m| m.role), Some(Role::Tool)) {
-            let dropped = self.history.remove(0);
+        if cut > 0 {
+            let dropped: Vec<Message> = self.history.drain(..cut).collect();
             self.history_version += 1;
-            self.archive_message(&dropped);
+            for message in &dropped {
+                self.archive_message(message);
+            }
         }
         while self.archive.len() > ARCHIVE_MAX_LINES {
             self.archive.remove(0);
@@ -950,6 +994,9 @@ impl Agent {
             Role::System => format!("note: {}", head(&message.text, 90)),
         };
         if line.trim().len() > 6 {
+            if self.archive.len() >= ARCHIVE_MAX_LINES {
+                self.archive.remove(0);
+            }
             self.archive.push(line);
         }
     }
@@ -1005,37 +1052,28 @@ impl Agent {
 
     /// The same number, always recomputed. Tests use it to prove the cache is not lying.
     pub fn history_tokens_uncached(&self) -> u32 {
-        self.history
-            .iter()
-            .map(|m| {
-                let calls: u32 = m
-                    .tool_calls
-                    .iter()
-                    .map(|c| {
-                        estimate_tokens(&c.name)
-                            .saturating_add(estimate_tokens(&llm::arguments_request_json(c).to_string()))
-                    })
-                    .sum();
-                estimate_tokens(&m.text).saturating_add(calls)
-            })
-            .fold(0u32, |a, b| a.saturating_add(b))
+        self.history.iter().map(Message::estimated_tokens).fold(0u32, |a, b| a.saturating_add(b))
     }
 
     /// How many trailing exchanges fit in `budget` tokens; at least one, so a single
     /// oversized exchange still survives compression rather than emptying the thread.
     fn turns_within(&self, budget: u32) -> usize {
         let mut kept = 0usize;
-        for turn in 1..=self.history.len().max(1) {
-            let start = turn_start(&self.history, turn);
-            let cost: u32 = self.history[start..]
-                .iter()
-                .map(|m| estimate_tokens(&m.text))
-                .fold(0u32, |a, b| a.saturating_add(b));
+        let mut used = 0u32;
+        let mut turn_cost = 0u32;
+        for message in self.history.iter().rev() {
+            turn_cost = turn_cost.saturating_add(message.estimated_tokens());
+            if message.role != Role::User {
+                continue;
+            }
+            let cost = used.saturating_add(turn_cost);
             if cost > budget && kept > 0 {
                 break;
             }
-            kept = turn;
-            if cost >= budget {
+            kept += 1;
+            used = cost;
+            turn_cost = 0;
+            if used >= budget {
                 break;
             }
         }
@@ -1043,15 +1081,7 @@ impl Agent {
     }
 
     fn history_bytes(&self) -> usize {
-        self.history
-            .iter()
-            .map(|m| {
-                m.text.len()
-                    + m.source.len()
-                    + m.tool_call_id.as_ref().map(|id| id.len()).unwrap_or(0)
-                    + m.tool_calls.iter().map(|c| c.id.len() + c.name.len() + 48).sum::<usize>()
-            })
-            .sum()
+        self.history.iter().map(Message::payload_bytes).sum()
     }
 
     /// The request payload: the generated system prompt, the host's own context, and
@@ -1187,6 +1217,24 @@ fn turn_start(history: &[Message], keep: usize) -> usize {
         }
     }
     0
+}
+
+/// Measure serialized arguments without allocating another copy of a large write.
+fn json_bytes(value: &Value) -> usize {
+    struct Counter(usize);
+    impl std::io::Write for Counter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0 += bytes.len();
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut counter = Counter(0);
+    serde_json::to_writer(&mut counter, value)
+        .expect("a JSON Value and an infallible byte counter are always serializable");
+    counter.0
 }
 
 /// The first `max` characters, newlines flattened: an archive line must stay one line.
@@ -1994,6 +2042,41 @@ mod tests {
         head.trim_to(RING_MESSAGES, RING_BYTES);
         assert_eq!(head.history.len(), 1, "the orphaned result went, the question stayed");
         assert_eq!(head.history[0].role, Role::User);
+
+        // Large write arguments, reasoning and attached images are history too:
+        // short visible text must not make their payload invisible to the byte cap.
+        let mut payload = Agent::new();
+        payload.set_budget(u32::MAX, 1);
+        for i in 0..8 {
+            payload.history.push(Message::user("look", "http", i).with_attachments(vec![Attachment {
+                name: "shot.png".into(),
+                mime: "image/png".into(),
+                data_b64: "a".repeat(2000),
+            }]));
+            payload.history.push(Message::assistant_with_reasoning(
+                "",
+                &"r".repeat(1000),
+                vec![ToolCall {
+                    id: format!("c{i}"),
+                    name: "write".into(),
+                    arguments: json!({ "content": "x".repeat(2000) }),
+                }],
+                i,
+            ));
+            payload.history.push(Message::tool(&format!("c{i}"), "{}", i));
+        }
+        assert_eq!(payload.history[0].payload_bytes(), 4 + 4 + 8 + 9 + 2000);
+        assert_eq!(
+            payload.history[1].payload_bytes(),
+            1000 + 2 + 5 + json!({ "content": "x".repeat(2000) }).to_string().len()
+        );
+        let escaped = json!({ "content": "界\n\"", "nested": [null, true, 42] });
+        assert_eq!(json_bytes(&escaped), escaped.to_string().len(), "the counter includes JSON escaping");
+        let before = payload.history.len();
+        payload.trim_to(1000, RING_BYTES);
+        assert!(payload.history.len() < before, "non-text payload bypassed the byte ceiling");
+        assert!(payload.history_bytes() <= RING_BYTES);
+        assert_transcript_valid(&payload);
     }
 
     /// The policy half, without filling anything: the two ceilings price the same request,
@@ -2056,6 +2139,10 @@ mod tests {
         );
         // The truncated text is what the next request carries.
         assert!(!transport.bodies[1].contains(&"y".repeat(MAX_TOOL_RESULT_BYTES + 1)));
+        let event = agent.events.iter().find(|e| e.kind == "tool_result").expect("journaled result");
+        assert!(event.text.len() <= MAX_EVENT_TEXT_BYTES, "the journal retained the unbounded result");
+        assert!(event.text.ends_with(llm::TRUNCATED_MARK));
+        assert_eq!(event.json()["text"], event.text, "rendering must not append a second marker");
     }
 
     #[test]
@@ -2140,6 +2227,16 @@ mod tests {
         let prompt = agent.system_message(&mut host);
         assert!(prompt.contains("Earlier in this conversation"), "{prompt}");
         assert!(prompt.contains("board_status"), "{prompt}");
+
+        // Public/manual compression has the same archive bound as an automatic
+        // trim; callers need not know to invoke a second cleanup operation.
+        let mut manual = Agent::new();
+        for i in 0..100 {
+            manual.history.push(Message::user(&format!("q{i}"), "http", i));
+            manual.history.push(Message::assistant("answer", Vec::new(), i));
+        }
+        manual.compress(1);
+        assert_eq!(manual.archive.len(), ARCHIVE_MAX_LINES);
     }
 
     #[test]
@@ -2163,6 +2260,21 @@ mod tests {
         let large = keep_recent_tokens(65536, 512);
         assert!(large >= small, "a bigger window keeps at least as much: {small} vs {large}");
         assert!(small >= 1, "one exchange always survives");
+
+        // The synchronous loop is a public entry point too; it must mirror the
+        // passed config just as App::drive_agent does for the board thread.
+        let config = LlmConfig { context_tokens: 600, max_output_tokens: 64, vision: false, ..cfg() };
+        agent.pending = Some(Message::user("look", "http", 1).with_attachments(vec![Attachment {
+            name: "shot.png".into(),
+            mime: "image/png".into(),
+            data_b64: "aGVsbG8=".into(),
+        }]));
+        let mut host = StubHost::returning("{}");
+        let mut transport = StubTransport::new(vec![answer_reply("ok")]);
+        agent.run_pending(&mut host, &mut transport, &config, clock).expect("answer");
+        assert_eq!(agent.budget(), (600, 64));
+        let body: Value = serde_json::from_str(&transport.bodies[0]).expect("JSON");
+        assert!(body["messages"][1]["content"].is_string(), "vision=false must not send image parts");
     }
 
     #[test]
@@ -2230,6 +2342,29 @@ mod tests {
         let prompt = agent.system_message(&mut host);
         assert!(prompt.contains("Earlier in this conversation"), "the index is carried");
         assert!(agent.history_tokens() > 0);
+
+        // Selecting the tail must price tool arguments and reasoning just as the
+        // trigger does. Otherwise a transcript of writes never actually compacts.
+        let mut writes = Agent::new();
+        writes.set_budget(1000, 128);
+        for i in 0..3 {
+            writes.history.push(Message::user("write", "http", i));
+            writes.history.push(Message::assistant_with_reasoning(
+                "",
+                &"r".repeat(200),
+                vec![ToolCall {
+                    id: format!("c{i}"),
+                    name: "write".into(),
+                    arguments: json!({ "content": "x".repeat(2000) }),
+                }],
+                i,
+            ));
+            writes.history.push(Message::tool(&format!("c{i}"), "{}", i));
+        }
+        assert!(writes.needs_compaction());
+        writes.trim();
+        assert_eq!(writes.history.len(), 3, "one oversized recent exchange survives, not all writes");
+        assert_transcript_valid(&writes);
     }
 
     #[test]
