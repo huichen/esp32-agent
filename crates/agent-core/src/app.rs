@@ -356,6 +356,12 @@ pub struct App {
     store_queue: store::StoreQueue,
     /// What the platform says about the task that drains the queue.
     store_writer: StoreWriter,
+    /// Only the latest admitted workspace generation. Its receipt, not queue admission,
+    /// decides when hashes can suppress a later write.
+    workspace_pending: Option<WorkspaceSave>,
+    /// Values potentially left by a refused publication/cleanup, retained for a later
+    /// successful index publication. Bounded with the queue's key budget before admission.
+    workspace_stale_keys: std::collections::BTreeSet<String>,
 }
 
 /// Whether the thread that runs the agent loop is up.
@@ -416,6 +422,13 @@ impl StoreWriter {
             "internal_stack": self.internal_stack,
         })
     }
+}
+
+struct WorkspaceSave {
+    receipt: store::PublicationReceipt,
+    hashes: std::collections::BTreeMap<String, u64>,
+    changed: Vec<String>,
+    cleanup: Vec<String>,
 }
 
 impl App {
@@ -495,6 +508,8 @@ impl App {
             agent_thread: AgentThread::NotStarted,
             store_queue: queue,
             store_writer: StoreWriter::default(),
+            workspace_pending: None,
+            workspace_stale_keys: Default::default(),
         };
         app.log.info(
             "boot",
@@ -596,8 +611,17 @@ impl App {
     /// firmware checks the calling task's stack before every call
     /// (`firmware/src/nvs_writer.rs`); the host tests call this directly, where there is
     /// no such thing as a flash window.
-    pub fn flush_store(&self, who: &str) -> store::FlushReport {
+    pub fn flush_store(&mut self, who: &str) -> store::FlushReport {
         let report = self.store_queue.flush();
+        self.acknowledge_store_flush(who, &report);
+        report
+    }
+
+    /// Complete app bookkeeping after the queue was drained, including generation-specific
+    /// workspace receipts. This method does no backend writes; platforms may drain outside
+    /// the app lock and then call it under a short mutable app lock.
+    pub fn acknowledge_store_flush(&mut self, who: &str, report: &store::FlushReport) {
+        self.acknowledge_workspace();
         // One line per refusal, not one line for all of them: a count says something is
         // wrong, and only the key says *what* is. `report.failed` is still the count, and
         // `/api/status.store.last_failure` carries the newest one off the wire.
@@ -620,7 +644,6 @@ impl App {
                 format!("wrote {} store value(s) from `{who}`: {}", report.written, report.keys.join(", ")),
             );
         }
-        report
     }
 
     /// Re-run board resolution, manifest device instantiation, detection and the
@@ -2628,101 +2651,133 @@ impl App {
         }
     }
 
-    /// Queue the workspace, or say why it cannot be stored at all.
-    ///
-    /// The return value is the point: a blob that cannot fit the storage plan has to reach
-    /// the caller as an error, because the caller is the one about to answer `ok: true` to
-    /// a model or a person, and [`App::workspace_edit`] undoes the change on `Err`. What is
-    /// checked here is therefore everything that is knowable before flash is touched —
-    /// the chunk count, the per-value ceiling, the UTF-8 boundaries; NVS refusing a write
-    /// it has room for is left to the writer task, which counts it in
-    /// `/api/status.store.failed` and logs the keys.
-    ///
-    /// The write itself is a request (see [`App::flush_store`]): this runs on whatever
-    /// thread made the change, and on this board only the store writer may touch flash.
-    /// Write the workspace: one value per file, plus an index that names them.
-    ///
-    /// This used to write the whole document on every save. Two measurements made that
-    /// untenable: the time grew with the workspace (14 s at 0.25 MB, 277 s at 2 MB, because a
-    /// save rewrote all of it), and the save needed a second copy of the document on flash at
-    /// the same time, which SPIFFS refused at about 2 MB with `ENOSPC` while reporting 9 MB
-    /// free. Per file, a save costs one file, and nothing is ever duplicated on flash.
-    ///
-    /// The index goes last: a value written without an index entry is garbage the next save
-    /// overwrites, while an index entry whose value is missing loses one file, not the board.
+    /// Admit one incremental workspace publication, not a synchronous durability promise.
+    /// Files precede the index; obsolete values and legacy data are removed only after
+    /// every required file and the index actually succeeds. Path-derived physical keys
+    /// still mean replacements are not an all-files transaction.
     fn persist_workspace(&mut self) -> std::result::Result<(), String> {
-        let mut index: std::collections::BTreeMap<String, String> = Default::default();
-        let mut written: std::collections::BTreeMap<String, u64> = Default::default();
-        let mut failed: Vec<String> = Vec::new();
-
+        self.acknowledge_workspace();
+        self.workspace.writable()?;
+        let mut index = std::collections::BTreeMap::new();
+        let mut hashes = std::collections::BTreeMap::new();
+        let mut writes = Vec::new();
+        let mut changed = Vec::new();
         for (path, text) in &self.workspace.files {
             let key = crate::keys::workspace_file(path);
-            index.insert(path.clone(), key.clone());
             let hash = crate::keys::fnv1a(text);
-            if self.workspace.saved.get(path) == Some(&hash) {
-                written.insert(path.clone(), hash);
-                continue;
+            // A queued/in-flight newer value may differ even when this edit returns to the
+            // last durable hash. Such a revert must replace that pending write too.
+            let pending_matches =
+                self.workspace_pending.as_ref().map_or(true, |save| save.hashes.get(path) == Some(&hash));
+            if self.workspace.saved.get(path) != Some(&hash) || !pending_matches {
+                writes.push((key.clone(), text.as_str()));
+                changed.push(path.clone());
             }
-            if self.store.set(&key, text) {
-                written.insert(path.clone(), hash);
-            } else {
-                // The old bytes stay: the key is derived from the path, not from the content,
-                // and `publish` renames only once the new value is complete.
-                failed.push(path.clone());
-            }
+            index.insert(path, key);
+            hashes.insert(path.clone(), hash);
         }
 
-        // Values whose file is gone. Only the paths we wrote before, so a stale key from an
-        // interrupted session is left to the save that follows it.
-        for path in self.workspace.saved.keys() {
+        let mut cleanup = self.workspace_stale_keys.clone();
+        cleanup.extend(self.workspace_pending.iter().flat_map(|save| save.cleanup.iter()).cloned());
+        for path in self
+            .workspace
+            .saved
+            .keys()
+            .chain(self.workspace_pending.iter().flat_map(|save| save.hashes.keys()))
+        {
             if !self.workspace.files.contains_key(path) {
-                self.store.remove(&crate::keys::workspace_file(path));
+                cleanup.insert(crate::keys::workspace_file(path));
             }
         }
-
+        // Enumerating names avoids materializing a possibly megabyte legacy document just
+        // to decide whether it needs cleanup. Check every historical chunk, including gaps.
+        let legacy: std::collections::BTreeSet<String> = (1..=WORKSPACE_PLAN.chunks_max)
+            .map(crate::keys::workspace_chunk)
+            .chain(std::iter::once(NVS_KEY_WORKSPACE.to_string()))
+            .collect();
+        for key in self.store.keys() {
+            if legacy.contains(&key) {
+                cleanup.insert(key);
+            }
+        }
+        // A new path may reuse an old path's physical hash; cleanup cannot unlink a key
+        // named by the new index, even across such a collision between generations.
+        for key in index.values() {
+            cleanup.remove(key);
+        }
+        let prospective_stale = cleanup.len().saturating_add(writes.len()).saturating_add(
+            self.workspace_stale_keys
+                .iter()
+                .filter(|key| !cleanup.contains(*key) && !writes.iter().any(|(write, _)| write == *key))
+                .count(),
+        );
+        if prospective_stale > store::PENDING_KEYS_MAX {
+            return Err(format!("the workspace was not saved: {prospective_stale} cleanup/dependency keys exceed the {}-key persistence budget; previous queue unchanged", store::PENDING_KEYS_MAX));
+        }
         let doc = serde_json::to_string(&index)
             .map_err(|e| format!("the workspace index could not be written: {e}"))?;
-        let committed = self.store.set(crate::keys::WORKSPACE_INDEX, &doc);
-        if committed {
-            // The layouts this one replaced, under keys nothing reads any more: the whole
-            // document (`ws`, or `ws1 ...` in its header) and its chunks. Asked for before
-            // removing, so the usual save leaves them alone entirely.
-            if self.store.get(NVS_KEY_WORKSPACE).is_some() {
-                self.store.remove(NVS_KEY_WORKSPACE);
-            }
-            for chunk in 1..=WORKSPACE_PLAN.chunks_max {
-                let key = crate::keys::workspace_chunk(chunk);
-                if self.store.get(&key).is_none() {
-                    break;
-                }
-                self.store.remove(&key);
-            }
-            self.workspace.saved = written;
-        }
-
-        if !failed.is_empty() {
+        let writes_ref: Vec<(&str, &str)> = writes.iter().map(|(key, text)| (key.as_str(), *text)).collect();
+        let cleanup: Vec<String> = cleanup.into_iter().collect();
+        let cleanup_ref: Vec<&str> = cleanup.iter().map(String::as_str).collect();
+        let receipt = self.store.publish(crate::keys::WORKSPACE_INDEX, &doc, &writes_ref, &cleanup_ref);
+        let Some(receipt) = receipt else {
+            let detail = self
+                .store
+                .last_error()
+                .map_or_else(|| "the store refused a file or index request".to_string(), |error| error.name);
             let why = format!(
-                "{} workspace file(s) were not saved ({}); the rest are",
-                failed.len(),
-                failed.join(", ")
+                "the workspace was not saved ({}): {detail}; see /api/status.store",
+                changed.join(", ")
             );
             self.log.error("agent", why.clone());
             return Err(why);
+        };
+        let previous = self.workspace_pending.replace(WorkspaceSave { receipt, hashes, changed, cleanup });
+        // Admission waited for any in-flight drain. Its older receipt is now completed or
+        // confirmed superseded; settle that generation without acknowledging the new one.
+        if let Some(previous) = previous {
+            if let Some(outcome) = previous.receipt.outcome() {
+                self.apply_workspace_outcome(previous, outcome);
+            }
         }
-        if !committed {
-            let why = "the workspace index was refused by the store, see /api/status.store";
-            self.log.error("agent", why);
-            return Err(why.to_string());
-        }
+        self.acknowledge_workspace(); // Also supports a genuinely synchronous KvStore.
         Ok(())
     }
 
-    /// One change to the workspace, durable or undone.
-    ///
-    /// Every caller that changes a file goes through here, so that "the write failed" and
-    /// "the file is there" cannot both be true. Without the rollback a failed save left the
-    /// new text in RAM: `write` answered ok, `read` served the file, and the next boot came
-    /// back without it - the failure was only visible in a log line nobody was reading.
+    fn acknowledge_workspace(&mut self) {
+        let Some(outcome) = self.workspace_pending.as_ref().and_then(|save| save.receipt.outcome()) else {
+            return;
+        };
+        let save = self.workspace_pending.take().expect("the receipt belongs to this generation");
+        self.apply_workspace_outcome(save, outcome);
+    }
+
+    fn apply_workspace_outcome(&mut self, save: WorkspaceSave, outcome: store::PublicationOutcome) {
+        match outcome {
+            store::PublicationOutcome::Superseded => {}
+            store::PublicationOutcome::Finished { published: true, cleanup_failed } => {
+                self.workspace.saved = save.hashes;
+                for path in self.workspace.saved.keys() {
+                    self.workspace_stale_keys.remove(&crate::keys::workspace_file(path));
+                }
+                for key in save.cleanup {
+                    self.workspace_stale_keys.remove(&key);
+                }
+                self.workspace_stale_keys.extend(cleanup_failed);
+            }
+            store::PublicationOutcome::Finished { published: false, .. } => {
+                // Some path-addressed values may have changed even though the index did not
+                // publish. Their old hashes cannot safely suppress a retry or a revert.
+                for path in save.changed {
+                    self.workspace.saved.remove(&path);
+                    self.workspace_stale_keys.insert(crate::keys::workspace_file(&path));
+                }
+                self.workspace_stale_keys.extend(save.cleanup);
+                self.log.error("agent", "the workspace publication failed; the RAM edit is not confirmed durable, obsolete/legacy cleanup was skipped, and a later save can retry");
+            }
+        }
+    }
+
     /// PSRAM free right now, in bytes, when the platform can say.
     ///
     /// Asked before a change that needs a copy of the workspace, so that running out is a
@@ -2731,10 +2786,16 @@ impl App {
         self.hw.heap_pools().into_iter().find(|p| p.pool == "spiram").map(|p| p.free_kb as usize * 1024)
     }
 
+    /// One change admitted for persistence, or fully undone on a closure/admission error.
+    /// A later backend refusal is asynchronous: RAM retains the edit, diagnostics report
+    /// the failure, and a subsequent explicit save can retry it.
     fn workspace_edit<T>(
         &mut self,
         change: impl FnOnce(&mut AppWorkspace) -> std::result::Result<T, String>,
     ) -> std::result::Result<T, String> {
+        // Settle an earlier completed publication before estimating or cloning the rollback;
+        // otherwise a refused new admission could restore stale persistence hashes.
+        self.acknowledge_workspace();
         // The rollback below needs a copy of the whole map, so this is the moment the board can
         // run out of PSRAM. Ask first: a refused write is a sentence the caller can act on, and
         // an allocation that fails is `memory allocation of N bytes failed` followed by
@@ -2743,7 +2804,13 @@ impl App {
             workspace_fits(&self.workspace, Some(free))?;
         }
         let before = self.workspace.clone();
-        let outcome = change(&mut self.workspace)?;
+        let outcome = match change(&mut self.workspace) {
+            Ok(outcome) => outcome,
+            Err(e) => {
+                self.workspace = before;
+                return Err(e);
+            }
+        };
         match self.persist_workspace() {
             Ok(()) => Ok(outcome),
             Err(e) => {
@@ -11599,6 +11666,307 @@ mod tests {
             Some(nvs["total_bytes"].as_u64().unwrap() - nvs["used_bytes"].as_u64().unwrap()),
             "{nvs}"
         );
+    }
+
+    /// A controllable write refusal, after queue admission and before publication.
+    #[derive(Clone)]
+    struct WorkspaceWriteStore {
+        inner: SharedStore,
+        refuse: Arc<Mutex<Option<String>>>,
+        refuse_remove: Arc<Mutex<Option<String>>>,
+        last_error: Option<store::StoreError>,
+    }
+
+    impl WorkspaceWriteStore {
+        fn new() -> Self {
+            let inner = SharedStore::new();
+            let mut cfg = Config::default();
+            cfg.skills.seed_defaults = false;
+            inner.clone().set(crate::config::NVS_KEY_CONFIG, &cfg.to_json_string());
+            Self {
+                inner,
+                refuse: Arc::new(Mutex::new(None)),
+                refuse_remove: Arc::new(Mutex::new(None)),
+                last_error: None,
+            }
+        }
+
+        fn app(&self) -> App {
+            App::new(
+                Box::new(VirtualBoard::new()),
+                Box::new(self.clone()),
+                LogBuf::new(128),
+                FwMeta::default(),
+            )
+        }
+    }
+
+    impl KvStore for WorkspaceWriteStore {
+        fn get(&self, key: &str) -> Option<String> {
+            self.inner.get(key)
+        }
+        fn set(&mut self, key: &str, value: &str) -> bool {
+            self.last_error = None;
+            if self.refuse.lock().unwrap().as_deref() == Some(key) {
+                self.last_error = Some(store::StoreError { code: 42, name: "TEST_WRITE_REFUSAL".into() });
+                return false;
+            }
+            self.inner.set(key, value)
+        }
+        fn remove(&mut self, key: &str) -> bool {
+            self.last_error = None;
+            if self.refuse_remove.lock().unwrap().as_deref() == Some(key) {
+                self.last_error = Some(store::StoreError { code: 43, name: "TEST_REMOVE_REFUSAL".into() });
+                return false;
+            }
+            self.inner.remove(key)
+        }
+        fn keys(&self) -> Vec<String> {
+            self.inner.keys()
+        }
+        fn whole_value_bytes(&self) -> Option<usize> {
+            self.inner.whole_value_bytes()
+        }
+        fn last_error(&self) -> Option<store::StoreError> {
+            self.last_error.clone()
+        }
+    }
+
+    #[test]
+    fn workspace_edit_rolls_back_a_partially_mutating_error() {
+        let backend = WorkspaceWriteStore::new();
+        let mut app = backend.app();
+        fs_tools::Workspace::write(&mut app.workspace, "/a", "before").unwrap();
+        app.persist_workspace().unwrap();
+        drain_store(&mut app);
+        let before = workspace_snapshot(&backend.inner);
+        let err = app
+            .workspace_edit::<()>(|ws| {
+                fs_tools::Workspace::write(ws, "/a", "partial")?;
+                fs_tools::Workspace::write(ws, "/extra", "also partial")?;
+                Err("the second operation failed".to_string())
+            })
+            .unwrap_err();
+        assert!(err.contains("second operation failed"), "{err}");
+        assert_eq!(fs_tools::Workspace::read(&app.workspace, "/a").unwrap(), "before");
+        assert!(fs_tools::Workspace::read(&app.workspace, "/extra").is_err());
+        assert!(app.flush_store("test-writer").is_empty());
+        assert_eq!(workspace_snapshot(&backend.inner), before);
+    }
+
+    #[test]
+    fn workspace_failed_queued_file_write_can_be_retried() {
+        let backend = WorkspaceWriteStore::new();
+        let mut app = backend.app();
+        let key = crate::keys::workspace_file("/a");
+        app.workspace_edit(|ws| fs_tools::Workspace::write(ws, "/a", "old")).unwrap();
+        drain_store(&mut app);
+        *backend.refuse.lock().unwrap() = Some(key.clone());
+        app.workspace_edit(|ws| fs_tools::Workspace::write(ws, "/a", "new")).unwrap();
+        assert_eq!(backend.inner.get(&key).as_deref(), Some("old"), "only admission so far");
+        let report = app.flush_store("test-writer");
+        assert!(report.failed > 0);
+        assert!(app.flush_store("test-writer").is_empty(), "a failure is not an automatic retry");
+        *backend.refuse.lock().unwrap() = None;
+        app.persist_workspace().unwrap();
+        drain_store(&mut app);
+        assert_eq!(
+            backend.inner.get(&key).as_deref(),
+            Some("new"),
+            "failed admission hashes suppressed retry"
+        );
+        assert_eq!(app.workspace.saved.get("/a"), Some(&crate::keys::fnv1a("new")));
+    }
+
+    #[test]
+    fn workspace_failed_index_publication_preserves_previous_indexed_files() {
+        let backend = WorkspaceWriteStore::new();
+        let mut app = backend.app();
+        app.workspace_edit(|ws| fs_tools::Workspace::write(ws, "/obsolete", "previous")).unwrap();
+        drain_store(&mut app);
+        let old_index = backend.inner.get(crate::keys::WORKSPACE_INDEX).unwrap();
+        let old_key = crate::keys::workspace_file("/obsolete");
+        *backend.refuse.lock().unwrap() = Some(crate::keys::WORKSPACE_INDEX.to_string());
+        app.workspace_edit(|ws| {
+            fs_tools::Workspace::remove(ws, "/obsolete")?;
+            fs_tools::Workspace::write(ws, "/new", "next")
+        })
+        .unwrap();
+        assert!(app.flush_store("test-writer").failed > 0);
+        assert_eq!(backend.inner.get(crate::keys::WORKSPACE_INDEX).as_deref(), Some(old_index.as_str()));
+        assert_eq!(
+            backend.inner.get(&old_key).as_deref(),
+            Some("previous"),
+            "a refused index cannot remove a referenced value"
+        );
+        assert_eq!(fs_tools::Workspace::read(&backend.app().workspace, "/obsolete").unwrap(), "previous");
+        *backend.refuse.lock().unwrap() = None;
+        app.persist_workspace().unwrap();
+        let report = app.flush_store("test-writer");
+        assert_eq!(report.failed, 0);
+        assert!(backend.inner.get(&old_key).is_none());
+        assert!(backend.inner.get(crate::keys::WORKSPACE_INDEX).unwrap().contains("/new"));
+    }
+
+    #[test]
+    fn workspace_failed_migration_publication_preserves_legacy_data() {
+        for chunked in [false, true] {
+            let backend = WorkspaceWriteStore::new();
+            let old = r#"{"version":1,"files":{"/a":"legacy"}}"#;
+            if chunked {
+                store::write_blob(&mut backend.inner.clone(), "ws", old, WORKSPACE_PLAN).unwrap();
+            } else {
+                backend.inner.clone().set("ws", old);
+                backend.inner.clone().set("ws.1", "legacy tail");
+            }
+            let before = workspace_snapshot(&backend.inner);
+            *backend.refuse.lock().unwrap() = Some(crate::keys::WORKSPACE_INDEX.to_string());
+            let mut app = backend.app();
+            app.persist_workspace().unwrap();
+            assert!(app.flush_store("test-writer").failed > 0);
+            for (key, value) in &before {
+                assert_eq!(
+                    backend.inner.get(key).as_deref(),
+                    Some(value.as_str()),
+                    "{key} removed before migration published"
+                );
+            }
+            assert!(backend.inner.get(crate::keys::WORKSPACE_INDEX).is_none());
+            *backend.refuse.lock().unwrap() = None;
+            app.persist_workspace().unwrap();
+            drain_store(&mut app);
+            assert!(backend.inner.get("ws").is_none());
+            assert!(backend.inner.get("ws.1").is_none());
+            assert_eq!(fs_tools::Workspace::read(&backend.app().workspace, "/a").unwrap(), "legacy");
+        }
+    }
+
+    #[test]
+    fn workspace_pending_reverts_replace_newer_values_and_confirmed_saves_stay_incremental() {
+        let backend = WorkspaceWriteStore::new();
+        let mut app = backend.app();
+        app.workspace_edit(|ws| {
+            fs_tools::Workspace::write(ws, "/a", "durable")?;
+            fs_tools::Workspace::write(ws, "/b", "unchanged")
+        })
+        .unwrap();
+        drain_store(&mut app);
+        app.workspace_edit(|ws| fs_tools::Workspace::write(ws, "/a", "pending")).unwrap();
+        assert_eq!(
+            app.workspace.saved.get("/a"),
+            Some(&crate::keys::fnv1a("durable")),
+            "admission did not change the saved hash"
+        );
+        app.workspace_edit(|ws| fs_tools::Workspace::write(ws, "/a", "durable")).unwrap();
+        let report = app.flush_store("test-writer");
+        assert_eq!(report.failed, 0);
+        assert_eq!(backend.inner.get(&crate::keys::workspace_file("/a")).as_deref(), Some("durable"));
+        assert!(!report.keys.contains(&crate::keys::workspace_file("/b")));
+        app.persist_workspace().unwrap();
+        assert_eq!(app.flush_store("test-writer").keys, vec![crate::keys::WORKSPACE_INDEX]);
+    }
+
+    #[test]
+    fn workspace_failed_dependency_preserves_the_index_and_invalidates_replaced_hashes() {
+        let backend = WorkspaceWriteStore::new();
+        let mut app = backend.app();
+        app.workspace_edit(|ws| fs_tools::Workspace::write(ws, "/a", "previous")).unwrap();
+        drain_store(&mut app);
+        let old_index = backend.inner.get(crate::keys::WORKSPACE_INDEX).unwrap();
+        *backend.refuse.lock().unwrap() = Some(crate::keys::workspace_file("/b"));
+        app.workspace_edit(|ws| {
+            fs_tools::Workspace::write(ws, "/a", "replacement")?;
+            fs_tools::Workspace::write(ws, "/b", "unpublished")
+        })
+        .unwrap();
+        let report = app.flush_store("test-writer");
+        assert_eq!(report.failed, 2, "file refusal and skipped index: {report:?}");
+        assert_eq!(backend.inner.get(crate::keys::WORKSPACE_INDEX).as_deref(), Some(old_index.as_str()));
+        assert!(
+            !app.workspace.saved.contains_key("/a"),
+            "a replaced value with no published index is not a confirmed old hash"
+        );
+        assert_eq!(
+            backend.inner.get(&crate::keys::workspace_file("/a")).as_deref(),
+            Some("replacement"),
+            "path-derived keys cannot roll back all files"
+        );
+        *backend.refuse.lock().unwrap() = None;
+        app.workspace_edit(|ws| {
+            fs_tools::Workspace::write(ws, "/a", "previous")?;
+            fs_tools::Workspace::remove(ws, "/b")
+        })
+        .unwrap();
+        drain_store(&mut app);
+        assert_eq!(
+            backend.inner.get(&crate::keys::workspace_file("/a")).as_deref(),
+            Some("previous"),
+            "a revert must restore a successfully replaced dependency too"
+        );
+        assert_eq!(backend.inner.get(crate::keys::WORKSPACE_INDEX).as_deref(), Some(old_index.as_str()));
+    }
+
+    #[test]
+    fn workspace_cleanup_failure_keeps_published_hashes_and_is_explicitly_retryable() {
+        let backend = WorkspaceWriteStore::new();
+        let mut app = backend.app();
+        app.workspace_edit(|ws| fs_tools::Workspace::write(ws, "/obsolete", "old")).unwrap();
+        drain_store(&mut app);
+        let obsolete = crate::keys::workspace_file("/obsolete");
+        let current = crate::keys::workspace_file("/current");
+        *backend.refuse_remove.lock().unwrap() = Some(obsolete.clone());
+        app.workspace_edit(|ws| {
+            fs_tools::Workspace::remove(ws, "/obsolete")?;
+            fs_tools::Workspace::write(ws, "/current", "new")
+        })
+        .unwrap();
+        let report = app.flush_store("test-writer");
+        assert_eq!(report.failed, 1);
+        assert_eq!(report.failures[0].op, store::StoreOp::Remove);
+        assert_eq!(app.workspace.saved.get("/current"), Some(&crate::keys::fnv1a("new")));
+        assert!(app.workspace_stale_keys.contains(&obsolete));
+        assert_eq!(backend.inner.get(&obsolete).as_deref(), Some("old"));
+        assert!(!backend.inner.get(crate::keys::WORKSPACE_INDEX).unwrap().contains("/obsolete"));
+        let index_at = report.keys.iter().position(|key| key == crate::keys::WORKSPACE_INDEX).unwrap();
+        let cleanup_at = report.keys.iter().position(|key| key == &obsolete).unwrap();
+        assert!(index_at < cleanup_at, "cleanup follows confirmed index publication");
+        assert!(app.flush_store("test-writer").is_empty(), "no background retry loop");
+        *backend.refuse_remove.lock().unwrap() = None;
+        app.persist_workspace().unwrap();
+        let retry = app.flush_store("test-writer");
+        assert_eq!(retry.failed, 0);
+        assert!(!retry.keys.contains(&current), "do not rewrite confirmed file content to retry cleanup");
+        assert!(backend.inner.get(&obsolete).is_none());
+        assert!(app.workspace_stale_keys.is_empty());
+    }
+
+    #[test]
+    fn workspace_admission_refusal_restores_ram_and_the_complete_previous_queue() {
+        let backend = WorkspaceWriteStore::new();
+        let mut app = backend.app();
+        app.workspace_edit(|ws| fs_tools::Workspace::write(ws, "/a", "prior request")).unwrap();
+        let queue = app.store_queue();
+        let remaining = store::PENDING_BYTES_MAX - queue.pending_bytes() - 1024;
+        assert!(app.store.set("budget", &"x".repeat(remaining)));
+        let before_index = app.store.get(crate::keys::WORKSPACE_INDEX).unwrap();
+        let before = (queue.pending(), queue.pending_bytes());
+        let error = app
+            .workspace_edit(|ws| {
+                fs_tools::Workspace::write(ws, "/a", &"a".repeat(4096))?;
+                fs_tools::Workspace::write(ws, "/new", &"b".repeat(4096))
+            })
+            .unwrap_err();
+        assert!(error.contains("STORE_QUEUE_FULL"), "{error}");
+        assert_eq!((queue.pending(), queue.pending_bytes()), before);
+        assert_eq!(app.store.get(crate::keys::WORKSPACE_INDEX).as_deref(), Some(before_index.as_str()));
+        assert_eq!(app.store.get(&crate::keys::workspace_file("/a")).as_deref(), Some("prior request"));
+        assert!(app.store.get(&crate::keys::workspace_file("/new")).is_none());
+        assert_eq!(fs_tools::Workspace::read(&app.workspace, "/a").unwrap(), "prior request");
+        assert!(fs_tools::Workspace::read(&app.workspace, "/new").is_err());
+        assert!(app.workspace_pending.as_ref().unwrap().receipt.outcome().is_none());
+        assert!(app.store.remove("budget"));
+        drain_store(&mut app);
+        assert_eq!(fs_tools::Workspace::read(&backend.app().workspace, "/a").unwrap(), "prior request");
     }
 
     /// A store whose workspace writes always fail, which is what a full NVS looks like from

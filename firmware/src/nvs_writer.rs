@@ -61,17 +61,12 @@ pub fn start(shared: Shared, log: Arc<LogBuf>) -> Result<(), String> {
     // `threads::spawn`, and the default config is put back afterwards. Doing it by hand was
     // the bug this replaces: the config outlived the spawn and the console, radio and agent
     // threads came up as `nvs-writer` (this task's name then) at priority 2.
-    let spawned = crate::threads::spawn(
-        b"store-writer\0",
-        STACK_BYTES,
-        crate::threads::INTERNAL,
-        Some(PRIORITY),
-        {
+    let spawned =
+        crate::threads::spawn(b"store-writer\0", STACK_BYTES, crate::threads::INTERNAL, Some(PRIORITY), {
             let shared = shared.clone();
             let log = log.clone();
             move || run(shared, log)
-        },
-    );
+        });
 
     match spawned {
         Ok(_) => Ok(()),
@@ -100,7 +95,7 @@ pub fn flush_now(shared: &Shared, log: &LogBuf, who: &str) -> bool {
         );
         return false;
     }
-    with_app(shared, |app| app.flush_store(who));
+    with_app_mut(shared, |app| app.flush_store(who));
     true
 }
 
@@ -116,13 +111,6 @@ pub(crate) fn on_internal_stack() -> bool {
 
 /// Run `f` under the app lock, tolerating a poisoned one: a thread that panicked mid-update
 /// must not stop the writes from ever happening again.
-fn with_app<R>(shared: &Shared, f: impl FnOnce(&App) -> R) -> R {
-    match shared.lock() {
-        Ok(guard) => f(&guard),
-        Err(poisoned) => f(&poisoned.into_inner()),
-    }
-}
-
 fn with_app_mut<R>(shared: &Shared, f: impl FnOnce(&mut App) -> R) -> R {
     match shared.lock() {
         Ok(mut guard) => f(&mut guard),
@@ -157,7 +145,7 @@ fn run(shared: Shared, log: Arc<LogBuf>) {
     let mut reported = false;
     loop {
         unsafe { sys::vTaskDelay(PERIOD_MS) };
-        let (written_now, total) = with_app(&shared, |app| {
+        let (written_now, total) = with_app_mut(&shared, |app| {
             // `flush_store` is where a refusal becomes one `log.error` line per key — key,
             // operation, the store's `esp_err_t` and its name — because this task is the
             // one that runs it. `/api/status.store.last_failure` carries the newest one.

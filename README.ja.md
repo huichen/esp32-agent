@@ -85,7 +85,7 @@ espflash write-bin --chip esp32s3 --flash-size 16mb 0x0 esp32-agent-vX.Y.Z.bin
 
 | 部分 | 状態 |
 |---|---|
-| `agent-core` | 814 個の単体テストと 5 個の統合テストが成功。`scripts/smoke.ps1` もエンドツーエンドで成功 |
+| `agent-core` | 826 個の単体テストと 5 個の統合テストが成功。`scripts/smoke.ps1` もエンドツーエンドで成功 |
 | シミュレーター | コンソール、MCP、エージェントループがエンドツーエンドで動作 |
 | ファームウェア | ESP32-S3-DevKitC-1 N16R8（IDF v5.5.2）に書き込み済み：42 個のツール、OLED 128×32、I²S マイクとアンプ、WS2812、TLS コンソール、HTTPS 経由のモデルターン |
 | 未実装 | OTA、SD カード、DHT11/22、カメラ。`ROADMAP.md` を参照 |
