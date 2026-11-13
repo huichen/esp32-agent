@@ -1,10 +1,11 @@
-﻿//! [`KvStore`] over ESP-IDF NVS.
+//! [`KvStore`] over ESP-IDF NVS.
 //!
 //! Two keys live here: `config` (WiFi, MCP endpoint, buses, pins) and `manifest`
 //! (devices and tools). Both are plain JSON strings, so a firmware update reads
 //! what an older one wrote and `#[serde(default)]` fills the gaps.
 
 use esp32_agent_core::store::{KvStore, StoreError, StoreSpace};
+use esp_idf_svc::handle::RawHandle;
 use esp_idf_svc::nvs::{EspDefaultNvsPartition, EspNvs, NvsDefault};
 use esp_idf_svc::sys;
 
@@ -59,7 +60,22 @@ impl KvStore for NvsStore {
 
     fn set(&mut self, key: &str, value: &str) -> bool {
         self.last_error = None;
-        match self.nvs.set_str(key, value) {
+        // esp-idf-svc 0.53.0's set_str erases first. IDF's nvs_set_str already
+        // updates existing strings and keeps the old entry until the new write succeeds.
+        // Calling it directly avoids losing the old configuration on an ENOSPC refusal.
+        let written = (|| -> Result<(), sys::EspError> {
+            if value.len() > esp32_agent_core::store::VALUE_MAX {
+                return Err(sys::EspError::from(sys::ESP_ERR_NVS_VALUE_TOO_LONG).unwrap());
+            }
+            let key = std::ffi::CString::new(key)
+                .map_err(|_| sys::EspError::from(sys::ESP_ERR_INVALID_ARG).unwrap())?;
+            let value = std::ffi::CString::new(value)
+                .map_err(|_| sys::EspError::from(sys::ESP_ERR_INVALID_ARG).unwrap())?;
+            sys::esp!(unsafe { sys::nvs_set_str(self.nvs.handle(), key.as_ptr(), value.as_ptr()) })?;
+            sys::esp!(unsafe { sys::nvs_commit(self.nvs.handle()) })?;
+            Ok(())
+        })();
+        match written {
             Ok(()) => true,
             Err(e) => {
                 log::error!("nvs write `{key}`: {e} (esp_err_t {})", e.code());
@@ -120,5 +136,3 @@ impl KvStore for NvsStore {
         })
     }
 }
-
-
