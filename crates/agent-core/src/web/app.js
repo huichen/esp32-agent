@@ -535,36 +535,39 @@ async function refreshConversation() {
   // A ring that appears and vanishes inside one frame reads as a glitch rather than as work.
   const spent = performance.now() - started;
   if (spent < 300) await new Promise((resolve) => setTimeout(resolve, 300 - spent));
-  setPullHint("idle", "Pull down to refresh");
+  setPullHint("idle", "Pull up to refresh");
   toast(ok ? "Conversation refreshed" : "Refresh failed; the conversation was not reloaded");
 }
 
-/** At the end of the transcript, dragging down used to do nothing: the page bounced and a
- * person could not tell "the board has nothing more" from "the page is stuck". Past the
- * last message the drag now offers a refresh, which reloads the transcript in place. */
+/** At the end of the transcript, scrolling further has nowhere to go: the page bounced and a
+ * person could not tell "the board has nothing more" from "the page is stuck". Past the last
+ * message a drag *upwards* — which is the motion that scrolls the conversation further
+ * forward — offers a refresh, which reloads the transcript in place. */
 function wirePullToRefresh() {
   const chat = $("#chat");
   const THRESHOLD = 60;
   let startY = null;
-  let pulled = 0;
+  let overshoot = 0;
   const atEnd = () => chat.scrollTop + chat.clientHeight >= chat.scrollHeight - 4;
   chat.addEventListener("touchstart", (event) => {
     startY = atEnd() && event.touches.length === 1 ? event.touches[0].clientY : null;
-    pulled = 0;
+    overshoot = 0;
   }, { passive: true });
   chat.addEventListener("touchmove", (event) => {
     if (startY === null) return;
-    pulled = event.touches[0].clientY - startY;
-    if (pulled > 12) {
-      setPullHint("pulling", pulled >= THRESHOLD ? "Release to refresh" : "Pull down to refresh");
+    // Positive when the finger moves up, which is the gesture that would have kept scrolling
+    // down. The old sign measured a downward drag, so it took a scroll *backwards* to refresh.
+    overshoot = startY - event.touches[0].clientY;
+    if (overshoot > 12) {
+      setPullHint("pulling", overshoot >= THRESHOLD ? "Release to refresh" : "Pull up to refresh");
     } else {
       setPullHint("idle");
     }
   }, { passive: true });
   const finish = () => {
-    const shouldRefresh = startY !== null && pulled >= THRESHOLD;
+    const shouldRefresh = startY !== null && overshoot >= THRESHOLD;
     startY = null;
-    pulled = 0;
+    overshoot = 0;
     // `refreshConversation` owns the hint from here: clearing it first would blank the
     // spinner for the frame between the gesture and the request.
     if (shouldRefresh) refreshConversation();
@@ -1153,6 +1156,16 @@ function kv(el, pairs) {
     .join("");
 }
 
+/** Uptime in the unit that makes it readable: seconds under a minute, minutes under an
+ * hour, then hours and minutes. "0 min" for the first minute was the entire reading on a
+ * board that had just booted — and every flash reboots it. */
+function formatUptime(seconds) {
+  const total = Math.max(0, Math.floor(Number(seconds) || 0));
+  if (total < 60) return total + " s";
+  if (total < 3600) return Math.floor(total / 60) + " min";
+  return Math.floor(total / 3600) + " h " + String(Math.floor((total % 3600) / 60)).padStart(2, "0") + " min";
+}
+
 async function loadStatus() {
   try {
     const d = await api("/api/status");
@@ -1160,7 +1173,7 @@ async function loadStatus() {
       ["Name", d.device_name],
       ["Profile", d.board.profile],
       ["Chip", d.board.soc + " / " + d.board.cores + " cores"],
-      ["Uptime", Math.floor(d.uptime_s / 60) + " min"],
+      ["Uptime", formatUptime(d.uptime_s)],
       ["Heap", d.memory.free_heap_kb + " kB"],
       ["Devices", d.devices.count],
       ["Tools", d.mcp.tools_visible],
