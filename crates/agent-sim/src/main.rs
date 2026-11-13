@@ -138,6 +138,9 @@ fn main() {
             // let whoever is waiting queue a turn.
             let now = esp32_agent_core::app::now_ms();
             let due = guard.sched_tick(now, minute_of_day(now));
+            // HTTP/script callers receive a job id, so the platform must actually
+            // finish queued scripts even when no model turn is waiting.
+            guard.run_next_script();
             // ...and the third: the store writer. The simulator has no flash window, so this
             // loop is a safe place to drain the queue the `App` filled; on a board that is a
             // task of its own whose stack is in internal RAM (`firmware/src/nvs_writer.rs`).
