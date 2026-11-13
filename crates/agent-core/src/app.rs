@@ -12,7 +12,7 @@ use crate::config::Config;
 use crate::device::Devices;
 use crate::drivers;
 use crate::error::{code, McpError, Result};
-use crate::hardware::Hardware;
+use crate::hardware::{BoardInfo, Hardware, WifiStatus};
 use crate::http::{EventSink, EventStreamGate, EventStreamSlot, Handler, Request, Response, StreamBody};
 use crate::llm;
 use crate::llm::{ChatTransport, LlmConfig};
@@ -262,6 +262,20 @@ pub struct ScriptJob {
     pub error: String,
 }
 
+/// The hardware's own view, sampled where no other lock is held.
+///
+/// `board_info`, `wifi_status`, `heap_internal` and `tasks` each take a lock of its own — the
+/// radio's status mutex, the driver's, FreeRTOS' task list. Taking them *under* the App mutex
+/// is one leg of a lock-order cycle, so the platform tick samples them into plain data and the
+/// status path reads that instead.
+#[derive(Debug, Clone, Default)]
+pub struct HwView {
+    pub info: BoardInfo,
+    pub wifi: WifiStatus,
+    pub internal: Option<(u32, u32)>,
+    pub threads: Vec<Value>,
+}
+
 pub struct App {
     pub cfg: Config,
     pub manifest: Manifest,
@@ -358,6 +372,8 @@ pub struct App {
     /// Values potentially left by a refused publication/cleanup, retained for a later
     /// successful index publication. Bounded with the queue's key budget before admission.
     workspace_stale_keys: std::collections::BTreeSet<String>,
+    /// The hardware's view as of the last tick. See [`HwView`].
+    hw_view: HwView,
     /// When the tool call now running must stop, from `agent.tool_timeout_s`.
     ///
     /// Nested calls inherit the outer deadline instead of starting a new one: a script that
@@ -530,6 +546,7 @@ impl App {
             workspace_pending: None,
             workspace_admissions: 0,
             workspace_stale_keys: Default::default(),
+            hw_view: HwView::default(),
             tool_deadline: None,
             run_active: false,
             cancel_requested: false,
@@ -547,6 +564,7 @@ impl App {
         // the default config. Both belong to the same moment: the three skills the
         // firmware carries are installed here, and in `seed_default_skills`'s other caller.
         app.seed_default_skills();
+        app.refresh_hw_view();
         app
     }
 
@@ -1278,10 +1296,11 @@ impl App {
     }
 
     pub fn status_json(&mut self) -> Value {
-        let info = self.hw.board_info();
-        let wifi = self.hw.wifi_status();
-        let internal = self.hw.heap_internal();
-        let threads = self.threads_json();
+        // Plain data from the last tick: no radio lock, no FreeRTOS task list.
+        let info = self.hw_view.info.clone();
+        let wifi = self.hw_view.wifi.clone();
+        let internal = self.hw_view.internal;
+        let threads = self.hw_view.threads.clone();
         let now = now_ms();
         // Built before the object literal: `json!` reads a brace after a `:` as a nested
         // object, so a block expression belongs in a local.
@@ -1420,8 +1439,21 @@ impl App {
     /// this. Both readings are needed to apply a rule like "≥ max(2 × peak, peak + 4 kB)",
     /// which is why the size stays in the source instead of being guessed from here.
     fn threads_json(&mut self) -> Vec<Value> {
-        self.hw
-            .tasks()
+        Self::threads_from(self.hw.tasks())
+    }
+
+    /// Sample the hardware's view into plain data. Called at construction and once per tick by
+    /// the platform, which holds the App lock but no radio or driver lock.
+    pub fn refresh_hw_view(&mut self) {
+        let info = self.hw.board_info();
+        let wifi = self.hw.wifi_status();
+        let internal = self.hw.heap_internal();
+        let threads = Self::threads_from(self.hw.tasks());
+        self.hw_view = HwView { info, wifi, internal, threads };
+    }
+
+    fn threads_from(tasks: Vec<Value>) -> Vec<Value> {
+        tasks
             .into_iter()
             .map(|t| {
                 json!({
