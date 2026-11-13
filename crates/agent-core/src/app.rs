@@ -912,15 +912,11 @@ impl App {
     /// below fails if one of them turns up backticked in the prompt.
     /// Tools a person uses and a model does not.
     ///
-    /// `reboot` restarts the board in the middle of a turn: the run that asked for it is the
-    /// one it destroys, and a restart is one click in the portal (`POST /api/reboot`, behind
-    /// the PIN) or one line from a person. So it is not offered — the prompt's "you cannot
-    /// reboot the board" is the same statement in words.
-    ///
-    /// `factory_reset` stays offered: it needs `confirm`, it is the only way a model can get
-    /// out of a manifest that has bricked the tool surface, and it is a reset of configuration
-    /// rather than of the run in progress.
-    const NEVER_OFFERED: &'static [&'static str] = &["reboot"];
+    /// Empty, and it stays: `reboot` used to sit here, and the answer to "why can't a model
+    /// restart the board" turned out to be that nobody can — the route went with it. The
+    /// list stays so the next tool whose answer is "not for a caller" has somewhere to go
+    /// that is not a rule buried inside one handler.
+    const NEVER_OFFERED: &'static [&'static str] = &[];
 
     pub const ALIASES_ACCEPTED_BUT_NOT_ADVERTISED: &'static [&'static str] = &[
         // the board family's members
@@ -929,8 +925,6 @@ impl App {
         "config_set",
         "chip_temp",
         "logs_tail",
-        "reboot",
-        "factory_reset",
         "delay",
         "inventory",
         // the bus family's
@@ -999,8 +993,7 @@ impl App {
     const MINIMAL_HIDDEN: &'static [&'static str] = &[
         "wifi_scan",
         "wifi_status",
-        // `board_config_get`, `delay`, `logs_tail`, `reboot` and `factory_reset` used to sit
-        // here. They belong to a family now, and a profile hides whole tools: a command is
+        // `board_config_get`, `delay` and `logs_tail` used to sit here. They belong to a family now, and a profile hides whole tools: a command is
         // a few bytes of one declaration, so there is nothing left to save by hiding it —
         // and a family that quietly drops commands costs a model a call to find out.
     ];
@@ -1027,7 +1020,7 @@ impl App {
             return Some(format!("reachable as `{reached}`"));
         }
         if Self::NEVER_OFFERED.contains(&name) {
-            return Some("a person restarts the board, from the portal; a model does not".to_string());
+            return Some("a person's action, not a caller's".to_string());
         }
         // `minimal` hides conveniences, never capabilities: an HTTP route or a manifest can
         // do these, and a model rarely needs them. Discovery, manifest, GPIO and the file
@@ -2035,19 +2028,7 @@ impl App {
         // Family aliases and generic/minimal folding change the listing, not whether
         // a previously learned tool can execute. Only explicit disables and missing
         // hardware are execution refusals (the former was checked before every fast path).
-        if Self::NEVER_OFFERED.contains(&name) || self.tools.get(name).is_none() {
-            // A tool a person has and a model does not: the refusal has to be a sentence, not a
-            // bare "no such tool". A stored script that calls `reboot` was written by somebody
-            // who believed the model could restart the board; that person needs to be told
-            // where a restart lives now, not left guessing at a missing name.
-            if Self::NEVER_OFFERED.contains(&name) {
-                return Err(McpError::forbidden(
-                    "`reboot` restarts the board and ends the run that asked for it, so it is not a tool. \
-                     A restart is a person's action: the portal's restart button, or `POST /api/reboot` \
-                     behind the PIN. Nothing on this board reaches it through a tool call.",
-                )
-                .with_data(json!({ "restart_route": "/api/reboot" })));
-            }
+        if self.tools.get(name).is_none() {
             let missing =
                 self.tools.get(name).map(|d| self.caps.missing(&d.spec.requires)).unwrap_or_default();
             if missing.is_empty() {
@@ -4307,16 +4288,6 @@ impl App {
                 }
                 self.wifi_connect(req)
             }
-            ("POST", "/api/wifi/forget") => {
-                if let Err(r) = self.require_pin(req) {
-                    return r;
-                }
-                self.cfg.wifi.ssid.clear();
-                self.cfg.wifi.password.clear();
-                self.runtime.config_dirty = true;
-                self.persist_config();
-                Response::json(&json!({ "ok": true, "note": "credentials cleared" }))
-            }
             ("GET", "/api/logs") => {
                 if let Err(r) = self.require_read(req) {
                     return r;
@@ -4366,19 +4337,6 @@ impl App {
                     self.runtime.counters.auth_failures += 1;
                     Response::json_status(401, &json!({ "ok": false, "error": "wrong PIN" }))
                 }
-            }
-            ("POST", "/api/reboot") => {
-                if let Err(r) = self.require_pin(req) {
-                    return r;
-                }
-                self.log.warn("system", "reboot requested from the portal");
-                self.runtime.restart_requested = true;
-                // No `hw.reboot()` here: restarting from inside this request would cut the
-                // reply off and, more importantly, drop whatever the store writer has queued
-                // (its tick is up to 100 ms away, and `esp_restart` does not wait for it).
-                // The platform's loop notices the flag, flushes on a stack it has checked, and
-                // restarts — `/api/config` already works that way for a bus or board change.
-                Response::json(&json!({ "ok": true, "note": "rebooting" }))
             }
             ("GET", "/generate_204")
             | ("GET", "/hotspot-detect.html")
@@ -9704,9 +9662,9 @@ mod tests {
             {"jsonrpc":"2.0","id":"first","method":"ping"},
             17,
             {"jsonrpc":"2.0","method":"ping"},
-            {"jsonrpc":"2.0","id":{},"method":"tools/call","params":{"name":"reboot"}},
+            {"jsonrpc":"2.0","id":{},"method":"tools/call","params":{"name":"devices_probe"}},
             {"jsonrpc":"2.0","id":null,"method":"ping"},
-            {"id":"bad-version","method":"tools/call","params":{"name":"reboot"}}
+            {"id":"bad-version","method":"tools/call","params":{"name":"devices_probe"}}
         ]"#,
                 None,
             )
@@ -9724,7 +9682,7 @@ mod tests {
         assert_eq!(reply[4]["error"]["code"], code::INVALID_REQUEST);
         assert_eq!(app.runtime.counters.bad_requests, 3);
         assert_eq!(app.runtime.counters.notifications, 1);
-        assert!(!app.runtime.restart_requested, "invalid requests must not execute");
+        assert!(!app.runtime.reprobe_requested, "invalid requests must not execute");
         assert!(app.handle_rpc(r#"[{"jsonrpc":"2.0","method":"ping"}]"#, None).is_none());
         let error = app.handle_rpc("[", None).unwrap();
         assert_eq!(error["error"]["code"], code::PARSE_ERROR);
@@ -10440,54 +10398,36 @@ mod tests {
         assert_eq!(unadvertised_tool_names(&injected, &offered), vec!["frobnicate".to_string()]);
     }
 
-    /// `reboot` is not something a model is given: it would restart the board in the middle of
-    /// the run that asked for it. It is not a command of `board` either, and the listing says
-    /// where it went; a person still restarts from the portal, behind the PIN.
+    /// Neither a tool nor a route.
+    ///
+    /// A restart ends the run that asked for it, and a factory reset wipes the board the
+    /// caller is standing on. The platform still restarts itself when a configuration change
+    /// needs one (`runtime.restart_requested`), but nobody can ask for either over a tool, a
+    /// route or the console: they are operations on the machine, not on the workload.
     #[test]
-    fn a_model_is_not_offered_a_restart_but_a_person_still_has_one() {
+    fn nobody_can_restart_or_reset_the_board() {
         let mut app = test_app();
-
-        // Not in the family, and asking the family for it is an unknown command, not a run.
+        for name in ["reboot", "factory_reset"] {
+            assert!(app.tools.get(name).is_none(), "{name} is still registered");
+            assert!(!app.is_visible(name), "{name} is still offered");
+            let err = app.call_tool(name, &json!({ "confirm": true })).unwrap_err();
+            assert_eq!(err.code, code::NOT_FOUND, "{name}: {err:?}");
+        }
+        // Not a command of `board` either, so the family door does not reach it.
         let help = app.call_tool("board", &json!({ "command": "help" })).unwrap();
         let commands: Vec<String> =
             help["commands"].as_array().unwrap().iter().map(|s| s.as_str().unwrap().to_string()).collect();
-        assert!(!commands.contains(&"reboot".to_string()), "{commands:?}");
-        let err = app.call_tool("board", &json!({ "command": "reboot" })).unwrap_err();
-        assert!(err.message.contains("no command"), "{err:?}");
-
-        // Not offered as a tool of its own either, and the reason is a sentence.
-        assert!(!app.is_visible("reboot"));
-        let why = app
-            .hidden_tools()
-            .into_iter()
-            .find(|t| t["name"] == "reboot")
-            .expect("`reboot` must be reported as hidden");
-        assert!(why["why"].as_str().unwrap_or("").contains("person"), "{why}");
-
-        // And it is refused, with the sentence a script author needs: this is their mistake,
-        // not a model's, and a bare "no such tool" would leave them guessing.
-        let err = app.call_tool("reboot", &json!({})).unwrap_err();
-        assert_eq!(err.code, code::FORBIDDEN, "{err:?}");
-        for needle in ["restart", "portal", "/api/reboot"] {
-            assert!(err.message.contains(needle), "`{needle}` missing from: {}", err.message);
+        for name in ["reboot", "factory_reset"] {
+            assert!(!commands.contains(&name.to_string()), "{name} is still a command: {commands:?}");
         }
-        assert_eq!(err.data.as_ref().and_then(|d| d["restart_route"].as_str()), Some("/api/reboot"));
-
-        // Through a script too: a stored `tool("reboot", {})` is exactly the caller this
-        // sentence exists for.
-        let scripted = app.call_tool("script", &json!({ "source": "tool(\"reboot\", {})" }));
-        let text = match scripted {
-            Ok(value) => value.to_string(),
-            Err(error) => error.message,
-        };
-        assert!(text.contains("/api/reboot"), "a script must be told the same thing: {text}");
-
-        // The portal's button is a route, not a tool: it keeps working.
-        let resp = app.route(&post("/api/reboot", "{}"));
-        assert_eq!(resp.status, 200, "the portal's restart must still answer");
-        assert!(app.runtime.restart_requested, "the platform must be told to restart");
+        // And the routes that did the same thing are gone with them.
+        for path in ["/api/reboot", "/api/factory-reset", "/api/wifi/forget"] {
+            let mut req = post(path, "{}");
+            req.method = "POST".into();
+            assert_eq!(app.route(&req).status, 404, "{path} still answers");
+        }
+        assert!(!app.runtime.restart_requested, "nothing here may ask for a restart");
     }
-
     /// "How much RAM is free" has two answers on a board with PSRAM, and the status tool
     /// used to give only the big one: asked in a real turn, the model read `free_heap_kb`
     /// (7 864 kB, nearly all PSRAM) and answered "7 919 KB of free internal heap". The
