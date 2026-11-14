@@ -149,6 +149,9 @@
           <option value="true">send to the model (multimodal)</option>
           <option value="false">name only (text-only model)</option>
         </select>
+        <label for="agent-tick">Scheduler tick (ms) \u2014 how often timed tasks and sensor rules are checked</label>
+        <input id="agent-tick" type="number" min="200" max="5000" step="100">
+        <p class="hint">A smaller number fires a timed task closer to its minute; a larger one leaves the board quieter. It does not make the model answer faster.</p>
         <div class="buttons"><button id="agent-save" class="btn primary">Save</button></div>
       </div>
       <div class="card">
@@ -238,8 +241,9 @@
         <h3>Access</h3>
         <label for="auth-pin">Portal PIN (empty = open on the LAN)</label>
         <input id="auth-pin" type="password" placeholder="__set__ = keep the stored one">
-        <label for="auth-tick">Agent tick (ms)</label>
-        <input id="auth-tick" type="number" min="200" max="5000" step="100">
+        <label for="auth-mcp-token">MCP bearer token (empty = keep the stored one)</label>
+        <input id="auth-mcp-token" type="password" placeholder="__set__ = keep the stored one">
+        <p class="hint">With a token set, the MCP endpoint accepts only <code>Authorization: Bearer &lt;token&gt;</code> and stops accepting the portal PIN; the PIN keeps guarding the console. Leaving this empty keeps whatever is stored.</p>
         <label for="auth-tz">Timezone (hours from UTC, e.g. 8 for UTC+8)</label>
         <input id="auth-tz" type="number" min="-12" max="14" step="1" inputmode="numeric" placeholder="0">
         <p class="hint">Whole hours only. It decides when a daily task fires and what the clock reads; half-hour zones cannot be expressed and are refused rather than rounded.</p>
