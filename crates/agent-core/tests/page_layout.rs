@@ -31,6 +31,12 @@ use std::thread;
 const PHONE_WIDTHS: &[u32] = &[390, 360];
 const PHONE_HEIGHT: u32 = 844;
 
+/// The desktop the page is checked at: a laptop window, not a monitor. The layout switches at
+/// 900 px, so this has to be comfortably past it or the assertion would pass on the phone
+/// rules.
+const DESKTOP_WIDTH: u32 = 1280;
+const DESKTOP_HEIGHT: u32 = 900;
+
 /// Served into the shipped page after `app.js`. It measures three states — nothing
 /// attached, an attachment chip shown, and the chip removed again — because each one puts
 /// a different set of boxes in the composer.
@@ -711,16 +717,41 @@ fn chrome_allows_port(port: u16) -> bool {
 /// files and the origin is a normal one (`localStorage`, `fetch` and the module-scope
 /// helpers behind `showAttach` all behave as they do on the board).
 fn page() -> String {
-    INDEX_HTML.replace("</body>", &format!("{MEASURE_JS}{CLEAR_JS}{COMPOSER_JS}</body>"))
+    INDEX_HTML.replace("</body>", &format!("{MEASURE_JS}{CLEAR_JS}{DESKTOP_JS}{COMPOSER_KEYS_JS}</body>"))
 }
 
-/// The composer's behaviour, measured in a real page: Enter makes a new line instead of
-/// sending, an IME confirmation does nothing, ctrl/cmd+Enter sends, a second line grows the
-/// field, and the whole row stays inside a viewport shrunk to a keyboard height.
+/// The wide-screen layout, measured in the same page: the column is centred and narrower
+/// than the window, and the panel is a side sheet instead of a second full screen.
 ///
-/// Every claim here was previously a comment. "Enter sends" and "the keyboard covers the
-/// field" are both things a source-level assertion cannot see.
-const COMPOSER_JS: &str = r##"
+/// A phone column stretched across a laptop is the failure this locks down, and it is
+/// invisible to a source-level check: the CSS is valid either way.
+const DESKTOP_JS: &str = r##"
+<script>
+window.__esp32Desktop = async function () {
+  const q = (s) => document.querySelector(s);
+  const rect = (el) => {
+    const b = el.getBoundingClientRect();
+    return { left: b.left, right: b.right, top: b.top, bottom: b.bottom, width: b.width, height: b.height };
+  };
+  const out = {
+    viewport: window.innerWidth,
+    bar: rect(q(".bar")),
+    chat: rect(q(".chat")),
+    composer: rect(q("#composer")),
+  };
+  // The panel is measured open, because that is when it covers things.
+  const sheet = q("#sheet");
+  const wasHidden = sheet.hidden;
+  sheet.hidden = false;
+  out.sheet = rect(sheet);
+  sheet.hidden = wasHidden;
+  return out;
+};
+</script>
+"##;
+
+/// The composer's keystroke and growth measurements.
+const COMPOSER_KEYS_JS: &str = r##"
 <script>
 window.__esp32Composer = async function () {
   const q = (s) => document.querySelector(s);
@@ -787,16 +818,23 @@ window.__esp32Composer = async function () {
 /// how a browser treats `--window-size`. Measurement runs on `load`, after the page's own
 /// `DOMContentLoaded` handler has wired the composer up.
 fn harness() -> String {
-    let widths = PHONE_WIDTHS.iter().map(u32::to_string).collect::<Vec<_>>().join(",");
+    // One list, so the wide frame is measured by the same pass as the phone ones and a
+    // desktop regression cannot hide behind a fixture that never rendered at that size.
+    let sizes = PHONE_WIDTHS
+        .iter()
+        .map(|w| format!("{{w:{w},h:{PHONE_HEIGHT}}}"))
+        .chain(std::iter::once(format!("{{w:{DESKTOP_WIDTH},h:{DESKTOP_HEIGHT}}}")))
+        .collect::<Vec<_>>()
+        .join(",");
     format!(
         r#"<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><title>phone widths</title></head>
 <body style="margin:0;background:#000">
 <script>
-const widths = [{widths}];
-const frames = widths.map((w) => {{
+const sizes = [{sizes}];
+const frames = sizes.map(({{ w, h }}) => {{
   const f = document.createElement("iframe");
-  f.style.cssText = "display:block;border:0;width:" + w + "px;height:{height}px";
+  f.style.cssText = "display:block;border:0;width:" + w + "px;height:" + h + "px";
   f.src = "/page";
   document.body.appendChild(f);
   return {{ w, f }};
@@ -809,6 +847,7 @@ async function measure() {{
     const metrics = f.contentWindow.__esp32Measure();
     metrics.clear = await f.contentWindow.__esp32Clear();
     metrics.composer = await f.contentWindow.__esp32Composer();
+    metrics.desktop = await f.contentWindow.__esp32Desktop();
     return {{ requested: w, metrics }};
   }}));
   document.body.dataset.esp32Layout = encodeURIComponent(JSON.stringify(out));
@@ -820,7 +859,7 @@ setTimeout(measure, 300);
 </script>
 </body></html>
 "#,
-        height = PHONE_HEIGHT,
+        sizes = sizes,
     )
 }
 
@@ -1512,6 +1551,71 @@ fn enter_starts_a_new_line_and_the_row_stays_above_the_keyboard() {
             c["rowHeightShrunk"]
         );
     }
+}
+
+/// The wide-screen layout: a centred reading column and a side panel, measured in a 1280 x 900
+/// frame rather than asserted in CSS.
+#[test]
+fn the_desktop_layout_keeps_a_reading_column_and_a_side_panel() {
+    let browser = browser();
+    let url = format!("{}/harness", serve());
+    let dom = dump_dom(&browser, &url);
+    let measured = measurements(&dom);
+    let metrics = measured
+        .get(&DESKTOP_WIDTH)
+        .unwrap_or_else(|| panic!("no {DESKTOP_WIDTH} px measurement; harness said {measured:?}"));
+    let d = &metrics["desktop"];
+    assert!(!d.is_null(), "the desktop fixture did not run");
+    let viewport = d["viewport"].as_f64().unwrap_or(f64::NAN);
+    assert!(
+        (viewport - f64::from(DESKTOP_WIDTH)).abs() < 1.0,
+        "the frame measured {viewport} px wide, so the desktop breakpoint was not in play"
+    );
+
+    let composer = &d["composer"];
+    let width = composer["width"].as_f64().unwrap_or(f64::NAN);
+    let left = composer["left"].as_f64().unwrap_or(f64::NAN);
+    let right = composer["right"].as_f64().unwrap_or(f64::NAN);
+    // A phone column stretched across the window is the failure: the composer must stop
+    // short of the edges and sit in the middle.
+    assert!(width <= 900.0, "the composer is {width:.0} px wide on a 1280 px screen");
+    assert!(width >= 600.0, "the composer is only {width:.0} px wide, so it did not fill the column");
+    let gap_left = left;
+    let gap_right = viewport - right;
+    assert!(
+        (gap_left - gap_right).abs() <= 2.0,
+        "the composer is not centred: {gap_left:.1} px on the left, {gap_right:.1} px on the right"
+    );
+
+    // The transcript uses the same column, so the three rows line up.
+    let chat = &d["chat"];
+    let chat_width = chat["width"].as_f64().unwrap_or(f64::NAN);
+    assert!(
+        (chat_width - width).abs() <= 2.0,
+        "the transcript is {chat_width:.0} px wide and the composer {width:.0} px"
+    );
+    let bar = &d["bar"];
+    let bar_width = bar["width"].as_f64().unwrap_or(f64::NAN);
+    assert!((bar_width - width).abs() <= 2.0, "the header is {bar_width:.0} px wide, the column {width:.0}");
+
+    // The panel is a side sheet: not the whole window, and flush with the right edge.
+    let sheet = &d["sheet"];
+    let sheet_width = sheet["width"].as_f64().unwrap_or(f64::NAN);
+    assert!(
+        sheet_width <= 480.0,
+        "the panel covers {sheet_width:.0} of {viewport:.0} px: it is still a full-screen sheet"
+    );
+    assert!(sheet_width >= 320.0, "the panel is only {sheet_width:.0} px wide");
+    assert!(
+        (viewport - sheet["right"].as_f64().unwrap_or(f64::NAN)).abs() <= 1.0,
+        "the panel is not flush with the right edge: right={}",
+        sheet["right"]
+    );
+    // And it does not cover the composer, which is what a full-screen sheet would do.
+    assert!(
+        sheet["left"].as_f64().unwrap_or(0.0) > composer["left"].as_f64().unwrap_or(0.0),
+        "the panel starts at or left of the composer"
+    );
 }
 
 /// A table is a table: the model answers a device question with four columns, and on a

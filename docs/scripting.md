@@ -69,7 +69,7 @@ if len(scan.addresses) > 0 { "found" } else { "nothing" }
 | Statements | `let`, assignment (`x = …`, `l[0] = …`, `m.k = …`), `if`/`else`, `while`, `for`, `break`, `return`, blocks |
 | Functions | `fn name(a, b) { … }`; top-level definitions are hoisted; bounded recursion is supported |
 | Operators | `+ - * / %`, `== != < <= > >=`, `and or not`, unary `-` |
-| Builtins | `len`, `str`, `num`, `type`, `log`, `print`, `echo`, `sleep(ms)`, `tool(name, args)` |
+| Builtins | `len`, `str`, `num`, `type`, `log`, `print`, `echo`, `sleep(ms)`, `tool(name, args)`, `async_tool(name, args)`, `await(h)`, `wait_all([h…])`, `task_state(h)` |
 | Comments | `#` and `//` |
 | Maps | `{a: 1}` reads like JSON; `{a = 1}` also parses. A map where a statement starts (`{a: 1}` as the last line) is the map, not a block: a `{` followed by `key:` is always one |
 
@@ -89,7 +89,35 @@ first_positive([-2, 0, 7])
 
 `tool(name, args)` is the only way out of the interpreter. It uses the same execution
 checks as MCP, including `mcp.disabled_tools`; listing profiles do not revoke an enabled
-legacy name. `tool("script", …)` is refused to prevent recursion through the tool layer.
+legacy name. ## Deferring a tool call
+
+`async_tool(name, args)` returns a handle without calling anything. `await(h)` runs it and
+returns the result; a second `await` on the same handle returns the stored result instead of
+calling the tool again. `wait_all([h1, h2])` awaits a list in order, and `task_state(h)` says
+`queued`, `done` or `failed` without running anything.
+
+```text
+let quiet = async_tool("indicators", {command: "led_set", arguments: {color: "#000000"}})
+let scan = tool("bus", {command: "i2c_scan"})
+log("found " + str(len(scan.addresses)))
+await(quiet)
+```
+
+**This is deferral, not parallelism.** Every board tool runs through one dispatcher behind
+one mutex and one I2C bus, so two calls cannot overlap whatever the script does; a second
+execution context would serialise on the same lock and only add a thread to the failure
+modes. What it buys is shape: a script can queue the calls it already knows it will need, do
+its own work in between, and collect them where it chooses.
+
+A queued call is **drained at the end of the script**, in the order it was queued, so
+fire-and-forget happens rather than vanishing. If a deferred call fails after the script has
+already produced its result, the failure is appended to the output (`deferred <tool> failed:
+…`) instead of turning the whole run into an error; if it was awaited, the error is raised
+where it was awaited, as `tool` does.
+
+A blocking wait is `await` on a handle, or `sleep(ms)` for a pause: there is no third kind.
+
+`tool("script", …)` is refused to prevent recursion through the tool layer.
 Use the argument names in the tool's description: `(required)` marks required fields and
 `?` marks optional ones. A failed call with a parameter error lists the available arguments.
 
