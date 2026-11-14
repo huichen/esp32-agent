@@ -2112,6 +2112,35 @@ function init() {
     } catch (e) { $("#wifi-result").textContent = e.message; }
   };
 
+  // Two-step on purpose: the first press says what will happen, the second does it.
+  // Rebuilding the radio can drop the link this page is on, so the click that causes it
+  // should not be the same click that decides to.
+  let netArmed = 0;
+  $("#net-apply").onclick = async () => {
+    const open = $("#set-keep-ap").checked;
+    const plain = $("#set-plain-http").checked;
+    const result = $("#net-result");
+    if (!netArmed) {
+      netArmed = Date.now();
+      result.textContent =
+        "Click Apply again to continue: the access point switch drops any device on 192.168.4.1 for a second, and turning plain HTTP off ends this page's http session.";
+      setTimeout(() => {
+        netArmed = 0;
+        if (result.textContent.startsWith("Click Apply again")) result.textContent = "";
+      }, 12000);
+      return;
+    }
+    netArmed = 0;
+    try {
+      await api("/api/config", { method: "POST", body: { mcp: { plain_http: plain } } });
+      const ap = await api("/api/wifi/ap", { method: "POST", body: { open } });
+      result.textContent = "applied: access point " + ap.ap + ", plain http " + (plain ? "on" : "off");
+      toast("applied");
+    } catch (e) {
+      result.textContent = e.message;
+    }
+  };
+
   $("#settings-save").onclick = async () => {
     const body = { agent: { tick_ms: Number($("#auth-tick").value || 1000) } };
     // Sent only when it is a whole number in range: the board refuses the rest, and a
