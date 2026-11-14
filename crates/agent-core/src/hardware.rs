@@ -95,6 +95,18 @@ pub fn threads_json(tasks: Vec<serde_json::Value>) -> Vec<serde_json::Value> {
 /// A pool is a set of capability flags, not an address range — `internal_8bit` and `dma`
 /// overlap on every chip — so the numbers here are answers to "how much RAM satisfies this
 /// request", which is the question a new stack or a DMA buffer actually asks.
+/// One pre-rendered frame of an asynchronous audio/video job.
+///
+/// `page` is the panel's own frame buffer (512 bytes for 128x32, 1024 for 128x64), drawn by
+/// the driver and stored in PSRAM. Pre-rendering is what makes the async path possible at
+/// all: the player only has to push bytes at a deadline, so it never needs the drawing code,
+/// the device registry or the App lock.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct MediaPicture {
+    pub at_ms: u64,
+    pub page: Vec<u8>,
+}
+
 /// What the background audio player is doing.
 ///
 /// Reported instead of assumed: without this, `queued: true` is the last thing a caller
@@ -119,6 +131,12 @@ pub struct MediaState {
     pub cancelled: bool,
     /// Jobs that ran to the end since boot.
     pub jobs_done: u64,
+    /// Frames this job has drawn, and how late the worst one was. A picture that is only
+    /// accurate to the audio-chunk boundary (~170 ms) is what the synchronous path
+    /// delivers; the async one draws at the frame's own deadline.
+    pub frames_done: u64,
+    pub frames_total: u64,
+    pub max_late_ms: u64,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -372,6 +390,22 @@ pub trait Hardware: Send {
     /// Stop the background player and drop whatever is queued. `false` = nothing was playing.
     fn media_cancel(&mut self) -> bool {
         false
+    }
+
+    /// Play audio and draw frames on one clock, in the background. `Err(unsupported)` means
+    /// this board cannot do it yet and the caller must fall back to the blocking path.
+    ///
+    /// Frames are already rendered (`MediaPicture::page`), so the player needs no drawing
+    /// code and no device registry: it owns the I2S channel and the panel for the duration
+    /// of the job, which is what keeps both off the App lock.
+    fn media_submit_av(
+        &mut self,
+        _samples: &[i16],
+        _rate_hz: u32,
+        _pictures: &[MediaPicture],
+        _panel: Option<(u8, u8)>,
+    ) -> Result<u64> {
+        Err(McpError::unsupported("this board cannot play audio and frames in the background"))
     }
 
     fn media_buffer(&mut self, len: usize) -> Option<(Vec<u8>, &'static str)> {

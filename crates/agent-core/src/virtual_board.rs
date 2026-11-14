@@ -204,6 +204,8 @@ pub struct VirtualBoard {
     pub scan: Vec<WifiAp>,
     pub wifi: WifiStatus,
     pub log: Vec<String>,
+    /// Frame deadlines per job, for `media_submit_av`.
+    media_pictures: std::collections::BTreeMap<u64, Vec<u64>>,
     /// Playing and queued jobs: `(job, started, duration_ms, rate_hz)`.
     media: std::collections::VecDeque<(u64, std::time::Instant, u64, u64)>,
     media_next: u64,
@@ -266,6 +268,7 @@ impl VirtualBoard {
             log: Vec::new(),
             hw_calls: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
             media: std::collections::VecDeque::new(),
+            media_pictures: std::collections::BTreeMap::new(),
             media_next: 0,
             media_done: 0,
             media_cancelled: false,
@@ -394,6 +397,10 @@ impl Hardware for VirtualBoard {
         state.duration_ms = duration_ms;
         state.rate_hz = rate_hz as u32;
         state.playing = true;
+        if let Some(deadlines) = self.media_pictures.get(&job) {
+            state.frames_total = deadlines.len() as u64;
+            state.frames_done = deadlines.iter().filter(|at| **at <= elapsed).count() as u64;
+        }
         // Derived here, not stored: the same reason the board derives it — a number written
         // once per chunk is stale the moment it is written.
         state.remaining_ms = duration_ms.saturating_sub(elapsed);
@@ -401,8 +408,24 @@ impl Hardware for VirtualBoard {
         state
     }
 
+    /// The fake player keeps the frame deadlines of each job and derives how many are due
+    /// from the same clock it uses for audio, so a test can see the picture track the sound
+    /// without a panel.
+    fn media_submit_av(
+        &mut self,
+        samples: &[i16],
+        rate_hz: u32,
+        pictures: &[crate::hardware::MediaPicture],
+        _panel: Option<(u8, u8)>,
+    ) -> Result<u64> {
+        let job = self.media_submit(samples, rate_hz)?;
+        self.media_pictures.insert(job, pictures.iter().map(|p| p.at_ms).collect());
+        Ok(job)
+    }
+
     fn media_cancel(&mut self) -> bool {
         let playing = !self.media.is_empty();
+        self.media_pictures.clear();
         self.media.clear();
         if playing {
             self.media_cancelled = true;
