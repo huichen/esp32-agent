@@ -38,7 +38,10 @@ authorize a write or MCP DELETE. The portal uses it for the run stream.
 Portal bearer tokens expire after 12 hours and live in RAM, so a reboot revokes them.
 The configured MCP token is a persistent secret, not one of those session tokens.
 `GET /api/config` masks its secrets as `__set__`; `GET /api/agent/config` omits `api_key`
-and reports `api_key_set`. A redaction placeholder is not a new credential value.
+and reports `api_key_set`. A redaction placeholder is not a new credential value. An explicit
+empty string clears a stored secret (`{"auth":{"portal_pin":""}}`), which is the only way to
+turn the credential gate off again; the console has a button for each, because a blank field
+in the page means "keep the stored one" and cannot mean both.
 
 ## Tool switches
 

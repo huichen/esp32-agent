@@ -1315,7 +1315,9 @@ async function loadAgent() {
     $("#agent-reasoning").value = d.reasoning || "";
     $("#agent-vision").value = d.vision === false ? "false" : "true";
     $("#agent-tick").value = d.tick_ms;
-    $("#auth-tz").value = d.tz_offset_h === undefined ? 0 : d.tz_offset_h;
+    // `#auth-tz` is not filled here: it lives in the Settings panel, which reads `/api/config`
+    // for it. Filling it from the agent document is what showed 0 on every visit — and filling
+    // it here at all was filling a field on a panel that was not open.
     const prompt = await api("/api/agent/prompt");
     kv($("#conversation-kv"), [
       ["Messages", prompt.history],
@@ -1496,6 +1498,11 @@ async function loadSettings() {
     $("#wifi-password").value = "";
     $("#set-keep-ap").checked = d.wifi && d.wifi.keep_ap === true;
     $("#set-plain-http").checked = !(d.mcp && d.mcp.plain_http === false);
+    // The timezone is board config and this panel is where it is edited, so it is read from
+    // the document this panel already holds. It used to be filled by the Agent panel from
+    // the agent document, which never carried it: Settings showed 0 on every visit while the
+    // board had the right offset stored.
+    $("#auth-tz").value = d.tz_offset_h === undefined ? 0 : d.tz_offset_h;
     // Where the board is right now, not only where it is trying to go.
     const s = await api("/api/status");
     if (s && s.wifi && s.wifi.ip) {
@@ -2200,6 +2207,37 @@ function init() {
       toast(applied ? "saved; restart required" : "applied");
     } catch (e) { $("#settings-result").textContent = e.message; toast(e.message); }
   };
+
+  // Clearing a credential is an action of its own: a blank input means "keep the stored
+  // one" (`__set__`), so there has to be a way to say "remove it" that is not the same
+  // keystrokes. Both are confirmed, because what they leave behind is a board that answers
+  // anyone on this network.
+  const clearCredential = async (field, label) => {
+    const result = $("#auth-clear-result");
+    const ok = await askConfirm(
+      `Clear the ${label}?`,
+      field === "portal_pin"
+        ? "The console then accepts any caller on this network, and the MCP endpoint falls back to whatever the PIN was."
+        : "The MCP endpoint then accepts the portal credential instead of a bearer token.",
+      `Clear the ${label}`
+    );
+    if (!ok) return;
+    try {
+      const body = { auth: {} };
+      body.auth[field] = "";
+      await api("/api/config", { method: "POST", body });
+      if (field === "portal_pin") {
+        S.token = "";
+        localStorage.removeItem("esp32-agent.token");
+      }
+      result.textContent = `${label} cleared on the board.`;
+      toast(`${label} cleared`);
+    } catch (e) {
+      result.textContent = e.message;
+    }
+  };
+  $("#auth-clear-pin").onclick = () => clearCredential("portal_pin", "portal PIN");
+  $("#auth-clear-token").onclick = () => clearCredential("mcp_token", "MCP bearer token");
 
   // A restart ends the page's own connection, and the board stays away for a few seconds, so
   // the click that decides is not the click that does it — the same two-step the network
