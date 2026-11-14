@@ -86,7 +86,7 @@ pub fn tools(devices: &Devices) -> Vec<ToolDef> {
     schema["anyOf"] = json!([{"required": ["notes"]}, {"required": ["frames"]}]);
     vec![ToolDef::new(
         "media_play",
-        "Play a score and OLED frames on one clock in one synchronous call. Optional notes use speaker_play's 64-note / 12 s budget; frames use at_ms slots (0-12000), replace the panel with a bitmap or rectangles plus text in one flush, and accept at most 32 KiB of decoded bitmap arguments per call. All frames are validated before playback. Audio is synthesized once and written in 4096-sample chunks; frames due between writes are drawn in timestamp order, including after the sound ends. The result reports frames_drawn, frames_late and max_late_ms rather than claiming exact audiovisual sync. This holds the caller; background playback is not implemented (docs/audio.md).",
+        "Play a score and OLED frames on one clock in one synchronous call. Optional notes use speaker_play's 64-note / 12 s budget; frames use at_ms slots (0-12000), replace the panel with a bitmap or rectangles plus text in one flush, and accept at most 32 KiB of decoded bitmap arguments per call. All frames are validated before playback. Audio is synthesized once and written in 4096-sample chunks split at frame deadlines, so a frame is drawn when its own slot is due rather than after the chunk that covered it; the result reports frames_drawn, frames_late and max_late_ms as the residual, which is the time a draw itself takes and not a 170 ms chunk. This holds the caller; background playback is not implemented (docs/audio.md).",
     )
     .title("Play sound and picture")
     .category("audio")
@@ -284,12 +284,37 @@ fn play_with_wait(
     let started = ctx.hw.millis();
     let mut next = 0;
     draw_due(ctx, &plan, started, &mut next, &mut progress).map_err(|e| progress.failure(e))?;
-    for piece in samples.chunks(WRITE_SAMPLES) {
+    // A frame is drawn at its own moment, so the audio is written up to that moment and no
+    // further: one 4096-sample chunk is 170 ms of sound at 24 kHz, and a frame due 20 ms into
+    // it was drawn 57 ms late on the bench. Splitting at the frame boundary costs one extra
+    // write per frame and puts the picture where the sound is.
+    let per_ms = (crate::drivers::audio::AMP_RATE_HZ as usize / 1000).max(1);
+    let mut written = 0usize;
+    while written < samples.len() {
+        let mut take = WRITE_SAMPLES.min(samples.len() - written);
+        if let Some(frame) = plan.frames.get(next) {
+            let due = (frame.at_ms as usize).saturating_mul(per_ms);
+            if due > written && due - written < take {
+                take = due - written;
+            }
+        }
+        let piece = &samples[written..written + take];
         let writing = ctx.hw.millis();
         let result = ctx.hw.i2s_out_write(piece);
         progress.write_ms = progress.write_ms.saturating_add(ctx.hw.millis().saturating_sub(writing));
         result.map_err(|e| progress.failure(e))?;
         progress.samples += piece.len() as u64;
+        written += take;
+        // The clock only reaches a frame's slot once its audio has been played; a write returns
+        // as soon as the DMA queue takes the samples, which is ahead of the sound. Waiting the
+        // remainder is what makes the slot mean something.
+        if let Some(frame) = plan.frames.get(next) {
+            let elapsed = ctx.hw.millis().saturating_sub(started);
+            let remaining = frame.at_ms.saturating_sub(elapsed);
+            if remaining > 0 {
+                wait(ctx.hw, remaining);
+            }
+        }
         draw_due(ctx, &plan, started, &mut next, &mut progress).map_err(|e| progress.failure(e))?;
     }
     // A frame-only plan, or a picture outlasting its melody, still owns its deadlines.
@@ -464,6 +489,9 @@ mod tests {
     }
 
     fn run(app: &mut App, args: &Value) -> Result<Value> {
+        // A gate of its own: nothing is running in a unit test, and this keeps the test off
+        // the App's private control plane.
+        let gate = crate::run_gate::RunGate::default();
         let mut ctx = ToolCtx {
             hw: &mut *app.hw,
             devices: &mut app.devices,
@@ -478,11 +506,13 @@ mod tests {
             tasks: &mut app.tasks,
             rules: &mut app.rules,
             families: &app.family_members,
+            gate: &gate,
         };
         play_with_wait(&mut ctx, args, |hw, ms| hw.delay_us((ms * 1000) as u32))
     }
 
     fn planned_fps(app: &mut App, args: &Value) -> u64 {
+        let gate = crate::run_gate::RunGate::default();
         let ctx = ToolCtx {
             hw: &mut *app.hw,
             devices: &mut app.devices,
@@ -497,6 +527,7 @@ mod tests {
             tasks: &mut app.tasks,
             rules: &mut app.rules,
             families: &app.family_members,
+            gate: &gate,
         };
         prepare(&ctx, args).unwrap().fps
     }
@@ -541,13 +572,16 @@ mod tests {
         let state = board.0.lock().unwrap();
         let pixels: Vec<_> = state.frames.iter().map(|f| f.pixels.clone()).collect();
         assert_eq!(pixels, ["A", "D", "B", "C"].map(text_pixels).to_vec());
-        assert_eq!(state.frames.iter().map(|f| f.at_ms).collect::<Vec<_>>(), [0, 170, 341, 341]);
-        assert_eq!(state.writes, [4096, 4096, 1408]);
+        // Each frame lands on its own slot: the audio is written up to a frame's moment and no
+        // further, so 0/100/200 rather than the 0/170/341 this test used to pin. Those numbers
+        // were the defect, measured on the bench as 57 ms of lag on a 4096-sample chunk.
+        assert_eq!(state.frames.iter().map(|f| f.at_ms).collect::<Vec<_>>(), [0, 100, 200, 200]);
+        assert_eq!(state.writes, [2400, 2400, 4096, 704]);
         assert_eq!(state.pcm, audio::melody(&[(440.0, 200), (0.0, 200)], 0.3));
         assert_eq!(result["notes"], 2);
         assert_eq!(result["frames_drawn"], state.frames.len());
-        assert_eq!(result["frames_late"], 3);
-        assert_eq!(result["max_late_ms"], 141);
+        assert_eq!(result["frames_late"], 0);
+        assert_eq!(result["max_late_ms"], 0);
         assert_eq!(result["played_ms"], 400);
     }
 
@@ -657,7 +691,9 @@ mod tests {
         assert_eq!(result["max_late_ms"], *lateness.iter().max().unwrap());
         assert_eq!(result["frames_late"], 4, "even the slot-zero flush took seven milliseconds");
         assert_eq!(result["played_ms"], 400);
-        assert_eq!(result["write_ms"], 436);
+        // Six writes instead of three: a frame's slot splits the chunk that would have covered
+        // it, and each write pays the fixture's 12 ms of write delay. The sound is unchanged.
+        assert_eq!(result["write_ms"], 448);
         assert_eq!(result["synth_ms"], 0);
     }
 
@@ -1042,10 +1078,12 @@ mod tests {
         let progress = &error.data.unwrap()["media_play"];
         let state = board.0.lock().unwrap();
         assert_eq!(progress["ok"], false);
-        assert_eq!(progress["played_ms"], 170);
+        // The first write stops at frame B's slot (100 ms = 2400 samples), so the picture that
+        // was due there was drawn before the second write failed.
+        assert_eq!(progress["played_ms"], 100);
         assert_eq!(progress["frames_drawn"], state.frames.len());
         assert_eq!(progress["frames_drawn"], 2);
-        assert_eq!(progress["frames_late"], 1);
-        assert_eq!(state.board.i2s_written, 4096);
+        assert_eq!(progress["frames_late"], 0);
+        assert_eq!(state.board.i2s_written, 2400);
     }
 }

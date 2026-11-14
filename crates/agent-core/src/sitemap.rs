@@ -425,8 +425,10 @@ pub fn mcp_json(path: &str, tools: usize, dedicated_token: bool, portal_pin: boo
         "methods": [
             "initialize",
             "notifications/initialized",
+            "notifications/cancelled",
             "ping",
             "prompts/list",
+            "prompts/get",
             "logging/setLevel",
             "completion/complete",
             "tools/list",

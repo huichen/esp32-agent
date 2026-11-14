@@ -63,6 +63,35 @@ pub struct WifiAp {
 
 /// One heap pool: what a capability asks for, and how much of it is left.
 ///
+/// A platform task list, as the JSON a person reads.
+///
+/// One place turns `Hardware::tasks` into an answer, because two callers need the same one:
+/// `/api/status` and the `board status` tool. The tool used to be silent about threads
+/// entirely — the reading that says whether another stack fits was reachable only from the
+/// portal route, which an agent driving the board over MCP cannot call.
+pub fn threads_json(tasks: Vec<serde_json::Value>) -> Vec<serde_json::Value> {
+    tasks
+        .into_iter()
+        .map(|t| {
+            serde_json::json!({
+                "name": t["name"],
+                "state": t["state"],
+                "priority": t["priority"],
+                // Which core the task sits on. Not every platform schedules (the host
+                // has one, the simulator says 0), which is why it is passed through
+                // rather than invented here.
+                "core": t["core"],
+                // One decimal: a 4 KB stack's answer has to be readable as 2.1, not 2.
+                "high_water_kb": t["stack_free_bytes"]
+                    .as_u64()
+                    .map(|bytes| ((bytes as f64 / 1024.0) * 10.0).round() / 10.0),
+            })
+        })
+        .collect()
+}
+
+/// A pool of memory, as a capability rather than an address range.
+///
 /// A pool is a set of capability flags, not an address range — `internal_8bit` and `dma`
 /// overlap on every chip — so the numbers here are answers to "how much RAM satisfies this
 /// request", which is the question a new stack or a DMA buffer actually asks.
