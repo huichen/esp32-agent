@@ -1113,6 +1113,7 @@ impl App {
             // tools, so the model, `/mcp tools/list` and the portal see the same six.
             board_tools::clip::specs(),
             board_tools::agent_extra_specs(),
+            board_tools::agent_specs(),
         ] {
             out.extend(openai_tools(&group));
         }
@@ -2064,6 +2065,22 @@ impl App {
         // only see a `ToolCtx`.
         if name == "script" {
             return self.run_script(args);
+        }
+        // The board's own agent, for a caller that is not the model: the four tools the portal's
+        // Agent panel reaches over REST. Reached here because they need `App` — the agent, the
+        // model config and the store queue — and never a driver.
+        match name {
+            "agent_say" => return self.agent_say_tool(args),
+            "agent_history" => return self.agent_history_tool(args),
+            "agent_forget" => return self.agent_forget_tool(args),
+            "agent_config_get" => {
+                if !args.is_object() {
+                    return Err(McpError::invalid_params("tool arguments must be an object"));
+                }
+                return Ok(self.agent_config_json());
+            }
+            "agent_config_set" => return self.agent_config_set_tool(args),
+            _ => {}
         }
         // `shell` is a router in front of the fs_*/net_* handlers, so it has to be reached
         // from both entry points: the model's tool host and the MCP `tools/call`.
@@ -3570,18 +3587,121 @@ impl App {
             Ok(v) => v,
             Err(e) => return Response::error_json(400, &format!("invalid JSON: {e}")),
         };
-        // Both schemes are carried by the platform transport (TLS on the board via
-        // esp-tls, on the host via rustls), so https:// is accepted here. Anything that
-        // is not HTTP at all is still refused by name.
+        match self.apply_agent_config(&body) {
+            Ok((mut v, queued)) => {
+                v["saved"] = json!(false);
+                v["queued"] = json!(queued);
+                v["note"] = json!("applied in RAM; queue admission is not flash acknowledgement. Check /api/status.store for pending writes and failures");
+                if queued {
+                    Response::json(&v)
+                } else {
+                    v["error"] = json!("model config was applied in RAM but could not be queued for saving");
+                    Response::json_status(503, &v)
+                }
+            }
+            Err(e) => Response::json_status(400, &json!({ "error": e.message })),
+        }
+    }
+
+    /// The `agent_*` tools: the board's own model, reached by a caller that is not it.
+    ///
+    /// `agent_begin`/`agent_reply` do the same work over REST for the portal; these are thin
+    /// wrappers so an outside agent gets the identical behaviour (the same coalescing queue,
+    /// the same truncation, the same refusal while a turn runs) instead of a second
+    /// implementation that drifts.
+    fn agent_say_tool(&mut self, args: &Value) -> Result<Value> {
+        let text = crate::json::str_arg(args, "text")?;
+        let text = text.trim();
+        if text.is_empty() {
+            return Err(McpError::invalid_params("`text` is empty: say something"));
+        }
+        let replaced = self.agent.pending.is_some();
+        let accepted = self.queue_user(text, "mcp", now_ms());
+        if !accepted {
+            return Err(McpError::internal("the message could not be queued"));
+        }
+        Ok(json!({
+            "ok": true,
+            "source": "mcp",
+            "bytes": text.len(),
+            // A queued turn is the answer, not a failure: the board runs it on its own thread
+            // and the transcript is where the reply lands.
+            "pending": true,
+            "replaced_a_waiting_message": replaced,
+            "next": "the board starts the turn on its own thread; `agent_history` has the answer",
+        }))
+    }
+
+    fn agent_history_tool(&mut self, args: &Value) -> Result<Value> {
+        let after = crate::json::opt_i64(args, "after").unwrap_or(0).max(0) as usize;
+        Ok(self.agent_history_json(after))
+    }
+
+    fn agent_forget_tool(&mut self, args: &Value) -> Result<Value> {
+        let keep = crate::json::opt_i64(args, "keep").unwrap_or(0).max(0) as usize;
+        if self.run_gate.active() {
+            return Err(McpError::invalid_params(
+                "a model turn is running, so the conversation cannot be cut: its question would be gone and \
+                 its answer would arrive in a thread that no longer has it. Wait for `board status` to say \
+                 `agent.run_active: false`",
+            ));
+        }
+        Ok(self.forget_conversation(keep))
+    }
+
+    fn agent_config_set_tool(&mut self, args: &Value) -> Result<Value> {
+        let patch = crate::json::field(args, "patch")
+            .cloned()
+            .ok_or_else(|| McpError::invalid_params("`patch` is required: the fields to change"))?;
+        if !patch.is_object() {
+            return Err(McpError::invalid_params("`patch` must be an object"));
+        }
+        let (mut value, queued) = self.apply_agent_config(&patch)?;
+        value["saved"] = json!(false);
+        value["queued"] = json!(queued);
+        if !queued {
+            value["error"] = json!("applied in RAM but could not be queued for saving");
+        }
+        Ok(value)
+    }
+
+    /// Cut the conversation down to the last `keep` exchanges.
+    ///
+    /// Shared by `POST /api/agent/forget` and the `agent_forget` tool: forgetting has to reach
+    /// flash or the conversation comes back after a reboot, which is the one outcome nobody
+    /// asking for `forget` would accept.
+    fn forget_conversation(&mut self, keep: usize) -> Value {
+        let (removed, kept) = self.agent.forget(keep);
+        self.clear_pending_message();
+        if keep == 0 {
+            self.attachments.clear();
+            self.active_attachments = None;
+        }
+        self.persist_transcript();
+        self.publish_agent_stats();
+        self.log.info(
+            "agent",
+            format!("forgot {removed} message(s), kept the last {kept} toward {keep} exchange(s)"),
+        );
+        json!({ "ok": true, "removed": removed, "kept": kept, "archive_cleared": true })
+    }
+
+    /// The body of `POST /api/agent/config`, shared with the `agent_config_set` tool.
+    ///
+    /// One function so the portal and an outside agent cannot disagree about what is accepted,
+    /// what is clamped and what is refused. Returns the settings as the caller may see them
+    /// (no key) and whether the write was queued.
+    fn apply_agent_config(&mut self, body: &Value) -> Result<(Value, bool)> {
+        // Both schemes are carried by the platform transport (TLS on the board via esp-tls,
+        // on the host via rustls), so https:// is accepted here. Anything that is not HTTP at
+        // all is still refused by name.
         if let Some(url) = body.get("base_url").and_then(|u| u.as_str()) {
             let url = url.trim();
             if !url.is_empty() && !url.starts_with("http://") && !url.starts_with("https://") {
-                return Response::json_status(
-                    400,
-                    &json!({ "error": "`base_url` must start with http:// or https:// and point at the chat completions endpoint" }),
-                );
+                return Err(McpError::invalid_params(
+                    "`base_url` must start with http:// or https:// and point at the chat completions endpoint",
+                ));
             }
-            self.llm.base_url = url.to_string();
         }
         // Apply the trimmed value too, so what is stored is exactly what was checked.
         let mut patch = body.clone();
@@ -3590,9 +3710,9 @@ impl App {
             patch["base_url"] = json!(url);
         }
         llm_apply_json(&mut self.llm, &patch);
-        // The tick belongs to the device config, not the model config, but the portal
-        // edits both from one form: accept it here and clamp it the way the platform
-        // does, so an out-of-range value never reaches the thread.
+        // The tick belongs to the device config, not the model config, but the portal edits
+        // both from one form: accept it here and clamp it the way the platform does, so an
+        // out-of-range value never reaches the thread.
         if let Some(ms) = body.get("tick_ms").and_then(|v| v.as_u64()) {
             let clamped = crate::config::clamp_tick_ms(ms.min(u32::MAX as u64) as u32);
             self.cfg.agent.tick_ms = clamped;
@@ -3609,16 +3729,7 @@ impl App {
                 if self.llm.api_key.is_empty() { "none" } else { "set" }
             ),
         );
-        let mut v = self.agent_config_json();
-        v["saved"] = json!(false);
-        v["queued"] = json!(queued);
-        v["note"] = json!("applied in RAM; queue admission is not flash acknowledgement. Check /api/status.store for pending writes and failures");
-        if queued {
-            Response::json(&v)
-        } else {
-            v["error"] = json!("model config was applied in RAM but could not be queued for saving");
-            Response::json_status(503, &v)
-        }
+        Ok((self.agent_config_json(), queued))
     }
 
     fn sched_json(&self) -> Value {
@@ -4354,25 +4465,7 @@ impl App {
                 }
                 let body: Value = serde_json::from_str(&req.body_str()).unwrap_or(Value::Null);
                 let keep = body.get("keep").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-                let (removed, kept) = self.agent.forget(keep);
-                self.clear_pending_message();
-                if keep == 0 {
-                    self.attachments.clear();
-                    self.active_attachments = None;
-                }
-                // Forgetting has to reach flash, or the conversation comes back after a
-                // reboot - the one outcome nobody asking for `forget` would accept.
-                self.persist_transcript();
-                self.log.info(
-                    "agent",
-                    format!("forgot {removed} message(s), kept the last {kept} toward {keep} exchange(s)"),
-                );
-                Response::json(&json!({
-                    "ok": true,
-                    "removed": removed,
-                    "kept": kept,
-                    "archive_cleared": true,
-                }))
+                Response::json(&self.forget_conversation(keep))
             }
             // Compress the conversation now instead of waiting for the budget. It is the
             // same deterministic projection the trigger uses, so it costs no model call and
@@ -15367,6 +15460,76 @@ mod tests {
         app.route(&post("/api/agent/message", r#"{"text":"are you busy"}"#));
         let status = app.call_tool("board", &json!({ "command": "status" })).unwrap();
         assert_eq!(status["agent"]["pending"], json!(true), "{status}");
+    }
+
+    /// The board's own model, reached over MCP: the one class of capability that used to need
+    /// the portal, a person or an HTTP client, because everything here assumed the caller *is*
+    /// the model.
+    #[test]
+    fn an_outside_agent_can_reach_the_boards_model() {
+        let mut app = test_app();
+
+        // `agent_say`: the message waits for the turn the board starts on its own thread.
+        let first = app.call_tool("agent_say", &json!({ "text": "  how warm is it  " })).unwrap();
+        assert_eq!(first["ok"], json!(true), "{first}");
+        assert_eq!(first["replaced_a_waiting_message"], json!(false), "{first}");
+        let pending = app.agent.pending.as_ref().expect("a queued turn");
+        assert_eq!(pending.text, "how warm is it", "trimmed like every other message");
+        assert_eq!(pending.source, "mcp", "the transcript has to say where it came from");
+
+        // One message waits at a time: the second call says so instead of pretending to queue
+        // two turns, and an empty question is refused rather than queued as work.
+        let second = app.call_tool("agent_say", &json!({ "text": "and now?" })).unwrap();
+        assert_eq!(second["replaced_a_waiting_message"], json!(true), "{second}");
+        assert_eq!(app.agent.pending.as_ref().unwrap().text, "and now?");
+        assert!(app.call_tool("agent_say", &json!({ "text": "   " })).is_err(), "an empty message");
+
+        // `agent_history`: the transcript, oldest first, with the cursor to poll with.
+        app.agent.history.push(crate::agent::Message::user("earlier question", "http", 1));
+        app.agent.history.push(crate::agent::Message::assistant("earlier answer", vec![], 2));
+        let all = app.call_tool("agent_history", &json!({})).unwrap();
+        assert_eq!(all["seq"], json!(2), "{all}");
+        assert_eq!(all["messages"][0]["text"], json!("earlier question"), "{all}");
+        // A queued question is visible before the turn starts, marked `pending`: that is how a
+        // caller knows the board has it and has not answered yet.
+        let tail = app.call_tool("agent_history", &json!({ "after": 1 })).unwrap();
+        let entries = tail["messages"].as_array().expect("messages");
+        assert_eq!(entries.len(), 2, "{tail}");
+        assert_eq!(entries[1]["text"], json!("and now?"), "{tail}");
+        assert_eq!(entries[1]["pending"], json!(true), "{tail}");
+
+        // `agent_config_*`: a partial patch, and the key stays write-only in both directions.
+        let before = app.call_tool("agent_config_get", &json!({})).unwrap();
+        assert!(before.get("base_url").is_some(), "{before}");
+        assert!(before.get("api_key").is_none(), "the key is never returned: {before}");
+        let set = app
+            .call_tool(
+                "agent_config_set",
+                &json!({ "patch": { "model": "another-model", "api_key": "__set__" } }),
+            )
+            .unwrap();
+        assert_eq!(set["model"], json!("another-model"), "{set}");
+        assert!(set.get("api_key").is_none(), "the key is write-only: {set}");
+        assert_eq!(set["queued"], json!(true), "the write has to be queued for flash: {set}");
+        assert_eq!(
+            app.call_tool("agent_config_set", &json!({ "patch": { "base_url": "ftp://nope" } }))
+                .unwrap_err()
+                .code,
+            code::INVALID_PARAMS,
+            "a scheme the transport cannot carry is refused, as on the portal"
+        );
+
+        // `agent_forget`: the tail stays and nothing is left waiting; mid-turn it is refused,
+        // because the answer that turn is producing would land in a thread that lost its question.
+        let forgotten = app.call_tool("agent_forget", &json!({ "keep": 0 })).unwrap();
+        assert!(forgotten["removed"].as_u64().unwrap() >= 2, "{forgotten}");
+        assert_eq!(forgotten["kept"], json!(0), "{forgotten}");
+        assert!(app.agent.history.is_empty(), "everything was dropped: {forgotten}");
+        assert!(app.agent.pending.is_none(), "a forgotten conversation has nothing waiting");
+        app.run_gate.set_active(true);
+        let refused = app.call_tool("agent_forget", &json!({ "keep": 0 })).unwrap_err();
+        assert!(refused.message.contains("turn is running"), "{refused:?}");
+        app.run_gate.set_active(false);
     }
 
     #[test]

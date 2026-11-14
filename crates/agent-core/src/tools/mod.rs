@@ -633,6 +633,86 @@ pub fn script_specs() -> Value {
     }]))
 }
 
+/// The board's own agent, as tools.
+///
+/// These are the one class of capability that an outside agent could not reach over MCP at
+/// all: the portal's Agent panel did it over REST, and everything else here assumed the caller
+/// *is* the model. That is backwards for the case this board is built for — an outside agent
+/// driving it — where the board's model is a resource, not the caller.
+///
+/// They live outside the registry for the same reason `shell` and the file tools do: the
+/// handling needs `App` (the agent, the model config, the store queue), not a `ToolCtx`.
+pub fn agent_specs() -> Value {
+    crate::tool::with_argument_descriptions(json!([
+        {
+            "type": "function",
+            "function": {
+                "name": "agent_say",
+                "description": "Ask the board's own model a question and let it run: the message is queued for exactly the turn a person's message starts, and the answer arrives in the transcript (`agent_history`). Use it when the work needs the board's model and its tools rather than yours. One message waits at a time: a second call while one is waiting replaces that text and joins its source, so check `board status` (`agent.pending`) before sending.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "text": { "type": "string", "description": "what to ask; bounded like any user message" },
+                    },
+                    "required": ["text"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "agent_history",
+                "description": "The board's transcript: role, text, tool calls and their results, oldest first. Read what the board's model was asked and answered — including turns a schedule or a person started — without needing the portal.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "after": { "type": "integer", "description": "only entries at or after this sequence number, default 0" },
+                    },
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "agent_forget",
+                "description": "Keep the last N question-and-answer exchanges and drop the rest, or drop everything with 0. The compressed archive goes with it. Refused while a turn is running, because the turn being answered would be dropped out from under it.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "keep": { "type": "integer", "description": "exchanges to keep; 0 drops the whole conversation" },
+                    },
+                    "required": ["keep"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "agent_config_get",
+                "description": "Where the board's model lives and how one run is bounded: base_url, model, protocol, temperature, context and output budgets, max_steps, timeout, reasoning, vision. The API key is never returned, only whether one is set.",
+                "parameters": { "type": "object", "properties": {} },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "agent_config_set",
+                "description": "Point the board's model at a provider, or tune the run. A partial patch: only the fields present change. `api_key` is write-only and `__set__` keeps the stored one. The answer is queue admission, not flash acknowledgement — `board status` reports the store's `pending`/`failed`.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "patch": {
+                            "type": "object",
+                            "description": "any subset of {base_url, model, api_key, max_steps, context_tokens, max_output_tokens, temperature, timeout_s, reasoning, protocol, vision, tick_ms}",
+                        },
+                    },
+                    "required": ["patch"],
+                },
+            },
+        }
+    ]))
+}
+
 /// What a device family is for, in one sentence.
 ///
 /// A family is declared by the drivers that join it (`display`, `indicators`, `audio`), so the
