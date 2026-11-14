@@ -43,6 +43,13 @@ pub struct ToolCtx<'a> {
     pub rules: &'a mut Vec<crate::sched::SensorRule>,
     /// Public action names and the families that own them, including suffixed instances.
     pub families: &'a BTreeMap<String, String>,
+    /// The certificate: whether https is up, on which port, and its fingerprint.
+    ///
+    /// Read through the ctx rather than snapshotted into `Runtime`: the platform fills this in
+    /// *after* `App::new` returns (it creates the TLS server first), so a boot-time copy is the
+    /// default forever — measured on the board 2026-11-14, where `/api/tls` said
+    /// `enabled: true, port: 443` and `board tls` said `enabled: false, port: 0`.
+    pub tls: &'a crate::app::TlsInfo,
     /// The control-plane gate: whether a turn is running, and which tool it is inside.
     ///
     /// A separate lock from everything else on purpose: a tool asking "is the board busy"
