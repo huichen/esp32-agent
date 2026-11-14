@@ -105,7 +105,13 @@ impl Player {
             queue.push_back(Job { id, samples: samples.to_vec(), rate_hz });
             if let Ok(mut state) = self.state.lock() {
                 state.queued = queue.len() as u64 - u64::from(state.playing);
-                state.duration_ms = duration_ms;
+                // Only an idle player takes the new length: a queued job must not rewrite
+                // the numbers belonging to the job that is playing right now, which is what
+                // made the remaining time jump when a second tune was queued.
+                if !state.playing {
+                    state.duration_ms = duration_ms;
+                    state.remaining_ms = duration_ms;
+                }
             }
         }
         self.stop.store(false, Ordering::Relaxed);
