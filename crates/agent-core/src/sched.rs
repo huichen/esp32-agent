@@ -152,6 +152,18 @@ pub fn due(task: &ScheduledTask, now_ms: u64, now_min_of_day: u32) -> bool {
     since_last > 60_000
 }
 
+/// Local minute of the day (`0..1440`) for a wall-clock instant and an hour offset.
+///
+/// The board has no timezone database, so the zone is an offset in whole hours east of
+/// UTC — the same unit `UTC+8` names. It lives in the config (`tz_offset_h`) rather than
+/// in `option_env!`, so a portal edit applies on the next tick instead of needing a
+/// reflash. Whole hours only: `UTC+5:30` cannot be expressed, and refusing the attempt is
+/// better than rounding someone's morning alarm by half an hour.
+pub fn minute_of_day(now_ms: u64, offset_h: i32) -> u32 {
+    let local = (now_ms / 1000) as i64 + i64::from(offset_h) * 3_600;
+    (local.rem_euclid(86_400) / 60) as u32
+}
+
 /// Does a tool result satisfy the rule's operator? A disabled rule never matches.
 pub fn rule_matches(rule: &SensorRule, value: &Value) -> bool {
     if !rule.enabled {
