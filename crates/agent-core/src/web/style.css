@@ -203,15 +203,23 @@ body {
   background: color-mix(in srgb, var(--text) 10%, transparent);
   padding: 1px 5px;
   border-radius: 6px;
+  /* A path or an identifier has no spaces to break at, and on a phone the alternative is
+     text running off the right edge where nobody can read it: `body` is overflow hidden, and
+     a horizontally scrolling code block is still "cut off" to a thumb. Measured on the live
+     page at 390 px: one fenced line reached 462 px, 110 px past the screen. */
+  overflow-wrap: anywhere;
 }
 .bubble pre {
   margin: 8px 0;
   padding: 10px 12px;
   background: rgba(0, 0, 0, 0.32);
   border-radius: 12px;
-  overflow-x: auto;
+  /* Wrap, do not scroll. `overflow-x: auto` keeps the box narrow but hides half the line
+     behind a swipe nobody performs on a reply they are reading. */
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
 }
-.bubble pre code { background: none; padding: 0; font-size: 12px; }
+.bubble pre code { background: none; padding: 0; font-size: 12px; white-space: inherit; }
 .bubble a { color: var(--accent); }
 
 /* While a turn runs: the board sends nothing until it has something, so the page says so

@@ -717,7 +717,10 @@ fn chrome_allows_port(port: u16) -> bool {
 /// files and the origin is a normal one (`localStorage`, `fetch` and the module-scope
 /// helpers behind `showAttach` all behave as they do on the board).
 fn page() -> String {
-    INDEX_HTML.replace("</body>", &format!("{MEASURE_JS}{CLEAR_JS}{DESKTOP_JS}{COMPOSER_KEYS_JS}</body>"))
+    INDEX_HTML.replace(
+        "</body>",
+        &format!("{MEASURE_JS}{CLEAR_JS}{DESKTOP_JS}{COMPOSER_KEYS_JS}{OVERFLOW_JS}</body>"),
+    )
 }
 
 /// The wide-screen layout, measured in the same page: the column is centred and narrower
@@ -757,6 +760,69 @@ window.__esp32Desktop = async function () {
 "##;
 
 /// The composer's keystroke and growth measurements.
+/// Horizontal overflow: the failure a phone shows as "the right side is cut off".
+///
+/// The real console clipped long replies on the right, and a phone cannot scroll sideways
+/// to read them — `body` is `overflow: hidden` on purpose. This renders the shapes that
+/// did it (a long user message, a table, a fenced block with a long line, an inline code
+/// span) and reports every element whose right edge is past the viewport, plus the
+/// document's own scroll width.
+const OVERFLOW_JS: &str = r##"
+<script>
+window.__esp32Overflow = function () {
+  const q = (s) => document.querySelector(s);
+  const chat = q(".chat");
+  chat.innerHTML = "";
+  const add = (role, blocks) => {
+    const row = document.createElement("div");
+    row.className = "row " + role;
+    const bubble = document.createElement("div");
+    bubble.className = "bubble";
+    bubble.innerHTML = blocks;
+    row.appendChild(bubble);
+    chat.appendChild(row);
+    return bubble;
+  };
+  const long = "This is a long question about the board, with a trailing word " +
+    "WidestWordWithoutAnyBreakOpportunityAtAllBecauseItIsAPathLikeString";
+  add("user", long);
+  add("agent", markdown([
+    "Fresh reading, and a **table** with four columns:",
+    "",
+    "| Pool | Free | Total | Largest block |",
+    "|---|---|---|---|",
+    "| Internal (8-bit) | 84 KB | 370 KB | 31 KB |",
+    "| PSRAM (SPIRAM) | 7457 KB | 8150 KB | 7040 KB |",
+    "",
+    "```",
+    "ESP32 board on a small LAN, agent runs on-board.",
+    "Peripherals: SSD1306 OLED, 3 buttons, WS2812 LED, I2S mic and speaker, plus one very long line that must wrap or scroll instead of pushing the page sideways",
+    "```",
+    "",
+    "An inline span of `a_very_long_identifier_that_cannot_break_anywhere_at_all` in a sentence.",
+  ].join("\n")));
+
+  const viewport = document.documentElement.clientWidth;
+  const offenders = [];
+  chat.querySelectorAll("*").forEach((el) => {
+    const r = el.getBoundingClientRect();
+    if (r.width > 0 && r.right > viewport + 1) {
+      offenders.push({ tag: el.tagName, cls: el.className || "", right: Math.round(r.right),
+                       width: Math.round(r.width) });
+    }
+  });
+  return {
+    viewport: viewport,
+    documentScrollWidth: document.documentElement.scrollWidth,
+    bodyScrollWidth: document.body.scrollWidth,
+    chatClientWidth: chat.clientWidth,
+    chatScrollWidth: chat.scrollWidth,
+    offenders: offenders.slice(0, 6),
+  };
+};
+</script>
+"##;
+
 const COMPOSER_KEYS_JS: &str = r##"
 <script>
 window.__esp32Composer = async function () {
@@ -854,6 +920,7 @@ async function measure() {{
     metrics.clear = await f.contentWindow.__esp32Clear();
     metrics.composer = await f.contentWindow.__esp32Composer();
     metrics.desktop = await f.contentWindow.__esp32Desktop();
+    metrics.overflow = f.contentWindow.__esp32Overflow();
     return {{ requested: w, metrics }};
   }}));
   document.body.dataset.esp32Layout = encodeURIComponent(JSON.stringify(out));
@@ -1388,6 +1455,46 @@ fn assert_conversation_clear(metrics: &Value, width: u32) {
         "rgba(0, 0, 0, 0)",
         "{width} px: the screen has no background of its own"
     );
+}
+
+/// Nothing may be wider than the phone screen: `body` is `overflow: hidden`, so a right
+/// edge past the viewport is text nobody can reach — which is exactly what "the content is
+/// cut off on the right" means.
+#[test]
+fn no_content_is_wider_than_the_phone_screen() {
+    let browser = browser();
+    let url = format!("{}/harness", serve());
+    let dom = dump_dom(&browser, &url);
+    let measured = measurements(&dom);
+
+    for width in PHONE_WIDTHS {
+        let metrics = measured
+            .get(width)
+            .unwrap_or_else(|| panic!("no measurement for {width} px; harness said {measured:?}"));
+        let o = &metrics["overflow"];
+        assert!(!o.is_null(), "{width} px: the overflow fixture did not run");
+        println!("{width} px overflow: {o}");
+        let viewport = o["viewport"].as_f64().unwrap_or(f64::NAN);
+        assert!(
+            (viewport - f64::from(*width)).abs() < 1.0,
+            "{width} px: the frame measured {viewport} px wide"
+        );
+        // The document itself must not scroll sideways; that is the state a phone shows as
+        // a clipped right edge.
+        assert!(
+            o["documentScrollWidth"].as_f64().unwrap_or(0.0) <= viewport + 1.0,
+            "{width} px: the document is {} px wide in a {viewport} px viewport",
+            o["documentScrollWidth"]
+        );
+        // And no element inside the transcript may stick out, even if the chat could
+        // scroll to it: a phone has no horizontal scroll affordance here.
+        let offenders = o["offenders"].as_array().cloned().unwrap_or_default();
+        assert!(
+            offenders.is_empty(),
+            "{width} px: {} element(s) end past the viewport: {offenders:?}",
+            offenders.len()
+        );
+    }
 }
 
 #[test]
