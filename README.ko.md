@@ -117,6 +117,7 @@ I²C 스캔은 8회 실행에서 안정적이었습니다. TLS 페이지를 읽�
 새 주변 장치는 `examples/manifests/` 아래의 매니페스트 조각으로 시작합니다. 타이밍, 보정 또는
 상태가 필요한 경우에만 Rust 드라이버가 필요합니다. 드라이버는 `CATALOG`에서 자신을 등록합니다.
 규칙은 [AGENTS.md](AGENTS.md)와 [CONTRIBUTING.md](CONTRIBUTING.md)에 있습니다.
+변경을 무엇으로 판단하는지, 그리고 이 프로젝트가 무엇이 되기를 거부하는지는 [VISION.md](VISION.md)에 있습니다.
 
 ## 라이선스
 

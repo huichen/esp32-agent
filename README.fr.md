@@ -121,6 +121,7 @@ Un nouveau périphérique commence comme fragment de manifeste sous `examples/ma
 pilote Rust n’est nécessaire que pour le minutage, la calibration ou l’état. `CATALOG` est
 l’endroit où un pilote s’enregistre. Les conventions sont dans [AGENTS.md](AGENTS.md) et
 [CONTRIBUTING.md](CONTRIBUTING.md).
+Ce à quoi une évolution est jugée, et ce que ce projet refuse de devenir, se trouve dans [VISION.md](VISION.md).
 
 ## Licence
 

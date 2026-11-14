@@ -121,6 +121,7 @@ El firmware actual está grabado y responde en la placa del banco; la durabilida
 Un periférico nuevo empieza como fragmento de manifiesto en `examples/manifests/`; un driver en
 Rust solo se necesita para temporización, calibración o estado. `CATALOG` es donde un driver se
 registra. Las convenciones están en [AGENTS.md](AGENTS.md) y [CONTRIBUTING.md](CONTRIBUTING.md).
+Con qué se juzga un cambio, y a qué se niega este proyecto a convertirse, está en [VISION.md](VISION.md).
 
 ## Licencia
 

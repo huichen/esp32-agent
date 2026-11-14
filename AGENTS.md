@@ -5,6 +5,10 @@ This repository follows the `future-versioning` skill. Load it before changing t
 What follows is what **this repository decides**: scope, branching, commits, the gate and
 its boundaries. The skill's default workflow is not repeated here.
 
+What is worth building at all is [`VISION.md`](VISION.md): what this project accepts, what it
+refuses, and the two tests a reviewer applies to a concrete change. This file says how the
+work is done; that one says what the work is for.
+
 ## 1. Scope
 
 Two buildable units and one firmware project:

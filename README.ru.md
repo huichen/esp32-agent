@@ -121,6 +121,7 @@ bash scripts/build-firmware.sh --flash --port /dev/ttyACM0
 Новая периферия начинается как фрагмент манифеста в `examples/manifests/`; драйвер на Rust
 нужен только для таймингов, калибровки или состояния. `CATALOG` — место, где драйвер
 регистрирует себя. Соглашения — в [AGENTS.md](AGENTS.md) и [CONTRIBUTING.md](CONTRIBUTING.md).
+То, по чему оценивается изменение, и то, чем этот проект отказывается становиться, — в [VISION.md](VISION.md).
 
 ## Лицензия
 
