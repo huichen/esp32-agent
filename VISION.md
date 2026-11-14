@@ -12,19 +12,22 @@ An absent device never shows the model a tool it would then call and fail on.
 A tool name no model endpoint would accept is refused when the manifest is declared, not when a turn fails.
 Two callers with one description is the product; a second, richer surface built for the on-board agent alone is a different project.
 
-## Adding a device is configuration until it has to be code
+## The manifest is a language, and it is meant to grow
 
 A GPIO switch, a PWM channel, an ADC reading or one I2C register is a manifest, applied live, in the same turn.
-A driver exists only for what configuration cannot express: timing, calibration, a protocol, a state machine that runs over several transfers.
-The manifest layer never knows a chip and the driver layer never knows MCP exists; the effort goes into the boundary between them.
+The manifest is a language rather than a form: expressions, conversion, thresholds and composition are the direction, and a more sophisticated one is the goal, not a tolerated cost.
+Every case the manifest can express is a case that no longer costs a reflash, so moving behaviour out of a driver and into the manifest is a win.
+A driver exists for what no declaration can express - timing, calibration, a protocol, a state machine over several transfers - and that boundary moves outward as the language grows.
+The language stays bounded: an expression is evaluated under the turn's deadline and cannot hang the board, so capability arrives with a budget rather than instead of one.
 A saved manifest on a board somewhere is a contract, so a field the firmware accepts stays accepted.
 A new capability that can move something physical arrives with its `safety` story, and an unrestricted path is not the default.
 
-## The board is the server
+## The board is the server, on a network its owner trusts
 
 The console, the certificate, the portal PIN and the MCP token live on the board, so the bench works when the cloud does not.
 The board issues its own TLS certificate and publishes the fingerprint, so a client can compare rather than trust.
 Port 80 stays open by default, and closing it is a setting with a stated cost: a device that answers on no port is not more secure, only unreachable.
+The console is a console for an internal network: a relay, a tunnel or a hosted panel that carries it off that network is not the convenience this project wants, because a board is then reachable by whoever reaches the relay.
 Credentials stay on the board - WiFi reaches NVS through `provision`, `api_key` is write-only and reads report `api_key_set` - and none of them enter the repository.
 
 ## Every refusal is an answer
@@ -34,14 +37,14 @@ A refused call says what was refused and why, in a sentence, because a missing n
 Every tool call runs under one configured deadline, and that budget reaches the device rather than staying in a client.
 Limits are checked before a buffer is allocated or a bus is touched, never after the copy has already happened.
 Every structure that grows - transcript, archive index, workspace, attachments - carries a stated ceiling that the code enforces.
-No tool call can take the board down or lock it away from its owner, and nothing on the board restarts or resets it on a caller's behalf.
-A driver's `probe` reports `None` or `Err` instead of panicking.
-Where the board cannot do a thing, the page that describes the tool says so in the same paragraph.
+No tool call and no driver probe can take the board down or lock it away from its owner, and nothing on the board restarts or resets it on a caller's behalf.
 
-## The board answers while it works
+## Concurrency is the goal, not the compromise
 
-A long tool call or a model turn in flight does not make `/api/status` wait.
-The model call runs outside the application lock, status, health and cancellation have their own plane, and the journal streams while the turn runs.
+A slow tool call must not queue an unrelated one, and a model turn in flight must not make `/api/status` wait.
+The shared application lock is where this board started, not where it stays: the work ahead is separate device and workspace ownership with resource locks, so independent calls run in parallel.
+Simplicity is not a trade this project makes for capability; the board is meant to do more at once, not less.
+The model call already runs outside the lock, status, health and cancellation have their own plane, and the journal streams while a turn runs.
 Queue admission is not storage completion: a reply that says `queued` does not claim `saved`, and a save is acknowledged only after publication.
 Concurrency is reported so it can be reasoned about - which core a task runs on, how much stack headroom it holds - not so it can be admired.
 
@@ -49,20 +52,19 @@ Concurrency is reported so it can be reasoned about - which core a task runs on,
 
 Host tests and board measurements are different claims, and neither stands in for the other.
 A change is verified when the command that verifies it is named: the test count, the gate sequence, the partition table the flasher was given.
-Behaviour with a build or a measurement behind it goes into `docs/`; everything else goes into `ROADMAP.md` as unverified.
-A firmware change that was not built here says so in the commit and the handoff instead of passing as verified.
+A gate only a maintainer remembers is not a gate, so the five commands run in CI on every change, and a contribution that passed only on its author's laptop has not passed.
+Contributions arrive from outside this repository, so the path from an issue to a merged driver is documented and templated, and a change is judged against this file rather than against who asked for it.
+Behaviour with a build or a measurement behind it goes into `docs/`, everything else goes into `ROADMAP.md` as unverified, and a firmware change not built here says so in the commit and the handoff instead of passing as verified.
 Historical bench numbers are dated, tied to the image that produced them, and never restated as a current limit.
-The repository ships without CI: the gate is five commands a contributor runs, and the README, its seven translations and `ROADMAP.md` state the same test count.
 
 ## Scope
 
-It is not a cloud service, a fleet manager or a hosted endpoint: one board, one owner, one LAN.
-It is not a general agent framework, and the goal control plane was removed rather than grown.
-It is not an OTA channel: remote firmware updates are out of scope, and a flash happens over the cable with the partition table passed explicitly.
+It is not a cloud service, a fleet manager or a hosted endpoint: it runs on one board, for one owner, on a network that owner trusts.
+Nothing in the firmware coordinates boards: the board serves its own tools and its own console, and an outside agent may hold several boards at once, but that is the agent's business rather than a reason to add a board list, a fleet view or cross-board scheduling here.
+It is not an OTA channel, and that is a risk decision rather than a missing feature: a firmware update is the one operation that can leave a board unreachable, so every flash happens over the cable with the partition table passed explicitly.
 It is not a Linux machine with a shell bolted on: the shell and the script interpreter are subsets, and what they do not implement they refuse by name.
-It is not every driver: a peripheral earns a driver only when configuration cannot express it, and unverified paths stay in `ROADMAP.md` instead of the feature list.
 It is not a place for secrets: no credential, token or WiFi password enters the code, the examples, the tests or the image.
 A name nothing calls is deleted - a REST route, an alias, a seeded skill, a changelog - because a surface kept for sentiment is a surface every later change has to defend.
 
-A change aligns when it makes one description serve another caller, moves a device from code to configuration, answers something the board could not answer before, makes a refusal clearer or a limit enforceable, or lets the board keep answering while it works.
-A change should be resisted when it adds a second source of truth about the tools, needs a reflash for hardware a manifest could describe, puts the cloud in the control path, spends a budget it never bounded, claims a verification it never ran, or keeps a surface nothing calls.
+A change aligns when it makes one description serve another caller, moves a case from a driver into the manifest, lets independent work run in parallel, answers something the board could not answer before, makes a refusal clearer or a limit enforceable, puts the gate in front of a contribution, or keeps the console on the network its owner trusts.
+A change should be resisted when it adds a second source of truth about the tools, needs a reflash for something a manifest could describe, serializes independent work behind one lock, carries the console off the trusted network, makes a firmware update reachable without the cable, spends a budget it never bounded, claims a verification it never ran, or keeps a surface nothing calls.
