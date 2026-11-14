@@ -181,6 +181,15 @@ impl PinMode {
 ///
 /// Methods a given board cannot support return [`McpError::unsupported`]; every
 /// method has a default so a new board implementation only writes what it has.
+/// Reads 32-bit samples from the microphone without the application lock.
+///
+/// `read` fills up to `out.len()` samples and returns how many arrived; `0` means the
+/// timeout expired with nothing to give, which is not an error. Left-justified 24-bit in
+/// 32, the way the INMP441 sends it; the stream shifts down to 16.
+pub trait MicReader: Send {
+    fn read(&mut self, out: &mut [i32], timeout_ms: u32) -> Result<usize>;
+}
+
 pub trait Hardware: Send {
     /// Identification of the running chip and firmware.
     fn board_info(&mut self) -> BoardInfo;
@@ -259,6 +268,17 @@ pub trait Hardware: Send {
     /// tool result can carry. Returns how many arrived before `timeout_ms`.
     fn i2s_mic_read(&mut self, _out: &mut [i32], _timeout_ms: u32) -> Result<usize> {
         Err(McpError::unsupported("no I2S microphone on this board"))
+    }
+
+    /// A reader for `GET /api/mic/pcm`, or `None` when this board has no microphone.
+    ///
+    /// The stream runs on an HTTP worker and reads every 20 ms, so it cannot take the
+    /// application lock for each block: that is the portal, `/api/status` and the agent
+    /// thread held for the length of a stream, which is exactly the serialization this
+    /// project keeps refusing. The platform hands out a reader that owns its own handle,
+    /// the same way the background player is given the transmit one.
+    fn mic_reader(&mut self) -> Option<Box<dyn MicReader>> {
+        None
     }
 
     /// Write 16-bit mono samples to the amplifier, blocking until they are accepted.

@@ -12,7 +12,7 @@ use crate::config::Config;
 use crate::device::Devices;
 use crate::drivers;
 use crate::error::{code, McpError, Result};
-use crate::hardware::{BoardInfo, Hardware, WifiStatus};
+use crate::hardware::{BoardInfo, Hardware, MicReader, WifiStatus};
 use crate::http::{EventSink, EventStreamGate, EventStreamSlot, Handler, Request, Response, StreamBody};
 use crate::llm;
 use crate::llm::{ChatTransport, LlmConfig};
@@ -378,6 +378,9 @@ pub struct App {
     /// Slots for `GET /api/agent/stream`. A stream holds an HTTP connection for its
     /// whole life, so the cap is about the pool, not about this struct.
     streams: EventStreamGate,
+    /// One slot: the microphone has one reader, so a second `GET /api/mic/pcm` is refused
+    /// with `Retry-After` rather than splitting the samples between two clients.
+    mic_streams: EventStreamGate,
     /// The `Arc` this `App` lives in, set by [`App::attach_shared`]. An event stream
     /// outlives the request that opened it, so it polls the journal through this
     /// instead of borrowing `&mut App`. `Weak` on purpose: the `App` must not keep
@@ -570,6 +573,7 @@ impl App {
             tool_transport: None,
             model_transport: None,
             streams: EventStreamGate::new(),
+            mic_streams: EventStreamGate::with_limit(1),
             shared: Weak::new(),
             session_counter: 0,
             agent_thread: AgentThread::NotStarted,
@@ -3630,6 +3634,39 @@ impl App {
         Response::streamed(200, "text/event-stream", event_stream_body(shared, slot, after, limits))
     }
 
+    /// `GET /api/mic/pcm`: the microphone as a live `audio/pcm` stream.
+    ///
+    /// This is the reverse of `POST /audio/pcm` and the one thing `mic_record` cannot do —
+    /// that tool returns a whole WAV inside a 32 KB tool result, which is half a second. A
+    /// stream lets a host record for as long as it likes, or hear the board live.
+    ///
+    /// The reader owns the I²S handle, so the loop below never takes the application lock:
+    /// a 20 ms read under that lock, for the length of a stream, is the board answering
+    /// nothing else, which is the serialization this project keeps refusing.
+    fn mic_stream(&mut self, req: &Request) -> Response {
+        if let Err(r) = self.require_read(req) {
+            return r;
+        }
+        let Some(reader) = self.hw.mic_reader() else {
+            return Response::error_json(503, "no microphone on this board; `mic_record` needs one too");
+        };
+        // One reader, one slot: a second client would take half the samples each and
+        // neither would get a stream. Refused while the connection is still cheap.
+        let Some(slot) = self.mic_streams.acquire() else {
+            return Response::error_json(503, "the microphone is already being streamed")
+                .with_header("Connection", "close")
+                .with_header("Retry-After", "5");
+        };
+        self.log.info("audio", format!("microphone stream opened for {}", req.peer));
+        let body = mic_stream_body(reader, slot, self.log.clone(), req.peer.clone());
+        Response::streamed(200, "audio/pcm", body)
+            .with_header("Cache-Control", "no-cache")
+            .with_header("X-Audio-Format", "pcm_s16le")
+            .with_header("X-Rate-Hz", &crate::drivers::audio::MIC_RATE_HZ.to_string())
+            .with_header("X-Channels", "1")
+            .with_header("X-Bits", "16")
+    }
+
     fn agent_config_apply(&mut self, req: &Request) -> Response {
         let body = match req.json() {
             Ok(v) => v,
@@ -4528,7 +4565,10 @@ impl App {
             }
             // The same journal as a live stream: replay from `after`, then follow.
             // Contract (frozen): docs/agent-stream.md §1.
-            ("GET", "/api/agent/stream") => self.agent_stream(req),
+            ("GET", "/api/agent/stream") => self.agent_stream(req), // The microphone as a chunked PCM16LE mono stream: the reverse direction of
+            // `POST /audio/pcm`, and the one thing `mic_record` cannot do (it returns a
+            // whole WAV, and a tool result is 32 KB).
+            ("GET", "/api/mic/pcm") => self.mic_stream(req),
             ("POST", "/api/agent/message") => {
                 if let Err(r) = self.require_pin(req) {
                     return r;
@@ -7937,6 +7977,73 @@ fn next_sse_frames(shared: &Mutex<App>, after: u64) -> (Vec<String>, u64) {
 /// The app lock is taken once per poll and released at the end of each statement -
 /// never held across the life of the connection, so the portal, `/api/status` and
 /// the agent thread itself keep working while a console is open.
+/// One write's worth of the microphone: 200 samples, which is exactly one RX DMA descriptor
+/// (`dma_frame_num = 200` frames, 8 bytes of stereo 32-bit each). Aligned like this, one read
+/// waits for one descriptor instead of straddling two — the same boundary wait that made
+/// playback drag by 13% before the transmit ring was given 8 descriptors (see `docs/audio.md`
+/// §6). 200 samples is 12.5 ms of audio, so a chunk every 12.5 ms is still live.
+const MIC_STREAM_BLOCK: usize = 200;
+
+/// How long one `GET /api/mic/pcm` connection may stay open. A stream is a budget, not a
+/// promise: a client that forgets it must not hold a socket pool slot until the board is
+/// reflashed.
+const MIC_STREAM_MAX_MS: u128 = 120_000;
+
+/// The body of `GET /api/mic/pcm`: read a block, convert it, send it, repeat until the
+/// client leaves or the budget runs out.
+///
+/// The left-justified 24-bit samples become the 16-bit PCM the rest of the board uses
+/// (`mic_record` does the same shift), so a host can write the bytes straight to a WAV.
+fn mic_stream_body(
+    mut reader: Box<dyn MicReader>,
+    slot: EventStreamSlot,
+    log: Arc<LogBuf>,
+    peer: String,
+) -> StreamBody {
+    Box::new(move |sink: &mut dyn EventSink| {
+        // Held for the life of the body: the slot goes back however the stream ends.
+        let _slot = slot;
+        let started = std::time::Instant::now();
+        let mut samples = vec![0i32; MIC_STREAM_BLOCK];
+        let mut bytes = Vec::with_capacity(MIC_STREAM_BLOCK * 2);
+        let mut sent = 0usize;
+        let mut failure: Option<String> = None;
+        while started.elapsed().as_millis() < MIC_STREAM_MAX_MS {
+            let got = match reader.read(&mut samples, 200) {
+                // A timeout with nothing to give is normal on a quiet microphone.
+                Ok(0) => {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                    continue;
+                }
+                Ok(n) => n.min(MIC_STREAM_BLOCK),
+                Err(e) => {
+                    failure = Some(e.message.clone());
+                    break;
+                }
+            };
+            bytes.clear();
+            for s in &samples[..got] {
+                bytes.extend_from_slice(&((*s >> 16) as i16).to_le_bytes());
+            }
+            if sink.send(&bytes).is_err() {
+                // The client hung up. That ends the stream, not the board.
+                break;
+            }
+            sent += got;
+        }
+        let seconds = sent as f64 / f64::from(crate::drivers::audio::MIC_RATE_HZ);
+        match failure {
+            Some(why) => log
+                .error("audio", format!("microphone stream for {peer} stopped: {why} after {sent} samples")),
+            None => log.info(
+                "audio",
+                format!("microphone stream for {peer} closed: {sent} samples ({seconds:.1} s)"),
+            ),
+        }
+        Ok(())
+    })
+}
+
 fn event_stream_body(shared: Shared, slot: EventStreamSlot, after: u64, limits: StreamLimits) -> StreamBody {
     Box::new(move |sink: &mut dyn EventSink| {
         // Owned here so every exit path - idle close, total close, failed write -
@@ -17710,5 +17817,94 @@ str(queued) + "/" + str(a.ok) + "/" + str(again.ok) + "/" + str(task_state(secon
             "a file became a directory: {body}"
         );
         assert_eq!(body["total_max"], WORKSPACE_TOTAL_MAX, "{body}");
+    }
+
+    /// Stands in for a socket that goes away: it takes a few chunks and then behaves like a
+    /// closed connection, which is how a microphone stream ends in the field.
+    struct DropAfter {
+        bytes: Vec<u8>,
+        left: usize,
+        chunks: usize,
+    }
+
+    impl EventSink for DropAfter {
+        fn send(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+            if self.left == 0 {
+                return Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "client left"));
+            }
+            self.left -= 1;
+            self.chunks += 1;
+            self.bytes.extend_from_slice(bytes);
+            Ok(())
+        }
+    }
+
+    /// A board with a microphone, without probing every bus.
+    fn app_with_mic() -> App {
+        let mut app = test_app();
+        app.hw
+            .i2s_setup(Some(crate::boards::I2sPins { bclk: 15, ws: 16, din: 14, dout: -1 }), None)
+            .expect("the virtual board has an I2S microphone when it is given pins");
+        app
+    }
+
+    /// `GET /api/mic/pcm` is a stream of the microphone: `audio/pcm`, 16-bit, one channel,
+    /// at the microphone's own rate, and the bytes are the 16-bit form `mic_record` writes.
+    #[test]
+    fn the_microphone_streams_pcm16_at_its_own_rate() {
+        let mut app = app_with_mic();
+        let resp = app.route(&get("/api/mic/pcm"));
+        assert_eq!(resp.status, 200, "a board with a microphone streams it");
+        let header = |name: &str| {
+            resp.headers
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case(name))
+                .map(|(_, v)| v.clone())
+                .unwrap_or_else(|| panic!("no {name} header: {:?}", resp.headers))
+        };
+        assert_eq!(header("content-type"), "audio/pcm");
+        assert_eq!(header("x-audio-format"), "pcm_s16le");
+        assert_eq!(header("x-rate-hz"), crate::drivers::audio::MIC_RATE_HZ.to_string());
+        assert_eq!(header("x-channels"), "1");
+        assert_eq!(header("x-bits"), "16");
+
+        let body = resp.stream.expect("a streamed response");
+        let mut sink = DropAfter { bytes: Vec::new(), left: 4, chunks: 0 };
+        body(&mut sink).expect("the stream ends cleanly when the client leaves");
+        assert_eq!(sink.chunks, 4, "four chunks, then the sink refused");
+        assert_eq!(sink.bytes.len(), 4 * MIC_STREAM_BLOCK * 2, "16-bit samples, no padding");
+        // The virtual microphone is a 440 Hz tone: 16-bit, so some samples are not zero.
+        let samples: Vec<i16> =
+            sink.bytes.chunks_exact(2).map(|c| i16::from_le_bytes([c[0], c[1]])).collect();
+        assert!(samples.iter().any(|s| *s != 0), "silence is not a stream of a tone");
+        assert!(samples.iter().any(|s| *s != samples[0]), "a constant is not a tone");
+    }
+
+    /// A board without a microphone says so instead of opening a stream that would never
+    /// carry a byte.
+    #[test]
+    fn the_microphone_stream_is_refused_without_a_microphone() {
+        let mut app = test_app();
+        assert!(app.hw.mic_reader().is_none(), "the fixture has no I2S at all");
+        let resp = app.route(&get("/api/mic/pcm"));
+        assert_eq!(resp.status, 503, "{:?}", body_json(&resp));
+        assert!(body_json(&resp)["error"].as_str().unwrap().contains("microphone"));
+    }
+
+    /// One reader, one slot: a second client is refused with `Retry-After` rather than given
+    /// half the samples, and the slot comes back when the first stream lets go.
+    #[test]
+    fn a_second_microphone_stream_is_refused_and_the_slot_comes_back() {
+        let mut app = app_with_mic();
+        let held = app.mic_streams.acquire().expect("the first slot");
+        let resp = app.route(&get("/api/mic/pcm"));
+        assert_eq!(resp.status, 503);
+        assert!(
+            resp.headers.iter().any(|(k, v)| k.eq_ignore_ascii_case("retry-after") && v == "5"),
+            "a client has to be told when to come back: {:?}",
+            resp.headers
+        );
+        drop(held);
+        assert_eq!(app.route(&get("/api/mic/pcm")).status, 200, "the slot came back");
     }
 }

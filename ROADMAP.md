@@ -5,7 +5,7 @@ what is not done or not verified.
 
 ## Verified / unverified
 
-- ✅ `agent-core`: 980 unit tests and 9 integration tests (protocol, HTTP, manifest
+- ✅ `agent-core`: 983 unit tests and 9 integration tests (protocol, HTTP, manifest
   validation, driver conversion, capability filtering, auth, hot reload, the agent loop,
   shell and script, the file tools, sched, SSE streams, a streamed request body)
 - ✅ Simulator end to end: the PowerShell smoke gate; `scripts/smoke.sh` is the Unix

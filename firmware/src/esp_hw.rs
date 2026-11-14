@@ -672,13 +672,19 @@ impl Hardware for EspHw {
     }
 
     fn i2s_out_write(&mut self, samples: &[i16]) -> Result<()> {
-        if self.i2s_tx.is_null() {
-            return Err(McpError::unsupported("no I2S speaker on this board"));
+        if self.i2s_tx.is_null() {            return Err(McpError::unsupported("no I2S speaker on this board"));
         }
         // One writer at a time: the background player may be mid-chunk, and two streams
         // interleaved into one DMA ring is noise, not a race that resolves itself.
         let _busy = self.media_writing.lock().unwrap_or_else(|p| p.into_inner());
         crate::media::write_chunk(self.i2s_tx, samples)
+    }
+
+    fn mic_reader(&mut self) -> Option<Box<dyn esp32_agent_core::hardware::MicReader>> {
+        if self.i2s_rx.is_null() {
+            return None;
+        }
+        Some(Box::new(EspMicReader { rx: self.i2s_rx }))
     }
 
     fn media_submit(&mut self, samples: &[i16], rate_hz: u32) -> Result<u64> {
@@ -942,6 +948,50 @@ fn i2s_channel(
         Ok(handle)
     }
 }
+
+/// The microphone, for `GET /api/mic/pcm`, without the application lock.
+///
+/// The stream asks for this once and then reads every 20 ms from an HTTP worker. Sharing
+/// the channel with `mic_record` is the same rule the speaker has: one reader at a time,
+/// and the driver serializes what it can.
+struct EspMicReader {
+    rx: sys::i2s_chan_handle_t,
+}
+
+// The handle is an opaque driver pointer; the driver is thread-safe for one reader and
+// the stream holds this reader for its whole life.
+unsafe impl Send for EspMicReader {}
+
+impl esp32_agent_core::hardware::MicReader for EspMicReader {
+    fn read(
+        &mut self,
+        out: &mut [i32],
+        timeout_ms: u32,
+    ) -> esp32_agent_core::error::Result<usize> {
+        // Stereo frames, the microphone's data in the left word and zeros in the right:
+        // read whole frames and keep every other word, as `i2s_mic_read` does.
+        let mut raw = vec![0i32; out.len().saturating_mul(2)];
+        let mut got: usize = 0;
+        let rc = unsafe {
+            sys::i2s_channel_read(
+                self.rx,
+                raw.as_mut_ptr() as *mut core::ffi::c_void,
+                raw.len() * core::mem::size_of::<i32>(),
+                &mut got,
+                timeout_ms,
+            )
+        };
+        if rc != 0 && rc != sys::ESP_ERR_TIMEOUT {
+            return Err(McpError::hardware(format!("i2s microphone read returned {rc}")));
+        }
+        let frames = (got / (2 * core::mem::size_of::<i32>())).min(out.len());
+        for i in 0..frames {
+            out[i] = raw[i * 2];
+        }
+        Ok(frames)
+    }
+}
+
 // ---------------------------------------------------------------- WS2812 helpers
 
 impl EspHw {

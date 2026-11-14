@@ -188,6 +188,25 @@ impl FakeI2c {
     }
 }
 
+/// The virtual microphone as a stream reader, so `GET /api/mic/pcm` can be exercised on a
+/// host: the same 440 Hz tone `i2s_mic_read` generates.
+struct VirtualMicReader {
+    start: std::time::Instant,
+}
+
+impl crate::hardware::MicReader for VirtualMicReader {
+    fn read(&mut self, out: &mut [i32], _timeout_ms: u32) -> Result<usize> {
+        let t = self.start.elapsed().as_micros() as f32 / 1_000_000.0;
+        let rate = crate::drivers::audio::MIC_RATE_HZ as f32;
+        for (i, s) in out.iter_mut().enumerate() {
+            let phase = 2.0 * std::f32::consts::PI * 440.0 * (t + i as f32 / rate);
+            let wobble = 1.0 + 0.1 * (i as f32 * 0.01).sin();
+            *s = (phase.sin() * 3280.0 * wobble) as i32 * 65_536;
+        }
+        Ok(out.len())
+    }
+}
+
 pub struct VirtualBoard {
     pub i2c: Vec<FakeI2c>,
     pub gpio_out: BTreeMap<i32, bool>,
@@ -548,6 +567,15 @@ impl Hardware for VirtualBoard {
         }
         self.i2s_written = self.i2s_written.saturating_add(samples.len() as u64);
         Ok(())
+    }
+
+    /// The same 440 Hz tone `i2s_mic_read` produces, as a reader the microphone stream can
+    /// own: the simulator and the tests then see bytes shaped like the real microphone's.
+    fn mic_reader(&mut self) -> Option<Box<dyn crate::hardware::MicReader>> {
+        if !self.i2s_mic {
+            return None;
+        }
+        Some(Box::new(VirtualMicReader { start: std::time::Instant::now() }))
     }
 
     fn ring_set(&mut self, pin: i32, rgb: (u8, u8, u8), _count: u16) -> Result<()> {

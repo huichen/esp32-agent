@@ -238,7 +238,11 @@ fn run(
     // original interface instead of leaking a second one.
     let _old_ap_netif = wifi.swap_netif_ap(ap_netif)?;
 
-    let with_ap = ap_fallback || ssid.is_empty();
+    // `wifi.keep_ap` is part of the boot configuration, not something to fix up later: the
+    // access point has to be *configured* before the driver starts, and re-applying the
+    // configuration mid-association is what stopped a freshly booted board from joining its
+    // network at all (2026-11-14: `Haven't to connect to a suitable AP now` for two minutes).
+    let with_ap = ap_fallback || keep_ap || ssid.is_empty();
     let configuration = if ssid.is_empty() {
         Configuration::AccessPoint(ap_config(&ap_ssid, &ap_password))
     } else if with_ap {
@@ -452,7 +456,11 @@ fn run(
             ap_open_ticks = ap_open_ticks.saturating_add(1);
             if ap_open_ticks >= 10 {
                 ap_open_ticks = 0;
-                match ap_switch(&mut wifi, true, &live, &ssid, &password) {
+                // Mode only, no `set_configuration`: the access point was configured at boot
+                // (see `with_ap`), and re-applying the configuration here aborts an
+                // association that is still in progress — which is exactly what happened to a
+                // board whose only fault was that the switch was on.
+                match ap_mode_only(true) {
                     Ok(note) => {
                         ap_closed = false;
                         log.info("wifi", format!("access point {note} (wifi.keep_ap is on)"));
@@ -726,6 +734,36 @@ fn scan_now(wifi: &mut EspWifi<'static>) -> anyhow::Result<Vec<WifiAp>> {
 /// report `ap+sta` (from a netif that keeps its address) while no beacon existed at all. The
 /// mode is read back, so the answer is the one the radio is in rather than the one we asked
 /// for.
+/// Switch the radio between station-only and AP+station without touching its configuration.
+///
+/// The access point's configuration is part of the boot configuration, so keeping it up is a
+/// mode change. `ap_switch` is for the console's explicit command, where reconnecting the
+/// station is part of the deal.
+fn ap_mode_only(open: bool) -> anyhow::Result<String> {
+    let mode = if open {
+        sys::wifi_mode_t_WIFI_MODE_APSTA
+    } else {
+        sys::wifi_mode_t_WIFI_MODE_STA
+    };
+    let rc = unsafe { sys::esp_wifi_set_mode(mode) };
+    if rc != 0 {
+        return Err(anyhow::anyhow!("esp_wifi_set_mode returned {rc}"));
+    }
+    let mut now: sys::wifi_mode_t = 0;
+    let rc = unsafe { sys::esp_wifi_get_mode(&mut now) };
+    if rc != 0 {
+        return Err(anyhow::anyhow!("esp_wifi_get_mode returned {rc}"));
+    }
+    let ap_on = now & sys::wifi_mode_t_WIFI_MODE_AP != 0;
+    if ap_on != open {
+        return Err(anyhow::anyhow!(
+            "the radio is in mode {now}, so the access point is {}",
+            if ap_on { "on" } else { "off" }
+        ));
+    }
+    Ok(if open { format!("up beside the station, mode {now}") } else { format!("closed; station stays, mode {now}") })
+}
+
 fn ap_switch(
     wifi: &mut EspWifi<'static>,
     open: bool,

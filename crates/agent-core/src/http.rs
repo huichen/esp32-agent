@@ -77,17 +77,33 @@ pub trait EventSink {
 pub type StreamBody = Box<dyn FnOnce(&mut dyn EventSink) -> std::io::Result<()> + Send>;
 
 /// The cap on concurrent event streams, shared by everything that opens one.
-///
 /// A slot is taken before the socket commits to a long write, so a third client is
 /// refused while its request is still cheap to answer with a 503.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct EventStreamGate {
     taken: Arc<AtomicUsize>,
+    limit: usize,
+}
+
+impl Default for EventStreamGate {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl EventStreamGate {
     pub fn new() -> Self {
-        Self::default()
+        Self::with_limit(MAX_EVENT_STREAMS)
+    }
+
+    /// A gate for a stream that is not an event stream — a microphone has one reader, so
+    /// its gate is one slot and a second client is refused instead of splitting samples.
+    pub fn with_limit(limit: usize) -> Self {
+        Self { taken: Arc::new(AtomicUsize::new(0)), limit: limit.max(1) }
+    }
+
+    pub fn limit(&self) -> usize {
+        self.limit
     }
 
     /// How many streams hold a slot right now.
@@ -95,11 +111,11 @@ impl EventStreamGate {
         self.taken.load(Ordering::SeqCst)
     }
 
-    /// Take a slot, or `None` when [`MAX_EVENT_STREAMS`] are already open.
+    /// Take a slot, or `None` when this gate's limit is already open.
     pub fn acquire(&self) -> Option<EventStreamSlot> {
         let mut cur = self.taken.load(Ordering::SeqCst);
         loop {
-            if cur >= MAX_EVENT_STREAMS {
+            if cur >= self.limit {
                 return None;
             }
             match self.taken.compare_exchange(cur, cur + 1, Ordering::SeqCst, Ordering::SeqCst) {
