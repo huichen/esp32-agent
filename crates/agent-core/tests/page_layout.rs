@@ -711,8 +711,76 @@ fn chrome_allows_port(port: u16) -> bool {
 /// files and the origin is a normal one (`localStorage`, `fetch` and the module-scope
 /// helpers behind `showAttach` all behave as they do on the board).
 fn page() -> String {
-    INDEX_HTML.replace("</body>", &format!("{MEASURE_JS}{CLEAR_JS}</body>"))
+    INDEX_HTML.replace("</body>", &format!("{MEASURE_JS}{CLEAR_JS}{COMPOSER_JS}</body>"))
 }
+
+/// The composer's behaviour, measured in a real page: Enter makes a new line instead of
+/// sending, an IME confirmation does nothing, ctrl/cmd+Enter sends, a second line grows the
+/// field, and the whole row stays inside a viewport shrunk to a keyboard height.
+///
+/// Every claim here was previously a comment. "Enter sends" and "the keyboard covers the
+/// field" are both things a source-level assertion cannot see.
+const COMPOSER_JS: &str = r##"
+<script>
+window.__esp32Composer = async function () {
+  const q = (s) => document.querySelector(s);
+  const input = q("#input");
+  const sent = [];
+  const nativeFetch = window.fetch;
+  window.fetch = async (url, opts = {}) => {
+    const path = new URL(url, location.href).pathname;
+    if (path === "/api/agent/message") {
+      sent.push(String(opts.body || ""));
+      return new Response(JSON.stringify({ queued: true }), {
+        status: 202, headers: { "Content-Type": "application/json" } });
+    }
+    if (path === "/api/agent/history" || path === "/api/agent/events")
+      return new Response(JSON.stringify({ messages: [], events: [], seq: 0 }), {
+        status: 200, headers: { "Content-Type": "application/json" } });
+    return nativeFetch(url, opts);
+  };
+  const press = (init) => {
+    const event = new KeyboardEvent("keydown", Object.assign(
+      { key: "Enter", bubbles: true, cancelable: true }, init));
+    input.dispatchEvent(event);
+    return event.defaultPrevented;
+  };
+
+  input.value = "first line";
+  const enterPrevented = press({});
+  const afterEnter = sent.length;
+  const imePrevented = press({ isComposing: true });
+  const afterIme = sent.length;
+  const chordPrevented = press({ ctrlKey: true });
+  await new Promise((r) => setTimeout(r, 30));
+  const afterChord = sent.length;
+
+  // A second line has to make the field taller, not scroll inside one row.
+  input.value = "";
+  autosize();
+  const oneLine = input.getBoundingClientRect().height;
+  input.value = "first\nsecond\nthird";
+  autosize();
+  const threeLines = input.getBoundingClientRect().height;
+
+  input.value = "typing";
+  const rowBefore = q("#composer").getBoundingClientRect();
+  // What a phone reports while the keyboard is up.
+  document.documentElement.style.setProperty("--vvh", "480px");
+  const rowShrunk = q("#composer").getBoundingClientRect();
+  document.documentElement.style.setProperty("--vvh", "844px");
+
+  return {
+    enterPrevented: enterPrevented, afterEnter: afterEnter,
+    imePrevented: imePrevented, afterIme: afterIme,
+    chordPrevented: chordPrevented, afterChord: afterChord,
+    sentBodies: sent, oneLine: oneLine, threeLines: threeLines,
+    rowBottomNormal: rowBefore.bottom, rowBottomShrunk: rowShrunk.bottom,
+    rowHeightShrunk: rowShrunk.height, viewportShrunk: 480,
+  };
+};
+</script>
+"##;
 
 /// The harness: one iframe per phone width, because an iframe *is* the viewport — that is
 /// the only way to get a fixed-position composer measured at 390 px without depending on
@@ -740,6 +808,7 @@ async function measure() {{
   const out = await Promise.all(frames.map(async ({{ w, f }}) => {{
     const metrics = f.contentWindow.__esp32Measure();
     metrics.clear = await f.contentWindow.__esp32Clear();
+    metrics.composer = await f.contentWindow.__esp32Composer();
     return {{ requested: w, metrics }};
   }}));
   document.body.dataset.esp32Layout = encodeURIComponent(JSON.stringify(out));
@@ -1381,6 +1450,67 @@ fn the_composer_fits_a_phone_screen() {
             );
         }
         assert_conversation_clear(metrics, *width);
+    }
+}
+
+/// Enter starts a new line, an IME confirmation sends nothing, cmd/ctrl+Enter sends, and the
+/// row stays inside a viewport the keyboard has shrunk.
+///
+/// The keyboard case is the one that kept coming back: binding `body` to the visual viewport
+/// is only half of it, and the previous attempt trusted a single `visualViewport.height`
+/// reading taken too early.
+#[test]
+fn enter_starts_a_new_line_and_the_row_stays_above_the_keyboard() {
+    let browser = browser();
+    let url = format!("{}/harness", serve());
+    let dom = dump_dom(&browser, &url);
+    let measured = measurements(&dom);
+
+    for width in PHONE_WIDTHS {
+        let metrics = measured
+            .get(width)
+            .unwrap_or_else(|| panic!("no measurement for {width} px; harness said {measured:?}"));
+        let c = &metrics["composer"];
+        assert!(!c.is_null(), "{width} px: the composer fixture did not run");
+
+        // Enter is a newline, and the page must not claim the keystroke.
+        assert_eq!(
+            c["enterPrevented"], false,
+            "{width} px: Enter was swallowed, so it cannot make a new line"
+        );
+        assert_eq!(c["afterEnter"], 0, "{width} px: Enter sent the message: {}", c["sentBodies"]);
+        // An IME confirming a candidate must not send either.
+        assert_eq!(c["afterIme"], 0, "{width} px: an IME confirmation sent the message");
+        // The explicit chord does send, exactly once.
+        assert_eq!(c["chordPrevented"], true, "{width} px: ctrl+Enter was not handled");
+        assert_eq!(c["afterChord"], 1, "{width} px: ctrl+Enter sent {} messages", c["afterChord"]);
+        assert!(
+            c["sentBodies"][0].as_str().unwrap_or("OK").contains("first line"),
+            "{width} px: the wrong text was sent: {}",
+            c["sentBodies"]
+        );
+
+        // More lines, a taller field: three lines cannot fit in one row.
+        let one = c["oneLine"].as_f64().unwrap_or(f64::NAN);
+        let three = c["threeLines"].as_f64().unwrap_or(f64::NAN);
+        assert!(one >= 30.0, "{width} px: a single-line field measured {one:.1} px");
+        assert!(
+            three > one + 10.0,
+            "{width} px: three lines measured {three:.1} px against {one:.1} for one line, so the field is not growing"
+        );
+
+        // The keyboard case: `--vvh` shrunk to 480 px, the row must end above it.
+        let bottom = c["rowBottomShrunk"].as_f64().unwrap_or(f64::NAN);
+        let visible = c["viewportShrunk"].as_f64().unwrap_or(480.0);
+        assert!(
+            bottom <= visible + 0.5,
+            "{width} px: with the keyboard up the composer ends at y={bottom:.1}, past the {visible:.0} px visible area "
+        );
+        assert!(
+            c["rowHeightShrunk"].as_f64().unwrap_or(0.0) > 30.0,
+            "{width} px: the composer collapsed to {} px with the keyboard up",
+            c["rowHeightShrunk"]
+        );
     }
 }
 
