@@ -20,7 +20,11 @@ use std::time::Duration;
 
 pub const MAX_HEADER_BYTES: usize = 8 * 1024;
 pub const MAX_BODY_BYTES: usize = 1024 * 1024;
-pub const MAX_CONNECTIONS: usize = 6;
+// A browser keeps its own keep-alive sockets open while it loads a page, so a phone
+// viewing the console can hold most of the budget before a second client asks for
+// anything. Twelve sockets are cheap (a permit and a descriptor); the expensive part,
+// request workers, stays at four. The old six produced `net::ERR` on subresources.
+pub const MAX_CONNECTIONS: usize = 12;
 const IDLE_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// Four preallocated request/handshake/stream stacks, shared by both listeners.
@@ -1114,6 +1118,7 @@ fn accept_loop(
     // return sockets to a new server after this receiver has been dropped.
     let (returned, returns) = sync_channel(MAX_CONNECTIONS);
     let mut pending: Vec<PendingConnection> = Vec::new();
+    let mut refused: u32 = 0;
     while !stop.load(Ordering::SeqCst) {
         while let Ok(conn) = returns.try_recv() {
             pending.push(conn);
@@ -1124,7 +1129,17 @@ fn accept_loop(
                 match listener.accept() {
                     Ok((stream, peer)) => {
                         let Some(connection) = Permit::take(&budget.connections, MAX_CONNECTIONS) else {
-                            continue; // Saturated: close without parsing or blocking writes.
+                            // Saturated: close without parsing or blocking writes. Say so once
+                            // in a while, because from the other side this is indistinguishable
+                            // from a network fault.
+                            refused = refused.saturating_add(1);
+                            if refused == 1 || refused % 32 == 0 {
+                                log.warn(
+                                    "http",
+                                    format!("connection refused: {refused} so far, all {MAX_CONNECTIONS} slots taken"),
+                                );
+                            }
+                            continue;
                         };
                         let conn = PendingConnection {
                             stream,
