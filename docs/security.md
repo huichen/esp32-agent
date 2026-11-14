@@ -53,6 +53,31 @@ permission. An explicit disable answers with an error rather than a successful e
 name remains callable. These switches govern tools, not the owner's PIN-authorized HTTP
 configuration routes. A caller that can change the configuration can change the switches.
 
+## What a tool cannot do
+
+Two things are refused at the tool surface, whoever the caller is, because neither has a way
+back from the outside.
+
+**A pin the board profile reserves.** The SPI flash and PSRAM lines are inside the GPIO range a
+manifest may name, and claiming one is not a failed call: it takes down the core that is
+executing from it. The configuration and the manifest are both persisted, so it takes the
+board down at every boot afterwards and the recovery is erasing the chip over serial. Every
+edge that can name a pin refuses one — `manifest` validation (a device's `pins` and an `exec`
+primitive), `config_set` and `POST /api/config` (`pins`, a bus's SDA/SCL, `bus.onewire_pins`),
+and the raw `bus` tools (`gpio_write`, `gpio_mode`, `adc_read`). `inventory` lists what a
+profile reserves; `board_profile.reserved_pins` is the same list. A device already stored from
+before that rule is skipped by the probe and reported, rather than instantiated at boot.
+
+**The portal PIN and the MCP token, from a tool call.** `config_set` refuses
+`auth.portal_pin` and `auth.mcp_token`: the caller would be the only one who knows the value,
+and a model asked to "make the board secure" used to be able to lock the owner out of their own
+board with a serial erase as the only way back. `POST /api/config` still accepts both — it asks
+for the current PIN when one is set, so the owner can set them deliberately.
+
+A scheduled prompt has a floor of ten seconds (`every_s`), because it costs a model call and
+the board has one agent thread: below that the next one is due before the last turn finished,
+which took the board off the network and put a turn per second on the owner's bill.
+
 ## TLS
 
 Port 443 serves the same routes with a certificate the board generates on first boot (EC

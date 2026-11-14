@@ -27,6 +27,51 @@ pub mod manifest_tools;
 
 pub use manifest_tools::{manifest_members, manifest_tools};
 
+/// Refuse a pin the board profile reserves before any hardware call touches it.
+///
+/// `gpio_config` on the SPI flash or PSRAM lines does not return an error — it takes the core
+/// that is executing down with it, and the board reboots. The profile knows which pins those
+/// are (`boards::BoardProfile::pin_problem`), and this is the one place the raw bus tools ask.
+fn refuse_reserved(ctx: &ToolCtx<'_>, pin: i32) -> crate::error::Result<()> {
+    match ctx.profile.pin_problem(pin) {
+        Some(why) => Err(McpError::invalid_params(why).with_data(json!({
+            "pin": pin,
+            "reserved": ctx.profile.reserved,
+            "profile": ctx.profile.id,
+        }))),
+        None => Ok(()),
+    }
+}
+
+/// Refuse the parts of a config patch that a tool call must not be able to change.
+///
+/// Each one is a write with no way back from the outside:
+///
+/// * `pins` (and a bus's SDA/SCL, and a 1-Wire probe pin) naming a pin the profile reserves.
+///   The SPI flash and PSRAM lines do not report an error when they are claimed, they take the
+///   board down — and the config is persisted, so the next boot does it again. That is a brick
+///   with a reboot in front of it, not a bad call.
+/// * `auth.portal_pin` / `auth.mcp_token`: whoever sets one is the only one who knows it. A
+///   model asked to "make the board safer" can lock the owner out of their own board, and the
+///   only recovery is a serial erase. The authenticated route `POST /api/config` still accepts
+///   both, so the owner can set them deliberately.
+fn refuse_dangerous_config(ctx: &ToolCtx<'_>, patch: &Value) -> crate::error::Result<()> {
+    if let Some(why) = crate::config::reserved_pin_problem(ctx.profile, patch) {
+        return Err(McpError::invalid_params(why).with_data(json!({
+            "reserved": ctx.profile.reserved,
+            "profile": ctx.profile.id,
+        })));
+    }
+    if let Some(key) = crate::config::sets_a_credential(patch) {
+        return Err(McpError::forbidden(format!(
+            "`auth.{key}` cannot be set from a tool call: the caller would be the only one who \
+             knows it, and the only way back is erasing the board. Set it from the portal, or \
+             with `POST /api/config` and the current PIN"
+        )));
+    }
+    Ok(())
+}
+
 /// Default I2C bus index for tools that omit `bus`.
 fn default_bus(ctx: &mut ToolCtx) -> u8 {
     ctx.cfg.bus.i2c.first().map(|b| b.bus).unwrap_or(0)
@@ -352,6 +397,7 @@ pub fn board_tools() -> Vec<ToolDef> {
             .bind(|ctx, args| {
                 let pin = j::required_ranged_i64(args, "pin", 0, 48)? as i32;
                 let level = j::required_ranged_i64(args, "level", 0, 1)? != 0;
+                refuse_reserved(ctx, pin)?;
                 ctx.hw.gpio_config(pin, PinMode::Output)?;
                 ctx.hw.gpio_write(pin, level)?;
                 Ok(json!({ "ok": true, "pin": pin, "level": if level { 1 } else { 0 } }))
@@ -370,6 +416,7 @@ pub fn board_tools() -> Vec<ToolDef> {
             .mutating()
             .bind(|ctx, args| {
                 let pin = j::required_ranged_i64(args, "pin", 0, 48)? as i32;
+                refuse_reserved(ctx, pin)?;
                 let m = j::str_arg(args, "mode")?;
                 let mode = PinMode::parse(&m)
                     .ok_or_else(|| McpError::invalid_params(format!("unknown mode `{m}`")))?;
@@ -383,6 +430,7 @@ pub fn board_tools() -> Vec<ToolDef> {
             .schema(object_schema(&[("pin", integer(0, 48, "ADC-capable GPIO"))], &["pin"]))
             .bind(|ctx, args| {
                 let pin = j::required_ranged_i64(args, "pin", 0, 48)? as i32;
+                refuse_reserved(ctx, pin)?;
                 let mv = ctx.hw.adc_mv(pin)?;
                 Ok(json!({ "pin": pin, "millivolts": mv, "volts": (mv as f32 / 1000.0 * 1000.0).round() / 1000.0 }))
             }),
@@ -446,6 +494,16 @@ pub fn system_tools() -> Vec<ToolDef> {
         ))
         .bind(|ctx, args| {
             let patch = j::field(args, "patch").cloned().unwrap_or_else(|| args.clone());
+            // Two things a *tool call* may not do, both because there is no way back from them
+            // for the person who owns the board:
+            //
+            // * a pin the profile reserves — the SPI flash/PSRAM lines take the board down, and
+            //   the config is persisted, so it takes it down at every boot afterwards;
+            // * the portal PIN and the MCP token — a caller that sets one locks the portal (or
+            //   every MCP client) out, and the only recovery is erasing the board over serial.
+            //   Both stay reachable over `POST /api/config`, which asks for the current PIN when
+            //   one is set, so the owner can still do it deliberately.
+            refuse_dangerous_config(ctx, &patch)?;
             let touched = ctx.cfg.apply_patch(&patch)?;
             ctx.runtime.config_dirty = true;
             ctx.log.info("config", format!("patched: {}", touched.join(", ")));
@@ -484,7 +542,7 @@ pub fn system_tools() -> Vec<ToolDef> {
                 ("prompt", string("what to ask the board's model when it fires")),
                 ("script", string("a board script to run instead of asking the model; costs no tokens")),
                 ("after_s", integer(1, 86_400, "fire once this many seconds from now, then remove the task")),
-                ("every_s", integer(0, 86_400, "repeat every N s; 0 = use at_hhmm")),
+                ("every_s", integer(0, 86_400, "repeat every N s; a prompt task needs 10 or more, a script task any; 0 = use at_hhmm")),
                 ("at_hhmm", string("daily \"07:30\" (UTC)")),
                 ("enabled", boolean("default true")),
             ],
