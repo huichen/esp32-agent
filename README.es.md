@@ -49,6 +49,8 @@ La placa no tiene credenciales WiFi, así que levanta un punto de acceso llamado
 contraseña, guarda. Van a NVS y la placa se reconecta. Hasta entonces no alcanza nada fuera de
 la red local: ni el endpoint del modelo, ni un espejo de paquetes.
 
+Para flashear la imagen precompilada en lugar de compilar: descarga `esp32-agent-v<version>.bin` desde la [última versión](https://github.com/huichen/esp32-agent/releases/latest), una imagen combinada del bootloader, la tabla de particiones y la aplicación, y escríbela desde 0x0 con `espflash write-bin --chip esp32s3 0x0 <file> --port COM3`. No incluye credenciales WiFi, así que la placa arranca el punto de acceso `esp32-agent-setup` la primera vez.
+
 ## Uso
 
 **En un navegador**: `http://<board>/` (o `https://<board>/`) es la consola. Hablar con el

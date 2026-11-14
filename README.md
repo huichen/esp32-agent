@@ -46,6 +46,8 @@ Join it, open `http://192.168.4.1/`, type the network name and password, save. T
 NVS and the board reconnects. Until that happens it reaches nothing outside the LAN: no
 model endpoint, no package mirror.
 
+To flash the prebuilt image instead of building: download `esp32-agent-v<version>.bin` from the [latest release](https://github.com/huichen/esp32-agent/releases/latest), a merged image of bootloader, partition table and application, and write it from 0x0 with `espflash write-bin --chip esp32s3 0x0 <file> --port COM3`. It carries no WiFi credentials, so the board starts the `esp32-agent-setup` access point on first boot.
+
 ## Use it
 
 **From a browser**: `http://<board>/` (or `https://<board>/`) is the console. Chat with the
