@@ -120,6 +120,7 @@ I²C スキャンは 8 回の実行で安定していました。TLS ページ�
 Rust ドライバーが必要なのは、タイミング、校正、状態の管理が必要な場合だけです。
 ドライバーは `CATALOG` で自身を登録します。規約は [AGENTS.md](AGENTS.md) と
 [CONTRIBUTING.md](CONTRIBUTING.md) にあります。
+変更を何で判断するか、このプロジェクトが何になることを拒むかは [VISION.md](VISION.md) にあります。
 
 ## ライセンス
 

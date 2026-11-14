@@ -105,6 +105,7 @@ agent 用 `POST /api/agent/config` 写进去——和面板发的是同一个调
 新外设从 `examples/manifests/` 下的清单片段开始；只有在涉及时序、校准或状态时才需要 Rust
 驱动。驱动在 `CATALOG` 中注册自己。约定见 [AGENTS.md](AGENTS.md) 与
 [CONTRIBUTING.md](CONTRIBUTING.md)。
+一次改动据以评判的依据，以及这个项目拒绝变成什么，见 [VISION.md](VISION.md)。
 
 ## 许可
 
