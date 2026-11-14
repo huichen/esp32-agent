@@ -14,7 +14,7 @@ curl -sS -X POST http://<board>/api/sched -H 'Content-Type: application/json' -d
 | Field | Meaning |
 |---|---|
 | `after_s` | fire once, this many seconds after the task was created, then remove the task. Use it alone: a one-shot is not combined with `every_s` or `at_hhmm` |
-| `every_s` | interval in seconds |
+| `every_s` | interval in seconds, **at least 10**: a scheduled prompt is a model call and the board has one agent thread, so a shorter interval is due before the last turn finished |
 | `at_hhmm` | `"07:30"`, in the board's local time: `tz_offset_h` (whole hours east of UTC) shifts it, and it is settable from the portal or `POST /api/config`, so no reflash is needed. Used when `every_s` is 0 |
 | `script` | a script to run instead of asking the model — costs no tokens and no call |
 | `enabled` | default true |
@@ -23,6 +23,12 @@ A task has exactly one trigger. `after_s` is the one-shot: the scheduler removes
 the same tick that fires it, so "remind me in twenty minutes" is one call and nothing to
 clean up afterwards. The agent can name its own task (`id`) when it adds one, which makes a
 second add of the same name a refusal instead of a task nobody can address.
+
+The ten-second floor on `every_s` is not politeness: with eight tasks at one second each the
+board spent every wakeup on a queued turn, answered nothing else on the network, and billed a
+model call every second. A `script` task has no such floor by intent — it costs no call — but
+it still passes through the same validation, so a pulse loop belongs in `script` with a wait,
+not in a one-second prompt.
 
 When both `prompt` and `script` are set the script wins and the prompt stays as the record of
 what the task is for. A task with neither is refused: a task that fires on schedule and does

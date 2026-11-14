@@ -171,6 +171,14 @@ or rate limiting is `-32005` (forbidden), with the range in the message.
 changes nothing.** On success it returns
 `{applied: true, revision, tools_added, tools_removed, restart_required: false}`.
 
+Two kinds of pin are refused beyond the plain `0..=48` range: a pin the board profile
+reserves, and a pin one of the SPI flash/PSRAM lines occupies. The second is not a matter of
+taste — claiming one does not fail, it takes down the core executing from it, and because the
+manifest is persisted the crash repeats at every boot until the board is erased over serial.
+`inventory` lists what the profile reserves (`board_profile.reserved_pins`), and a device
+stored from before this rule is skipped by the probe with its reason in `declared_errors`
+rather than instantiated. See [security](security.md#what-a-tool-cannot-do).
+
 ## 7. Merge and rollback
 
 - `mode: "merge"`: overwrite by `tools[].name` / `devices[].id`, keep everything else

@@ -52,12 +52,32 @@ pub struct BoardProfile {
     pub mic: Option<I2sPins>,
     pub amp: Option<I2sPins>,
     pub adc_pins: &'static [i32],
-    /// UART pins used by the console (never used for peripherals).
+    /// Pins a device may never use: the console UART, USB, and the SPI flash/PSRAM.
+    ///
+    /// The last group is not a courtesy. Those lines carry the instructions the core is
+    /// executing and the PSRAM this build allocates from, so `gpio_config` on one of them does
+    /// not fail with an error — it takes the board down. A manifest or a config that names one
+    /// is persisted, so the crash repeats at every boot until the board is erased over serial:
+    /// that is the difference between a bad call and a brick. `pin_problem` refuses them at
+    /// every edge (manifest validation, `config_set`, the raw `bus` tools, and the probe).
     pub reserved: &'static [i32],
     pub notes: &'static str,
 }
 
 const I2C_8_9: &[I2cHint] = &[I2cHint { sda: 8, scl: 9, freq_hz: 400_000 }];
+
+/// An ESP32-S3's flash and PSRAM lines, plus its USB-Serial/JTAG pins.
+///
+/// GPIO26–32 are SPI0/1 (the flash this build executes from); GPIO33–37 are the octal PSRAM's
+/// data and clock, which the 8 MB chip on these boards uses; 19/20 are USB-Serial/JTAG and
+/// 43/44 the console UART. Source: the pin-description table of the ESP32-S3 series datasheet.
+const S3_RESERVED: &[i32] = &[19, 20, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 43, 44];
+/// ESP32-C3/C2: the in-package SPI flash sits on GPIO12–17; 20/21 are the console UART.
+const C3_RESERVED: &[i32] = &[12, 13, 14, 15, 16, 17, 20, 21];
+/// ESP32-C6: SPI flash on GPIO24–30; 16/17 are the console UART.
+const C6_RESERVED: &[i32] = &[16, 17, 24, 25, 26, 27, 28, 29, 30];
+/// ESP32 (original): the integrated SPI flash is GPIO6–11; 1/3 the console UART.
+const ESP32_RESERVED: &[i32] = &[1, 3, 6, 7, 8, 9, 10, 11];
 const I2C_41_42: &[I2cHint] = &[I2cHint { sda: 41, scl: 42, freq_hz: 400_000 }];
 const I2C_21_22: &[I2cHint] = &[I2cHint { sda: 21, scl: 22, freq_hz: 400_000 }];
 const I2C_6_7: &[I2cHint] = &[I2cHint { sda: 6, scl: 7, freq_hz: 400_000 }];
@@ -75,7 +95,7 @@ pub static PROFILES: &[BoardProfile] = &[
         mic: None,
         amp: None,
         adc_pins: &[1, 2, 3, 4, 5, 6, 7, 8, 9],
-        reserved: &[19, 20, 43, 44],
+        reserved: S3_RESERVED,
         notes: "USB-Serial/JTAG on 19/20; GPIO48 is the onboard WS2812.",
     },
     BoardProfile {
@@ -94,7 +114,7 @@ pub static PROFILES: &[BoardProfile] = &[
         mic: Some(I2sPins { bclk: 5, ws: 4, din: 6, dout: -1 }),
         amp: Some(I2sPins { bclk: 15, ws: 16, din: -1, dout: 7 }),
         adc_pins: &[1, 2, 3, 4, 5, 6, 7, 8, 9],
-        reserved: &[19, 20, 43, 44],
+        reserved: S3_RESERVED,
         notes:
             "OLED SSD1306 on SDA41/SCL42, INMP441 mic (BCLK5/WS4/DIN6), MAX98357A amp (BCLK15/WS16/DOUT7), \
                 the devkit's ws2812 on GPIO48. A strip on GPIO18 is wired on this bench but is a manifest \
@@ -112,7 +132,7 @@ pub static PROFILES: &[BoardProfile] = &[
         mic: None,
         amp: None,
         adc_pins: &[32, 33, 34, 35, 36, 39],
-        reserved: &[1, 3, 6, 7, 8, 9, 10, 11],
+        reserved: ESP32_RESERVED,
         notes: "Classic WROOM-32 dev board; GPIO2 LED is active-high.",
     },
     BoardProfile {
@@ -127,7 +147,7 @@ pub static PROFILES: &[BoardProfile] = &[
         mic: None,
         amp: None,
         adc_pins: &[0, 1, 2, 3, 4],
-        reserved: &[20, 21],
+        reserved: C3_RESERVED,
         notes: "Single-core RISC-V; GPIO8 is the onboard RGB pixel.",
     },
     BoardProfile {
@@ -142,7 +162,7 @@ pub static PROFILES: &[BoardProfile] = &[
         mic: None,
         amp: None,
         adc_pins: &[0, 1, 2, 3, 4],
-        reserved: &[16, 17],
+        reserved: C6_RESERVED,
         notes: "WiFi 6 + Thread/Zigbee; keep GPIO8/9 free if you use the RGB LED.",
     },
     BoardProfile {
@@ -164,6 +184,29 @@ pub static PROFILES: &[BoardProfile] = &[
 
 pub fn profiles() -> &'static [BoardProfile] {
     PROFILES
+}
+
+impl BoardProfile {
+    /// Why a pin cannot carry a device, or `None` when it can.
+    ///
+    /// The reserved list is not advice: `gpio_config` on the flash or PSRAM lines does not
+    /// return an error, it takes the board down, and a manifest or config that names one is
+    /// persisted — so the crash repeats at every boot until the board is erased over serial.
+    /// Every edge that can name a pin calls this: manifest validation, `config_set`, the raw
+    /// `bus` tools, and the probe that instantiates declared devices.
+    pub fn pin_problem(&self, pin: i32) -> Option<String> {
+        if !(0..=48).contains(&pin) {
+            return Some(format!("pin {pin} is outside 0..=48"));
+        }
+        if self.reserved.contains(&pin) {
+            return Some(format!(
+                "pin {pin} is reserved on `{}`: the console, USB or the SPI flash/PSRAM use it, and \
+                 driving it crashes the board",
+                self.id
+            ));
+        }
+        None
+    }
 }
 
 pub fn find(id: &str) -> Option<&'static BoardProfile> {

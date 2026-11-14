@@ -279,6 +279,9 @@ impl Issue {
 /// Facts the validator needs from the running board.
 pub struct ValidateCtx<'a> {
     pub caps: &'a crate::capability::CapSet,
+    /// The board in force: its reserved pins are refused here, so a manifest cannot declare a
+    /// device on the flash or PSRAM lines (which crashes the board at every boot, not once).
+    pub profile: &'static crate::boards::BoardProfile,
     pub buses: Vec<u8>,
     pub drivers: Vec<String>,
     pub known_device_ids: Vec<String>,
@@ -349,11 +352,12 @@ impl Manifest {
                 }
             }
             for (name, pin) in &dev.pins {
-                if !(0..=48).contains(pin) {
+                if let Some(why) = ctx.profile.pin_problem(*pin) {
                     issues.push(Issue::new(
                         &format!("{p}/pins/{name}"),
-                        format!("pin {pin} is outside 0..=48"),
-                        "ESP32-S3 has GPIO0..GPIO48.",
+                        why,
+                        "Pick a pin this board can actually give you; `inventory` lists the \
+                         reserved ones.",
                     ));
                 }
             }
@@ -447,10 +451,10 @@ impl Manifest {
     ) {
         match exec {
             Exec::GpioWrite { pin, .. } | Exec::GpioRead { pin } | Exec::Adc { pin } => {
-                self.check_pin(pin, &format!("{path}/pin"), issues);
+                self.check_pin(pin, &format!("{path}/pin"), ctx, issues);
             }
             Exec::Toggle { pin, times, gap_ms } => {
-                self.check_pin(pin, &format!("{path}/pin"), issues);
+                self.check_pin(pin, &format!("{path}/pin"), ctx, issues);
                 let before_limits = issues.len();
                 if let Num::Lit(t) = times {
                     if !t.is_finite() || *t < 1.0 || *t > 20.0 {
@@ -480,7 +484,7 @@ impl Manifest {
                 }
             }
             Exec::Pwm { pin, freq_hz, duty_pct } => {
-                self.check_pin(pin, &format!("{path}/pin"), issues);
+                self.check_pin(pin, &format!("{path}/pin"), ctx, issues);
                 if let Num::Lit(f) = freq_hz {
                     if *f < 1.0 || *f > 40_000.0 {
                         issues.push(Issue::new(
@@ -543,7 +547,7 @@ impl Manifest {
                 self.check_bus(*bus, &format!("{path}/bus"), ctx, issues);
             }
             Exec::Rgb { pin, color, .. } => {
-                self.check_pin(pin, &format!("{path}/pin"), issues);
+                self.check_pin(pin, &format!("{path}/pin"), ctx, issues);
                 if let Text::Lit(c) = color {
                     if crate::json::parse_color(&json!(c)).is_none() {
                         issues.push(Issue::new(
@@ -616,15 +620,20 @@ impl Manifest {
         }
     }
 
-    fn check_pin(&self, pin: &Num, path: &str, issues: &mut Vec<Issue>) {
-        if let Num::Lit(p) = pin {
-            if *p < 0.0 || *p > 48.0 {
-                issues.push(Issue::new(
-                    path,
-                    format!("pin {p} is outside 0..=48"),
-                    "ESP32-S3 has GPIO0..GPIO48; check the strapping pins too.",
-                ));
-            }
+    fn check_pin(&self, pin: &Num, path: &str, ctx: &ValidateCtx, issues: &mut Vec<Issue>) {
+        let Num::Lit(p) = pin else { return };
+        if *p < 0.0 || *p > 48.0 {
+            issues.push(Issue::new(
+                path,
+                format!("pin {p} is outside 0..=48"),
+                "ESP32 boards have GPIO0..GPIO48; check the strapping pins too.",
+            ));
+            return;
+        }
+        // The range is not the whole question: the flash and PSRAM lines are inside it, and a
+        // device on one of them takes the board down at every boot.
+        if let Some(why) = ctx.profile.pin_problem(*p as i32) {
+            issues.push(Issue::new(path, why, "`inventory` lists the pins this board reserves."));
         }
     }
 
@@ -1189,6 +1198,7 @@ mod tests {
     fn ctx() -> ValidateCtx<'static> {
         ValidateCtx {
             caps: Box::leak(Box::new(CapSet::from_caps(["gpio", "i2c", "led"]))),
+            profile: crate::boards::find("esp32s3-xiaozhi-bread").expect("the bench profile"),
             buses: vec![0],
             drivers: vec!["bme280".into(), "ssd1306".into()],
             known_device_ids: vec!["bme280".into()],
