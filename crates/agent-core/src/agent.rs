@@ -138,13 +138,37 @@ pub fn trigger_tokens(context_tokens: u32) -> u32 {
 
 /// How much of the tail survives compression verbatim, in tokens.
 ///
-/// The host computes `min(RECENT_HISTORY, trigger / 4)`; the board has no 8000-token
-/// history budget to spend, so its cap is a quarter of the trigger and never more than
-/// what is left after the reply reserve. One exchange is always kept.
+/// The host computes `min(RECENT_HISTORY, trigger / 4)`; this board keeps a third of the
+/// trigger, because everything beyond that turns into an index line and an index line is
+/// always worse than the message it replaced. The larger share is what makes compaction
+/// rarer in practice: the same transcript crosses the trigger later, and when it does,
+/// less of it is thrown away.
 pub fn keep_recent_tokens(context_tokens: u32, max_output_tokens: u32) -> u32 {
     let trigger = trigger_tokens(context_tokens);
     let room = trigger.saturating_sub(max_output_tokens.min(trigger.saturating_sub(1)));
-    (trigger / 4).min(room).max(1)
+    (trigger / 3).min(room).max(1)
+}
+
+/// What an archive line is worth when the index is full, high survives longest.
+///
+/// The order is a statement about this board, not a guess: the question is what was
+/// wanted, an answer is a compressed version of prose the model wrote, and a tool line is
+/// a machine result that has already been consumed. A `result:` can be rebuilt by running
+/// the call again; a question cannot be rebuilt at all.
+fn line_rank(line: &str) -> u8 {
+    if line.starts_with("user: ") {
+        4
+    } else if line.starts_with("answer: ") {
+        3
+    } else if line.starts_with("note: ") {
+        2
+    } else if line.starts_with("called: ") {
+        1
+    } else {
+        // `result: …`, and anything a later format adds: unknown lines are treated as the
+        // cheapest thing, because a line nobody classified must not outlive a question.
+        0
+    }
 }
 
 /// Whether `c` falls in a CJK range whose characters tokenise to about one token each,
@@ -1035,8 +1059,14 @@ impl Agent {
             // The newest line was built with the newest budget; once another arrives it is
             // an older line and the older budget applies. Without this step "the newest may
             // be long" would quietly become "every line that ever was newest may be long".
+            //
+            // Questions are exempt: this is the only place a user's own words were being
+            // cut in half, and "trim the old ones harder" was already the wrong instinct
+            // for the one line that states what was wanted. Space comes back from tool
+            // results instead (see `evict_one`).
             if let Some(previous) = self.archive.len().checked_sub(1) {
-                if self.archive[previous].len() > ARCHIVE_LINE_BYTES {
+                let is_question = self.archive[previous].starts_with("user: ");
+                if !is_question && self.archive[previous].len() > ARCHIVE_LINE_BYTES {
                     self.archive[previous] = excerpt(&self.archive[previous], ARCHIVE_LINE_BYTES);
                 }
             }
@@ -1047,16 +1077,43 @@ impl Agent {
 
     /// Hold the archive to both caps: the line count and the total bytes.
     ///
-    /// The byte cap is the one that matters. A count and a per-line clip only bound the
-    /// total if their product is what somebody meant, which it was not here: 40 lines ×
-    /// 32 KiB was a megabyte of an index that exists to save space. Oldest first, because
-    /// the newest line is the one a resumed conversation starts from.
+    /// Eviction is by **value**, not by age. The most valuable line in a conversation is
+    /// the question somebody asked; the least valuable is the JSON a tool returned, which
+    /// the model has already used and cannot use again. Dropping strictly oldest-first
+    /// spent the index on tool traffic and eventually threw the questions away, so the
+    /// order now is: tool results, then tool calls, then notes, then answers, and a
+    /// question only when nothing else is left. Within a rank the oldest goes first.
+    ///
+    /// Reasoning never reaches the index at all: it is dropped with the message that
+    /// carried it, which makes it the cheapest thing in a transcript to lose.
     fn trim_archive(&mut self) {
-        while self.archive.len() > ARCHIVE_MAX_LINES {
-            self.archive.remove(0);
-        }
+        while self.archive.len() > ARCHIVE_MAX_LINES && self.evict_one() {}
         while archive_bytes(&self.archive) > ARCHIVE_MAX_BYTES && self.archive.len() > 1 {
-            self.archive.remove(0);
+            if !self.evict_one() {
+                break;
+            }
+        }
+    }
+
+    /// Remove the least valuable line, oldest first within a rank.
+    /// Returns false when a single line is left, so the index never becomes empty.
+    fn evict_one(&mut self) -> bool {
+        if self.archive.len() <= 1 {
+            return false;
+        }
+        let mut pick: Option<(u8, usize)> = None;
+        for (index, line) in self.archive.iter().enumerate() {
+            let rank = line_rank(line);
+            if pick.map_or(true, |(best, _)| rank < best) {
+                pick = Some((rank, index));
+            }
+        }
+        match pick {
+            Some((_, index)) => {
+                self.archive.remove(index);
+                true
+            }
+            None => false,
         }
     }
 
@@ -2552,8 +2609,7 @@ mod tests {
             "archive holds {held} bytes of excerpt text, cap is {ARCHIVE_MAX_BYTES}"
         );
         assert!(agent.archive.len() < ARCHIVE_MAX_LINES, "eviction must have removed lines");
-        // The oldest lines are the ones that go, because the newest is what a resumed
-        // conversation starts from.
+        // The newest line is what a resumed conversation starts from, so it survives whole.
         let newest = agent.archive.last().expect("an archive");
         assert!(newest.starts_with("user: 39 "), "the newest question survived: {newest:.20}");
         assert_eq!(
@@ -2562,10 +2618,64 @@ mod tests {
             "the newest question is kept whole, not clipped to the older budget"
         );
         assert!(!newest.ends_with('\u{2026}'), "the newest line carries no truncation marker");
-        // Every other line is an older line now, and pays the older budget.
-        for line in &agent.archive[..agent.archive.len() - 1] {
-            assert!(line.len() <= ARCHIVE_LINE_BYTES, "an older line kept {} bytes", line.len());
+        // A question is never demoted, however old it is: it is the one line that says what
+        // was wanted, and the space comes back from tool results instead.
+        for line in &agent.archive {
+            assert!(line.len() <= "user: ".len() + ARCHIVE_NEWEST_BYTES, "{line:.20} is too long");
+            if line.starts_with("user: ") {
+                assert!(!line.ends_with('\u{2026}'), "an older question was clipped: {line:.40}");
+            }
         }
+        // Non-question lines still pay the older budget.
+        for line in agent.archive.iter().filter(|l| !l.starts_with("user: ")) {
+            assert!(line.len() <= ARCHIVE_LINE_BYTES, "an older non-question kept {} bytes", line.len());
+        }
+        // And the index stays inside its byte cap even when every line is a long question.
+        assert!(
+            archive_bytes(&agent.archive) <= ARCHIVE_MAX_BYTES,
+            "{} bytes",
+            archive_bytes(&agent.archive)
+        );
+    }
+
+    #[test]
+    fn a_full_index_gives_up_tool_results_then_calls_then_answers_then_questions() {
+        // One exchange with a tool call, then a second question: what a real archive looks
+        // like after a few tool-using turns.
+        let mut agent = Agent::new();
+        agent.archive = vec![
+            "user: q1".into(),
+            "called: board({})".into(),
+            "result: one".into(),
+            "answer: a1".into(),
+            "called: gpio_read({})".into(),
+            "result: two".into(),
+            "user: q2".into(),
+        ];
+        let mut removed = Vec::new();
+        while agent.archive.len() > 1 {
+            let before = agent.archive.clone();
+            agent.evict_one();
+            let gone: Vec<&String> = before.iter().filter(|l| !agent.archive.contains(l)).collect();
+            removed.extend(gone.into_iter().cloned());
+        }
+        // Tool results first (oldest first), then the tool calls, then the answer, and the
+        // questions only when there is nothing else left.
+        assert_eq!(
+            removed,
+            vec![
+                "result: one".to_string(),
+                "result: two".to_string(),
+                "called: board({})".to_string(),
+                "called: gpio_read({})".to_string(),
+                "answer: a1".to_string(),
+                "user: q1".to_string(),
+            ],
+            "{:?}",
+            agent.archive
+        );
+        assert_eq!(agent.archive, vec!["user: q2".to_string()], "the newest question is the last line left");
+        assert!(!agent.evict_one(), "the index never empties itself");
     }
 
     #[test]
