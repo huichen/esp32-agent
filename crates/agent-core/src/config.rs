@@ -411,6 +411,18 @@ impl Default for LogCfg {
     }
 }
 
+/// The entries of `config.pins` that are settings rather than GPIO numbers.
+///
+/// `pins` is one map with two kinds of thing in it: a GPIO number (`led`, `button.left`,
+/// `mic.bclk`) and a value a driver reads as a parameter (`oled.height`, `oled.sh1106`,
+/// `ina219.shunt_mohm`). Only the first kind names a pin, and only the first kind may be
+/// checked against the profile's reserved list — reading the second as a pin refuses
+/// `{"oled.height": 32}`, the documented fix for a 128×32 panel, on every ESP32-S3, because
+/// GPIO32 is the flash there and 64 falls outside the GPIO range. The panel is then drawn as
+/// 64 rows and shows snow. These names are the ones `drivers::probe` reads out of the map;
+/// anything else in `pins` is a GPIO.
+pub const PIN_SETTINGS: &[&str] = &["oled.height", "oled.sh1106", "ina219.shunt_mohm"];
+
 /// The first pin in a config patch that the board profile reserves, with the reason.
 ///
 /// Config is persisted, so a pin that crashes the board does not crash it once: it does it at
@@ -420,6 +432,9 @@ impl Default for LogCfg {
 pub fn reserved_pin_problem(profile: &crate::boards::BoardProfile, patch: &Value) -> Option<String> {
     if let Some(pins) = patch.get("pins").and_then(|v| v.as_object()) {
         for (name, value) in pins {
+            if PIN_SETTINGS.contains(&name.as_str()) {
+                continue;
+            }
             let Some(pin) = value.as_i64() else { continue };
             if let Some(why) = profile.pin_problem(pin as i32) {
                 return Some(format!("`pins.{name}`: {why}"));
@@ -1003,5 +1018,29 @@ mod tests {
         let mut faster = back.clone();
         faster.apply_patch(&json!({ "agent": { "tick_ms": 200 } })).unwrap();
         assert!(!back.needs_network_restart(&faster));
+    }
+
+    #[test]
+    fn a_setting_in_the_pins_map_is_not_checked_as_a_gpio() {
+        // This board is the one that bites: its panel is 128×32, GPIO32 is the flash on an
+        // ESP32-S3, and 64 (the taller glass) is outside the GPIO range at all. Both of the
+        // values that make the screen work used to come back as a reserved-pin refusal.
+        let profile = crate::boards::find("esp32s3-xiaozhi-bread").expect("the bench profile");
+        for patch in [
+            json!({ "pins": { "oled.height": 32 } }),
+            json!({ "pins": { "oled.height": 64 } }),
+            json!({ "pins": { "oled.sh1106": 1 } }),
+            json!({ "pins": { "ina219.shunt_mohm": 100 } }),
+        ] {
+            assert_eq!(reserved_pin_problem(profile, &patch), None, "{patch} is a setting");
+        }
+        // A real GPIO in the same map is still refused, so the guard keeps its teeth.
+        let refused = reserved_pin_problem(profile, &json!({ "pins": { "led": 32 } }))
+            .expect("GPIO32 is reserved on this board");
+        assert!(refused.contains("GPIO") || refused.contains("reserved"), "{refused}");
+        // And the panel height lands in the config, not just past the guard.
+        let mut c = Config::default();
+        c.apply_patch(&json!({ "pins": { "oled.height": 32 } })).unwrap();
+        assert_eq!(c.pins.get("oled.height"), Some(&32));
     }
 }

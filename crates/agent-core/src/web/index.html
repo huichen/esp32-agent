@@ -149,6 +149,9 @@
           <option value="true">send to the model (multimodal)</option>
           <option value="false">name only (text-only model)</option>
         </select>
+        <label for="agent-tick">Scheduler tick (ms) \u2014 how often timed tasks and sensor rules are checked</label>
+        <input id="agent-tick" type="number" min="200" max="5000" step="100">
+        <p class="hint">A smaller number fires a timed task closer to its minute; a larger one leaves the board quieter. It does not make the model answer faster.</p>
         <div class="buttons"><button id="agent-save" class="btn primary">Save</button></div>
       </div>
       <div class="card">
@@ -247,8 +250,9 @@
         <h3>Access</h3>
         <label for="auth-pin">Portal PIN (empty = open on the LAN)</label>
         <input id="auth-pin" type="password" placeholder="__set__ = keep the stored one">
-        <label for="auth-tick">Agent tick (ms)</label>
-        <input id="auth-tick" type="number" min="200" max="5000" step="100">
+        <label for="auth-mcp-token">MCP bearer token (empty = keep the stored one)</label>
+        <input id="auth-mcp-token" type="password" placeholder="__set__ = keep the stored one">
+        <p class="hint">With a token set, the MCP endpoint accepts only <code>Authorization: Bearer &lt;token&gt;</code> and stops accepting the portal PIN; the PIN keeps guarding the console. Leaving this empty keeps whatever is stored.</p>
         <label for="auth-tz">Timezone (hours from UTC, e.g. 8 for UTC+8)</label>
         <input id="auth-tz" type="number" min="-12" max="14" step="1" inputmode="numeric" placeholder="0">
         <p class="hint">Whole hours only. It decides when a daily task fires and what the clock reads; half-hour zones cannot be expressed and are refused rather than rounded.</p>
@@ -260,7 +264,9 @@
         <p class="hint">On: the board also answers on its own network at <code>http://192.168.4.1/</code>. Off: the access point closes as soon as the station has an address, and only the network address works.</p>
         <label for="set-plain-http"><input id="set-plain-http" type="checkbox"> Answer on plain HTTP (port 80) as well as HTTPS</label>
         <p class="hint">HTTPS on 443 is always on — the board issues its own certificate. Plain HTTP is what makes a phone pop the portal up on a new network; turning it off means typing <code>https://</code> by hand. The board refuses a state where neither port would answer.</p>
-        <p class="hint">Both take effect after a restart; the Agent tab has the button.</p>
+        <p class="hint">Applying takes effect immediately. The access point switch rebuilds the radio, so a device on <code>192.168.4.1</code> loses that link for a second or two; plain HTTP stops answering on port 80 at once.</p>
+        <div class="buttons"><button id="net-apply" class="btn primary">Apply</button></div>
+        <p id="net-result" class="hint"></p>
       </div>
       <div class="card"><h3>Log</h3><pre id="logs" class="log"></pre>
         <div class="buttons"><button id="logs-refresh" class="btn ghost">Refresh</button></div>

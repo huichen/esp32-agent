@@ -1314,7 +1314,7 @@ async function loadAgent() {
     $("#agent-protocol").value = d.protocol || "chat";
     $("#agent-reasoning").value = d.reasoning || "";
     $("#agent-vision").value = d.vision === false ? "false" : "true";
-    $("#auth-tick").value = d.tick_ms;
+    $("#agent-tick").value = d.tick_ms;
     $("#auth-tz").value = d.tz_offset_h === undefined ? 0 : d.tz_offset_h;
     const prompt = await api("/api/agent/prompt");
     kv($("#conversation-kv"), [
@@ -2049,6 +2049,7 @@ function init() {
       protocol: $("#agent-protocol").value,
       reasoning: $("#agent-reasoning").value,
       vision: $("#agent-vision").value === "true",
+      tick_ms: Number($("#agent-tick").value || 1000),
     };
     const key = $("#agent-key").value.trim();
     if (key) body.api_key = key;
@@ -2129,8 +2130,37 @@ function init() {
     } catch (e) { $("#wifi-result").textContent = e.message; }
   };
 
+  // Two-step on purpose: the first press says what will happen, the second does it.
+  // Rebuilding the radio can drop the link this page is on, so the click that causes it
+  // should not be the same click that decides to.
+  let netArmed = 0;
+  $("#net-apply").onclick = async () => {
+    const open = $("#set-keep-ap").checked;
+    const plain = $("#set-plain-http").checked;
+    const result = $("#net-result");
+    if (!netArmed) {
+      netArmed = Date.now();
+      result.textContent =
+        "Click Apply again to continue: the access point switch drops any device on 192.168.4.1 for a second, and turning plain HTTP off ends this page's http session.";
+      setTimeout(() => {
+        netArmed = 0;
+        if (result.textContent.startsWith("Click Apply again")) result.textContent = "";
+      }, 12000);
+      return;
+    }
+    netArmed = 0;
+    try {
+      await api("/api/config", { method: "POST", body: { mcp: { plain_http: plain } } });
+      const ap = await api("/api/wifi/ap", { method: "POST", body: { open } });
+      result.textContent = "applied: access point " + ap.ap + ", plain http " + (plain ? "on" : "off");
+      toast("applied");
+    } catch (e) {
+      result.textContent = e.message;
+    }
+  };
+
   $("#settings-save").onclick = async () => {
-    const body = { agent: { tick_ms: Number($("#auth-tick").value || 1000) } };
+    const body = {};
     // Sent only when it is a whole number in range: the board refuses the rest, and a
     // refusal here is clearer than a toast after a round trip.
     const tz = $("#auth-tz").value.trim();
@@ -2143,18 +2173,27 @@ function init() {
       body.tz_offset_h = hours;
     }
     const pin = $("#auth-pin").value.trim();
-    if (pin) body.auth = { portal_pin: pin };
+    const mcpToken = $("#auth-mcp-token").value.trim();
+    if (pin || mcpToken) {
+      body.auth = {};
+      if (pin) body.auth.portal_pin = pin;
+      if (mcpToken) body.auth.mcp_token = mcpToken;
+    }
     // Neither of these can be rebound at runtime: the access point is built when the
     // radio task starts and the listeners when the server does, so the page says
     // restart instead of pretending the change is live.
     body.wifi = { keep_ap: $("#set-keep-ap").checked };
     body.mcp = { plain_http: $("#set-plain-http").checked };
     try {
-      await api("/api/config", { method: "POST", body });
+      const res = await api("/api/config", { method: "POST", body });
       $("#auth-pin").value = "";
+      $("#auth-mcp-token").value = "";
       // A new PIN invalidates the token the page is holding.
       if (pin) { S.token = ""; localStorage.removeItem("esp32-agent.token"); }
-      toast("applied; restart to apply the network changes");
+      const applied = res && res.restart_required;
+      toast(applied
+        ? "saved; the board restarts now, the console is back in a few seconds"
+        : "applied");
     } catch (e) { toast(e.message); }
   };
 

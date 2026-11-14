@@ -492,19 +492,20 @@ mod tests {
         let mut hw = FakeSpi::working();
         let mut d = driver(1);
         assert_eq!(d.text(0, "A"), 1);
-        // FONT6X8['A'] = 18 0E 09 1C 00 00, columns with bit 0 at the top.
-        assert_eq!(d.fb[0], [0x20, 0x40, 0x50, 0xF0, 0x90, 0x00, 0x00, 0x00]);
+        // FONT6X8['A'] = 7C 12 11 12 7C 00, columns with bit 0 at the top.
+        assert_eq!(d.fb[0], [0x20, 0x50, 0x88, 0x88, 0xF8, 0x88, 0x88, 0x00]);
         d.flush(&mut hw).unwrap();
         assert_eq!(hw.transfers[0][0..2].to_vec(), vec![0x01, 0x20]);
-        // A glyph pushed off the left edge is clipped, not wrapped.
+        // A glyph pushed off the left edge is clipped, not wrapped. One whole cell off, so
+        // no column of it lands on the panel.
         d.clear();
-        d.text(-4, "A");
+        d.text(-6, "A");
         assert_eq!(d.fb[0], [0x00; 8]);
         // Same for the right edge of a single chip: only the first two columns fit
         // into pixels 6 and 7.
         d.clear();
         d.text(6, "A");
-        assert_eq!(d.fb[0], [0x00, 0x01, 0x01, 0x03, 0x02, 0x00, 0x00, 0x00]);
+        assert_eq!(d.fb[0], [0x00, 0x01, 0x02, 0x02, 0x03, 0x02, 0x02, 0x00]);
     }
 
     #[test]

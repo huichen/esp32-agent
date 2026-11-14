@@ -299,6 +299,14 @@ pub trait Hardware: Send {
         Err(McpError::unsupported("WiFi is not available on this board"))
     }
 
+    /// Bring the setup access point up or down beside the station, live.
+    ///
+    /// The moment it matters is the moment the console is being read over that access
+    /// point, so a restart there would cut the page that asked for the change.
+    fn wifi_set_ap(&mut self, _open: bool) -> Result<()> {
+        Err(McpError::unsupported("this platform cannot reconfigure the radio at runtime"))
+    }
+
     fn wifi_connect(&mut self, _ssid: &str, _pw: &str) -> Result<()> {
         Err(McpError::unsupported("WiFi is not available on this board"))
     }

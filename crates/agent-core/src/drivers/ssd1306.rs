@@ -943,6 +943,34 @@ mod tests {
         assert!(panel.read_text().iter().all(|l| l.trim().is_empty()), "a cleared panel reads empty");
     }
 
+    /// Every character the font carries has to survive a draw and a read-back unchanged.
+    /// Both directions walk the one table, so a glyph shared by two characters - this font
+    /// once had `b` == `p`, `h` == `n` and `M` == `N` - reads back as whichever entry comes
+    /// first, and the screen disagrees with the text that was sent to it.
+    #[test]
+    fn every_character_draws_and_reads_back() {
+        let mut p = bare_panel();
+        for code in 0x20u8..=0x7E {
+            let text = char::from(code).to_string();
+            p.clear();
+            p.text(0, 0, &text, false);
+            let back = p.read_text()[0].trim_end().to_string();
+            // A space is ink-free by definition; every other cell has to come back as itself.
+            let expected = if code == b' ' { String::new() } else { text.clone() };
+            assert_eq!(back, expected, "{code:#04x} came back as {back:?}");
+        }
+    }
+
+    /// Two characters that share a glyph cannot be told apart on the glass, so the table is
+    /// checked for it directly rather than only through the characters a test happens to draw.
+    #[test]
+    fn no_two_characters_share_a_glyph() {
+        for (i, glyph) in FONT6X8.iter().enumerate() {
+            let first = FONT6X8.iter().position(|other| other == glyph).unwrap_or(i);
+            assert_eq!(first, i, "{:#04x} draws the same glyph as {:#04x}", i + 0x20, first + 0x20);
+        }
+    }
+
     /// Pixels that are not a font glyph cannot be read back as text, so they have to be
     /// reported as '?' rather than invented into a character.
     #[test]

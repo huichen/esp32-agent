@@ -27,6 +27,8 @@ pub enum WifiCmd {
     Connect { ssid: String, password: String },
     Scan(Sender<Result<Vec<WifiAp>>>),
     Reconfigure,
+    /// Open or close the setup access point without restarting the board.
+    SetAp { open: bool },
 }
 
 static STATUS: OnceLock<Arc<Mutex<WifiStatus>>> = OnceLock::new();
@@ -250,6 +252,35 @@ fn run(
                 // A new join starts over: the AP may be needed again while it associates.
                 ap_closed = false;
                 apply_static_ip(&static_ip, &static_netmask, &static_gateway, &static_dns);
+            }
+            Ok(WifiCmd::SetAp { open }) => {
+                let cfg = if open {
+                    Configuration::Mixed(
+                        client_config(&ssid, &password),
+                        ap_config("esp32-agent-setup", ""),
+                    )
+                } else {
+                    Configuration::Client(client_config(&ssid, &password))
+                };
+                if let Err(e) = wifi.set_configuration(&cfg) {
+                    log::error!("wifi: set_configuration for the access point failed: {e}");
+                    continue;
+                }
+                let _ = wifi.stop();
+                if let Err(e) = wifi.start() {
+                    log::error!("wifi: radio restart failed: {e}");
+                    continue;
+                }
+                if !ssid.is_empty() {
+                    if let Err(e) = wifi.connect() {
+                        log::error!("wifi: reconnect after the access point change failed: {e}");
+                    }
+                }
+                ap_closed = !open;
+                log::info!(
+                    "wifi: access point {}",
+                    if open { "kept up beside the station" } else { "closed; station stays" }
+                );
             }
             Ok(WifiCmd::Scan(reply)) => {
                 let result = scan_now(&mut wifi).map_err(|e| McpError::hardware(format!("{e}")));

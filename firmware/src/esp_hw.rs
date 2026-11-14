@@ -717,6 +717,11 @@ impl Hardware for EspHw {
         self.player.submit_av(samples, rate_hz, &pages, Some(shared))
     }
 
+    fn wifi_set_ap(&mut self, open: bool) -> Result<()> {
+        wifi::command(wifi::WifiCmd::SetAp { open })
+            .map_err(|e| McpError::hardware(format!("{e}")))
+    }
+
     fn wifi_scan(&mut self) -> Result<Vec<WifiAp>> {
         wifi::scan()
     }
