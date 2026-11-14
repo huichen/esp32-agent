@@ -318,6 +318,12 @@ pub struct App {
     pub tls: TlsInfo,
     /// The on-board agent: transcript, the one-slot queue and the last error.
     pub agent: Agent,
+    /// True while `with_agent` has the `Agent` moved out of this struct.
+    ///
+    /// A tool handler runs *inside* that window, so anything that samples the agent for a
+    /// caller (`board status`) must know whether it is looking at the real agent or at the
+    /// empty placeholder that stands in for it while a turn runs.
+    agent_out: bool,
     status_views: crate::status_view::StatusViews,
     run_gate: crate::run_gate::RunGate,
     /// Where the model lives and how far one run may go. `api_key` is kept in
@@ -539,6 +545,7 @@ impl App {
             active_attachments: None,
             tls: TlsInfo::default(),
             agent: Agent::new(),
+            agent_out: false,
             status_views: Default::default(),
             run_gate: Default::default(),
             llm: LlmConfig::default(),
@@ -579,6 +586,12 @@ impl App {
         // firmware carries are installed here, and in `seed_default_skills`'s other caller.
         app.seed_default_skills();
         app.refresh_hw_view();
+        // The readings `board status` and `board tls` report about things a tool handler cannot
+        // reach — the store's counters, the agent's own numbers, the certificate — filled once
+        // at boot so the first call answers rather than returning null.
+        app.sample_store();
+        app.publish_agent_stats();
+        app.runtime.tls = app.tls.json();
         app
     }
 
@@ -1108,6 +1121,7 @@ impl App {
             // tools, so the model, `/mcp tools/list` and the portal see the same six.
             board_tools::clip::specs(),
             board_tools::agent_extra_specs(),
+            board_tools::agent_specs(),
         ] {
             out.extend(openai_tools(&group));
         }
@@ -1474,7 +1488,7 @@ impl App {
     /// this. Both readings are needed to apply a rule like "≥ max(2 × peak, peak + 4 kB)",
     /// which is why the size stays in the source instead of being guessed from here.
     fn threads_json(&mut self) -> Vec<Value> {
-        Self::threads_from(self.hw.tasks())
+        crate::hardware::threads_json(self.hw.tasks())
     }
 
     /// Sample the hardware's view into plain data. Called at construction and once per tick by
@@ -1485,27 +1499,6 @@ impl App {
         let internal = self.hw.heap_internal();
         let threads = self.threads_json();
         self.hw_view = HwView { info, wifi, internal, threads };
-    }
-
-    fn threads_from(tasks: Vec<Value>) -> Vec<Value> {
-        tasks
-            .into_iter()
-            .map(|t| {
-                json!({
-                    "name": t["name"],
-                    "state": t["state"],
-                    "priority": t["priority"],
-                    // Which core the task sits on. Not every platform schedules (the host
-                    // has one, the simulator says 0), which is why it is passed through
-                    // rather than invented here.
-                    "core": t["core"],
-                    // One decimal: a 4 KB stack's answer has to be readable as 2.1, not 2.
-                    "high_water_kb": t["stack_free_bytes"]
-                        .as_u64()
-                        .map(|bytes| ((bytes as f64 / 1024.0) * 10.0).round() / 10.0),
-                })
-            })
-            .collect()
     }
 
     /// True while the board is waiting to be told which WiFi to join.
@@ -2097,6 +2090,22 @@ impl App {
         if name == "script" {
             return self.run_script(args);
         }
+        // The board's own agent, for a caller that is not the model: the four tools the portal's
+        // Agent panel reaches over REST. Reached here because they need `App` — the agent, the
+        // model config and the store queue — and never a driver.
+        match name {
+            "agent_say" => return self.agent_say_tool(args),
+            "agent_history" => return self.agent_history_tool(args),
+            "agent_forget" => return self.agent_forget_tool(args),
+            "agent_config_get" => {
+                if !args.is_object() {
+                    return Err(McpError::invalid_params("tool arguments must be an object"));
+                }
+                return Ok(self.agent_config_json());
+            }
+            "agent_config_set" => return self.agent_config_set_tool(args),
+            _ => {}
+        }
         // `shell` is a router in front of the fs_*/net_* handlers, so it has to be reached
         // from both entry points: the model's tool host and the MCP `tools/call`.
         if name == "shell" {
@@ -2186,6 +2195,7 @@ impl App {
                 tasks,
                 rules,
                 family_members,
+                run_gate,
                 ..
             } = self;
             let def = match tools.get(name) {
@@ -2212,6 +2222,7 @@ impl App {
                 tasks,
                 rules,
                 families: family_members,
+                gate: run_gate,
             };
             (def.handler)(&mut ctx, args)
         };
@@ -2286,6 +2297,9 @@ impl App {
         // taken here, on the only thread that owns both — `board status` then has an answer to
         // "did the change reach flash?" that an MCP caller can actually see.
         self.sample_store();
+        // Same reason, one field over: a turn that was queued outside the agent (`/api/agent/
+        // message`, a schedule) changes `pending` without another step starting.
+        self.publish_agent_stats();
         let manifest_changed = self.runtime.manifest_dirty;
         if manifest_changed {
             self.runtime.manifest_dirty = false;
@@ -2679,6 +2693,9 @@ impl App {
             return false;
         }
         self.persist_pending_message();
+        // A queued turn that has not started is exactly what `board status` reports as
+        // `pending`, and this is the moment it becomes true.
+        self.publish_agent_stats();
         true
     }
 
@@ -2708,6 +2725,7 @@ impl App {
         if self.store.get(NVS_KEY_PENDING_MESSAGE).is_some() && !self.store.remove(NVS_KEY_PENDING_MESSAGE) {
             self.log.warn("agent", "could not queue removal of the stored pending user message");
         }
+        self.publish_agent_stats();
     }
 
     fn load_pending_message(&mut self) {
@@ -2939,9 +2957,36 @@ impl App {
     /// sees the transcript between phases.
     fn with_agent<R>(&mut self, run: impl FnOnce(&mut Agent, &mut App) -> R) -> R {
         let mut agent = std::mem::replace(&mut self.agent, Agent::new());
+        self.agent_out = true;
         let out = run(&mut agent, self);
         self.agent = agent;
+        self.agent_out = false;
+        // The only place the real agent comes back, so the only place its numbers can be
+        // published for a caller that is not the agent itself.
+        self.publish_agent_stats();
         out
+    }
+
+    /// What the board's own agent is doing, as plain data for a caller.
+    ///
+    /// `run_active` and `active_tool` are not here: they come from the `RunGate`, which is
+    /// live while a turn runs. Everything in this snapshot is as of the last step boundary,
+    /// which is the honest reading — the numbers a turn is in the middle of producing are
+    /// not finished numbers.
+    fn publish_agent_stats(&mut self) {
+        if self.agent_out {
+            return;
+        }
+        let stats = {
+            let a = &self.agent;
+            json!({
+                "runs": a.runs,
+                "history": a.history.len(),
+                "pending": a.pending.is_some(),
+                "last_error": &a.last_error,
+            })
+        };
+        self.runtime.agent = stats;
     }
 
     /// Evaluate the schedule once and queue whatever came due.
@@ -3566,18 +3611,121 @@ impl App {
             Ok(v) => v,
             Err(e) => return Response::error_json(400, &format!("invalid JSON: {e}")),
         };
-        // Both schemes are carried by the platform transport (TLS on the board via
-        // esp-tls, on the host via rustls), so https:// is accepted here. Anything that
-        // is not HTTP at all is still refused by name.
+        match self.apply_agent_config(&body) {
+            Ok((mut v, queued)) => {
+                v["saved"] = json!(false);
+                v["queued"] = json!(queued);
+                v["note"] = json!("applied in RAM; queue admission is not flash acknowledgement. Check /api/status.store for pending writes and failures");
+                if queued {
+                    Response::json(&v)
+                } else {
+                    v["error"] = json!("model config was applied in RAM but could not be queued for saving");
+                    Response::json_status(503, &v)
+                }
+            }
+            Err(e) => Response::json_status(400, &json!({ "error": e.message })),
+        }
+    }
+
+    /// The `agent_*` tools: the board's own model, reached by a caller that is not it.
+    ///
+    /// `agent_begin`/`agent_reply` do the same work over REST for the portal; these are thin
+    /// wrappers so an outside agent gets the identical behaviour (the same coalescing queue,
+    /// the same truncation, the same refusal while a turn runs) instead of a second
+    /// implementation that drifts.
+    fn agent_say_tool(&mut self, args: &Value) -> Result<Value> {
+        let text = crate::json::str_arg(args, "text")?;
+        let text = text.trim();
+        if text.is_empty() {
+            return Err(McpError::invalid_params("`text` is empty: say something"));
+        }
+        let replaced = self.agent.pending.is_some();
+        let accepted = self.queue_user(text, "mcp", now_ms());
+        if !accepted {
+            return Err(McpError::internal("the message could not be queued"));
+        }
+        Ok(json!({
+            "ok": true,
+            "source": "mcp",
+            "bytes": text.len(),
+            // A queued turn is the answer, not a failure: the board runs it on its own thread
+            // and the transcript is where the reply lands.
+            "pending": true,
+            "replaced_a_waiting_message": replaced,
+            "next": "the board starts the turn on its own thread; `agent_history` has the answer",
+        }))
+    }
+
+    fn agent_history_tool(&mut self, args: &Value) -> Result<Value> {
+        let after = crate::json::opt_i64(args, "after").unwrap_or(0).max(0) as usize;
+        Ok(self.agent_history_json(after))
+    }
+
+    fn agent_forget_tool(&mut self, args: &Value) -> Result<Value> {
+        let keep = crate::json::opt_i64(args, "keep").unwrap_or(0).max(0) as usize;
+        if self.run_gate.active() {
+            return Err(McpError::invalid_params(
+                "a model turn is running, so the conversation cannot be cut: its question would be gone and \
+                 its answer would arrive in a thread that no longer has it. Wait for `board status` to say \
+                 `agent.run_active: false`",
+            ));
+        }
+        Ok(self.forget_conversation(keep))
+    }
+
+    fn agent_config_set_tool(&mut self, args: &Value) -> Result<Value> {
+        let patch = crate::json::field(args, "patch")
+            .cloned()
+            .ok_or_else(|| McpError::invalid_params("`patch` is required: the fields to change"))?;
+        if !patch.is_object() {
+            return Err(McpError::invalid_params("`patch` must be an object"));
+        }
+        let (mut value, queued) = self.apply_agent_config(&patch)?;
+        value["saved"] = json!(false);
+        value["queued"] = json!(queued);
+        if !queued {
+            value["error"] = json!("applied in RAM but could not be queued for saving");
+        }
+        Ok(value)
+    }
+
+    /// Cut the conversation down to the last `keep` exchanges.
+    ///
+    /// Shared by `POST /api/agent/forget` and the `agent_forget` tool: forgetting has to reach
+    /// flash or the conversation comes back after a reboot, which is the one outcome nobody
+    /// asking for `forget` would accept.
+    fn forget_conversation(&mut self, keep: usize) -> Value {
+        let (removed, kept) = self.agent.forget(keep);
+        self.clear_pending_message();
+        if keep == 0 {
+            self.attachments.clear();
+            self.active_attachments = None;
+        }
+        self.persist_transcript();
+        self.publish_agent_stats();
+        self.log.info(
+            "agent",
+            format!("forgot {removed} message(s), kept the last {kept} toward {keep} exchange(s)"),
+        );
+        json!({ "ok": true, "removed": removed, "kept": kept, "archive_cleared": true })
+    }
+
+    /// The body of `POST /api/agent/config`, shared with the `agent_config_set` tool.
+    ///
+    /// One function so the portal and an outside agent cannot disagree about what is accepted,
+    /// what is clamped and what is refused. Returns the settings as the caller may see them
+    /// (no key) and whether the write was queued.
+    fn apply_agent_config(&mut self, body: &Value) -> Result<(Value, bool)> {
+        // Both schemes are carried by the platform transport (TLS on the board via esp-tls,
+        // on the host via rustls), so https:// is accepted here. Anything that is not HTTP at
+        // all is still refused by name.
         if let Some(url) = body.get("base_url").and_then(|u| u.as_str()) {
             let url = url.trim();
             if !url.is_empty() && !url.starts_with("http://") && !url.starts_with("https://") {
-                return Response::json_status(
-                    400,
-                    &json!({ "error": "`base_url` must start with http:// or https:// and point at the chat completions endpoint" }),
-                );
+                return Err(McpError::invalid_params(
+                    "`base_url` must start with http:// or https:// and point at the chat completions endpoint",
+                ));
             }
-            self.llm.base_url = url.to_string();
         }
         // Apply the trimmed value too, so what is stored is exactly what was checked.
         let mut patch = body.clone();
@@ -3586,9 +3734,9 @@ impl App {
             patch["base_url"] = json!(url);
         }
         llm_apply_json(&mut self.llm, &patch);
-        // The tick belongs to the device config, not the model config, but the portal
-        // edits both from one form: accept it here and clamp it the way the platform
-        // does, so an out-of-range value never reaches the thread.
+        // The tick belongs to the device config, not the model config, but the portal edits
+        // both from one form: accept it here and clamp it the way the platform does, so an
+        // out-of-range value never reaches the thread.
         if let Some(ms) = body.get("tick_ms").and_then(|v| v.as_u64()) {
             let clamped = crate::config::clamp_tick_ms(ms.min(u32::MAX as u64) as u32);
             self.cfg.agent.tick_ms = clamped;
@@ -3605,16 +3753,7 @@ impl App {
                 if self.llm.api_key.is_empty() { "none" } else { "set" }
             ),
         );
-        let mut v = self.agent_config_json();
-        v["saved"] = json!(false);
-        v["queued"] = json!(queued);
-        v["note"] = json!("applied in RAM; queue admission is not flash acknowledgement. Check /api/status.store for pending writes and failures");
-        if queued {
-            Response::json(&v)
-        } else {
-            v["error"] = json!("model config was applied in RAM but could not be queued for saving");
-            Response::json_status(503, &v)
-        }
+        Ok((self.agent_config_json(), queued))
     }
 
     fn sched_json(&self) -> Value {
@@ -3985,7 +4124,15 @@ impl App {
             "resources/list" => Ok(self.resources_list()),
             "resources/read" => self.on_resources_read(&msg.params),
             "resources/templates/list" => Ok(json!({ "resourceTemplates": [] })),
-            "prompts/list" => Ok(json!({ "prompts": [] })),
+            "prompts/list" => Ok(self.prompts_list()),
+            "prompts/get" => self.on_prompts_get(&msg.params),
+            // A client asking the board to stop a turn. The MCP way to say what
+            // `POST /api/agent/cancel` says; the gate is what makes it reachable while the
+            // App lock is held by the very turn being stopped.
+            "notifications/cancelled" => {
+                self.request_cancel();
+                Ok(json!({}))
+            }
             "logging/setLevel" => Ok(json!({})),
             "completion/complete" => Ok(json!({ "completion": { "values": [], "total": 0 } })),
             other => Err(McpError::new(
@@ -4000,6 +4147,52 @@ impl App {
                 (!msg.is_notification).then(|| protocol::err(id, e.code, &e.message, e.data))
             }
         }
+    }
+
+    /// The board's skills, as MCP prompts.
+    ///
+    /// A skill is a written procedure the board's model is given (the same index that reaches
+    /// its system prompt), so it is exactly what an MCP prompt is: a named instruction set a
+    /// client can list and fetch. Advertising `prompts/list` while answering `[]` was a
+    /// capability that did nothing; answering it with the skills is the honest version, and it
+    /// hands an outside agent the conventions this board was told to follow.
+    fn prompts_list(&self) -> Value {
+        let skills: Vec<Value> = crate::tools::knowledge::index(&self.workspace)
+            .into_iter()
+            .map(|s| {
+                json!({
+                    "name": s.name,
+                    "description": s.description,
+                    "arguments": [],
+                })
+            })
+            .collect();
+        json!({ "prompts": skills })
+    }
+
+    fn on_prompts_get(&mut self, params: &Value) -> Result<Value> {
+        let name = params.get("name").and_then(|n| n.as_str()).unwrap_or("").trim();
+        if !crate::tools::knowledge::is_skill_name(name) {
+            return Err(McpError::invalid_params(
+                "`name` is required: one of the names `prompts/list` returned",
+            ));
+        }
+        let skill =
+            crate::tools::knowledge::index(&self.workspace).into_iter().find(|s| s.name == name).ok_or_else(
+                || McpError::not_found(format!("no skill `{name}`; `prompts/list` has the ones that exist")),
+            )?;
+        // The body without its front matter: the YAML header is metadata the prompt already
+        // carries as `description`, and a caller asking for a procedure wants the procedure.
+        let text = crate::tools::fs::Workspace::read(&self.workspace, &skill.path)
+            .map_err(|e| McpError::internal(format!("skill `{name}` could not be read: {e}")))?;
+        let body = crate::tools::knowledge::split_front_matter(&text).1;
+        Ok(json!({
+            "description": skill.description,
+            "messages": [{
+                "role": "user",
+                "content": { "type": "text", "text": body },
+            }],
+        }))
     }
 
     fn on_initialize(&mut self, params: &Value, session: Option<&str>, scheme: &str) -> Value {
@@ -4350,25 +4543,7 @@ impl App {
                 }
                 let body: Value = serde_json::from_str(&req.body_str()).unwrap_or(Value::Null);
                 let keep = body.get("keep").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-                let (removed, kept) = self.agent.forget(keep);
-                self.clear_pending_message();
-                if keep == 0 {
-                    self.attachments.clear();
-                    self.active_attachments = None;
-                }
-                // Forgetting has to reach flash, or the conversation comes back after a
-                // reboot - the one outcome nobody asking for `forget` would accept.
-                self.persist_transcript();
-                self.log.info(
-                    "agent",
-                    format!("forgot {removed} message(s), kept the last {kept} toward {keep} exchange(s)"),
-                );
-                Response::json(&json!({
-                    "ok": true,
-                    "removed": removed,
-                    "kept": kept,
-                    "archive_cleared": true,
-                }))
+                Response::json(&self.forget_conversation(keep))
             }
             // Compress the conversation now instead of waiting for the budget. It is the
             // same deterministic projection the trigger uses, so it costs no model call and
@@ -15528,7 +15703,6 @@ str(queued) + "/" + str(a.ok) + "/" + str(again.ok) + "/" + str(task_state(secon
     }
 
     /// The one reading a writing tool leaves open: did the queued change reach flash?
-    ///
     /// `write` and `edit` answer `saved: false` and point at the store's own counters. Those
     /// lived on `/api/status` only, which is a portal route — an agent driving the board
     /// through MCP was told to check something it had no way to read.
@@ -15545,6 +15719,175 @@ str(queued) + "/" + str(a.ok) + "/" + str(again.ok) + "/" + str(task_state(secon
             store["pending"].as_u64().unwrap() >= 1,
             "a write that was only queued has to show as owed work: {store}"
         );
+    }
+
+    #[test]
+    fn board_status_reports_the_agent_its_threads_and_the_pools() {
+        // The three readings that only `/api/status` used to carry. An agent driving this
+        // board over MCP has no portal route, so "is the board busy", "which tool is it in",
+        // "does another stack fit" and "how much RAM can this pool still give" were all out
+        // of reach.
+        let mut app = test_app();
+        let status = app.call_tool("board", &json!({ "command": "status" })).unwrap();
+
+        let agent = &status["agent"];
+        assert_eq!(agent["run_active"], json!(false), "an idle board is not running: {status}");
+        assert_eq!(agent["pending"], json!(false), "{status}");
+        // `active_tool` names the synchronous tool in flight — which, for a `board status` call,
+        // is this one. It says nothing about a turn, and `run_active` is what does.
+        assert_eq!(agent["active_tool"]["name"], json!("board"), "{status}");
+        assert_eq!(agent["runs"], json!(app.agent.runs), "{status}");
+        assert!(
+            agent["history"].as_u64().unwrap_or(u64::MAX) == app.agent.history.len() as u64,
+            "history disagrees with the transcript: {status}"
+        );
+        assert!(agent["last_error"].is_string(), "{status}");
+
+        let threads = status["threads"].as_array().expect("threads");
+        assert_eq!(threads.len(), 3, "the virtual board reports three tasks: {status}");
+        assert!(threads.iter().all(|t| t["high_water_kb"].as_f64().is_some()), "{status}");
+
+        let pools = status["memory"]["pools"].as_array().expect("memory pools");
+        assert!(!pools.is_empty(), "the virtual board has pools: {status}");
+        assert!(
+            pools.iter().all(|p| p["pool"].is_string() && p["free_kb"].is_number()),
+            "a pool has to name itself and its numbers: {status}"
+        );
+
+        // The certificate the board made for itself: a caller told to compare a fingerprint
+        // needs to be able to read it.
+        let tls = app.call_tool("board", &json!({ "command": "tls" })).unwrap();
+        assert!(tls["enabled"].is_boolean(), "{tls}");
+        assert!(tls["how_to_check"].is_string(), "{tls}");
+
+        // A turn queued from outside the agent shows up without the board starting it: that
+        // is the question "should I wait" an outside caller asks.
+        app.route(&post("/api/agent/message", r#"{"text":"are you busy"}"#));
+        let status = app.call_tool("board", &json!({ "command": "status" })).unwrap();
+        assert_eq!(status["agent"]["pending"], json!(true), "{status}");
+    }
+
+    /// The board's own model, reached over MCP: the one class of capability that used to need
+    /// the portal, a person or an HTTP client, because everything here assumed the caller *is*
+    /// the model.
+    #[test]
+    fn an_outside_agent_can_reach_the_boards_model() {
+        let mut app = test_app();
+
+        // `agent_say`: the message waits for the turn the board starts on its own thread.
+        let first = app.call_tool("agent_say", &json!({ "text": "  how warm is it  " })).unwrap();
+        assert_eq!(first["ok"], json!(true), "{first}");
+        assert_eq!(first["replaced_a_waiting_message"], json!(false), "{first}");
+        let pending = app.agent.pending.as_ref().expect("a queued turn");
+        assert_eq!(pending.text, "how warm is it", "trimmed like every other message");
+        assert_eq!(pending.source, "mcp", "the transcript has to say where it came from");
+
+        // One message waits at a time: the second call says so instead of pretending to queue
+        // two turns, and an empty question is refused rather than queued as work.
+        let second = app.call_tool("agent_say", &json!({ "text": "and now?" })).unwrap();
+        assert_eq!(second["replaced_a_waiting_message"], json!(true), "{second}");
+        assert_eq!(app.agent.pending.as_ref().unwrap().text, "and now?");
+        assert!(app.call_tool("agent_say", &json!({ "text": "   " })).is_err(), "an empty message");
+
+        // `agent_history`: the transcript, oldest first, with the cursor to poll with.
+        app.agent.history.push(crate::agent::Message::user("earlier question", "http", 1));
+        app.agent.history.push(crate::agent::Message::assistant("earlier answer", vec![], 2));
+        let all = app.call_tool("agent_history", &json!({})).unwrap();
+        assert_eq!(all["seq"], json!(2), "{all}");
+        assert_eq!(all["messages"][0]["text"], json!("earlier question"), "{all}");
+        // A queued question is visible before the turn starts, marked `pending`: that is how a
+        // caller knows the board has it and has not answered yet.
+        let tail = app.call_tool("agent_history", &json!({ "after": 1 })).unwrap();
+        let entries = tail["messages"].as_array().expect("messages");
+        assert_eq!(entries.len(), 2, "{tail}");
+        assert_eq!(entries[1]["text"], json!("and now?"), "{tail}");
+        assert_eq!(entries[1]["pending"], json!(true), "{tail}");
+
+        // `agent_config_*`: a partial patch, and the key stays write-only in both directions.
+        let before = app.call_tool("agent_config_get", &json!({})).unwrap();
+        assert!(before.get("base_url").is_some(), "{before}");
+        assert!(before.get("api_key").is_none(), "the key is never returned: {before}");
+        let set = app
+            .call_tool(
+                "agent_config_set",
+                &json!({ "patch": { "model": "another-model", "api_key": "__set__" } }),
+            )
+            .unwrap();
+        assert_eq!(set["model"], json!("another-model"), "{set}");
+        assert!(set.get("api_key").is_none(), "the key is write-only: {set}");
+        assert_eq!(set["queued"], json!(true), "the write has to be queued for flash: {set}");
+        assert_eq!(
+            app.call_tool("agent_config_set", &json!({ "patch": { "base_url": "ftp://nope" } }))
+                .unwrap_err()
+                .code,
+            code::INVALID_PARAMS,
+            "a scheme the transport cannot carry is refused, as on the portal"
+        );
+
+        // `agent_forget`: the tail stays and nothing is left waiting; mid-turn it is refused,
+        // because the answer that turn is producing would land in a thread that lost its question.
+        let forgotten = app.call_tool("agent_forget", &json!({ "keep": 0 })).unwrap();
+        assert!(forgotten["removed"].as_u64().unwrap() >= 2, "{forgotten}");
+        assert_eq!(forgotten["kept"], json!(0), "{forgotten}");
+        assert!(app.agent.history.is_empty(), "everything was dropped: {forgotten}");
+        assert!(app.agent.pending.is_none(), "a forgotten conversation has nothing waiting");
+        app.run_gate.set_active(true);
+        let refused = app.call_tool("agent_forget", &json!({ "keep": 0 })).unwrap_err();
+        assert!(refused.message.contains("turn is running"), "{refused:?}");
+        app.run_gate.set_active(false);
+    }
+
+    /// `prompts/list` used to answer `[]` — a capability that did nothing. The board's skills
+    /// are written procedures for its own model, which is what an MCP prompt is, so listing
+    /// them hands an outside agent the conventions this board follows.
+    #[test]
+    fn the_prompts_are_the_boards_skills() {
+        let mut app = test_app();
+        let listed = app
+            .handle_rpc(&json!({"jsonrpc":"2.0","id":1,"method":"prompts/list"}).to_string(), None)
+            .expect("a reply");
+        let prompts = listed["result"]["prompts"].as_array().expect("prompts");
+        assert!(!prompts.is_empty(), "the board seeds skills, so a prompt exists: {listed}");
+        let name = prompts[0]["name"].as_str().expect("a name").to_string();
+        assert!(!prompts[0]["description"].as_str().unwrap_or("").is_empty(), "{listed}");
+
+        let got = app
+            .handle_rpc(
+                &json!({"jsonrpc":"2.0","id":2,"method":"prompts/get","params":{"name":name}}).to_string(),
+                None,
+            )
+            .expect("a reply");
+        let text = got["result"]["messages"][0]["content"]["text"].as_str().expect("the skill body");
+        assert!(!text.trim().is_empty(), "the body is the point: {got}");
+        assert!(!text.starts_with("---"), "the front matter is metadata, not the procedure: {text}");
+
+        let missing = app
+            .handle_rpc(
+                &json!({"jsonrpc":"2.0","id":3,"method":"prompts/get","params":{"name":"nope"}}).to_string(),
+                None,
+            )
+            .expect("a reply");
+        assert!(missing["error"].is_object(), "an unknown prompt is an error: {missing}");
+    }
+
+    /// The MCP way to stop a turn, which used to have no handler at all: a client that sent it
+    /// got `method not found` and had to fall back to `POST /api/agent/cancel`.
+    #[test]
+    fn a_client_can_stop_a_turn_the_mcp_way() {
+        let mut app = test_app();
+        app.run_gate.set_active(true);
+        let reply = app.handle_rpc(
+            &json!({
+                "jsonrpc": "2.0",
+                "method": "notifications/cancelled",
+                "params": { "requestId": 7, "reason": "changed my mind" }
+            })
+            .to_string(),
+            None,
+        );
+        assert!(reply.is_none(), "a notification has no reply: {reply:?}");
+        assert!(app.run_gate.cancelled(), "the gate is what the loop checks between steps");
+        app.run_gate.set_active(false);
     }
 
     #[test]

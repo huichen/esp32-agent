@@ -26,8 +26,14 @@ example), the error shape, and the limits that apply to a caller.
 curl -sS http://<ip>:80/agent.json | jq '.endpoints[] | "\(.method) \(.path) — \(.summary)"'
 ```
 
-`endpoints` is the surface an external agent should call: those routes have no MCP tool that
-compares. `portal_endpoints` is the console's own half, and each row names the tool that
+`endpoints` is the surface a client should call. Four of them now have an MCP tool that does
+the same job — `/api/agent/message`, `/api/agent/history`, `/api/agent/forget` and
+`/api/agent/config` are `agent_say`, `agent_history`, `agent_forget` and
+`agent_config_get`/`agent_config_set` — and a caller that already speaks MCP should take the
+tool. The rest have none, and that is deliberate: attachments carry bytes, the event stream
+needs a socket, and minting a portal token needs the PIN, which is the one thing that must
+not travel in a tool call.
+`portal_endpoints` is the console's own half, and each row names the tool that
 does the same job — a model that reads this document is meant to take the tool and leave
 the route to the browser. The document uses a static endpoint/settings table plus
 runtime values such as `base_url`, tool count, credential-set flags and model endpoint.
