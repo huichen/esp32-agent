@@ -16,6 +16,7 @@ mod console;
 mod dns;
 mod esp_hw;
 mod file_store;
+mod media;
 mod nvs_store;
 mod nvs_writer;
 mod runner;
