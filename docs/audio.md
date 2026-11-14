@@ -519,7 +519,9 @@ waiting for everything else — before, a 12 s tune held the agent thread, and f
 chunks took turns on that one thread, which is what the ear heard as stutter.
 
 `media_status` reports what it is doing (`playing`, `job`, `duration_ms`, `remaining_ms`,
-`chunks`, `queued`, `jobs_done`, `cancelled`); `media_cancel` stops it within one chunk
+`chunks`, `queued`, `jobs_done`, `cancelled`). `remaining_ms` is derived from the job's own
+start time at every read — storing it once per chunk left a stale number in between, and
+a 2 s job queued behind a 1 s one used to overwrite the length that was playing; `media_cancel` stops it within one chunk
 (about 170 ms at 24 kHz). Both are tools, so a script can start a tune, keep working, and ask
 how it went:
 
