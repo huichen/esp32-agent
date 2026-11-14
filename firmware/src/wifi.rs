@@ -435,13 +435,7 @@ fn apply_network_overrides(gateway: &str, dns: &str, dns2: &str, netif: &EspNeti
 fn prefix_to_mask(prefix: u8) -> String {
     let bits = u32::from(prefix.min(32));
     let mask = if bits == 0 { 0 } else { u32::MAX << (32 - bits) };
-    format!(
-        "{}.{}.{}.{}",
-        (mask >> 24) & 0xff,
-        (mask >> 16) & 0xff,
-        (mask >> 8) & 0xff,
-        mask & 0xff
-    )
+    format!("{}.{}.{}.{}", (mask >> 24) & 0xff, (mask >> 16) & 0xff, (mask >> 8) & 0xff, mask & 0xff)
 }
 
 /// Signal strength and channel of the association the station currently has.
