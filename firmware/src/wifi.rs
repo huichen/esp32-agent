@@ -255,7 +255,9 @@ fn run(
         let netmask = sta_info
             .as_ref()
             .filter(|i| !i.ip.is_unspecified())
-            .map(|i| i.subnet.mask.to_string())
+            // The lease carries a prefix length (24), not an address; printing it as-is
+            // reads like a netmask of "24", which is not a mask anyone can use.
+            .map(|i| prefix_to_mask(i.subnet.mask.0))
             .unwrap_or_default();
         let gateway = sta_info
             .as_ref()
@@ -426,6 +428,20 @@ fn apply_network_overrides(gateway: &str, dns: &str, dns2: &str, netif: &EspNeti
             );
         }
     }
+}
+
+/// `24` into `255.255.255.0`: the lease stores a prefix length and every consumer of a
+/// netmask expects the dotted form.
+fn prefix_to_mask(prefix: u8) -> String {
+    let bits = u32::from(prefix.min(32));
+    let mask = if bits == 0 { 0 } else { u32::MAX << (32 - bits) };
+    format!(
+        "{}.{}.{}.{}",
+        (mask >> 24) & 0xff,
+        (mask >> 16) & 0xff,
+        (mask >> 8) & 0xff,
+        mask & 0xff
+    )
 }
 
 /// Signal strength and channel of the association the station currently has.
