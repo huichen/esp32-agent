@@ -7977,10 +7977,12 @@ fn next_sse_frames(shared: &Mutex<App>, after: u64) -> (Vec<String>, u64) {
 /// The app lock is taken once per poll and released at the end of each statement -
 /// never held across the life of the connection, so the portal, `/api/status` and
 /// the agent thread itself keep working while a console is open.
-/// One write's worth of the microphone: 20 ms at its own rate. Small enough that the stream
-/// is live (a chunk header per 20 ms is 3 bytes of 643), large enough that the driver is not
-/// woken for every sample.
-const MIC_STREAM_BLOCK: usize = 320;
+/// One write's worth of the microphone: 200 samples, which is exactly one RX DMA descriptor
+/// (`dma_frame_num = 200` frames, 8 bytes of stereo 32-bit each). Aligned like this, one read
+/// waits for one descriptor instead of straddling two — the same boundary wait that made
+/// playback drag by 13% before the transmit ring was given 8 descriptors (see `docs/audio.md`
+/// §6). 200 samples is 12.5 ms of audio, so a chunk every 12.5 ms is still live.
+const MIC_STREAM_BLOCK: usize = 200;
 
 /// How long one `GET /api/mic/pcm` connection may stay open. A stream is a budget, not a
 /// promise: a client that forgets it must not hold a socket pool slot until the board is
