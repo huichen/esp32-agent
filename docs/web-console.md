@@ -86,6 +86,40 @@ browser (Chrome, Edge or Chromium). Set `ESP32_AGENT_BROWSER` to the executable 
 not in a standard location; without one the test fails rather than skipping, because a
 skipped layout test is how this bug came back.
 
+## Screenshots
+
+`scripts/console-shot.py` captures the console with headless Chrome/Chromium — the same
+browser the layout tests measure with, found the same way (`ESP32_AGENT_BROWSER`, then the
+usual install paths). It needs no dependency and no driver:
+
+```bash
+python scripts/console-shot.py --url http://192.168.3.7 --out chat.png
+python scripts/console-shot.py --url http://192.168.3.7 --out chat-tall.png --size 390x1400
+python scripts/console-shot.py --url 'http://192.168.3.7/?panel=devices' --out devices.png \
+    --size 900x1200
+```
+
+| Flag | Meaning |
+|---|---|
+| `--size WxH` | viewport. Chrome's `--screenshot` captures the viewport, so a **taller** size is how you get more of the conversation |
+| `--wait MS` | page time before the shot (default 4000). The console fetches its history; too short a wait captures an empty chat |
+| `--scale N` | device scale factor (default 2, so the PNG is retina-sized and still reads in a README) |
+
+The browser runs against a throwaway profile, so the user's own Chrome session is not
+touched and a first-run dialog cannot end up in the picture.
+
+### Deep links
+
+`?panel=devices` (or `#devices`) opens that panel on load: `devices`, `tools`, `agent`,
+`files`, `terminal`, `settings`. An unknown name opens nothing rather than an empty sheet.
+This exists because a headless browser cannot click, and because a bookmark to "the tools
+tab" should work — a screenshot of a panel is the same mechanism.
+
+Two things a screenshot must not contain: the WiFi password (the settings panel shows
+`__set__`, never the value) and the access-point name of a network you would rather not
+publish. Capture the chat or Devices/Tools panels, not Settings, when the picture is going
+somewhere public.
+
 ## The certificate
 
 Generated on first boot (EC P-256, self-signed, valid 2020–2035 so a 1970 clock still works),

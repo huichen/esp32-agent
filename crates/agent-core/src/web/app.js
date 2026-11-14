@@ -1935,6 +1935,15 @@ function init() {
   };
   $("#sheet-close").onclick = () => ($("#sheet").hidden = true);
   $$(".tabs button").forEach((b) => (b.onclick = () => showPanel(b.dataset.panel)));
+  // A deep link is how a screenshot tool, a bookmark or a support thread reaches one
+  // panel: `?panel=devices` or `#devices` opens the sheet on it. Without this the only way
+  // in is a click, and a headless browser cannot click.
+  const wanted = new URLSearchParams(location.search).get("panel")
+    || location.hash.replace(/^#/, "");
+  if (wanted && $(`#panel-${wanted}`)) {
+    $("#sheet").hidden = false;
+    showPanel(wanted);
+  }
 
   // The terminal: a form so a phone keyboard has a Go key, an input because a command is one
   // line, and a keydown handler for the history arrows the form does not give for free.
