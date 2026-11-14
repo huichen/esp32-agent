@@ -225,4 +225,25 @@ mod tests {
             "the Agent panel is not where the timezone field is filled"
         );
     }
+
+    /// "Save and join" used to send the password field as-is, and a blank field is an explicit
+    /// empty string to `apply_patch` — which clears the stored password. A board with no
+    /// password cannot associate with a WPA2 network, so that button could quietly take the
+    /// board off the network (seen on the bench 2026-11-14: `no suitable AP`, for minutes).
+    #[test]
+    fn saving_a_network_keeps_the_stored_password_when_the_field_is_blank() {
+        let join = APP_JS
+            .split("#wifi-connect")
+            .nth(1)
+            .and_then(|tail| tail.split("waitForStationIp").next())
+            .expect("the join handler exists");
+        assert!(
+            join.contains("__set__"),
+            "a blank password field has to send __set__, or it clears the stored one"
+        );
+        assert!(
+            !join.contains("password: $(\"#wifi-password\").value }"),
+            "the raw field value is what cleared it"
+        );
+    }
 }

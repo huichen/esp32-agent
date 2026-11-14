@@ -7972,18 +7972,6 @@ fn next_sse_frames(shared: &Mutex<App>, after: u64) -> (Vec<String>, u64) {
     (frames, newest)
 }
 
-/// The body of `GET /api/agent/stream`: replay, then follow live, on a budget.
-///
-/// The app lock is taken once per poll and released at the end of each statement -
-/// never held across the life of the connection, so the portal, `/api/status` and
-/// the agent thread itself keep working while a console is open.
-/// One write's worth of the microphone: 200 samples, which is exactly one RX DMA descriptor
-/// (`dma_frame_num = 200` frames, 8 bytes of stereo 32-bit each). Aligned like this, one read
-/// waits for one descriptor instead of straddling two — the same boundary wait that made
-/// playback drag by 13% before the transmit ring was given 8 descriptors (see `docs/audio.md`
-/// §6). 200 samples is 12.5 ms of audio, so a chunk every 12.5 ms is still live.
-const MIC_STREAM_BLOCK: usize = 200;
-
 /// How long one `GET /api/mic/pcm` connection may stay open. A stream is a budget, not a
 /// promise: a client that forgets it must not hold a socket pool slot until the board is
 /// reflashed.
@@ -8003,9 +7991,10 @@ fn mic_stream_body(
     Box::new(move |sink: &mut dyn EventSink| {
         // Held for the life of the body: the slot goes back however the stream ends.
         let _slot = slot;
+        let block = reader.block_samples().max(1);
         let started = std::time::Instant::now();
-        let mut samples = vec![0i32; MIC_STREAM_BLOCK];
-        let mut bytes = Vec::with_capacity(MIC_STREAM_BLOCK * 2);
+        let mut samples = vec![0i32; block];
+        let mut bytes = Vec::with_capacity(block * 2);
         let mut sent = 0usize;
         let mut failure: Option<String> = None;
         while started.elapsed().as_millis() < MIC_STREAM_MAX_MS {
@@ -8015,7 +8004,7 @@ fn mic_stream_body(
                     std::thread::sleep(std::time::Duration::from_millis(5));
                     continue;
                 }
-                Ok(n) => n.min(MIC_STREAM_BLOCK),
+                Ok(n) => n.min(block),
                 Err(e) => {
                     failure = Some(e.message.clone());
                     break;
@@ -8044,6 +8033,11 @@ fn mic_stream_body(
     })
 }
 
+/// The body of `GET /api/agent/stream`: replay, then follow live, on a budget.
+///
+/// The app lock is taken once per poll and released at the end of each statement -
+/// never held across the life of the connection, so the portal, `/api/status` and
+/// the agent thread itself keep working while a console is open.
 fn event_stream_body(shared: Shared, slot: EventStreamSlot, after: u64, limits: StreamLimits) -> StreamBody {
     Box::new(move |sink: &mut dyn EventSink| {
         // Owned here so every exit path - idle close, total close, failed write -
@@ -17872,7 +17866,8 @@ str(queued) + "/" + str(a.ok) + "/" + str(again.ok) + "/" + str(task_state(secon
         let mut sink = DropAfter { bytes: Vec::new(), left: 4, chunks: 0 };
         body(&mut sink).expect("the stream ends cleanly when the client leaves");
         assert_eq!(sink.chunks, 4, "four chunks, then the sink refused");
-        assert_eq!(sink.bytes.len(), 4 * MIC_STREAM_BLOCK * 2, "16-bit samples, no padding");
+        let block = app_with_mic().hw.mic_reader().expect("a reader").block_samples();
+        assert_eq!(sink.bytes.len(), 4 * block * 2, "16-bit samples, no padding");
         // The virtual microphone is a 440 Hz tone: 16-bit, so some samples are not zero.
         let samples: Vec<i16> =
             sink.bytes.chunks_exact(2).map(|c| i16::from_le_bytes([c[0], c[1]])).collect();
@@ -17880,8 +17875,48 @@ str(queued) + "/" + str(a.ok) + "/" + str(again.ok) + "/" + str(task_state(secon
         assert!(samples.iter().any(|s| *s != samples[0]), "a constant is not a tone");
     }
 
-    /// A board without a microphone says so instead of opening a stream that would never
-    /// carry a byte.
+    /// The stream asks the platform for one DMA descriptor's worth per read. A read that
+    /// straddles a descriptor boundary waits on it, and 320-sample reads into 200-frame
+    /// descriptors delivered 10.6 k samples/s instead of 16 k on the bench.
+    #[test]
+    fn the_stream_reads_one_descriptor_at_a_time() {
+        struct Counting {
+            asked: Vec<usize>,
+            left: usize,
+        }
+        impl crate::hardware::MicReader for Counting {
+            fn read(&mut self, out: &mut [i32], _timeout_ms: u32) -> crate::error::Result<usize> {
+                self.asked.push(out.len());
+                if self.left == 0 {
+                    // An error ends the stream; `Ok(0)` means "nothing yet" and would keep the
+                    // body waiting for its whole budget, which is right for a quiet
+                    // microphone and wrong for a test.
+                    return Err(crate::error::McpError::hardware("test: the reader is done"));
+                }
+                self.left -= 1;
+                for (i, s) in out.iter_mut().enumerate() {
+                    *s = (i as i32) << 16;
+                }
+                Ok(out.len())
+            }
+            fn block_samples(&self) -> usize {
+                200
+            }
+        }
+        let slot = EventStreamGate::with_limit(1).acquire().expect("a slot");
+        let body = mic_stream_body(
+            Box::new(Counting { asked: Vec::new(), left: 3 }),
+            slot,
+            LogBuf::new(8),
+            "test".into(),
+        );
+        let mut sink = Sink(Vec::new());
+        body(&mut sink).expect("a failed read ends the stream cleanly");
+        assert_eq!(sink.0.len(), 3 * 200 * 2, "three blocks of 200 samples, 16-bit");
+        // And the bytes are 16-bit LE of the left-justified samples the reader produced.
+        assert_eq!(&sink.0[0..2], &0i16.to_le_bytes());
+        assert_eq!(&sink.0[2..4], &1i16.to_le_bytes());
+    }
     #[test]
     fn the_microphone_stream_is_refused_without_a_microphone() {
         let mut app = test_app();
