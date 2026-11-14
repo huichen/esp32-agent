@@ -41,6 +41,55 @@ struct Job {
     id: u64,
     samples: Vec<i16>,
     rate_hz: u32,
+    /// Frames already rendered to page bytes, in deadline order.
+    pictures: Vec<(u64, Vec<u8>)>,
+    panel: Option<std::sync::Arc<Panel>>,
+}
+
+/// The OLED, as the player sees it: its own I2C device handle and nothing else.
+///
+/// Sharing the App lock is what made asynchronous video impossible: the panel was reachable
+/// only through `EspHw`, which lives inside `Mutex<App>`, so a player that wanted to draw
+/// would have had to wait for whatever tool call was running. This type is the separation —
+/// one device handle plus the bus mutex that the blocking path also takes, so two writers
+/// cannot interleave their transfers, and neither of them needs App.
+pub struct Panel {
+    dev: usize,
+    bus: Mutex<()>,
+}
+
+impl Panel {
+    pub fn new(dev: usize) -> Self {
+        Self { dev, bus: Mutex::new(()) }
+    }
+
+    /// Write one whole frame buffer to the glass, page by page.
+    ///
+    /// The sequence is the driver's `flush`: for each page, the page/column command, then
+    /// the 128 bytes of that page behind the data control byte. It is duplicated here on
+    /// purpose — the driver cannot be reached from this task without the App lock, and a
+    /// one-line "call the driver" would be the very coupling this exists to avoid.
+    fn blit(&self, page: &[u8]) -> bool {
+        let pages = page.len() / 128;
+        if pages == 0 {
+            return false;
+        }
+        let _guard = self.bus.lock().unwrap_or_else(|p| p.into_inner());
+        let dev = self.dev as sys::i2c_master_dev_handle_t;
+        for index in 0..pages {
+            let command = [0x00u8, 0xB0 | index as u8, 0x00, 0x10];
+            if unsafe { sys::i2c_master_transmit(dev, command.as_ptr(), command.len(), 50) } != 0 {
+                return false;
+            }
+            let mut chunk = Vec::with_capacity(129);
+            chunk.push(0x40);
+            chunk.extend_from_slice(&page[index * 128..(index + 1) * 128]);
+            if unsafe { sys::i2c_master_transmit(dev, chunk.as_ptr(), chunk.len(), 50) } != 0 {
+                return false;
+            }
+        }
+        true
+    }
 }
 
 pub struct Player {
@@ -89,8 +138,29 @@ impl Player {
         }
     }
 
+    /// Accept an audio/video job and answer immediately.
+    pub fn submit_av(
+        &self,
+        samples: &[i16],
+        rate_hz: u32,
+        pictures: &[(u64, Vec<u8>)],
+        panel: Option<Arc<Panel>>,
+    ) -> Result<u64> {
+        self.push_job(samples, rate_hz, pictures.to_vec(), panel)
+    }
+
     /// Accept a buffer and answer immediately.
     pub fn submit(&self, samples: &[i16], rate_hz: u32) -> Result<u64> {
+        self.push_job(samples, rate_hz, Vec::new(), None)
+    }
+
+    fn push_job(
+        &self,
+        samples: &[i16],
+        rate_hz: u32,
+        pictures: Vec<(u64, Vec<u8>)>,
+        panel: Option<Arc<Panel>>,
+    ) -> Result<u64> {
         if samples.is_empty() {
             return Err(esp32_agent_core::error::McpError::invalid_params(
                 "nothing to play: the buffer is empty",
@@ -110,7 +180,7 @@ impl Player {
                     "the player already has four jobs queued; wait or cancel",
                 ));
             }
-            queue.push_back(Job { id, samples: samples.to_vec(), rate_hz });
+            queue.push_back(Job { id, samples: samples.to_vec(), rate_hz, pictures, panel });
             if let Ok(mut state) = self.state.lock() {
                 state.queued = queue.len() as u64 - u64::from(state.playing);
                 // Only an idle player takes the new length: a queued job must not rewrite
@@ -124,6 +194,11 @@ impl Player {
         }
         self.stop.store(false, Ordering::Relaxed);
         Ok(id)
+    }
+
+    /// How many jobs are still waiting behind the one that is playing.
+    fn pending(&self) -> usize {
+        self.queue.lock().map(|q| q.len()).unwrap_or(0)
     }
 
     pub fn state(&self) -> MediaState {
@@ -230,32 +305,83 @@ pub fn start(player: Arc<Player>) {
             let started = std::time::Instant::now();
             *player.started.lock().unwrap_or_else(|p| p.into_inner()) = Some(started);
             let mut completed = true;
-            for (index, piece) in job.samples.chunks(CHUNK).enumerate() {
+            let total_frames = job.pictures.len() as u64;
+            let mut drawn = 0u64;
+            let mut worst_late = 0u64;
+            player.publish(|state| {
+                state.frames_total = total_frames;
+                state.frames_done = 0;
+                state.max_late_ms = 0;
+            });
+            // Write the audio, splitting a chunk at the next frame deadline. Writing a
+            // whole 4096-sample chunk (170 ms at 24 kHz) and *then* looking at the clock is
+            // what left a picture 162 ms late on the bench: by the time the write returned,
+            // the deadline had already gone past. Splitting costs one extra write per frame
+            // and puts the picture where the sound is.
+            let per_ms = (job.rate_hz / 1000).max(1) as usize;
+            let mut written = 0usize;
+            let mut index = 0u64;
+            while written < job.samples.len() {
                 if player.stop.load(Ordering::Relaxed) {
                     completed = false;
                     break;
                 }
+                // Frames due by now, checked *before* the write: `write_chunk` blocks
+                // until the DMA ring has room (~140 ms for the first buffer), so a frame
+                // due at t=0 used to be drawn that late.
+                let now_ms = started.elapsed().as_millis() as u64;
+                while let Some((at_ms, page)) = job.pictures.get(drawn as usize) {
+                    if *at_ms > now_ms {
+                        break;
+                    }
+                    let late = now_ms.saturating_sub(*at_ms);
+                    if let Some(panel) = job.panel.as_ref() {
+                        if panel.blit(page) {
+                            worst_late = worst_late.max(late);
+                        }
+                    }
+                    drawn += 1;
+                    player.publish(|state| {
+                        state.frames_done = drawn;
+                        state.max_late_ms = worst_late;
+                    });
+                }
+                let mut take = CHUNK.min(job.samples.len() - written);
+                if let Some((at_ms, _)) = job.pictures.get(drawn as usize) {
+                    let due = (*at_ms as usize).saturating_mul(per_ms);
+                    if due > written && due - written < take {
+                        take = due - written;
+                    }
+                }
+                let piece = &job.samples[written..written + take];
                 if let Err(e) = write_chunk(tx, piece) {
                     log::warn!("media: playback of job {} stopped: {}", job.id, e.message);
                     completed = false;
                     break;
                 }
+                written += take;
+                index += 1;
                 let done_ms = (started.elapsed().as_millis() as u64)
                     .min((job.samples.len() as u64).saturating_mul(1000) / u64::from(job.rate_hz.max(1)));
                 player.publish(|state| {
-                    state.chunks = index as u64 + 1;
+                    state.chunks = index;
                     state.remaining_ms = state.duration_ms.saturating_sub(done_ms);
                 });
             }
             *player.started.lock().unwrap_or_else(|p| p.into_inner()) = None;
             if completed {
                 let done = u64::from(player.jobs_done.fetch_add(1, Ordering::Relaxed)) + 1;
+                let waiting = player.pending() as u64;
                 player.publish(|state| {
                     state.playing = false;
                     state.job = 0;
                     state.chunks = total_chunks;
                     state.remaining_ms = 0;
                     state.jobs_done = done;
+                    // The queue is the authority: a job that finished leaves whatever is
+                    // still waiting, and a submit that was counted before the player picked
+                    // the job up must not survive it.
+                    state.queued = waiting;
                 });
             }
         })
