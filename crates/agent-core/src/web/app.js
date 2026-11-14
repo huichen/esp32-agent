@@ -1315,6 +1315,7 @@ async function loadAgent() {
     $("#agent-reasoning").value = d.reasoning || "";
     $("#agent-vision").value = d.vision === false ? "false" : "true";
     $("#auth-tick").value = d.tick_ms;
+    $("#auth-tz").value = d.tz_offset_h === undefined ? 0 : d.tz_offset_h;
     const prompt = await api("/api/agent/prompt");
     kv($("#conversation-kv"), [
       ["Messages", prompt.history],
@@ -1896,7 +1897,11 @@ function fitChatToComposer() {
 function trackViewport() {
   const vv = window.visualViewport;
   const apply = () => {
-    const h = vv ? vv.height : window.innerHeight;
+    // Both numbers, smallest wins. Some Android builds report the *layout* height in
+    // `visualViewport.height` for a frame or two after focus, and trusting that puts the
+    // composer back behind the keys — the exact failure this function exists to prevent.
+    const raw = vv ? vv.height : window.innerHeight;
+    const h = Math.max(240, Math.min(raw, window.innerHeight));
     document.documentElement.style.setProperty("--vvh", h + "px");
     composerLift = 0;
     fitChatToComposer();
@@ -1909,8 +1914,10 @@ function trackViewport() {
   window.addEventListener("resize", apply);
   window.addEventListener("orientationchange", () => setTimeout(apply, 250));
   // Android reports the new visual viewport a little after focus, and the keyboard animation
-  // settles later still: reapply once after the keyboard has had time to appear.
-  $("#input").addEventListener("focus", () => setTimeout(apply, 350));
+  // settles later still: reapply across the whole animation instead of at one guessed
+  // moment. A single delayed call is what left the row half covered on slower keyboards.
+  [80, 200, 350, 600, 900, 1400, 2000].forEach((ms) =>
+    $("#input").addEventListener("focus", () => setTimeout(apply, ms)));
   $("#input").addEventListener("blur", () => setTimeout(apply, 250));
   if (window.ResizeObserver) {
     new ResizeObserver(() => fitChatToComposer()).observe($("#composer"));
@@ -1976,11 +1983,23 @@ function init() {
     }
   };
   $("#input").addEventListener("input", autosize);
+  // Enter starts a new line; the message goes out on the button or cmd/ctrl+Enter.
+  //
+  // Enter-to-send was wrong twice over: a question about two things is two paragraphs, and a
+  // Chinese/Japanese IME confirms a candidate with Enter, so "press Enter to send" sent a
+  // half-finished sentence the moment a word was accepted. `isComposing` is checked too,
+  // because some IMEs never set `keyCode 229`.
   $("#input").addEventListener("keydown", (e) => {
-    if (e.key === "Enter" && !e.shiftKey) {
+    if (e.isComposing || e.keyCode === 229) return;
+    if (e.key !== "Enter") return;
+    if (e.metaKey || e.ctrlKey) {
       e.preventDefault();
       send($("#input").value);
+      return;
     }
+    // The textarea inserts the newline itself. Only stop the form from submitting, which
+    // Safari does on Enter inside a form even when the field is a textarea.
+    e.stopPropagation();
   });
 
   $("#login-go").onclick = doLogin;
@@ -2084,6 +2103,17 @@ function init() {
 
   $("#settings-save").onclick = async () => {
     const body = { agent: { tick_ms: Number($("#auth-tick").value || 1000) } };
+    // Sent only when it is a whole number in range: the board refuses the rest, and a
+    // refusal here is clearer than a toast after a round trip.
+    const tz = $("#auth-tz").value.trim();
+    if (tz !== "") {
+      const hours = Number(tz);
+      if (!Number.isInteger(hours) || hours < -12 || hours > 14) {
+        toast("timezone must be a whole number of hours between -12 and 14");
+        return;
+      }
+      body.tz_offset_h = hours;
+    }
     const pin = $("#auth-pin").value.trim();
     if (pin) body.auth = { portal_pin: pin };
     try {
