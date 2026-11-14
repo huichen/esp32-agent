@@ -162,7 +162,7 @@ the board re-reads and what it cannot. Since 2026-11-14 the board re-reads live:
 | `wifi.ip`, `wifi.netmask`, `wifi.gateway`, `wifi.dns`, `wifi.dns2` | Within a second; `gateway`/`dns` are re-applied every 30 s because lwIP rewrites them from the lease on renewal |
 | `wifi.auto_reconnect`, `wifi.low_latency`, `wifi.ap_after_s`, `wifi.hostname` | Within a second |
 | `log.level` | On the next line; an error is never filtered out |
-| `mcp.*` except `port` | On the next request, `plain_http`, `cors`, `sse`, `path`, `tools_mode` and `disabled_tools` included |
+| `mcp.*` except `port` | On the next request, `cors`, `sse`, `path`, `tools_mode` and `disabled_tools` included. `plain_http` is the exception: turning it **off** refuses http at once, turning it **on** needs a listener, so it is a restart |
 | `tz_offset_h`, `agent.tick_ms`, `agent.tool_timeout_s`, `agent.persist_transcript` | Immediately |
 | `auth.*` | On the next request |
 | `pins`, `bus.*`, `board`, `auto_peripherals` | A re-probe (`/api/devices/probe`) rebuilds the drivers |
