@@ -41,6 +41,16 @@ pub struct WifiStatus {
     pub ap_ssid: String,
     pub ap_ip: String,
     pub clients: u32,
+    /// Default gateway as the interface reports it (the DHCP lease, or the configured
+    /// override once it has been applied). Empty until the interface has an address.
+    pub gateway: String,
+    /// Netmask from the lease. `0.0.0.0` and the empty string both mean "not known yet",
+    /// and a caller must not print it as if it were a measurement.
+    pub netmask: String,
+    /// Resolvers the stack will actually use, in order, empties removed. A second entry
+    /// that is the unspecified address used to be reported as `""`, which reads like a
+    /// configured-but-broken server rather than "there is no secondary".
+    pub dns: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
