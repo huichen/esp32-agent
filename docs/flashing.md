@@ -2,16 +2,18 @@
 
 ## 0. The image you flash
 
-There is no prebuilt binary here: the repository contains no release workflow and publishes
-no image. Section 1 builds an ELF, which can be flashed directly. If you have separately
-created a merged image for this layout, write that image with:
+Each release publishes a merged image for this layout: `esp32-agent-v<version>.bin`, built
+from the tagged commit, with a `.sha256` file beside it. Bootloader, partition table and
+application are all inside it, so write it from address 0x0 and do not pass a partition
+table — it is already in the image. Section 1 builds an ELF instead, which can be flashed
+directly.
 
 ```bash
 # espflash (Rust, any OS)
-espflash write-bin --chip esp32s3 --flash-size 16mb 0x0 esp32-agent.bin
+espflash write-bin --chip esp32s3 --flash-size 16mb 0x0 esp32-agent-v<version>.bin
 
 # or the Python tooling
-esptool.py --chip esp32s3 write_flash 0x0 esp32-agent.bin
+esptool.py --chip esp32s3 write_flash 0x0 esp32-agent-v<version>.bin
 ```
 
 If you would rather not merge, flash the ELF directly with the command in section 1 — that

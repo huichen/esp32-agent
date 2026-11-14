@@ -48,6 +48,8 @@ Rejoignez-le, ouvrez `http://192.168.4.1/`, saisissez le nom du réseau et le mo
 enregistrez. Ils vont en NVS et la carte se reconnecte. Avant cela elle n'atteint rien hors
 du réseau local : ni point d'entrée de modèle, ni miroir de paquets.
 
+Pour flasher l'image précompilée au lieu de compiler : téléchargez `esp32-agent-v<version>.bin` depuis la [dernière version](https://github.com/huichen/esp32-agent/releases/latest), une image fusionnée du bootloader, de la table de partitions et de l'application, et écrivez-la à partir de 0x0 avec `espflash write-bin --chip esp32s3 0x0 <file> --port COM3`. Elle ne contient aucune identification WiFi : la carte démarre donc le point d'accès `esp32-agent-setup` au premier démarrage.
+
 ## Utilisation
 
 **Dans un navigateur** : `http://<board>/` (ou `https://<board>/`) est la console. Parler au

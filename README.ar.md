@@ -45,6 +45,8 @@ bash scripts/build-firmware.sh --flash --port /dev/ttyACM0
 `http://192.168.4.1/`، واكتب اسم الشبكة وكلمة المرور، واحفظ. تذهب إلى NVS وتعيد اللوحة
 الاتصال. وقبل ذلك لا تصل إلى شيء خارج الشبكة المحلية: لا نقطة النموذج ولا مرآة الحزم.
 
+لتحميل الصورة الجاهزة بدل البناء: نزّل `esp32-agent-v<version>.bin` من [أحدث إصدار](https://github.com/huichen/esp32-agent/releases/latest)، وهي صورة مدموجة تضم الـ bootloader وجدول الأقسام والتطبيق، واكتبها من العنوان 0x0 بالأمر `espflash write-bin --chip esp32s3 0x0 <file> --port COM3`. لا تحتوي على بيانات WiFi، لذا تُشغّل اللوحة نقطة الوصول `esp32-agent-setup` عند أول إقلاع.
+
 ## الاستخدام
 
 **من المتصفح**: `http://<board>/` (أو `https://<board>/`) هي وحدة التحكم. محادثة مع النموذج،

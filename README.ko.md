@@ -46,6 +46,8 @@ Windows에서는 `powershell -File scripts/build-firmware.ps1 -Flash -Port COM3`
 자격 증명은 NVS에 저장되고 보드는 다시 연결합니다. 그때까지는 LAN 밖의 어떤 곳에도 접근할 수
 없습니다. 모델 엔드포인트에도, 패키지 미러에도 연결되지 않습니다.
 
+빌드하지 않고 미리 빌드된 이미지를 굽는 경우: [최신 릴리스](https://github.com/huichen/esp32-agent/releases/latest) 에서 `esp32-agent-v<version>.bin` 을 받으세요(bootloader, 파티션 테이블, 애플리케이션을 합친 이미지). `espflash write-bin --chip esp32s3 0x0 <file> --port COM3` 로 주소 0x0 에서 굽습니다. WiFi 자격 증명은 들어 있지 않으므로 첫 부팅에서 `esp32-agent-setup` 접속점이 뜹니다.
+
 ## 사용 방법
 
 **브라우저에서**: `http://<board>/`(또는 `https://<board>/`)가 콘솔입니다. 모델과 대화하고,

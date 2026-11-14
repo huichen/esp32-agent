@@ -46,6 +46,8 @@ Windows では `powershell -File scripts/build-firmware.ps1 -Flash -Port COM3` �
 認証情報は NVS に保存され、ボードは再接続します。それが完了するまでは、LAN の外には一切
 アクセスできません。モデルのエンドポイントにも、パッケージミラーにも接続できません。
 
+ビルドせずにプリビルドイメージを書き込む場合：[最新リリース](https://github.com/huichen/esp32-agent/releases/latest) から `esp32-agent-v<version>.bin` を取得してください（bootloader・パーティションテーブル・アプリをまとめた結合イメージ）。`espflash write-bin --chip esp32s3 0x0 <file> --port COM3` でアドレス 0x0 から書き込みます。WiFi 認証情報は含まれないため、初回起動時に `esp32-agent-setup` アクセスポイントが立ち上がります。
+
 ## 使い方
 
 **ブラウザーから**：`http://<board>/`（または `https://<board>/`）がコンソールです。モデルとの会話、

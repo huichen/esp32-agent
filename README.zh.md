@@ -43,6 +43,8 @@ Windows 上使用 `powershell -File scripts/build-firmware.ps1 -Flash -Port COM3
 `http://192.168.4.1/`，填网络名和密码，保存。凭据进 NVS，板子重连。在这一步完成之前，
 它到不了局域网以外的任何地方：模型端点、软件源都到不了。
 
+也可以直接刷预编译镜像：从[最新发布](https://github.com/huichen/esp32-agent/releases/latest)下载 `esp32-agent-v<version>.bin`（bootloader、分区表与应用合并在一个文件里），用 `espflash write-bin --chip esp32s3 0x0 <file> --port COM3` 从地址 0x0 写入。镜像里没有 WiFi 凭据，所以首次启动会开 `esp32-agent-setup` 接入点。
+
 ## 使用
 
 **在浏览器里**：`http://<board>/`（或 `https://<board>/`）就是控制台。和模型对话、看探测到的
