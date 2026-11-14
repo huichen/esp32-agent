@@ -251,7 +251,7 @@
         <p class="hint">On: the board also answers on its own network at <code>http://192.168.4.1/</code>. Off: the access point closes as soon as the station has an address, and only the network address works.</p>
         <label for="set-plain-http"><input id="set-plain-http" type="checkbox"> Answer on plain HTTP (port 80) as well as HTTPS</label>
         <p class="hint">HTTPS on 443 is always on — the board issues its own certificate. Plain HTTP is what makes a phone pop the portal up on a new network; turning it off means typing <code>https://</code> by hand. The board refuses a state where neither port would answer.</p>
-        <p class="hint">Both take effect after a restart; the Agent tab has the button.</p>
+        <p class="hint">Saving either one restarts the board: the listeners are bound and the radio configured at startup, so there is nothing to switch over in place. The console drops for a few seconds and reconnects. Saving WiFi credentials does not restart anything \u2014 the join is live.</p>
       </div>
       <div class="card"><h3>Log</h3><pre id="logs" class="log"></pre>
         <div class="buttons"><button id="logs-refresh" class="btn ghost">Refresh</button></div>

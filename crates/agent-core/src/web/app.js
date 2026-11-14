@@ -2133,11 +2133,14 @@ function init() {
     body.wifi = { keep_ap: $("#set-keep-ap").checked };
     body.mcp = { plain_http: $("#set-plain-http").checked };
     try {
-      await api("/api/config", { method: "POST", body });
+      const res = await api("/api/config", { method: "POST", body });
       $("#auth-pin").value = "";
       // A new PIN invalidates the token the page is holding.
       if (pin) { S.token = ""; localStorage.removeItem("esp32-agent.token"); }
-      toast("applied; restart to apply the network changes");
+      const applied = res && res.restart_required;
+      toast(applied
+        ? "saved; the board restarts now, the console is back in a few seconds"
+        : "applied");
     } catch (e) { toast(e.message); }
   };
 

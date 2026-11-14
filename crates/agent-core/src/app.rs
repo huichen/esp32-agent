@@ -4975,12 +4975,27 @@ impl App {
                 // path the touched list does not name.
                 let bus_or_board = before.bus != self.cfg.bus || before.board != self.cfg.board;
                 if bus_or_board {
-                    self.runtime.restart_requested = true;
                     self.rebuild();
+                }
+                // Three settings cannot be rebound in place: the I2C pins belong to the
+                // open driver, the listeners are bound once at startup, and the radio task
+                // builds its station/AP configuration when it starts. Rather than leave the
+                // console showing a state the board is not in, the board restarts itself —
+                // which is what a person means by "apply". Credentials are the exception:
+                // they are applied live, and restarting in the middle of a join would drop
+                // it, so a patch that changes them is not turned into a restart.
+                let creds_changed =
+                    before.wifi.ssid != self.cfg.wifi.ssid || before.wifi.password != self.cfg.wifi.password;
+                let needs_restart = bus_or_board
+                    || before.mcp.port != self.cfg.mcp.port
+                    || before.mcp.plain_http != self.cfg.mcp.plain_http
+                    || (!creds_changed && before.wifi.keep_ap != self.cfg.wifi.keep_ap);
+                if needs_restart {
+                    self.runtime.restart_requested = true;
                 }
                 let mut v = self.status_json();
                 v["touched"] = json!(touched);
-                v["restart_required"] = json!(bus_or_board || before.mcp.port != self.cfg.mcp.port);
+                v["restart_required"] = json!(needs_restart);
                 Response::json(&v)
             }
             Err(e) => Response::json_status(400, &json!({ "error": e.message })),
