@@ -37,7 +37,7 @@ A refused call says what was refused and why, in a sentence, because a missing n
 Every tool call runs under one configured deadline, and that budget reaches the device rather than staying in a client.
 Limits are checked before a buffer is allocated or a bus is touched, never after the copy has already happened.
 Every structure that grows - transcript, archive index, workspace, attachments - carries a stated ceiling that the code enforces.
-No tool call and no driver probe can take the board down or lock it away from its owner, and nothing on the board restarts or resets it on a caller's behalf.
+No tool call and no driver probe can take the board down or lock it away from its owner. A restart is the owner's own act: the console has one, behind the portal credential, and it shares the platform's single flush-then-restart path with a configuration change that needs one. It is never a model's — no tool, no `board` command and no MCP resource ends the run the caller is standing on.
 
 ## Concurrency is the goal, not the compromise
 

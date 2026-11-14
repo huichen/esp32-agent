@@ -503,6 +503,10 @@ impl App {
             .get(crate::config::NVS_KEY_CONFIG)
             .and_then(|s| Config::from_json_str(&s))
             .unwrap_or_default();
+        // `log.level` used to be stored, validated, served and shown in the portal while no
+        // line was ever filtered by it. It is a property of the ring itself, so it belongs to
+        // the log and not to a reader that would have to pass it around.
+        log.set_min_level(&cfg.log.level);
         let (mut manifest, manifest_source) = match store.get(NVS_KEY_MANIFEST) {
             Some(s) => match Manifest::from_json_str(&s) {
                 Ok(m) => (m, "nvs"),
@@ -3110,6 +3114,11 @@ impl App {
             json!(self.llm.base_url.starts_with("http://") || self.llm.base_url.starts_with("https://"));
         // The platform tick, so the portal can show and edit it next to the model settings.
         v["tick_ms"] = json!(self.cfg.agent.tick_ms);
+        // `tz_offset_h` is board config, but the portal edits it beside the model settings, so
+        // it has to be readable from the same document it is written from. It used to be
+        // written to `/api/config` and read from here, where it was absent: the field showed 0
+        // on every page load and the save looked lost.
+        v["tz_offset_h"] = json!(self.cfg.tz_offset_h);
         v["run"] = json!({
             "runs": self.agent.runs,
             "last_error": self.agent.last_error,
@@ -4731,6 +4740,20 @@ impl App {
                     ),
                 }
             }
+            ("POST", "/api/reboot") => {
+                if let Err(r) = self.require_pin(req) {
+                    return r;
+                }
+                // The owner's restart, not a caller's. This is the one operation on the
+                // machine rather than on the workload, so it is reachable only from the
+                // console, with the portal credential, and it is deliberately not an MCP tool
+                // and not a command of `board`: a model cannot end the run it is standing on.
+                // The platform's loop already performs flush-then-restart for a configuration
+                // change, so this asks for the same one restart rather than adding a path.
+                self.runtime.restart_requested = true;
+                self.log.warn("system", "restart requested from the console");
+                Response::json_status(202, &json!({ "ok": true, "restarting": true }))
+            }
             ("POST", "/api/wifi/connect") => {
                 if let Err(r) = self.require_pin(req) {
                     return r;
@@ -4987,7 +5010,14 @@ impl App {
         match self.cfg.apply_patch(&patch) {
             Ok(touched) => {
                 self.runtime.config_dirty = true;
-                if before.wifi != self.cfg.wifi && !self.cfg.wifi.ssid.is_empty() {
+                self.log.set_min_level(&self.cfg.log.level);
+                // Credentials are the one thing the radio cannot pick up from the live config
+                // on its own: a new SSID means a new association. Everything else about WiFi
+                // (the access point switches, the static address, the reconnect policy) is
+                // read from `cfg` by the radio thread every second.
+                if (before.wifi.ssid != self.cfg.wifi.ssid || before.wifi.password != self.cfg.wifi.password)
+                    && !self.cfg.wifi.ssid.is_empty()
+                {
                     let ssid = self.cfg.wifi.ssid.clone();
                     let pw = self.cfg.wifi.password.clone();
                     if let Err(e) = self.hw.wifi_connect(&ssid, &pw) {
@@ -5013,7 +5043,13 @@ impl App {
                 // Only the pins/board and the listening port still need a restart: the radio
                 // rebuilds its configuration on command, and plain http is gated per
                 // request rather than by unbinding.
-                let needs_restart = bus_or_board || before.mcp.port != self.cfg.mcp.port;
+                let needs_restart = bus_or_board
+                    || before.mcp.port != self.cfg.mcp.port
+                    || before.mcp.enabled != self.cfg.mcp.enabled
+                    // The ring is allocated at boot with its capacity, so a new `log.ring`
+                    // cannot be honoured in place. Until this was listed the portal answered
+                    // "applied" and nothing changed, at all, ever.
+                    || before.log.ring != self.cfg.log.ring;
                 if needs_restart {
                     self.runtime.restart_requested = true;
                 }
@@ -11532,11 +11568,12 @@ mod tests {
     /// Neither a tool nor a route.
     ///
     /// A restart ends the run that asked for it, and a factory reset wipes the board the
-    /// caller is standing on. The platform still restarts itself when a configuration change
-    /// needs one (`runtime.restart_requested`), but nobody can ask for either over a tool, a
-    /// route or the console: they are operations on the machine, not on the workload.
+    /// caller is standing on, so neither is a tool, a command or a route an agent can reach.
+    /// A restart is still something an *owner* does to their own machine, so the console has
+    /// one — on `POST /api/reboot`, behind the portal credential, and it shares the platform's
+    /// single flush-then-restart path with a configuration change that needs one.
     #[test]
-    fn nobody_can_restart_or_reset_the_board() {
+    fn the_owner_may_restart_the_board_but_no_caller_of_a_tool_may() {
         let mut app = test_app();
         for name in ["reboot", "factory_reset"] {
             assert!(app.tools.get(name).is_none(), "{name} is still registered");
@@ -11551,13 +11588,70 @@ mod tests {
         for name in ["reboot", "factory_reset"] {
             assert!(!commands.contains(&name.to_string()), "{name} is still a command: {commands:?}");
         }
-        // And the routes that did the same thing are gone with them.
-        for path in ["/api/reboot", "/api/factory-reset", "/api/wifi/forget"] {
+        // A factory reset is gone whatever the caller is.
+        for path in ["/api/factory-reset", "/api/wifi/forget"] {
             let mut req = post(path, "{}");
             req.method = "POST".into();
             assert_eq!(app.route(&req).status, 404, "{path} still answers");
         }
-        assert!(!app.runtime.restart_requested, "nothing here may ask for a restart");
+        assert!(!app.runtime.restart_requested, "nothing above may ask for a restart");
+
+        // The console's route: accepted for the owner, and it is the same flag the platform
+        // already acts on for a configuration change — one restart path, not two.
+        let resp = app.route(&post("/api/reboot", "{}"));
+        assert_eq!(resp.status, 202, "the console restart is accepted");
+        assert!(app.runtime.restart_requested, "the platform must be told to restart");
+    }
+
+    #[test]
+    fn the_console_restart_needs_the_portal_credential() {
+        let mut app = test_app();
+        app.cfg.auth.portal_pin = "4242".into();
+        let resp = app.route(&post("/api/reboot", "{}"));
+        assert_eq!(resp.status, 401, "no PIN, no restart");
+        assert!(!app.runtime.restart_requested);
+    }
+
+    /// The Settings page edits the timezone beside the model settings and reads it back from
+    /// `/api/agent/config`. It used to be written to `/api/config` and read from a document
+    /// that did not carry it, so the field showed 0 on every load and the save looked lost.
+    #[test]
+    fn the_agent_config_document_carries_the_timezone_it_is_edited_next_to() {
+        let mut app = test_app();
+        assert_eq!(app.route(&post("/api/config", r#"{"tz_offset_h":8}"#)).status, 200);
+        assert_eq!(body_json(&app.route(&get("/api/config")))["tz_offset_h"], 8);
+        assert_eq!(
+            body_json(&app.route(&get("/api/agent/config")))["tz_offset_h"],
+            8,
+            "the page reads the value from here"
+        );
+    }
+
+    /// `log.ring` sizes a buffer allocated once at boot, so a change cannot be honoured in
+    /// place. The answer has to say so — and `log.level`, which can move in place, must not
+    /// ask for a restart the board does not need.
+    #[test]
+    fn a_log_ring_change_asks_for_a_restart_and_a_level_change_does_not() {
+        let mut app = test_app();
+        let ring = body_json(&app.route(&post("/api/config", r#"{"log":{"ring":256}}"#)));
+        assert_eq!(ring["restart_required"], json!(true), "{ring}");
+        assert_eq!(app.cfg.log.ring, 256);
+
+        let mut app = test_app();
+        app.log.set_min_level("info");
+        let level = body_json(&app.route(&post("/api/config", r#"{"log":{"level":"error"}}"#)));
+        assert_eq!(level["restart_required"], json!(false), "{level}");
+        assert_eq!(app.cfg.log.level, "error");
+        // Applied to the ring itself, not only to the config: the next info line is dropped
+        // and the next error is kept.
+        app.log.info("config", "this line is below the level");
+        app.log.error("config", "this one is not");
+        let last = app.log.tail(1, 0).pop().expect("a line");
+        assert_eq!(last.message, "this one is not");
+
+        let bad = app.route(&post("/api/config", r#"{"log":{"level":"verbose"}}"#));
+        assert_eq!(bad.status, 400, "a level the board does not know is refused, not guessed");
+        assert_eq!(app.cfg.log.level, "error");
     }
     /// "How much RAM is free" has two answers on a board with PSRAM, and the status tool
     /// used to give only the big one: asked in a real turn, the model read `free_heap_kb`

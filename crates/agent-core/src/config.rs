@@ -101,7 +101,6 @@ pub struct Config {
     pub bus: BusCfg,
     pub pins: BTreeMap<String, i32>,
     pub auth: AuthCfg,
-    pub ui: UiCfg,
     pub log: LogCfg,
     /// The platform half of the agent: how often its loop wakes up.
     pub agent: AgentCfg,
@@ -225,14 +224,6 @@ pub struct AuthCfg {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
-pub struct UiCfg {
-    /// `zh` or `en`: the portal's initial language.
-    pub lang: String,
-    pub theme: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(default)]
 pub struct LogCfg {
     pub ring: usize,
     pub level: String,
@@ -331,7 +322,6 @@ impl Default for Config {
             bus: BusCfg::default(),
             pins: BTreeMap::new(),
             auth: AuthCfg::default(),
-            ui: UiCfg::default(),
             log: LogCfg::default(),
             agent: AgentCfg::default(),
             skills: SkillsCfg::default(),
@@ -396,12 +386,6 @@ impl Default for BusCfg {
 impl Default for I2cBusCfg {
     fn default() -> Self {
         Self { bus: 0, sda: 8, scl: 9, freq_hz: 400_000 }
-    }
-}
-
-impl Default for UiCfg {
-    fn default() -> Self {
-        Self { lang: "zh".into(), theme: "dark".into() }
     }
 }
 
@@ -740,22 +724,19 @@ impl Config {
                 }
             }
         }
-        if let Some(u) = patch.get("ui").and_then(|v| v.as_object()) {
-            if let Some(s) = u.get("lang").and_then(|v| v.as_str()) {
-                self.ui.lang = s.to_string();
-                touched.push("ui.lang".into());
-            }
-            if let Some(s) = u.get("theme").and_then(|v| v.as_str()) {
-                self.ui.theme = s.to_string();
-                touched.push("ui.theme".into());
-            }
-        }
         if let Some(l) = patch.get("log").and_then(|v| v.as_object()) {
             if let Some(n) = l.get("ring").and_then(|v| v.as_u64()) {
                 self.log.ring = n.clamp(16, 1024) as usize;
                 touched.push("log.ring".into());
             }
             if let Some(s) = l.get("level").and_then(|v| v.as_str()) {
+                // Refused rather than silently defaulted: a level the board does not know
+                // would quietly drop nothing, and the caller would think filtering works.
+                if !matches!(s, "trace" | "debug" | "info" | "warn" | "error") {
+                    return Err(crate::error::McpError::invalid_params(format!(
+                        "`log.level` is `{s}`; use trace, debug, info, warn or error"
+                    )));
+                }
                 self.log.level = s.to_string();
                 touched.push("log.level".into());
             }
@@ -817,11 +798,13 @@ impl Config {
             self.bus.i2c = BusCfg::default().i2c;
         }
         self.log.ring = self.log.ring.clamp(16, 1024);
+        // A stored config can carry a level this build does not know; `apply_patch` refuses
+        // one, but NVS outlives a build.
+        if !matches!(self.log.level.as_str(), "trace" | "debug" | "info" | "warn" | "error") {
+            self.log.level = "info".into();
+        }
         self.agent.tick_ms = clamp_tick_ms(self.agent.tick_ms);
         self.agent.tool_timeout_s = clamp_tool_timeout_s(self.agent.tool_timeout_s);
-        if self.ui.lang != "en" {
-            self.ui.lang = "zh".into();
-        }
         if self.wifi.hostname.trim().is_empty() {
             self.wifi.hostname = "esp32-agent".into();
         }

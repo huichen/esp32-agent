@@ -14,6 +14,7 @@ use esp32_agent_core::logbuf::LogBuf;
 use esp32_agent_core::Shared;
 use esp_idf_svc::eventloop::EspSystemEventLoop;
 use esp_idf_svc::hal::modem::Modem;
+use esp_idf_svc::handle::RawHandle;
 use esp_idf_svc::ipv4;
 use esp_idf_svc::netif::{EspNetif, NetifConfiguration};
 use esp_idf_svc::nvs::EspDefaultNvsPartition;
@@ -33,6 +34,50 @@ pub enum WifiCmd {
 
 static STATUS: OnceLock<Arc<Mutex<WifiStatus>>> = OnceLock::new();
 static CMD: OnceLock<Arc<Mutex<Option<Sender<WifiCmd>>>>> = OnceLock::new();
+
+/// The configuration the radio loop acts on, re-read from the live config every tick.
+///
+/// Every one of these used to be copied once, when the thread started, which is how
+/// `wifi.keep_ap` came to be saved, shown as checked, and never applied: the loop was
+/// comparing against the value the board booted with. They are read here instead, and the
+/// loop treats this snapshot as the truth — the same way `gateway`/`dns` already worked.
+#[derive(Clone, Debug, PartialEq)]
+struct Live {
+    ap_ssid: String,
+    ap_password: String,
+    ap_after_s: u32,
+    keep_ap: bool,
+    auto_reconnect: bool,
+    low_latency: bool,
+    hostname: String,
+    ip: String,
+    netmask: String,
+    gateway: String,
+    dns: String,
+    dns2: String,
+}
+
+/// `try_lock`, not `lock`: a long tool call holds the application lock, and a radio tick that
+/// waited for it would be a radio that stops reporting for the length of a model call. A
+/// missed sample only means the previous configuration lives one second longer.
+fn live_from(app: &Shared) -> Option<Live> {
+    let guard = app.try_lock().ok()?;
+    let w = &guard.cfg.wifi;
+    Some(Live {
+        ap_ssid: w.ap_ssid.clone(),
+        ap_password: w.ap_password.clone(),
+        ap_after_s: w.ap_after_s,
+        keep_ap: w.keep_ap,
+        auto_reconnect: w.auto_reconnect,
+        low_latency: w.low_latency,
+        hostname: w.hostname.clone(),
+        ip: w.ip.clone(),
+        netmask: w.netmask.clone(),
+        gateway: w.gateway.clone(),
+        dns: w.dns.clone(),
+        dns2: w.dns2.clone(),
+    })
+}
 
 fn status_slot() -> Arc<Mutex<WifiStatus>> {
     STATUS
@@ -154,6 +199,9 @@ fn run(
         ap_fallback,
         keep_ap,
         auto_reconnect,
+        low_latency,
+        boot_hostname,
+        ap_after_s,
         static_ip,
         static_netmask,
         static_gateway,
@@ -168,6 +216,9 @@ fn run(
             guard.cfg.wifi.ap_fallback,
             guard.cfg.wifi.keep_ap,
             guard.cfg.wifi.auto_reconnect,
+        guard.cfg.wifi.low_latency,
+        guard.cfg.wifi.hostname.clone(),
+        guard.cfg.wifi.ap_after_s,
             guard.cfg.wifi.ip.clone(),
             guard.cfg.wifi.netmask.clone(),
             guard.cfg.wifi.gateway.clone(),
@@ -224,6 +275,32 @@ fn run(
         if ssid.is_empty() { "not configured".to_string() } else { format!("joining `{ssid}`") }
     );
     apply_static_ip(&static_ip, &static_netmask, &static_gateway, &static_dns);
+    apply_hostname(&wifi, &boot_hostname, &log);
+    apply_modem_sleep(low_latency, &log);
+
+    // From here on the loop reads the configuration instead of the copy taken at boot.
+    let mut live = live_from(&app).unwrap_or(Live {
+        ap_ssid: ap_ssid.clone(),
+        ap_password: ap_password.clone(),
+        ap_after_s,
+        keep_ap,
+        auto_reconnect,
+        low_latency,
+        hostname: boot_hostname.clone(),
+        ip: static_ip.clone(),
+        netmask: static_netmask.clone(),
+        gateway: static_gateway.clone(),
+        dns: static_dns.clone(),
+        dns2: String::new(),
+    });
+    let mut applied_hostname = live.hostname.clone();
+    let mut applied_addr = (live.ip.clone(), live.netmask.clone(), live.gateway.clone(), live.dns.clone());
+    let mut applied_low_latency = live.low_latency;
+    // Seconds since the access point was last asked for, for `wifi.ap_after_s`. The field
+    // was stored, documented as "start the setup AP after this long without a station", and
+    // read by nothing: a board with `ap_fallback` off that missed its network was simply gone.
+    let mut no_station_ticks = 0u32;
+    let mut ap_open_ticks = 0u32;
 
     let mut last_state = String::new();
     let mut reconnect_ticks = 0u32;
@@ -232,55 +309,75 @@ fn run(
     // every tick would fight the driver; closing it again after a reconnect would flap.
     let mut ap_closed = false;
     loop {
+        // Re-read the switches a person changes in the portal. `try_lock` so a long tool call
+        // cannot stall the radio; a missed sample means one more second of the old setup.
+        if let Some(next) = live_from(&app) {
+            if next != live {
+                if next.hostname != applied_hostname {
+                    apply_hostname(&wifi, &next.hostname, &log);
+                    applied_hostname = next.hostname.clone();
+                }
+                let addr =
+                    (next.ip.clone(), next.netmask.clone(), next.gateway.clone(), next.dns.clone());
+                if addr != applied_addr {
+                    apply_static_ip(&addr.0, &addr.1, &addr.2, &addr.3);
+                    applied_addr = addr;
+                }
+                if next.low_latency != applied_low_latency {
+                    apply_modem_sleep(next.low_latency, &log);
+                    applied_low_latency = next.low_latency;
+                }
+                live = next;
+            }
+        }
         match rx.recv_timeout(Duration::from_millis(1000)) {
             Ok(WifiCmd::Connect { ssid: new_ssid, password }) => {
                 log.info("wifi", format!("reconfiguring for `{new_ssid}`"));
-                let cfg = Configuration::Mixed(
-                    client_config(&new_ssid, password.as_str()),
-                    ap_config("esp32-agent-setup", ""),
-                );
+                // Credentials are the one thing the radio cannot pick up from the live config
+                // by itself. The access point is built from the configured name and password
+                // now; it used to be the literal `esp32-agent-setup` with an empty one, which
+                // turned "keep the AP up" into "open a second, unauthenticated network".
+                let with_ap = live.keep_ap || new_ssid.is_empty();
+                let cfg = if new_ssid.is_empty() {
+                    Configuration::AccessPoint(ap_config(&live.ap_ssid, &live.ap_password))
+                } else if with_ap {
+                    Configuration::Mixed(
+                        client_config(&new_ssid, password.as_str()),
+                        ap_config(&live.ap_ssid, &live.ap_password),
+                    )
+                } else {
+                    Configuration::Client(client_config(&new_ssid, password.as_str()))
+                };
                 wifi.set_configuration(&cfg)?;
                 // A disconnect/connect cycle is what actually picks up new
                 // credentials on ESP-IDF.
                 let _ = wifi.stop();
                 wifi.start()?;
-                if let Err(e) = wifi.connect() {
-                    log::error!("wifi.connect failed: {e}");
-                }
-                ssid = new_ssid;
-                ap_ssid = "esp32-agent-setup".into();
-                // A new join starts over: the AP may be needed again while it associates.
-                ap_closed = false;
-                apply_static_ip(&static_ip, &static_netmask, &static_gateway, &static_dns);
-            }
-            Ok(WifiCmd::SetAp { open }) => {
-                let cfg = if open {
-                    Configuration::Mixed(
-                        client_config(&ssid, &password),
-                        ap_config("esp32-agent-setup", ""),
-                    )
-                } else {
-                    Configuration::Client(client_config(&ssid, &password))
-                };
-                if let Err(e) = wifi.set_configuration(&cfg) {
-                    log::error!("wifi: set_configuration for the access point failed: {e}");
-                    continue;
-                }
-                let _ = wifi.stop();
-                if let Err(e) = wifi.start() {
-                    log::error!("wifi: radio restart failed: {e}");
-                    continue;
-                }
-                if !ssid.is_empty() {
+                if !new_ssid.is_empty() {
                     if let Err(e) = wifi.connect() {
-                        log::error!("wifi: reconnect after the access point change failed: {e}");
+                        log.error("wifi", format!("connect after a credentials change failed: {e}"));
                     }
                 }
-                ap_closed = !open;
-                log::info!(
-                    "wifi: access point {}",
-                    if open { "kept up beside the station" } else { "closed; station stays" }
-                );
+                ssid = new_ssid;
+                ap_ssid = live.ap_ssid.clone();
+                // A new join starts over: the AP may be needed again while it associates.
+                ap_closed = !with_ap;
+                apply_static_ip(&live.ip, &live.netmask, &live.gateway, &live.dns);
+            }
+            Ok(WifiCmd::SetAp { open }) => {
+                // In place, deliberately: this used to be `stop()` + `start()`, which reset
+                // the TCP stack that was waiting for the answer to this very request. The
+                // mode switch is what gates the beacon, so open sets APSTA and close sets STA.
+                match ap_switch(&mut wifi, open, &live, &ssid, &password) {
+                    Ok(note) => {
+                        ap_closed = !open;
+                        log.info("wifi", format!("access point {note}"));
+                    }
+                    Err(e) => log.error(
+                        "wifi",
+                        format!("access point {} failed: {e}", if open { "open" } else { "close" }),
+                    ),
+                }
             }
             Ok(WifiCmd::Scan(reply)) => {
                 let result = scan_now(&mut wifi).map_err(|e| McpError::hardware(format!("{e}")));
@@ -334,11 +431,42 @@ fn run(
         // means "it had one". Once the AP is closed the status must say so; a board that
         // reports `ap+sta` with 192.168.4.1 after closing the AP is the kind of lie this
         // whole session keeps tripping over.
-        let ap_up = ap_ip.is_some() && !ap_closed;
+        // `ap_netif` keeps its address after the interface is stopped, so the address says
+        // nothing about whether the access point is on the air. The WiFi mode does, and the
+        // close path already sets it by hand: this is the bit that decides `ap+sta` in the
+        // status, so it is the bit that is read back.
+        let ap_mode = unsafe {
+            let mut mode: sys::wifi_mode_t = 0;
+            if sys::esp_wifi_get_mode(&mut mode) == 0 {
+                mode & sys::wifi_mode_t_WIFI_MODE_AP != 0
+            } else {
+                false
+            }
+        };
+        let ap_up = ap_mode && !ap_closed;
+        // `wifi.keep_ap` on means the access point stays up beside the station — including
+        // when it is switched on while the board is already joined, which is the case that
+        // used to be saved, acknowledged and never applied. Opening it is retried every ten
+        // seconds, so a driver refusal does not become a line of log per tick.
+        if live.keep_ap && !ap_up && !ssid.is_empty() {
+            ap_open_ticks = ap_open_ticks.saturating_add(1);
+            if ap_open_ticks >= 10 {
+                ap_open_ticks = 0;
+                match ap_switch(&mut wifi, true, &live, &ssid, &password) {
+                    Ok(note) => {
+                        ap_closed = false;
+                        log.info("wifi", format!("access point {note} (wifi.keep_ap is on)"));
+                    }
+                    Err(e) => log.error("wifi", format!("could not open the setup AP: {e}")),
+                }
+            }
+        } else {
+            ap_open_ticks = 0;
+        }
         // The access point exists to get the board onto a network. Once the station has an
         // address it is closed — the portal shows that address, so there is nothing left for
         // the AP to do. `wifi.keep_ap` asks for both networks on purpose.
-        if !keep_ap && !ap_closed && sta_connected && ap_up {
+        if !live.keep_ap && !ap_closed && sta_connected && ap_up {
             let rc = unsafe { sys::esp_wifi_set_mode(sys::wifi_mode_t_WIFI_MODE_STA) };
             match rc {
                 0 => {
@@ -351,10 +479,35 @@ fn run(
                         ),
                     );
                 }
-                other => log.warn(
+                other => log.error(
                     "wifi",
                     format!("could not close the setup AP (esp_wifi_set_mode returned {other}); it stays up"),
                 ),
+            }
+        }
+        // `wifi.ap_after_s`: no station for this long and the setup AP comes up. The field was
+        // stored and documented as exactly this, and nothing read it, so a board with
+        // `ap_fallback` off that missed its network was reachable only by reflashing it.
+        if sta_connected {
+            no_station_ticks = 0;
+        } else {
+            no_station_ticks = no_station_ticks.saturating_add(1);
+            if !ap_up && no_station_ticks >= live.ap_after_s.max(1) {
+                no_station_ticks = 0;
+                match ap_switch(&mut wifi, true, &live, &ssid, &password) {
+                    Ok(_) => {
+                        ap_closed = false;
+                        log.warn(
+                            "wifi",
+                            format!(
+                                "no station for {} s; setup AP `{}` is up at http://192.168.4.1/",
+                                live.ap_after_s.max(1),
+                                live.ap_ssid
+                            ),
+                        );
+                    }
+                    Err(e) => log.error("wifi", format!("could not start the setup AP: {e}")),
+                }
             }
         }
         let state = match (sta_connected, ap_up) {
@@ -375,7 +528,7 @@ fn run(
             };
             s.ap_ssid = ap_ssid.clone();
             s.ssid = ssid.clone();
-            s.hostname = "esp32-agent".into();
+            s.hostname = live.hostname.clone();
             s.rssi_dbm = rssi_dbm;
             s.channel = channel;
             s.mac = sta_mac.clone();
@@ -399,21 +552,13 @@ fn run(
         // should take effect without a reboot, and lwIP's DHCP client rewrites the DNS
         // servers from the lease on renewal, which would otherwise undo the setting.
         if sta_connected && overrides_due == 0 {
-            let (gw, dns, dns2) = {
-                let guard = app.lock().map_err(|_| anyhow::anyhow!("app lock poisoned"))?;
-                (
-                    guard.cfg.wifi.gateway.trim().to_string(),
-                    guard.cfg.wifi.dns.trim().to_string(),
-                    guard.cfg.wifi.dns2.trim().to_string(),
-                )
-            };
-            apply_network_overrides(&gw, &dns, &dns2, wifi.sta_netif(), &log);
+            apply_network_overrides(&live.gateway, &live.dns, &live.dns2, wifi.sta_netif(), &log);
         }
         overrides_due = (overrides_due + 1) % 30;
 
         // `esp_wifi` only tries once per `connect()`; without this a router that
         // reboots leaves the board off the network until somebody reboots it too.
-        if auto_reconnect && !ssid.is_empty() && !sta_connected {
+        if live.auto_reconnect && !ssid.is_empty() && !sta_connected {
             reconnect_ticks += 1;
             if reconnect_ticks >= 15 {
                 reconnect_ticks = 0;
@@ -573,6 +718,93 @@ fn scan_now(wifi: &mut EspWifi<'static>) -> anyhow::Result<Vec<WifiAp>> {
 /// lease it is about to receive overwrites the address a few milliseconds later. A bad
 /// address is refused with a log line instead of half-applying — a board that quietly
 /// keeps DHCP while the console shows a static address is worse than one that says no.
+/// Open or close the setup access point without restarting the driver.
+///
+/// Returns what happened, for the ring log. The beacon follows the WiFi mode, so opening has
+/// to name APSTA back: the close path sets `WIFI_MODE_STA` directly, and until now nothing
+/// set it the other way — `set_configuration` was assumed to, which is why the board could
+/// report `ap+sta` (from a netif that keeps its address) while no beacon existed at all. The
+/// mode is read back, so the answer is the one the radio is in rather than the one we asked
+/// for.
+fn ap_switch(
+    wifi: &mut EspWifi<'static>,
+    open: bool,
+    live: &Live,
+    ssid: &str,
+    password: &str,
+) -> anyhow::Result<String> {
+    let cfg = if !open {
+        Configuration::Client(client_config(ssid, password))
+    } else if ssid.is_empty() {
+        Configuration::AccessPoint(ap_config(&live.ap_ssid, &live.ap_password))
+    } else {
+        Configuration::Mixed(
+            client_config(ssid, password),
+            ap_config(&live.ap_ssid, &live.ap_password),
+        )
+    };
+    wifi.set_configuration(&cfg)?;
+    let mode = if open {
+        sys::wifi_mode_t_WIFI_MODE_APSTA
+    } else {
+        sys::wifi_mode_t_WIFI_MODE_STA
+    };
+    let rc = unsafe { sys::esp_wifi_set_mode(mode) };
+    if rc != 0 {
+        return Err(anyhow::anyhow!("esp_wifi_set_mode returned {rc}"));
+    }
+    let mut now: sys::wifi_mode_t = 0;
+    let rc = unsafe { sys::esp_wifi_get_mode(&mut now) };
+    if rc != 0 {
+        return Err(anyhow::anyhow!("esp_wifi_get_mode returned {rc}"));
+    }
+    let ap_on = now & sys::wifi_mode_t_WIFI_MODE_AP != 0;
+    if ap_on != open {
+        return Err(anyhow::anyhow!(
+            "the radio is in mode {now}, so the access point is {}",
+            if ap_on { "on" } else { "off" }
+        ));
+    }
+    Ok(if open {
+        format!(
+            "up beside the station (`{}`, {}), mode {now}",
+            live.ap_ssid,
+            if live.ap_password.is_empty() { "open network" } else { "WPA2" }
+        )
+    } else {
+        format!("closed; station stays, mode {now}")
+    })
+}
+
+/// `wifi.hostname` is the name the network sees. It was stored, served and shown while the
+/// interface kept the compile-time default and `/api/status` printed a literal, so a board
+/// named in the portal answered to `esp32-agent` anyway.
+fn apply_hostname(wifi: &EspWifi<'static>, name: &str, log: &Arc<LogBuf>) {
+    let name = name.trim();
+    if name.is_empty() {
+        return;
+    }
+    let Ok(cname) = std::ffi::CString::new(name) else {
+        log.error("wifi", format!("hostname `{name}` has a NUL byte; keeping the old one"));
+        return;
+    };
+    let rc = unsafe { sys::esp_netif_set_hostname(wifi.sta_netif().handle(), cname.as_ptr()) };
+    if rc != 0 {
+        log.error("wifi", format!("esp_netif_set_hostname(`{name}`) returned {rc}"));
+    }
+}
+
+/// `wifi.low_latency`: the field was documented as "disable modem sleep" and nothing read it.
+/// Modem sleep is what makes a quiet board answer a ping tens of milliseconds late, so the
+/// default (on) is also the setting that keeps the console usable.
+fn apply_modem_sleep(disabled: bool, log: &Arc<LogBuf>) {
+    let ps = if disabled { sys::wifi_ps_type_t_WIFI_PS_NONE } else { sys::wifi_ps_type_t_WIFI_PS_MIN_MODEM };
+    let rc = unsafe { sys::esp_wifi_set_ps(ps) };
+    if rc != 0 {
+        log.error("wifi", format!("esp_wifi_set_ps({ps}) returned {rc}"));
+    }
+}
+
 fn apply_static_ip(ip: &str, netmask: &str, gateway: &str, dns: &str) {
     let ip = ip.trim();
     if ip.is_empty() || ip == "0.0.0.0" {

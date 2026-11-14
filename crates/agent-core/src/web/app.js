@@ -2190,11 +2190,41 @@ function init() {
       $("#auth-mcp-token").value = "";
       // A new PIN invalidates the token the page is holding.
       if (pin) { S.token = ""; localStorage.removeItem("esp32-agent.token"); }
+      // Ask the board which of the things just sent it can honour without a reboot, instead
+      // of the page deciding: `log.ring` and the listen port cannot move in place, and a
+      // reader that says "applied" for those is a reader that lies.
       const applied = res && res.restart_required;
-      toast(applied
-        ? "saved; the board restarts now, the console is back in a few seconds"
-        : "applied");
-    } catch (e) { toast(e.message); }
+      $("#settings-result").textContent = applied
+        ? "saved, restart required: use the Restart card below to apply it now, or it takes effect at the next boot."
+        : "applied; nothing here needed a restart.";
+      toast(applied ? "saved; restart required" : "applied");
+    } catch (e) { $("#settings-result").textContent = e.message; toast(e.message); }
+  };
+
+  // A restart ends the page's own connection, and the board stays away for a few seconds, so
+  // the click that decides is not the click that does it — the same two-step the network
+  // switches use. It is the console's route only: no tool and no `board` command reaches it.
+  let restartArmed = 0;
+  $("#board-restart").onclick = async () => {
+    const result = $("#restart-result");
+    if (!restartArmed) {
+      restartArmed = Date.now();
+      result.textContent =
+        "Click Restart again to continue: the board flushes what is queued and reboots. This page and the WiFi link drop for a few seconds; the conversation and the settings survive.";
+      setTimeout(() => {
+        restartArmed = 0;
+        if (result.textContent.startsWith("Click Restart again")) result.textContent = "";
+      }, 12000);
+      return;
+    }
+    restartArmed = 0;
+    try {
+      await api("/api/reboot", { method: "POST", body: {} });
+      result.textContent = "restarting; the console comes back on the same address in a few seconds";
+      toast("restarting");
+    } catch (e) {
+      result.textContent = e.message;
+    }
   };
 
   $("#logs-refresh").onclick = loadLogs;

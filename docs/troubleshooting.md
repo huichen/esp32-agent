@@ -150,6 +150,33 @@ That is by design: `safety.min/max` and `params.min/max` are both checked on the
 the message carries the range, e.g. `` `ms` = 90000 is outside 10..=5000 ms ``. Change the
 argument, not the firmware.
 
+## A setting is saved and nothing changes
+
+The console answers every save, so a field that looks applied and is not needs a list of what
+the board re-reads and what it cannot. Since 2026-11-14 the board re-reads live:
+
+| Setting | Takes effect |
+|---|---|
+| `wifi.ssid`, `wifi.password` | On save: a new association |
+| `wifi.keep_ap`, `wifi.ap_ssid`, `wifi.ap_password` | Within a second, without a reboot. The beacon follows the WiFi mode, so the access point coming up is what `/api/status` `wifi.state` then reports as `ap+sta` |
+| `wifi.ip`, `wifi.netmask`, `wifi.gateway`, `wifi.dns`, `wifi.dns2` | Within a second; `gateway`/`dns` are re-applied every 30 s because lwIP rewrites them from the lease on renewal |
+| `wifi.auto_reconnect`, `wifi.low_latency`, `wifi.ap_after_s`, `wifi.hostname` | Within a second |
+| `log.level` | On the next line; an error is never filtered out |
+| `mcp.*` except `port` | On the next request, `plain_http`, `cors`, `sse`, `path`, `tools_mode` and `disabled_tools` included |
+| `tz_offset_h`, `agent.tick_ms`, `agent.tool_timeout_s`, `agent.persist_transcript` | Immediately |
+| `auth.*` | On the next request |
+| `pins`, `bus.*`, `board`, `auto_peripherals` | A re-probe (`/api/devices/probe`) rebuilds the drivers |
+
+What still needs a restart, and says so: `mcp.port` (the listener is bound once), `mcp.enabled`
+and `log.ring` (the ring is allocated at boot with its capacity). The Settings page prints
+"saved, restart required" for those and has the button, `POST /api/reboot`.
+
+Before that list existed the opposite was true of several of them: `wifi.keep_ap`, the access
+point name and password, the static address, `wifi.auto_reconnect`, `wifi.low_latency` and
+`wifi.ap_after_s` were copied once when the radio thread started, and `log.level` and the
+AP's state were never read at all. The access point could therefore be "on" in the
+configuration, "on" in `/api/status`, and absent from the air.
+
 ## The portal will not open
 
 Three things produce the same symptom — a browser showing nothing — and the board's log

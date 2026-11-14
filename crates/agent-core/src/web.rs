@@ -112,8 +112,12 @@ mod tests {
         assert!(APP_JS.contains("await askConfirm(\"Clear conversation\""));
         assert!(APP_JS.contains("Instructions, skills, files and model settings stay."));
         assert!(!APP_JS.contains("/api/factory-reset"), "clearing must not erase the workspace or config");
-        assert!(!APP_JS.contains("/api/reboot"), "no button may restart the board");
-        assert!(!INDEX_HTML.contains("id=\"reboot\""), "the Reboot button is gone");
+        // Clearing is not a restart either. The console has one restart of its own — the
+        // Settings card, owner-only, `POST /api/reboot` — and it must stay the only one: this
+        // button, the network switches and the clear button all leave the board running.
+        assert_eq!(APP_JS.matches("/api/reboot").count(), 1, "exactly one restart in the page");
+        assert!(INDEX_HTML.contains("id=\"board-restart\""), "the restart lives in Settings");
+        assert!(!INDEX_HTML.contains("id=\"reboot\""), "and not in the header, next to Clear chat");
         assert!(STYLE_CSS.contains(".clear-chat:focus-visible"), "keyboard focus must be visible");
         assert!(INDEX_HTML.contains("<html lang=\"en\">"), "the page declares one language");
     }
