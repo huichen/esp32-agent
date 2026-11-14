@@ -118,6 +118,8 @@ is on that list, because neither is offered anywhere — see
 | POST | `/api/tools` | `{mode: auto|generic|all, disabled: [...]}` — no tool changes visibility, so this one stays a route |
 | GET | `/api/wifi/scan` | Scan |
 | POST | `/api/wifi/connect` | `{ssid, password}`, save and reconnect |
+| POST | `/api/wifi/ap` | `{open}`, keep the setup access point up beside the station (or close it) without a reboot; the name and password come from `wifi.ap_ssid` / `wifi.ap_password` |
+| POST | `/api/reboot` | The owner's restart: the board flushes what is queued and reboots. Behind the console credential, and deliberately not an MCP tool — a model cannot end the run it is standing on |
 | GET | `/api/logs?n=&since=` | Ring log |
 | GET | `/api/files/tree` | The whole workspace in one answer: every directory (derived from the paths) and file with `size_bytes`, plus `total_bytes` / `total_max` / `file_max`. What the portal's Files tab reads |
 | GET | `/api/files/read?path=<file>` | One file as text |

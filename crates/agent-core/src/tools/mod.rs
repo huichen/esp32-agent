@@ -509,16 +509,23 @@ pub fn system_tools() -> Vec<ToolDef> {
             refuse_dangerous_config(ctx, &patch)?;
             let touched = ctx.cfg.apply_patch(&patch)?;
             ctx.runtime.config_dirty = true;
+            ctx.log.set_min_level(&ctx.cfg.log.level);
             ctx.log.info("config", format!("patched: {}", touched.join(", ")));
-            let needs_restart = touched
-                .iter()
-                .any(|t| t.starts_with("wifi") || t == "mcp.port" || t == "mcp.enabled" || t == "bus.i2c");
+            // Only what the running system cannot re-read: the listening socket, the service
+            // switch and the log ring's allocation. WiFi settings are live now — the radio
+            // thread reads them every tick — so restarting for them was a reboot the board did
+            // not need.
+            let needs_restart =
+                touched.iter().any(|t| t == "mcp.port" || t == "mcp.enabled" || t == "log.ring");
             if needs_restart {
                 ctx.runtime.restart_requested = true;
             }
-            // Turning the board's own peripherals on or off changes the device list, which
-            // only a fresh probe can do.
-            if touched.iter().any(|t| t == "auto_peripherals" || t == "board") {
+            // The bus pins and the pin overrides belong to drivers that are already open, and
+            // the device list is what a fresh probe rebuilds.
+            if touched.iter().any(|t| {
+                t == "auto_peripherals" || t == "board" || t == "bus.i2c" || t == "pins"
+                    || t == "bus.onewire_pins"
+            }) {
                 ctx.runtime.reprobe_requested = true;
             }
             Ok(json!({ "ok": true, "touched": touched, "restart_required": needs_restart }))
@@ -915,7 +922,8 @@ const BOARD_COMMANDS: &[&str] = &[
     // Neither `reboot` nor `factory_reset` is a tool any more, and neither is a command
     // here: both end the run, or wipe the board, that the caller is standing on. The
     // platform still restarts itself when a configuration change needs it
-    // (`runtime.restart_requested`); nothing can ask it to.
+    // (`runtime.restart_requested`), and the console has its own `/api/reboot` behind the
+    // portal credential — an owner acting on their machine, not a caller on the workload.
     "delay",
     "inventory",
     // The certificate the board made for itself. The portal showed it on `/api/tls` and a

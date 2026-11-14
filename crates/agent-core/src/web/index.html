@@ -257,6 +257,13 @@
         <input id="auth-tz" type="number" min="-12" max="14" step="1" inputmode="numeric" placeholder="0">
         <p class="hint">Whole hours only. It decides when a daily task fires and what the clock reads; half-hour zones cannot be expressed and are refused rather than rounded.</p>
         <div class="buttons"><button id="settings-save" class="btn primary">Save</button></div>
+        <p id="settings-result" class="hint"></p>
+      </div>
+      <div class="card">
+        <h3>Restart</h3>
+        <p class="hint">The port it listens on, the log ring and the bus pins are bound when the board boots, so those changes answer "saved, restart required" instead of pretending. Everything else on this page is live. A restart drops the WiFi link and the console for a few seconds; the conversation and the settings survive it.</p>
+        <div class="buttons"><button id="board-restart" class="btn">Restart the board</button></div>
+        <p id="restart-result" class="hint"></p>
       </div>
             <div class="card">
         <h3>Network services</h3>

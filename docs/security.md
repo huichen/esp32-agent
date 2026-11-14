@@ -17,6 +17,7 @@ REST routes enforce the following when `auth.portal_pin` is nonempty:
 | Surface | Portal credential required? |
 |---|---|
 | State-changing REST writes | Yes; `/api/auth` itself is the login route |
+| `POST /api/reboot` | Yes, and only the console has it: no MCP tool and no `board` command reaches a restart |
 | `GET /api/config`, `/api/agent/config`, `/api/sched`, `/api/agent/history`, `/api/agent/prompt` | Yes |
 | `GET /api/files/tree`, `/api/files/read`, `/api/attachment/<name>` | Yes |
 | Status, memory pools, TLS identity, devices, tools and discovery | No |

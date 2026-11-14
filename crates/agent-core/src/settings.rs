@@ -104,12 +104,7 @@ const BOARD: &[Field] = &[
     f("wifi.ap_password", "string", "\"\"", "write-only; empty means an open setup AP"),
     f("mcp.enabled", "boolean", "true", "serve the MCP endpoint"),
     f("mcp.port", "integer", "80", "needs a restart"),
-    f(
-        "mcp.plain_http",
-        "boolean",
-        "true",
-        "false closes port 80 and leaves only https on 443; needs a restart, and is refused when no certificate exists",
-    ),
+    f("mcp.plain_http", "boolean", "true", "false closes port 80 and leaves only https on 443; takes effect on the next request, not the next boot"),
     f("mcp.path", "string", "/mcp", "endpoint path"),
     f("mcp.tools_mode", "string", "auto", "auto | generic | all"),
     f(
@@ -132,10 +127,14 @@ const BOARD: &[Field] = &[
     f("pins", "object", "{}", "explicit pin overrides, e.g. {\"oled.height\":32}"),
     f("auth.portal_pin", "string", "\"\"", "empty = every mutation is open"),
     f("auth.mcp_token", "string", "\"\"", "empty = MCP needs no bearer token"),
-    f("log.level", "string", "info", "trace | debug | info | warn | error"),
-    f("log.ring", "integer", "96", "lines kept in RAM"),
-    f("ui.lang", "string", "zh", "portal language"),
-    f("ui.theme", "string", "dark", "portal theme"),
+    f("log.level", "string", "info", "trace | debug | info | warn | error; applied to new lines immediately"),
+    f("log.ring", "integer", "96", "lines kept in RAM; the buffer is allocated at boot, so a change needs a restart"),
+    f(
+        "tz_offset_h",
+        "integer",
+        "0",
+        "whole hours east of UTC for the local clock and `at_hhmm` tasks; -12 to 14, refused rather than clamped",
+    ),
     f("agent.tick_ms", "integer", "1000", "how often the agent thread and scheduler tick"),
     f(
         "agent.tool_timeout_s",
