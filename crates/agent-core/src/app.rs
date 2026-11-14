@@ -15887,6 +15887,11 @@ str(queued) + "/" + str(a.ok) + "/" + str(again.ok) + "/" + str(task_state(secon
             pools.iter().all(|p| p["pool"].is_string() && p["free_kb"].is_number()),
             "a pool has to name itself and its numbers: {status}"
         );
+        // The sentence a caller would otherwise invent. Measured on the bench 2026-11-14:
+        // 77 KB free, 31 KB largest, and the board's own agent wrote the caveat itself.
+        let note = status["memory"]["note"].as_str().unwrap_or("");
+        assert!(note.contains("largest_kb"), "the note has to name the number that matters: {note}");
+        assert!(note.contains("dma"), "and which pool a peripheral buffer comes from: {note}");
 
         // The certificate the board made for itself: a caller told to compare a fingerprint
         // needs to be able to read it.

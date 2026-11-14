@@ -167,6 +167,17 @@ pub fn board_tools() -> Vec<ToolDef> {
                 "threads": crate::hardware::threads_json(ctx.hw.tasks()),
                 "memory": {
                     "pools": serde_json::to_value(ctx.hw.heap_pools()).unwrap_or(Value::Null),
+                    // The sentence a caller otherwise has to invent. Measured on the bench
+                    // 2026-11-14: 77 KB free with a 31 KB largest block, and the board's own
+                    // agent had to add "a big DMA buffer can fail even with 84 KB nominally
+                    // free" itself. A tool that hands over `free_kb` alone invites exactly that
+                    // mistake.
+                    "note": "free_kb is not the budget for a buffer: largest_kb is the biggest \
+                             single allocation, and that is what a new thread stack or DMA buffer \
+                             has to fit in. A pool is a set of capabilities, not an address range, \
+                             so the pools overlap: a thread stack comes from `internal_8bit`, a \
+                             buffer a peripheral reads or writes comes from `dma`, and `spiram` \
+                             supplies neither.",
                 },
             }))
         }),
