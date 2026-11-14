@@ -28,6 +28,8 @@ use serde_json::{json, Value};
 /// familiar single-command equivalent on a board with one storage area.
 pub const OPS: &[(&str, &str)] = &[
     ("ls", "fs_ls"),
+    // Running a script file, the way a shell does it.
+    ("sh", "shell_sh"),
     ("rm", "fs_rm"),
     ("cp", "fs_cp"),
     ("mv", "fs_mv"),
@@ -815,6 +817,19 @@ fn arguments_inner(parsed: &Parsed, piped: bool) -> Result<serde_json::Value, St
         "ifconfig" | "df" | "free" | "uptime" | "date" | "uname" | "ps" | "help" | "du" | "whoami" | "id"
         | "netstat" | "route" | "arp" => json!({}),
         "env" => json!({ "action": "list" }),
+        // `sh <file> [args…]`: everything after the path becomes the script's `argv`.
+        // Flags the shell grammar lifted out of the line are put back in `--name value`
+        // form, or `sh x.bh --who world` would arrive as `--who` with nothing beside it.
+        "sh" => {
+            let mut list: Vec<Value> = parsed.args.iter().cloned().map(Value::String).collect::<Vec<Value>>();
+            for (name, value) in &parsed.flags {
+                list.push(Value::String(format!("--{name}")));
+                if !value.is_empty() {
+                    list.push(Value::String(value.clone()));
+                }
+            }
+            json!({ "args": list })
+        }
         "cat" | "uniq" | "crc32" | "touch" => json!({ "path": path_arg(0)? }),
         "wc" => {
             // One mode per call, as the usage line says; `-l`, `-w` and `-c` are plain flags
@@ -911,6 +926,7 @@ pub fn usage(op: &str) -> Option<&'static str> {
         "jq" => "jq [query] <path>   query: . .name .a.b .[0] .a[0].b .[] .length (-r for strings)",
         "md5sum" => "md5sum <path>",
         "system_prompt" => "system_prompt get | set <text> | append <text> | clear",
+        "sh" => "sh <path> [args…]   run a board script file (same interpreter as `script`)",
         // Reading and slicing text. Each takes its input as a path, or as the pipe a stage
         // before it left behind.
         "echo" => "echo [-n] <text...>",
