@@ -62,3 +62,8 @@ firmware/.espressif/
 # through /.future/). Local to one machine, not part of the repository.
 /FUTURE.md
 .local*
+
+# Python bytecode from the interface-suite checks (python -m py_compile).
+__pycache__/
+*.pyc
+
