@@ -310,6 +310,15 @@ pub const ROUTES: &[Route] = &[
         "{ok, rate_hz, channels, bits, bytes, samples, ms, limit_bytes}",
     ),
     r(
+        "GET",
+        "/api/mic/pcm",
+        "audio",
+        Auth::Pin,
+        "The microphone as a chunked stream: audio/pcm, 16-bit mono at 16000 Hz, 20 ms per chunk. One reader at a time (a second client gets 503 and Retry-After), 120 s per connection (docs/audio.md)",
+        "",
+        "raw PCM16LE mono until the client leaves or the budget ends; X-Audio-Format, X-Rate-Hz, X-Channels and X-Bits in the headers",
+    ),
+    r(
         "POST",
         "/av",
         "audio",

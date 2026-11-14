@@ -175,9 +175,35 @@ not. Odd final bytes and incomplete HTTP framing return `400` / `ok: false`; a h
 write failure returns `500`. Successful responses count samples submitted to the driver,
 not an independently measured acoustic waveform.
 
-What this does **not** do: change the sample rate (`?rate=` accepts 24000 only), capture
-a microphone stream, or serve two uploads concurrently. Those require additional
-implementation/measurement, not a conclusion that no task could ever fit.
+What this does **not** do: change the sample rate (`?rate=` accepts 24000 only), or serve two
+uploads concurrently. Those require additional implementation/measurement, not a conclusion
+that no task could ever fit.
+
+### The microphone the other way: `GET /api/mic/pcm`
+
+The reverse direction is a chunked stream with the same shape: `audio/pcm`, 16-bit signed,
+mono, at the microphone's own 16000 Hz (`X-Audio-Format`, `X-Rate-Hz`, `X-Channels`,
+`X-Bits` say so in the headers, because a caller should not have to read this file to find
+out). A host writes the bytes straight to a WAV header and has a recording of any length.
+
+```
+curl -N -H 'X-Portal-Pin: …' http://<board>/api/mic/pcm > mic.pcm
+```
+
+Four things make it usable rather than a firehose:
+
+- **It never takes the application lock.** The platform hands out a `MicReader` that owns
+  the I²S handle (the same trick the background player uses for transmit), so a 20 ms read
+  does not hold the portal, `/api/status` or the agent thread for the length of a stream.
+- **One reader.** A second client is refused with `503` and `Retry-After: 5` instead of being
+  given half the samples; the slot returns as soon as the first stream ends.
+- **A budget.** One connection lasts at most 120 s and then closes. The console reconnects,
+  a recorder reopens, and a forgotten stream cannot hold a pool socket until a reflash.
+- **It ends on the client's terms.** A socket that goes away ends the stream — the body's
+  write fails, the loop stops, and the close is logged with the sample count.
+
+`mic_record` remains the tool for a short clip inside a tool result; this is the route for a
+recording that does not fit one.
 
 ## 7. Playing a melody: send the score, not the samples
 
