@@ -158,12 +158,19 @@ mod tests {
         // Bench evidence in commit 2187401: oled_text "HELLO BOARD", then
         // oled_read returned ["HELLO BOARD", "", "", ""]. Re-render through
         // the very same driver/font, not UTF-8 bytes or a hand-drawn substitute.
+        //
+        // That frame packed to 67 bytes because the glyph table it was measured with is
+        // not the one in this tree: it had `b` == `p`, `h` == `n`, `M` == `N` and missing
+        // strokes (A, G, K, S), which is why the panel never showed a readable line. The
+        // table was replaced on 2026-11-14, so the same text is 68 bytes and 13 runs now.
+        // The round trip and the 512-byte frame are unchanged; only the compression of a
+        // different set of glyphs differs, and this pins the current one.
         let mut hw = VirtualBoard::new();
         let mut oled = Ssd1306::probe(&mut hw, 0, 0x3c, 32, Controller::Ssd1306, 1).unwrap();
         oled.text_line(0, "HELLO BOARD");
         assert_eq!(oled.read_text(), ["HELLO BOARD", "", "", ""]);
         assert_eq!(oled.framebuffer().len(), 512);
-        assert_eq!(measurement("128x32 HELLO BOARD, 6x8 glyphs", oled.framebuffer()), (67, 0.130859375, 9));
+        assert_eq!(measurement("128x32 HELLO BOARD, 6x8 glyphs", oled.framebuffer()), (68, 0.1328125, 13));
     }
 
     #[test]
