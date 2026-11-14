@@ -113,6 +113,13 @@ pub const PIPE_RESULT_MAX: usize = 8192;
 pub const MAX_TASKS: usize = 8;
 pub const MAX_RULES: usize = 8;
 
+/// The shortest interval a scheduled prompt may have.
+///
+/// It costs a model call and the board has one agent thread; below this the next task is due
+/// before the last turn finished, so the queue never drains. A tool call could once set
+/// `every_s: 1` and turn the board into a stream of turns on somebody else's bill.
+pub const MIN_SCHEDULE_EVERY_S: u32 = 10;
+
 /// The longest message the portal may queue: the same bound the agent applies to
 /// its own history, so a page can never enqueue what the loop would have to cut.
 pub const AGENT_TEXT_MAX: usize = crate::agent::MAX_USER_BYTES;
@@ -797,12 +804,19 @@ impl App {
                 );
                 continue;
             }
+            // A manifest that names a reserved pin is refused at validation, but a *stored* one
+            // can predate that rule — and this runs at boot, so instantiating it would take the
+            // board down before anyone could reach it to fix the manifest. Skip it and say why.
+            if let Some(why) = spec.pins.values().find_map(|p| profile.pin_problem(*p)) {
+                self.log.error("manifest", format!("device `{}` skipped: {why}", spec.id));
+                declared_errors.push(json!({ "device": spec.id, "error": why }));
+                continue;
+            }
             match drivers::instantiate(spec, &mut *self.hw) {
                 Ok(dev) => {
-                    self.log.info("manifest", format!("instantiated `{}` from the manifest", spec.id));
-                    // The manifest's id is the one `device_invoke` and `devices_list`
-                    // use; the driver's own default (`led`, `relay`) would make two
-                    // devices of one kind indistinguishable.
+                    self.log.info("manifest", format!("instantiated `{}` from the manifest", spec.id)); // The manifest's id is the one `device_invoke` and `devices_list`
+                                                                                                        // use; the driver's own default (`led`, `relay`) would make two
+                                                                                                        // devices of one kind indistinguishable.
                     self.devices.push(Box::new(crate::device::NamedDevice::new(dev, &spec.id)));
                 }
                 Err(e) => {
@@ -4931,6 +4945,15 @@ impl App {
             Ok(v) => v,
             Err(e) => return Response::error_json(400, &format!("invalid JSON: {e}")),
         };
+        // The owner may change anything they like here — including the portal PIN — but not a
+        // pin the board reserves: the config is persisted, so that one takes the board down at
+        // every boot and the way back is a serial erase.
+        if let Some(why) = crate::config::reserved_pin_problem(self.profile, &patch) {
+            return Response::json_status(
+                400,
+                &json!({ "error": why, "reserved": self.profile.reserved, "profile": self.profile.id }),
+            );
+        }
         let before = self.cfg.clone();
         // A patch can change the profile, `tools_mode`, `disabled_tools` or `discovery`,
         // all of which decide what `tool_specs` answers — so the cached array goes first.
@@ -7164,6 +7187,18 @@ fn task_problem(t: &ScheduledTask) -> Option<String> {
     }
     if t.every_s == 0 && t.at_hhmm.is_empty() {
         return Some("a task needs `after_s` > 0, `every_s` > 0 or `at_hhmm` (\"07:30\")".to_string());
+    }
+    // The floor is about model calls, so a task that runs a `script` — which costs no call — is
+    // not held to it: a one-second script that reads a sensor is a legitimate pulse.
+    if t.every_s > 0 && t.every_s < MIN_SCHEDULE_EVERY_S && t.script.trim().is_empty() {
+        // A scheduled prompt costs a model call, and the board has one agent thread: below this
+        // the next task is due before the last turn finished, so the queue never drains and
+        // the board is a heater with a WiFi driver. It is also the cheapest way to spend
+        // somebody else's credits from a tool call.
+        return Some(format!(
+            "`every_s` must be at least {MIN_SCHEDULE_EVERY_S} s: a scheduled prompt is a model call, and \
+             the board cannot finish one in less than that"
+        ));
     }
     if !t.at_hhmm.is_empty() && !valid_hhmm(&t.at_hhmm) {
         return Some(format!("`at_hhmm` must be \"HH:MM\" between 00:00 and 23:59, got \"{}\"", t.at_hhmm));
@@ -16047,6 +16082,136 @@ str(queued) + "/" + str(a.ok) + "/" + str(again.ok) + "/" + str(task_state(secon
         assert!(reply.is_none(), "a notification has no reply: {reply:?}");
         assert!(app.run_gate.cancelled(), "the gate is what the loop checks between steps");
         app.run_gate.set_active(false);
+    }
+
+    /// The pins that take the board down, refused at every edge that can name one.
+    ///
+    /// Driving an ESP32-S3's SPI flash or PSRAM line does not fail: the core executing from it
+    /// stops. The config and the manifest are persisted, so a bad value is a boot loop and the
+    /// way back is erasing the chip over serial. The bench cannot be used to demonstrate that
+    /// (losing the board *is* the demonstration), so the edges are what this test holds.
+    #[test]
+    fn a_pin_the_board_cannot_spare_is_refused_at_every_edge() {
+        let mut app = test_app();
+        assert!(app.profile.reserved.contains(&27), "the S3 profiles reserve the flash lines");
+
+        // The raw bus tools.
+        for call in [
+            json!({"command": "gpio_write", "arguments": {"pin": 27, "level": 1}}),
+            json!({"command": "gpio_mode", "arguments": {"pin": 27, "mode": "output"}}),
+            json!({"command": "adc_read", "arguments": {"pin": 27}}),
+        ] {
+            let err = app.call_tool("bus", &call).unwrap_err();
+            assert_eq!(err.code, code::INVALID_PARAMS, "{call}: {err:?}");
+            assert!(err.message.contains("reserved"), "{call}: {err:?}");
+        }
+        // A pin the profile does give out still works.
+        app.call_tool("bus", &json!({"command": "gpio_write", "arguments": {"pin": 47, "level": 0}}))
+            .expect("GPIO47 is free on this profile");
+
+        // `config_set`: an override, a bus's data line, the 1-Wire probe list.
+        for patch in [
+            json!({"pins": {"led": 27}}),
+            json!({"bus": {"i2c": [{"bus": 0, "sda": 27, "scl": 42}]}}),
+            json!({"bus": {"onewire_pins": [27]}}),
+        ] {
+            let err = app
+                .call_tool("board", &json!({ "command": "config_set", "arguments": { "patch": patch } }))
+                .unwrap_err();
+            assert_eq!(err.code, code::INVALID_PARAMS, "{patch}: {err:?}");
+        }
+        assert!(app.cfg.pins.get("led").is_none(), "a refused patch must not land");
+
+        // The portal route is the owner's, but a typo there is the same crash.
+        let resp = app.route(&post("/api/config", &json!({ "pins": { "led": 27 } }).to_string()));
+        assert_eq!(resp.status, 400);
+
+        // The manifest: a declared device, and a tool whose exec drives one.
+        let verdict = app
+            .call_tool(
+                "manifest",
+                &json!({"command": "validate", "arguments": {"manifest": {
+                    "devices": [{"id": "lamp", "kind": "led", "driver": "led", "pins": {"out": 27}}]
+                }}}),
+            )
+            .unwrap();
+        assert_eq!(verdict["valid"], json!(false), "{verdict}");
+        let verdict = app
+            .call_tool(
+                "manifest",
+                &json!({"command": "validate", "arguments": {"manifest": {"tools": [{
+                    "name": "flash_pin", "exec": {"type": "gpio_write", "pin": 27, "level": 1}
+                }]}}}),
+            )
+            .unwrap();
+        assert_eq!(verdict["valid"], json!(false), "{verdict}");
+    }
+
+    /// A stored manifest can predate the rule, and `rebuild` runs at boot: instantiating that
+    /// device would take the board down before anyone could reach it to fix the file.
+    #[test]
+    fn a_stored_device_on_a_reserved_pin_is_skipped_instead_of_instantiated() {
+        let mut app = test_app();
+        app.manifest = crate::manifest::Manifest::from_json_str(
+            r#"{"devices":[{"id":"bad","kind":"led","driver":"led","pins":{"out":27}}]}"#,
+        )
+        .expect("a manifest");
+        app.rebuild();
+        assert!(
+            !app.devices.ids().iter().any(|id| id == "bad"),
+            "a device on a reserved pin was instantiated: {:?}",
+            app.devices.ids()
+        );
+    }
+
+    /// A tool call cannot set the one credential its caller would then be the only one to know.
+    ///
+    /// "Make this board secure" is a sentence a model will act on, and the answer used to be a
+    /// portal PIN the owner had never seen — with a serial erase as the only way back.
+    #[test]
+    fn a_tool_call_cannot_set_the_credential_it_would_be_the_only_one_to_know() {
+        let mut app = test_app();
+        for patch in [json!({"auth": {"portal_pin": "1234"}}), json!({"auth": {"mcp_token": "tok"}})] {
+            let err = app
+                .call_tool("board", &json!({ "command": "config_set", "arguments": { "patch": patch } }))
+                .unwrap_err();
+            assert_eq!(err.code, code::FORBIDDEN, "{patch}: {err:?}");
+        }
+        assert!(app.cfg.auth.portal_pin.is_empty() && app.cfg.auth.mcp_token.is_empty());
+
+        // The owner's route still accepts it, and `__set__` from a tool is not a change.
+        assert_eq!(app.route(&post("/api/config", r#"{"auth":{"portal_pin":"1234"}}"#)).status, 200);
+        assert_eq!(app.cfg.auth.portal_pin, "1234");
+        app.call_tool(
+            "board",
+            &json!({ "command": "config_set", "arguments": { "patch": {"auth": {"portal_pin": "__set__"}} } }),
+        )
+        .expect("`__set__` keeps the stored value");
+    }
+
+    /// A tool call could once book a model turn every second.
+    ///
+    /// `every_s: 1` is eight tasks times one turn per second, each a paid model call, and the
+    /// board has one agent thread — the queue never drains, the board answers nothing else, and
+    /// the bill is somebody else's. Ten seconds is the floor now, on the tool and on the route.
+    #[test]
+    fn a_scheduled_prompt_cannot_be_booked_every_second() {
+        let mut app = test_app();
+        for every in [1, 5, 9] {
+            let err = app
+                .call_tool("schedule", &json!({"action": "add", "prompt": "storm", "every_s": every}))
+                .unwrap_err();
+            assert_eq!(err.code, code::INVALID_PARAMS, "every_s {every}: {err:?}");
+            let resp = app.route(&post(
+                "/api/sched",
+                &json!({"kind": "task", "op": "add", "task": {"prompt": "storm", "every_s": every}})
+                    .to_string(),
+            ));
+            assert_eq!(resp.status, 400, "the route has to agree: every_s {every}");
+        }
+        assert!(app.tasks.is_empty(), "a refused task must not be stored");
+        app.call_tool("schedule", &json!({"action": "add", "prompt": "fine", "every_s": 10}))
+            .expect("ten seconds is allowed");
     }
 
     #[test]
