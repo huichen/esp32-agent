@@ -534,11 +534,31 @@ tool("media_status", {})
 The default is still the blocking write: `async` is opt-in, so nothing that worked before
 changed behaviour, and a one-note tone has nothing to gain from a queue.
 
-**Video is not asynchronous, on purpose.** The OLED is written through `i2c_write` on a bus
-shared with other chips, so a task drawing frames would need a second owner of that bus. What
-the split buys instead is the property that matters: audio no longer waits for the panel, and
-a script can draw while a tune plays. `media_play` (audio and frames paced together) is still
-synchronous and still paces itself on chunk boundaries.
+**Video is asynchronous too, and it needed the panel to stop living inside `App`.** The OLED
+was written through `i2c_write`, i.e. through `EspHw` inside `Mutex<App>`, so a task that
+wanted to draw had to wait for whatever tool call was running. The firmware now has a
+`Panel` of its own — the display's I2C device handle plus a mutex around the bus that the
+blocking path also takes — and the player draws through it without ever acquiring App. The
+two writers cannot interleave their transfers, and neither of them queues behind a tool.
+
+`media_play {async: true}` uses it: the score is synthesized, **every frame is pre-rendered
+into the panel's page bytes** (512 B for 128×32, 1024 B for 128×64, kept in PSRAM), and the
+whole job is handed to the player, which returns `{queued, job, frames, ms}` at once.
+
+Two details decide whether the picture lands where the sound is:
+
+* **The deadline is the audio stream position**, `written_samples * 1000 / rate`, not
+  `Instant::elapsed`. `write_chunk` blocks until the DMA ring has room, so wall time runs
+  ahead of what has actually been sent; measuring against it put every frame one buffer
+  late (169 ms on the bench — the same order as the old chunk-boundary quantisation).
+* **The write is split at the next deadline**, so a frame is drawn as the samples it belongs
+  to enter the ring instead of after the buffer that covered them. That makes it early by the
+  ring depth (about 42 ms) rather than late by a buffer, which is inside what an eye accepts.
+
+`media_status` reports `frames_done`, `frames_total` and `max_late_ms` alongside the audio
+fields. Bench run: a 2 s score with eight frames every 250 ms returned in 632 ms, drew 8/8
+with `max_late_ms: 0`, left `F7` (the last frame) on the glass, and an `i2c_scan` issued
+during playback answered in 136 ms.
 
 Two rules keep this from becoming the lock cycle this board has already paid for twice: the
 player takes only its own queue and state mutexes and **never** the App lock, and the two
