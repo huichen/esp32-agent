@@ -2926,8 +2926,14 @@ impl App {
     /// Kept here rather than in the platform layer because firing a task touches the
     /// store (last_run_ms), the tool host (sensor rules call a tool) and the agent
     /// queue. Pure time is passed in, so the host tests can drive it.
+    ///
+    /// The local minute is derived here from `tz_offset_h` rather than handed in by the
+    /// platform: the offset is a setting, and a platform that computed the minute itself
+    /// would need a lock on the config before every tick and would still be the wrong
+    /// place for a value the portal edits.
     /// Returns the sources that were queued, in order.
-    pub fn sched_tick(&mut self, at_ms: u64, minute_of_day: u32) -> Vec<String> {
+    pub fn sched_tick(&mut self, at_ms: u64) -> Vec<String> {
+        let minute_of_day = crate::sched::minute_of_day(at_ms, self.cfg.tz_offset_h);
         let mut fired = Vec::new();
         let mut spent: Vec<String> = Vec::new();
         let mut dirty = false;
@@ -5652,22 +5658,46 @@ impl App {
     }
 
     /// `ifconfig`: what the board thinks its network is, including the overrides.
+    ///
+    /// Measured first, configured second. The interface knows the netmask, gateway and
+    /// resolvers it was given by DHCP; the config only knows what somebody typed. Reporting
+    /// the config alone printed an empty netmask and gateway on a working DHCP board, and a
+    /// second DNS slot that was `""` — three fields that looked broken and were merely
+    /// never asked.
     fn ifconfig_json(&mut self) -> Value {
         let wifi = self.hw.wifi_status();
         let info = self.hw.board_info();
+        let overrides = !self.cfg.wifi.gateway.trim().is_empty()
+            || !self.cfg.wifi.dns.trim().is_empty()
+            || !self.cfg.wifi.netmask.trim().is_empty();
+        let gateway =
+            if wifi.gateway.is_empty() { self.cfg.wifi.gateway.clone() } else { wifi.gateway.clone() };
+        let netmask =
+            if wifi.netmask.is_empty() { self.cfg.wifi.netmask.clone() } else { wifi.netmask.clone() };
+        // Only real addresses. An empty slot is not a resolver, and printing it as one
+        // invites a "fix the DNS" that has nothing to fix.
+        let mut dns: Vec<String> = wifi.dns.iter().filter(|s| !s.is_empty()).cloned().collect();
+        if dns.is_empty() {
+            dns = [self.cfg.wifi.dns.clone(), self.cfg.wifi.dns2.clone()]
+                .into_iter()
+                .filter(|s| !s.trim().is_empty())
+                .collect();
+        }
         json!({
             "interface": "wlan0",
             "state": wifi.state,
             "ip": wifi.ip,
-            "netmask": self.cfg.wifi.netmask,
-            "gateway": self.cfg.wifi.gateway,
-            "dns": [self.cfg.wifi.dns, self.cfg.wifi.dns2],
+            "netmask": netmask,
+            "gateway": gateway,
+            "dns": dns,
             "ssid": wifi.ssid,
             "rssi_dbm": wifi.rssi_dbm,
-            "mac": info.mac,
+            "channel": wifi.channel,
+            "mac": if wifi.mac.is_empty() { info.mac } else { wifi.mac },
             "hostname": self.cfg.wifi.hostname,
             "ap": { "ssid": wifi.ap_ssid, "ip": wifi.ap_ip },
-            "note": "gateway and dns show the configured overrides; empty means the DHCP lease",
+            "lease_or_override": if overrides { "override" } else { "dhcp lease" },
+            "note": "rssi 0 and channel 0 mean not associated, not a measurement",
         })
     }
 
@@ -8697,7 +8727,7 @@ mod tests {
             every_s: 1,
             ..Default::default()
         });
-        assert_eq!(app.sched_tick(1_000, 0), vec!["schedule:large"]);
+        assert_eq!(app.sched_tick(1_000), vec!["schedule:large"]);
         let queued = app.store.get(NVS_KEY_PENDING_MESSAGE).unwrap();
         let value: Value = serde_json::from_str(&queued).unwrap();
         let saved_text = value["text"].as_str().unwrap();
@@ -8741,7 +8771,7 @@ mod tests {
             every_s: 1,
             ..Default::default()
         });
-        assert_eq!(app.sched_tick(1_000, 0), vec!["schedule:t1"]);
+        assert_eq!(app.sched_tick(1_000), vec!["schedule:t1"]);
         drain_store(&mut app);
         let saved: Value = serde_json::from_str(&store.get(NVS_KEY_PENDING_MESSAGE).unwrap()).unwrap();
         assert_eq!(saved, json!({ "text": "scheduled", "source": "schedule:t1", "at_ms": 1_000 }));
@@ -8760,7 +8790,7 @@ mod tests {
             prompt: "sensor".to_string(),
             ..Default::default()
         });
-        assert_eq!(app.sched_tick(1_001, 0), vec!["sensor:r1"]);
+        assert_eq!(app.sched_tick(1_001), vec!["sensor:r1"]);
         drain_store(&mut app);
         let saved: Value = serde_json::from_str(&store.get(NVS_KEY_PENDING_MESSAGE).unwrap()).unwrap();
         assert_eq!(
@@ -9478,6 +9508,80 @@ mod tests {
     }
 
     #[test]
+    fn at_hhmm_fires_on_the_configured_local_clock_not_utc() {
+        let mut app = test_app();
+        // 2026-11-14T23:40:00Z. UTC+8 makes that 07:40 the next morning.
+        let at_utc_evening = 1_794_613_200_000u64;
+        assert_eq!(crate::sched::minute_of_day(at_utc_evening, 0), 23 * 60 + 40);
+        assert_eq!(crate::sched::minute_of_day(at_utc_evening, 8), 7 * 60 + 40);
+        assert_eq!(crate::sched::minute_of_day(at_utc_evening, -5), 18 * 60 + 40);
+
+        let add = app.route(&post(
+            "/api/sched",
+            r#"{"kind":"task","op":"add","task":{"id":"morning","prompt":"good morning","at_hhmm":"07:40","last_run_ms":0}}"#,
+        ));
+        assert_eq!(add.status, 200, "{:?}", body_json(&add));
+
+        // In UTC it is 23:40, so a 07:40 task is not due: the offset is what makes it fire.
+        assert!(app.sched_tick(at_utc_evening).is_empty(), "fired at the UTC minute");
+        app.cfg.tz_offset_h = 8;
+        assert_eq!(app.sched_tick(at_utc_evening), vec!["schedule:morning".to_string()]);
+
+        // A second tick in the same local minute does not run it twice.
+        assert!(app.sched_tick(at_utc_evening + 30_000).is_empty());
+    }
+
+    #[test]
+    fn the_timezone_offset_is_a_validated_setting() {
+        let mut app = test_app();
+        assert_eq!(app.cfg.tz_offset_h, 0, "a fresh board is UTC, not a guess");
+        let ok = app.route(&post("/api/config", r#"{"tz_offset_h":8}"#));
+        assert_eq!(ok.status, 200, "{:?}", body_json(&ok));
+        assert_eq!(app.cfg.tz_offset_h, 8);
+        assert_eq!(body_json(&app.route(&get("/api/config")))["tz_offset_h"], 8);
+        // Half-hour zones are refused rather than rounded: 5.5 is not an hour offset the
+        // board can honour, and silently storing 5 would shift every task by half an hour.
+        for bad in [
+            r#"{"tz_offset_h":5.5}"#,
+            r#"{"tz_offset_h":15}"#,
+            r#"{"tz_offset_h":-13}"#,
+            r#"{"tz_offset_h":"+8"}"#,
+        ] {
+            let resp = app.route(&post("/api/config", bad));
+            assert_eq!(resp.status, 400, "{bad} was accepted");
+            assert_eq!(app.cfg.tz_offset_h, 8, "{bad} changed the stored offset");
+        }
+        assert_eq!(app.route(&post("/api/config", r#"{"tz_offset_h":-12}"#)).status, 200);
+        assert_eq!(app.cfg.tz_offset_h, -12);
+        assert_eq!(app.route(&post("/api/config", r#"{"tz_offset_h":14}"#)).status, 200);
+    }
+
+    #[test]
+    fn ifconfig_reports_measured_network_values_and_never_an_empty_dns_slot() {
+        let mut app = test_app();
+        // Before any lease: nothing measured, so the config's (empty) values show and the
+        // DNS list is empty rather than `["", ""]`.
+        app.hw = Box::new(crate::virtual_board::VirtualBoard::new());
+        let fresh = body_json(&app.route(&get("/api/workspace")));
+        let _ = fresh;
+        let ifconfig = app.ifconfig_json();
+        assert_eq!(ifconfig["netmask"], "255.255.255.0", "the lease's mask, not the config's empty one");
+        assert_eq!(ifconfig["gateway"], "192.168.3.1");
+        assert_eq!(ifconfig["dns"], json!(["192.168.3.1"]));
+        assert_eq!(ifconfig["channel"], 6);
+        assert_eq!(ifconfig["rssi_dbm"], -48);
+        assert_eq!(ifconfig["lease_or_override"], "dhcp lease");
+        // The note has to distinguish "no association" from "0 dBm at the antenna".
+        assert!(ifconfig["note"].as_str().unwrap().contains("not associated"));
+
+        // A configured override is reported as an override, not silently mixed with the lease.
+        app.cfg.wifi.gateway = "192.168.3.232".into();
+        let override_view = app.ifconfig_json();
+        assert_eq!(override_view["gateway"], "192.168.3.1", "the interface still reports what it has");
+        assert_eq!(override_view["lease_or_override"], "override");
+    }
+
+    #[test]
     fn a_scheduled_task_can_run_a_script_instead_of_a_prompt() {
         let mut app = test_app();
         // One call per task, in the shape the route documents: `kind` + `op` + `task`.
@@ -9489,7 +9593,7 @@ mod tests {
             assert_eq!(resp.status, 200, "{:?}", body_json(&resp));
         }
 
-        let fired = app.sched_tick(60_000, 0);
+        let fired = app.sched_tick(60_000);
         assert_eq!(fired.len(), 2, "{fired:?}");
         assert!(fired.contains(&"schedule:t2".to_string()));
 
@@ -9526,7 +9630,7 @@ mod tests {
 
         // One interval later, exactly what the agent thread's tick does on the board.
         let now = 60_000;
-        let fired = app.sched_tick(now, 0);
+        let fired = app.sched_tick(now);
         assert_eq!(fired, vec!["schedule:t1".to_string()]);
         assert_eq!(
             store.writes(),
@@ -9548,7 +9652,7 @@ mod tests {
         assert!(store.get(NVS_KEY_SCHED).expect("stored").contains("\"t1\""));
         assert_eq!(app.store_queue().pending(), 0);
         // And the next tick is not due: only true because the write was applied.
-        assert!(app.sched_tick(now + 1_000, 0).is_empty());
+        assert!(app.sched_tick(now + 1_000).is_empty());
     }
 
     /// The same rule for every other durable change, driven through the routes and tools a
@@ -12130,8 +12234,8 @@ mod tests {
 
         // The tool stamps the task's clock now, so a tick at the current instant must not fire it.
         let now = crate::app::now_ms();
-        assert!(app.sched_tick(now, 0).is_empty(), "fired in the turn that created it");
-        let fired = app.sched_tick(now + 6_000, 0);
+        assert!(app.sched_tick(now).is_empty(), "fired in the turn that created it");
+        let fired = app.sched_tick(now + 6_000);
         assert_eq!(fired, vec!["schedule:later".to_string()]);
         assert!(
             app.tasks.iter().all(|t| t.id != "later"),

@@ -247,7 +247,36 @@ fn run(
         }
 
         let sta_up = wifi.is_up().unwrap_or(false);
-        let sta_ip = wifi.sta_netif().get_ip_info().ok().map(|i| i.ip);
+        // One `get_ip_info` for all four fields it carries: address, netmask, gateway and the
+        // resolvers. Reading the config instead is what made `ifconfig` print an empty
+        // netmask and gateway on a DHCP board — the values existed, nobody asked the interface.
+        let sta_info = wifi.sta_netif().get_ip_info().ok();
+        let sta_ip = sta_info.as_ref().map(|i| i.ip);
+        let netmask = sta_info
+            .as_ref()
+            .filter(|i| !i.ip.is_unspecified())
+            .map(|i| i.subnet.mask.to_string())
+            .unwrap_or_default();
+        let gateway = sta_info
+            .as_ref()
+            .filter(|i| !i.ip.is_unspecified())
+            .map(|i| i.subnet.gw.to_string())
+            .unwrap_or_default();
+        let dns: Vec<String> = sta_info
+            .as_ref()
+            .map(|i| {
+                [i.dns, i.secondary_dns]
+                    .into_iter()
+                    .flatten()
+                    .filter(|ip| !ip.is_unspecified())
+                    .map(|ip| ip.to_string())
+                    .collect::<Vec<String>>()
+            })
+            .unwrap_or_default();
+        // Signal and channel come from the association, not from a default value: a board
+        // reporting 0 dBm on channel 0 is reporting "never asked".
+        let (rssi_dbm, channel) = sta_signal();
+        let sta_mac = sta_mac();
         let sta_connected = sta_ip.map(|ip| !ip.is_unspecified()).unwrap_or(false);
         let ap_ip = wifi.ap_netif().get_ip_info().ok().map(|i| i.ip);
         // `ap_netif` keeps its address after the interface is stopped, so `Some` here only
@@ -296,6 +325,13 @@ fn run(
             s.ap_ssid = ap_ssid.clone();
             s.ssid = ssid.clone();
             s.hostname = "esp32-agent".into();
+            s.rssi_dbm = rssi_dbm;
+            s.channel = channel;
+            s.mac = sta_mac.clone();
+            s.gateway = gateway.clone();
+            s.netmask = netmask.clone();
+            s.dns = dns.clone();
+            s.clients = if ap_up { ap_clients() } else { 0 };
         });
         // The console needs this line as much as the in-RAM log: a board whose
         // portal never appears is debugged over the serial port, and this is the
@@ -390,6 +426,38 @@ fn apply_network_overrides(gateway: &str, dns: &str, dns2: &str, netif: &EspNeti
             );
         }
     }
+}
+
+/// Signal strength and channel of the association the station currently has.
+///
+/// `(0, 0)` means "not associated" rather than a measurement: 0 dBm is 1 mW at the antenna,
+/// which no indoor link reaches, and channel 0 does not exist. The old code reported these
+/// struct defaults as if they were readings, and a model reading them concluded the board
+/// was lying — it was, about having measured anything.
+fn sta_signal() -> (i32, u8) {
+    let mut ap: sys::wifi_ap_record_t = unsafe { std::mem::zeroed() };
+    if unsafe { sys::esp_wifi_sta_get_ap_info(&mut ap) } != 0 {
+        return (0, 0);
+    }
+    (ap.rssi as i32, ap.primary)
+}
+
+fn sta_mac() -> String {
+    let mut mac = [0u8; 6];
+    if unsafe { sys::esp_wifi_get_mac(sys::wifi_interface_t_WIFI_IF_STA, mac.as_mut_ptr()) } != 0 {
+        return String::new();
+    }
+    mac.iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(":")
+}
+
+/// How many phones are associated with the setup AP. Zero when it is closed, which is the
+/// normal state after the station comes up.
+fn ap_clients() -> u32 {
+    let mut list: sys::wifi_sta_list_t = unsafe { std::mem::zeroed() };
+    if unsafe { sys::esp_wifi_ap_get_sta_list(&mut list) } != 0 {
+        return 0;
+    }
+    list.num.max(0) as u32
 }
 
 /// `a.b.c.d` to the network-order u32 lwIP wants. Anything else is "unset", not an error:

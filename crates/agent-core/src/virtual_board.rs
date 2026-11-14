@@ -252,6 +252,11 @@ impl VirtualBoard {
                 ap_ssid: String::new(),
                 ap_ip: "192.168.4.1".into(),
                 clients: 0,
+                // What a DHCP lease on a normal LAN looks like, so `ifconfig` has measured
+                // values to report instead of falling back to the config.
+                gateway: "192.168.3.1".into(),
+                netmask: "255.255.255.0".into(),
+                dns: vec!["192.168.3.1".into()],
             },
             log: Vec::new(),
             hw_calls: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
