@@ -12,6 +12,8 @@ sensor can be declared in JSON while the board runs.
 > The agent loop follows [FutureOS](https://github.com/futuregene/future-os): transcript,
 > tool journal, stream events, protocol adapters, memory index. 
 
+![Four panels of the web console: the board showing the devices it found and an I2C scan, a skill it wrote and then ran from the shell, a melody playing while a starfield animates, and one DFT computed two ways.](docs/images/features-quad.jpg)
+
 | What | In detail |
 |---|---|
 | On-board agent | Loop, tools, memory and transcript are firmware; the model is any OpenAI-compatible or Anthropic endpoint. [Model](docs/model.md) |
