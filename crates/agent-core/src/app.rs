@@ -9978,7 +9978,7 @@ mod tests {
         assert!(ifconfig["note"].as_str().unwrap().contains("not associated"));
 
         // A configured override is reported as an override, not silently mixed with the lease.
-        app.cfg.wifi.gateway = "192.168.3.232".into();
+        app.cfg.wifi.gateway = "192.168.1.1".into();
         let override_view = app.ifconfig_json();
         assert_eq!(override_view["gateway"], "192.168.3.1", "the interface still reports what it has");
         assert_eq!(override_view["lease_or_override"], "override");
