@@ -6,7 +6,7 @@
 <meta name="theme-color" content="#0b0f14">
 <meta name="color-scheme" content="dark light">
 <title>esp32-agent</title>
-<link rel="stylesheet" href="/assets/style.css">
+<link rel="stylesheet" href="/assets/style.css" onerror="(function(el){if(el.dataset.retried){return;}el.dataset.retried='1';setTimeout(function(){var again=el.cloneNode();again.href=el.href+'?retry=1';el.parentNode.replaceChild(again,el);},400);})(this)">
 </head>
 <body>
 
@@ -288,6 +288,6 @@
   </div>
 </section>
 
-<script src="/assets/app.js"></script>
+<script src="/assets/app.js" onerror="(function(el){if(el.dataset.retried){return;}el.dataset.retried='1';setTimeout(function(){var again=document.createElement('script');again.src=el.src+'?retry=1';document.body.appendChild(again);},400);})(this)"></script>
 </body>
 </html>
