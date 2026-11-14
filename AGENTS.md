@@ -87,10 +87,12 @@ suspicious. The bench board and the exact flash command are described in
 
 ## 5. Finishing
 
-- Commit on the branch by default; the user decides when to push or open a PR. Do not
-  push, open issues or release without being asked.
-- The handoff states: files changed, commands run, their results, and what is still
-  unverified.
+- A change is handed off as a merged pull request. Commit on the branch, open the PR and
+  merge it; do not stop to ask whether to push or open one. The branch is the review
+  surface and the PR is the record of what was decided.
+- The PR body is the handoff, because it is where a later reader looks: files changed,
+  commands run, their results, and what is still unverified.
+- Do not open issues or make a release unless asked.
 - After a merge, clean up worktrees and branches (§2). Do not leave stale branches.
 
 ## 6. Translations
