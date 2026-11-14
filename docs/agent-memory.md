@@ -120,14 +120,35 @@ retry after `run_end`.
 the dropped part is still on flash, so a reboot restores it. It happens when
 `persist_transcript` is off or the store queue rejected the write.
 
+### What a full index gives up, and in what order
+
+Eviction is by **value**, not by age. The most valuable line in the index is the question
+somebody asked: it states what was wanted and nothing else in the index says it. The least
+valuable is the JSON a tool returned — the model has already used it, and the call can be run
+again to get it back. So when the index is full the order is:
+
+| Order | Line | Why it can go first |
+|---|---|---|
+| 1st | `result: …` | a machine result, already consumed, reproducible by calling again |
+| 2nd | `called: …` | which tools ran; the useful part usually reappears in the reply |
+| 3rd | `note: …` | system notes |
+| 4th | `answer: …` | prose the model wrote, already reduced to one line |
+| last | `user: …` | what was asked; nothing replaces it |
+
+Reasoning is not in the index at all: it is dropped with the message that carried it, so
+"delete the thinking first" is not a policy call here — it is what already happens.
+
+A question is also never demoted to a shorter line: it keeps its full budget however old it
+is, and the space for that comes from the tool lines above. Only when a conversation is
+*all* questions is an older question evicted, oldest first, and only to stay under the byte
+cap.
+
 ### What repeated compaction does
 
 Compaction is idempotent **per transcript**: a second pass over an unchanged conversation
 removes nothing (`removed: 0`). It is not a fixed point across cycles, and that is worth
-knowing before calling it in a loop.
-
-Each cycle of "grow the conversation, compact, grow again, compact" behaves like this
-(measured on the host, six cycles of six exchanges with `keep: 1`):
+knowing before calling it in a loop. Measured on the host, six cycles of six exchanges with
+`keep: 1`:
 
 | Cycle | Before | After | Dropped | Archive lines |
 |---|---|---|---|---|
@@ -138,16 +159,16 @@ Each cycle of "grow the conversation, compact, grow again, compact" behaves like
 | 5 | 14 | 2 | 12 | 40 |
 | 6 | 14 | 2 | 12 | 40 |
 
-The transcript never grows past the exchange that was kept, and the archive stops at its
-own caps: 40 lines and 96 KiB. So the cost is not memory — it is **the beginning of the
-conversation**: from cycle 4 onward the oldest archive lines are evicted, and a question
-from cycle 1 is gone entirely. Nothing brings it back; the index is bounded on purpose and
-the transcript is not restored from it.
+The transcript never grows past the exchange that was kept, and the archive stops at its own
+caps: 40 lines and 96 KiB. What the caps take is the interesting part — after those six
+cycles the index holds **35 questions and 5 answers**, and the question from cycle 1 is still
+there. Repeated compaction therefore costs the tool traffic and the prose, not the
+questions: the same order a reader would choose by hand.
 
-The practical consequence: compact when you mean it. A loop that keeps compacting the same
-conversation keeps the newest exchange readable and progressively loses the earlier detail,
-which is exactly what a *summary* would also do — except that here it is mechanical, so what
-survives is whatever fits, not whatever mattered.
+How much survives verbatim: `keep_recent_tokens` is a third of the trigger (it was a
+quarter), so at the default 256k window about 68k tokens of the tail stay untouched instead
+of 51k. Compaction itself still starts at 80% of the window — the budget that protects the
+next request from being refused — so on a default board it is a rare event, not a routine.
 
 ## 3. Forgetting
 

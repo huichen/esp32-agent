@@ -739,12 +739,18 @@ window.__esp32Desktop = async function () {
     chat: rect(q(".chat")),
     composer: rect(q("#composer")),
   };
-  // The panel is measured open, because that is when it covers things.
+  // The panel is measured open, because that is when it covers things. Its entry
+  // animation starts at translateX(24px), and the first frame of it is 24 px off the
+  // edge: measuring geometry must not race an animation, so it is switched off for the
+  // measurement and put back afterwards.
   const sheet = q("#sheet");
   const wasHidden = sheet.hidden;
+  const wasAnimation = sheet.style.animation;
+  sheet.style.animation = "none";
   sheet.hidden = false;
   out.sheet = rect(sheet);
   sheet.hidden = wasHidden;
+  sheet.style.animation = wasAnimation;
   return out;
 };
 </script>
