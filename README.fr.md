@@ -13,6 +13,8 @@ répond avec eux ; un nouveau capteur peut être déclaré en JSON pendant que
 > La boucle d’agent suit [FutureOS](https://github.com/futuregene/future-os) : transcription,
 > journal des outils, événements de flux, adaptateurs de protocole, index de mémoire.
 
+![Four panels of the web console: the board showing the devices it found and an I2C scan, a skill it wrote and then ran from the shell, a melody playing while a starfield animates, and one DFT computed two ways.](docs/images/features-quad.jpg)
+
 | Quoi | En détail |
 |---|---|
 | Un agent tourne sur la carte | Boucle, outils, mémoire et transcription sont dans le firmware ; le modèle est n’importe quel point de terminaison compatible OpenAI ou Anthropic. [Donnez-lui un modèle](docs/model.md) |

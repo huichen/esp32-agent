@@ -11,6 +11,8 @@
 > 智能体循环遵循 [FutureOS](https://github.com/futuregene/future-os)：会话记录、工具
 > 日志、流事件、协议适配器、记忆索引。
 
+![Four panels of the web console: the board showing the devices it found and an I2C scan, a skill it wrote and then ran from the shell, a melody playing while a starfield animates, and one DFT computed two ways.](docs/images/features-quad.jpg)
+
 | 要点 | 细节 |
 |---|---|
 | 智能体跑在板上 | 循环、工具、记忆与会话记录都是固件；模型可以是任何 OpenAI 兼容或 Anthropic 端点。[给它一个模型](docs/model.md) |

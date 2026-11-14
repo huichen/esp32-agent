@@ -12,6 +12,8 @@
 > エージェントループは [FutureOS](https://github.com/futuregene/future-os) に倣っています。
 > 会話記録、ツールジャーナル、ストリームイベント、プロトコルアダプター、メモリインデックスです。
 
+![Four panels of the web console: the board showing the devices it found and an I2C scan, a skill it wrote and then ran from the shell, a melody playing while a starfield animates, and one DFT computed two ways.](docs/images/features-quad.jpg)
+
 | 機能 | 詳細 |
 |---|---|
 | ボード上のエージェント | ループ、ツール、メモリ、会話記録はファームウェアに含まれます。モデルには、任意の OpenAI 互換または Anthropic のエンドポイントを使えます。[モデル](docs/model.md) |
