@@ -141,6 +141,7 @@ authoritative when this table and a firmware disagree.
 | `devices_list`, `devices_probe` | the detected devices and their capabilities; re-scan the buses |
 | `bus` | raw access for chips without a driver, in eight commands: `i2c_scan`, `i2c_read`, `i2c_write`, `i2c_identify`, `gpio_mode`, `gpio_read`, `gpio_write`, `adc_read` — the command names are exactly the `exec` primitives they wrap; `command: help` lists what each takes |
 | `device_invoke` | one detected device's tool, by id — what `tools_mode: generic` collapses the device tools into |
+| `agent_say`, `agent_history`, `agent_forget`, `agent_config_get`, `agent_config_set` | the board's own model, for a caller that is *not* it: queue a turn in the same queue a person's message uses, read the transcript, cut the conversation, and point the model at a provider. `agent_config_get` never returns the key, and `agent_say` says when it replaced a message that was still waiting |
 
 The `manifest` (five commands) and `board` (seven) families are in [manifest](manifest.md) and here above; `shell`, `read`,
 `write`, `edit` and `script` are in [shell](shell.md) and [scripting](scripting.md).
