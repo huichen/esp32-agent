@@ -15,7 +15,7 @@ curl -sS -X POST http://<board>/api/sched -H 'Content-Type: application/json' -d
 |---|---|
 | `after_s` | fire once, this many seconds after the task was created, then remove the task. Use it alone: a one-shot is not combined with `every_s` or `at_hhmm` |
 | `every_s` | interval in seconds |
-| `at_hhmm` | `"07:30"`, in UTC unless the firmware was built with `MCP_TZ_OFFSET_H` (`MCP_TZ_OFFSET_H=8` shifts it to UTC+8); used when `every_s` is 0 |
+| `at_hhmm` | `"07:30"`, in the board's local time: `tz_offset_h` (whole hours east of UTC) shifts it, and it is settable from the portal or `POST /api/config`, so no reflash is needed. Used when `every_s` is 0 |
 | `script` | a script to run instead of asking the model — costs no tokens and no call |
 | `enabled` | default true |
 
@@ -31,6 +31,19 @@ nothing looks like a bug six hours later.
 Every answer lands in the transcript tagged `source: "schedule:t1"`, so the origin of a turn
 is never a guess. The agent can schedule itself with
 `schedule {"action":"add","prompt":"…","every_s":300}` (`list`, `remove`, `enable`, `disable`).
+
+### The clock
+
+`at_hhmm` is local time, and `tz_offset_h` is the setting that makes "local" mean something:
+whole hours east of UTC, `-12..=14`, changed with `POST /api/config {"tz_offset_h":8}` or the
+portal's Settings tab, applied on the next tick. It used to be a build-time constant
+(`MCP_TZ_OFFSET_H`), which meant moving the board to another country was a reflash.
+
+The board has no timezone database, so a zone *name* would be a promise it cannot keep, and
+half-hour and 45-minute zones cannot be expressed. A fractional value is refused rather than
+rounded: silently turning `UTC+5:30` into `UTC+5` moves every daily task by half an hour, and
+nothing would say so. `every_s` and `after_s` do not depend on the clock at all — they count
+from the last run.
 
 ### Run a task now
 

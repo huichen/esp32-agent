@@ -105,7 +105,7 @@ is on that list, because neither is offered anywhere — see
 | GET | `/api/status` | Board, memory, WiFi, MCP, device count, counters, `agent.thread` — `running`, `not started`, or `did not start: <why>` — `threads[]`, each task with the stack it has left at its deepest point (`high_water_kb`), `memory.pools` (the heap pool by pool: `[{pool, note, total_kb, free_kb, largest_kb, min_free_kb}]`, empty on a platform that cannot split it), and `store`: `{pending, written, failed}` plus `writer`, `last_failure` (`{key, op, err, err_name, at_ms}` or `null`), `refused_keys` (per-key counts), `refused_other` and `space` (`{used_bytes, free_bytes, total_bytes}`, or `{used_entries, free_entries, total_entries, used_bytes, free_bytes, total_bytes}` on NVS) - every number and where it comes from is in [what the store reports](troubleshooting.md#what-the-store-reports) — see [a store write was refused](troubleshooting.md#a-store-write-was-refused) |
 | GET | `/api/tls` | The board's own certificate: `{enabled, port, fingerprint, error}` |
 | GET | `/api/config` | Configuration (secrets shown as `__set__`) |
-| POST | `/api/config` | Partial update (JSON of the same shape) |
+| POST | `/api/config` | Partial update (JSON of the same shape). `tz_offset_h` takes whole hours from UTC, `-12..=14`, and is refused rather than rounded outside that |
 | GET | `/api/devices` | Device table + unidentified addresses + buses |
 | POST | `/api/devices/probe` | Probe again |
 | GET | `/api/tools` | Tool table, including why anything is hidden |

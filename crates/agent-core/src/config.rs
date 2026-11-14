@@ -73,6 +73,15 @@ pub struct Config {
     pub device_name: String,
     /// Board profile id, or `"auto"` to pick one from the SoC/flash it finds.
     pub board: String,
+    /// Hours east of UTC, `-12..=14`, used by `at_hhmm` schedules and by every clock
+    /// reading the board reports.
+    ///
+    /// The board has no timezone database, so a zone name would be a promise it cannot
+    /// keep. An offset is the honest unit: it is what `UTC+8` means and it is settable at
+    /// runtime, which the old build-time `MCP_TZ_OFFSET_H` was not — changing it needed a
+    /// reflash. Half-hour zones are not expressible; that is a real limit, not an
+    /// oversight (see `docs/scheduling.md`).
+    pub tz_offset_h: i32,
     /// Instantiate the board profile's own peripherals (the devkit's RGB LED and its
     /// BOOT button) at boot.
     ///
@@ -314,6 +323,7 @@ impl Default for Config {
             version: CONFIG_VERSION,
             device_name: "esp32-agent".into(),
             board: "auto".into(),
+            tz_offset_h: 0,
             auto_peripherals: true,
             discovery: default_discovery(),
             wifi: WifiCfg::default(),
@@ -447,6 +457,18 @@ impl Config {
                 self.board = s.trim().to_string();
                 touched.push("board".into());
             }
+        }
+        if let Some(v) = patch.get("tz_offset_h") {
+            // Refuse rather than clamp: a silent clamp turns "UTC+5:30" typed as 5.5 into a
+            // board that schedules an hour and a half early, and nobody would know.
+            let hours = v.as_i64().ok_or_else(|| {
+                crate::error::McpError::invalid_params("tz_offset_h must be a whole number of hours")
+            })?;
+            if !(-12..=14).contains(&hours) {
+                return Err(crate::error::McpError::invalid_params("tz_offset_h must be between -12 and 14"));
+            }
+            self.tz_offset_h = hours as i32;
+            touched.push("tz_offset_h".into());
         }
         if let Some(v) = patch.get("agent").and_then(|a| a.get("system_prompt")).and_then(|v| v.as_str()) {
             self.agent.system_prompt = v.chars().take(MAX_SYSTEM_PROMPT).collect();

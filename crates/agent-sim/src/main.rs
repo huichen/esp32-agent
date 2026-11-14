@@ -18,15 +18,6 @@ mod net;
 
 use net::HostTransport;
 
-/// Minute of the day for `at_hhmm` scheduling.
-///
-/// The firmware applies `MCP_TZ_OFFSET_H` at build time because a board has no timezone
-/// database; the simulator runs on a host that has one and is only used for trying
-/// things out, so it schedules in UTC and says so.
-fn minute_of_day(now_ms: u64) -> u32 {
-    ((now_ms / 1000 / 60) % 1_440) as u32
-}
-
 struct Args {
     host: String,
     port: u16,
@@ -137,7 +128,7 @@ fn main() {
             // The same two jobs the firmware thread does: evaluate the schedule, then
             // let whoever is waiting queue a turn.
             let now = esp32_agent_core::app::now_ms();
-            let due = guard.sched_tick(now, minute_of_day(now));
+            let due = guard.sched_tick(now);
             // ...and the second: the schedule may have run a script, which is now inline and
             // already finished by the time `sched_tick` returns.
             // ...and the third: the store writer. The simulator has no flash window, so this

@@ -435,12 +435,16 @@ fn run_loop(shared: Shared, log: Arc<LogBuf>, timeout_s: Arc<AtomicU32>, mut tra
     // The interval is config, not a constant: it is the queue-drain latency, so the
     // portal is allowed to trade latency against scheduling overhead without a reflash.
     let mut tick_ms = tick_interval(&shared);
+    let offset_h = {
+        let app = lock(&shared);
+        app.cfg.tz_offset_h
+    };
     log.info(
         "agent",
         format!(
             "agent thread up: tick {tick_ms} ms, stack in internal RAM: {}, scheduler clock {}",
             if crate::nvs_writer::on_internal_stack() { "yes" } else { "no (PSRAM)" },
-            clock_note()
+            clock_note(offset_h)
         ),
     );
     if now_ms() / 1000 < CLOCK_SET_AFTER_S {
@@ -460,8 +464,7 @@ fn run_loop(shared: Shared, log: Arc<LogBuf>, timeout_s: Arc<AtomicU32>, mut tra
         }
         std::thread::sleep(Duration::from_millis(tick_ms));
         let now = now_ms();
-        let minute = minute_of_day(now);
-        tick(&shared, &mut transport, now, minute, &timeout_s, &log);
+        tick(&shared, &mut transport, now, &timeout_s, &log);
     }
 }
 
@@ -482,14 +485,7 @@ fn tick_interval(shared: &Shared) -> u64 {
 /// and it takes an `App` plus an explicit clock rather than doing its own sleeping,
 /// so the same function can be driven on the host with a virtual board and a stub
 /// model instead of only on the bench.
-fn tick(
-    shared: &Shared,
-    transport: &mut EspHttpTransport,
-    now: u64,
-    minute: u32,
-    timeout_s: &AtomicU32,
-    log: &LogBuf,
-) {
+fn tick(shared: &Shared, transport: &mut EspHttpTransport, now: u64, timeout_s: &AtomicU32, log: &LogBuf) {
     // Everything that needs the transcript or the tools happens in a short phase under
     // the lock; the model call below happens with it released, so the portal keeps
     // answering while the model thinks.
@@ -506,7 +502,7 @@ fn tick(
 
         // Schedule first: a task that comes due on this tick runs on this tick, and a task
         // whose work is a script runs it inline — there is no queued job to finish here.
-        for source in app.sched_tick(now, minute) {
+        for source in app.sched_tick(now) {
             log.info("agent", format!("scheduler queued {source}"));
         }
 
@@ -587,27 +583,13 @@ fn lock(shared: &Shared) -> MutexGuard<'_, App> {
 
 // ============================ clock (pure) ============================
 
-/// Local minute of the day, `0..1440`, for `ScheduledTask::at_hhmm`.
-///
-/// The board has no timezone database, so the offset is a build-time constant:
-/// `MCP_TZ_OFFSET_H=8` for UTC+8, unset for UTC. `every_s` tasks do not use this.
-pub fn minute_of_day(now_ms: u64) -> u32 {
-    let local = (now_ms / 1000) as i64 + offset_secs();
-    (local.rem_euclid(86_400) / 60) as u32
-}
-
-fn offset_secs() -> i64 {
-    option_env!("MCP_TZ_OFFSET_H")
-        .and_then(|text| text.trim().parse::<i64>().ok())
-        .unwrap_or(0)
-        .clamp(-12, 14)
-        * 3600
-}
-
-fn clock_note() -> String {
-    match offset_secs() {
-        0 => "UTC (build with MCP_TZ_OFFSET_H to shift at_hhmm)".to_string(),
-        secs => format!("UTC{:+}", secs / 3600),
+/// Local minute of the day, `0..1440`, comes from `App::sched_tick` now: the offset is
+/// `cfg.tz_offset_h`, settable at runtime. This used to be an `option_env!` constant, which
+/// meant changing a zone needed a reflash.
+fn clock_note(offset_h: i32) -> String {
+    match offset_h {
+        0 => "UTC (set tz_offset_h for at_hhmm)".to_string(),
+        h => format!("UTC{h:+}"),
     }
 }
 
