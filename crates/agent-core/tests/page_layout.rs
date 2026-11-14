@@ -986,6 +986,12 @@ fn in_path(name: &str) -> Option<PathBuf> {
 /// threads of one process, and two browsers handed the same `--user-data-dir` do the same
 /// thing — the second prints nothing (exit code 21).
 fn dump_dom(browser: &Path, url: &str) -> String {
+    dump_page(browser, url, true)
+}
+
+/// Dump a page without requiring a measurement: used where the assertion is about an
+/// element's state (open/closed) rather than its geometry.
+fn dump_page(browser: &Path, url: &str, want_measurement: bool) -> String {
     static RUNS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     let run = RUNS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let profile = std::env::temp_dir().join(format!("esp32-agent-layout-{}-{run}", std::process::id()));
@@ -1010,7 +1016,7 @@ fn dump_dom(browser: &Path, url: &str) -> String {
         .unwrap_or_else(|e| panic!("could not run {}: {e}", browser.display()));
     let _ = std::fs::remove_dir_all(&profile);
     let dom = String::from_utf8_lossy(&out.stdout).into_owned();
-    if !dom.contains("esp32Layout") {
+    if want_measurement && !dom.contains("esp32Layout") {
         panic!(
             "{} printed no measurement (status {}): {}\nstderr: {}",
             browser.display(),
@@ -1621,6 +1627,44 @@ fn the_desktop_layout_keeps_a_reading_column_and_a_side_panel() {
     assert!(
         sheet["left"].as_f64().unwrap_or(0.0) > composer["left"].as_f64().unwrap_or(0.0),
         "the panel starts at or left of the composer"
+    );
+}
+
+/// `?panel=devices` opens that panel on load.
+///
+/// A deep link is how a screenshot tool captures a panel at all — a headless browser
+/// cannot click — and it is also what makes a bookmark to "the tools tab" possible. The
+/// check is on the dumped DOM: the sheet must be visible and the named panel must not be
+/// hidden, which is the same state a person would see.
+#[test]
+fn a_query_parameter_opens_a_panel() {
+    let browser = browser();
+    let url = format!("{}/page?panel=devices", serve());
+    let dom = dump_page(&browser, &url, false);
+
+    let sheet =
+        dom.split("<section id=\"sheet\"").nth(1).unwrap_or_else(|| panic!("no sheet element in:\n{dom}"));
+    let sheet_tag = &sheet[..sheet.find('>').expect("the sheet tag ends")];
+    assert!(!sheet_tag.contains("hidden"), "the sheet stayed closed: <section id=\"sheet\"{sheet_tag}>");
+
+    let devices = dom
+        .split("<div id=\"panel-devices\"")
+        .nth(1)
+        .unwrap_or_else(|| panic!("no devices panel in:\n{dom}"));
+    let devices_tag = &devices[..devices.find('>').expect("the panel tag ends")];
+    assert!(
+        !devices_tag.contains("hidden"),
+        "the devices panel is still hidden: <div id=\"panel-devices\"{devices_tag}>"
+    );
+
+    // And an unknown panel does not open an empty sheet: the link has to name a tab that
+    // exists, or nothing happens.
+    let bogus = dump_page(&browser, &format!("{}/page?panel=nonsense", serve()), false);
+    let sheet = bogus.split("<section id=\"sheet\"").nth(1).expect("a sheet element");
+    let sheet_tag = &sheet[..sheet.find('>').expect("the sheet tag ends")];
+    assert!(
+        sheet_tag.contains("hidden"),
+        "an unknown panel opened the sheet: <section id=\"sheet\"{sheet_tag}>"
     );
 }
 
