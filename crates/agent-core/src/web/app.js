@@ -1487,6 +1487,12 @@ async function loadSettings() {
     $("#wifi-ssid").value = d.wifi.ssid || "";
     $("#wifi-gateway").value = d.wifi.gateway || "";
     $("#wifi-dns").value = d.wifi.dns || "";
+    const staticIp = (d.wifi.ip || "").trim();
+    $("#wifi-ip").value = staticIp;
+    $("#wifi-netmask").value = d.wifi.netmask || "";
+    $("#wifi-static").checked = staticIp !== "";
+    $("#wifi-dhcp").checked = staticIp === "";
+    $("#wifi-static-fields").hidden = staticIp === "";
     $("#wifi-password").value = "";
     $("#set-keep-ap").checked = d.wifi && d.wifi.keep_ap === true;
     $("#set-plain-http").checked = !(d.mcp && d.mcp.plain_http === false);
@@ -2084,6 +2090,17 @@ function init() {
       await api("/api/config", {
         method: "POST",
         body: { wifi: { gateway: $("#wifi-gateway").value.trim(), dns: $("#wifi-dns").value.trim() } },
+      });
+      const staticChosen = $("#wifi-static").checked;
+      const staticIp = staticChosen ? $("#wifi-ip").value.trim() : "";
+      const netmask = staticChosen ? $("#wifi-netmask").value.trim() : "";
+      if (staticChosen && !staticIp) {
+        toast("a static address needs an IP");
+        return;
+      }
+      await api("/api/config", {
+        method: "POST",
+        body: { wifi: { ip: staticIp, netmask } },
       });
       await api("/api/wifi/connect", {
         method: "POST",

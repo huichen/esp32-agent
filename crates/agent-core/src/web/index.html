@@ -227,7 +227,16 @@
         <input id="wifi-ssid" type="text" autocomplete="off">
         <label for="wifi-password">Password</label>
         <input id="wifi-password" type="password" autocomplete="new-password">
-        <label for="wifi-gateway">Gateway (empty = from DHCP)</label>
+        <p class="hint">Address</p>
+        <label for="wifi-dhcp"><input id="wifi-dhcp" type="radio" name="wifi-addr" value="dhcp" checked> DHCP</label>
+        <label for="wifi-static"><input id="wifi-static" type="radio" name="wifi-addr" value="static"> Static</label>
+        <div id="wifi-static-fields" hidden>
+          <label for="wifi-ip">IP address</label>
+          <input id="wifi-ip" type="text" inputmode="decimal" placeholder="192.168.1.50">
+          <label for="wifi-netmask">Netmask</label>
+          <input id="wifi-netmask" type="text" inputmode="decimal" placeholder="255.255.255.0">
+        </div>
+        <label for="wifi-gateway">Gateway (empty = from DHCP; required for a static address)</label>
         <input id="wifi-gateway" type="text" inputmode="decimal" placeholder="192.168.1.1">
         <label for="wifi-dns">DNS (empty = from DHCP)</label>
         <input id="wifi-dns" type="text" inputmode="decimal" placeholder="192.168.1.1">
