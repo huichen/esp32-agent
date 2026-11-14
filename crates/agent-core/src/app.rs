@@ -4387,6 +4387,11 @@ impl App {
     }
 
     fn route_inner(&mut self, req: &Request) -> Response {
+        // Plain http is a switch, not a suggestion. Checked per request rather than by
+        // unbinding: the listener is bound once at startup, and this has to be live.
+        if req.scheme == "http" && !self.cfg.mcp.plain_http {
+            return Response::json_status(403, &json!({ "error": "plain http is off; use https" }));
+        }
         let method = req.method.as_str();
         let path = req.path.as_str();
         let mcp_path = self.cfg.mcp.path.clone();
@@ -4705,6 +4710,27 @@ impl App {
                 Ok(aps) => Response::json(&json!({ "networks": aps })),
                 Err(e) => Response::json_status(503, &json!({ "error": e.message })),
             },
+            ("POST", "/api/wifi/ap") => {
+                if let Err(r) = self.require_pin(req) {
+                    return r;
+                }
+                let open = match req.json() {
+                    Ok(v) => v.get("open").and_then(|b| b.as_bool()),
+                    Err(e) => return Response::error_json(400, &format!("invalid JSON: {e}")),
+                };
+                let Some(open) = open else {
+                    return Response::error_json(400, "expected an open boolean");
+                };
+                self.cfg.wifi.keep_ap = open;
+                self.runtime.config_dirty = true;
+                match self.hw.wifi_set_ap(open) {
+                    Ok(()) => Response::json(&json!({ "ap": if open { "open" } else { "closed" } })),
+                    Err(e) => Response::json_status(
+                        501,
+                        &json!({ "error": e.message, "ap": if open { "open" } else { "closed" } }),
+                    ),
+                }
+            }
             ("POST", "/api/wifi/connect") => {
                 if let Err(r) = self.require_pin(req) {
                     return r;
@@ -4984,12 +5010,10 @@ impl App {
                 // which is what a person means by "apply". Credentials are the exception:
                 // they are applied live, and restarting in the middle of a join would drop
                 // it, so a patch that changes them is not turned into a restart.
-                let creds_changed =
-                    before.wifi.ssid != self.cfg.wifi.ssid || before.wifi.password != self.cfg.wifi.password;
-                let needs_restart = bus_or_board
-                    || before.mcp.port != self.cfg.mcp.port
-                    || before.mcp.plain_http != self.cfg.mcp.plain_http
-                    || (!creds_changed && before.wifi.keep_ap != self.cfg.wifi.keep_ap);
+                // Only the pins/board and the listening port still need a restart: the radio
+                // rebuilds its configuration on command, and plain http is gated per
+                // request rather than by unbinding.
+                let needs_restart = bus_or_board || before.mcp.port != self.cfg.mcp.port;
                 if needs_restart {
                     self.runtime.restart_requested = true;
                 }
@@ -9899,9 +9923,15 @@ mod tests {
             serde_json::from_str(&app.cfg.to_json_string()).expect("the stored config is JSON");
         assert_eq!(stored["mcp"]["plain_http"], json!(false));
 
-        // Turning it back on is allowed without ceremony: that is the safe direction.
-        let resp = app.route(&post("/api/config", r#"{"mcp":{"plain_http":true}}"#));
-        assert_eq!(resp.status, 200);
+        // Turning it back on is allowed without ceremony: that is the safe direction. It
+        // has to come over TLS though, because plain http now answers nothing at all —
+        // the switch is enforced per request, so the port is not a door left ajar.
+        let over_http = post("/api/config", r#"{"mcp":{"plain_http":true}}"#);
+        assert_eq!(app.route(&over_http).status, 403, "plain http is off, so it answers nothing");
+        let mut over_tls = post("/api/config", r#"{"mcp":{"plain_http":true}}"#);
+        over_tls.scheme = "https";
+        let resp = app.route(&over_tls);
+        assert_eq!(resp.status, 200, "{:?}", body_json(&resp));
         assert!(app.cfg.mcp.plain_http);
     }
 
