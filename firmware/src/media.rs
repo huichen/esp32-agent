@@ -37,6 +37,16 @@ const CHUNK: usize = 4_096;
 /// healthy write never trips it.
 const WRITE_TIMEOUT_MS: u32 = 1_000;
 
+/// Mono samples that fill exactly one DMA descriptor: 512 frames of (L,R) 16-bit slots.
+///
+/// Writes that straddle a descriptor boundary make `i2s_channel_write` wait on the boundary
+/// before it can copy the rest, and a stream written in socket-sized pieces (often a few
+/// hundred bytes) then runs measurably behind the ring: on this board a 30 s clip took
+/// 33.9 s of wall clock, which is heard as a slowed, dragging soundtrack. The bench firmware
+/// that plays this hardware in real time writes 512-frame blocks with 8 descriptors, and the
+/// measurement that went with it is in `D:\esp32s3-probe\README.md` §10.7.
+const CHUNK_SAMPLES: usize = 512;
+
 struct Job {
     id: u64,
     samples: Vec<i16>,
@@ -247,6 +257,15 @@ impl Player {
 /// The driver returns as soon as the DMA has taken what it can, so one call can be short;
 /// dropping the rest would be a gap in the music rather than "normal under load".
 pub fn write_chunk(tx: sys::i2s_chan_handle_t, samples: &[i16]) -> Result<()> {
+    // Descriptor-aligned pieces: the last one may be short, which the loop below already
+    // copes with.
+    for piece in samples.chunks(CHUNK_SAMPLES) {
+        write_piece(tx, piece)?;
+    }
+    Ok(())
+}
+
+fn write_piece(tx: sys::i2s_chan_handle_t, samples: &[i16]) -> Result<()> {
     let mut frames: Vec<i16> = Vec::with_capacity(samples.len() * 2);
     for s in samples {
         frames.push(*s);

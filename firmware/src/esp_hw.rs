@@ -881,9 +881,11 @@ fn i2s_channel(
         // runs between those calls. With 2 x 200 frames the ring holds 16.7 ms, which is less
         // than one 128x32 frame on the bus, so the last descriptor is replayed and the music
         // repeats fragments instead of pausing. 2 x 512 frames is 42.7 ms of slack for 4 KB
-        // of internal RAM - enough for a 9 ms frame draw, and this board has no 8 KB to spare
-        // (its internal heap sits at a few kilobytes once the agent and TLS are up).
-        chan.dma_desc_num = 2;
+        // of internal RAM, but 2 descriptors still leaves the writer waiting on a boundary
+        // every other call; 8 x 512 is 170 ms of slack and 16 KB, which a 30 s clip turned
+        // from 33.9 s of wall clock back into 30.0 s (measured 2026-11-14 against the same
+        // media, `audio.pcm` from `D:\esp32s3-probe`).
+        chan.dma_desc_num = 8;
         chan.dma_frame_num = if rx { 200 } else { 512 };
         // A DMA descriptor keeps being replayed, so a tone whose writer went away loops
         // forever — the amplifier screams until someone sends silence. Clearing the TX
