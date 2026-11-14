@@ -591,7 +591,6 @@ impl App {
         // at boot so the first call answers rather than returning null.
         app.sample_store();
         app.publish_agent_stats();
-        app.runtime.tls = app.tls.json();
         app
     }
 
@@ -2196,6 +2195,7 @@ impl App {
                 rules,
                 family_members,
                 run_gate,
+                tls,
                 ..
             } = self;
             let def = match tools.get(name) {
@@ -2223,6 +2223,7 @@ impl App {
                 rules,
                 families: family_members,
                 gate: run_gate,
+                tls,
             };
             (def.handler)(&mut ctx, args)
         };
@@ -15774,6 +15775,26 @@ str(queued) + "/" + str(a.ok) + "/" + str(again.ok) + "/" + str(task_state(secon
         app.route(&post("/api/agent/message", r#"{"text":"are you busy"}"#));
         let status = app.call_tool("board", &json!({ "command": "status" })).unwrap();
         assert_eq!(status["agent"]["pending"], json!(true), "{status}");
+    }
+
+    /// The certificate is installed by the platform *after* `App::new` returns — it creates the
+    /// TLS server first — so the tool has to read it, not a copy taken at construction.
+    ///
+    /// It was a copy: on the board (firmware 5722ef2) `/api/tls` answered `enabled: true,
+    /// port: 443` with a fingerprint while `board tls` answered `enabled: false, port: 0`,
+    /// because the snapshot was the default and nothing ever replaced it.
+    #[test]
+    fn board_tls_reads_the_certificate_the_platform_installs_later() {
+        let mut app = test_app();
+        let before = app.call_tool("board", &json!({ "command": "tls" })).unwrap();
+        assert_eq!(before["enabled"], json!(false), "a host App has no certificate: {before}");
+        assert_eq!(before["port"], json!(0), "{before}");
+
+        app.tls = crate::app::TlsInfo { port: 443, fingerprint: "aa:bb:cc".into(), error: String::new() };
+        let after = app.call_tool("board", &json!({ "command": "tls" })).unwrap();
+        assert_eq!(after["enabled"], json!(true), "the tool read a stale copy: {after}");
+        assert_eq!(after["port"], json!(443), "{after}");
+        assert_eq!(after["fingerprint"], json!("aa:bb:cc"), "{after}");
     }
 
     /// The board's own model, reached over MCP: the one class of capability that used to need

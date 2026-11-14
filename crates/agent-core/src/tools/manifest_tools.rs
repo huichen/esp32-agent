@@ -494,7 +494,7 @@ pub(crate) fn board_extra_tools() -> Vec<ToolDef> {
         .category("board")
         .core()
         .schema(object_schema(&[], &[]))
-        .bind(|ctx, _args| Ok(ctx.runtime.tls.clone())),
+        .bind(|ctx, _args| Ok(ctx.tls.json())),
     ]
 }
 

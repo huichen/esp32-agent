@@ -1241,6 +1241,8 @@ mod tests {
         let mut tasks = Vec::new();
         let mut rules = Vec::new();
         let gate = crate::run_gate::RunGate::default();
+        // Nothing here generates a certificate; an empty one says so.
+        let tls = crate::app::TlsInfo::default();
         let result = run_tool(
             t,
             &mut ToolCtx {
@@ -1258,6 +1260,7 @@ mod tests {
                 rules: &mut rules,
                 families: &std::collections::BTreeMap::new(),
                 gate: &gate,
+                tls: &tls,
             },
             args,
         );
