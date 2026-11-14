@@ -485,6 +485,16 @@ pub(crate) fn board_extra_tools() -> Vec<ToolDef> {
             v["manifest_version"] = json!(MANIFEST_VERSION);
             Ok(v)
         }),
+        ToolDef::new(
+            "board_tls",
+            "The certificate this board made for itself: whether https is up, its port, the \
+             SHA-256 fingerprint of the DER certificate, and why https is off when it is",
+        )
+        .title("TLS certificate")
+        .category("board")
+        .core()
+        .schema(object_schema(&[], &[]))
+        .bind(|ctx, _args| Ok(ctx.runtime.tls.clone())),
     ]
 }
 

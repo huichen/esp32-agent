@@ -793,6 +793,10 @@ const BOARD_COMMANDS: &[&str] = &[
     // (`runtime.restart_requested`); nothing can ask it to.
     "delay",
     "inventory",
+    // The certificate the board made for itself. The portal showed it on `/api/tls` and a
+    // caller that drives the board over https had no way to read the fingerprint it is asked
+    // to compare — the one reading that turns a browser warning into a decision.
+    "board_tls",
 ];
 
 /// The commands, as tools. Each one keeps the handler it already had; only the name it is
