@@ -334,6 +334,25 @@ impl crate::device::Device for Speaker {
                         // per-note `i2s_out_write` would be equally cheap here and sound
                         // like it — the DMA ring holds 400 frames (16.7 ms) and the
                         // synthesis of the next note would have to fit in that.
+                        // `async: true`: hand the whole buffer to the board's player and
+                        // answer now. The player owns the I2S channel and runs on its own
+                        // task, so the caller keeps the thread it was on — which is the
+                        // whole reason this option exists (see `Hardware::media_submit`).
+                        if j::opt_bool(args, "async").unwrap_or(false) {
+                            let job = hw.media_submit(&samples, AMP_RATE_HZ)?;
+                            return Ok(json!({
+                                "ok": true,
+                                "queued": true,
+                                "job": job,
+                                "notes": score.len(),
+                                "samples": samples.len(),
+                                "ms": total_ms,
+                                "rate_hz": AMP_RATE_HZ,
+                                "volume_pct": (volume * 100.0) as i64,
+                                "synth_ms": synth_ms,
+                                "next": "the board plays it in the background; `media {command: status}` reports progress and `cancel` stops it",
+                            }));
+                        }
                         let writing = std::time::Instant::now();
                         hw.i2s_out_write(&samples)?;
                         let write_ms = writing.elapsed().as_millis() as u64;
@@ -722,6 +741,9 @@ mod tests {
     struct Ear {
         writes: Vec<usize>,
         samples: Vec<i16>,
+        /// Buffers handed to the background player instead of written here.
+        submitted: Vec<usize>,
+        cancelled: bool,
     }
 
     impl crate::hardware::Hardware for Ear {
@@ -733,6 +755,26 @@ mod tests {
             self.writes.push(samples.len());
             self.samples.extend_from_slice(samples);
             Ok(())
+        }
+
+        fn media_submit(&mut self, samples: &[i16], _rate_hz: u32) -> crate::error::Result<u64> {
+            self.submitted.push(samples.len());
+            Ok(self.submitted.len() as u64)
+        }
+
+        fn media_state(&mut self) -> crate::hardware::MediaState {
+            crate::hardware::MediaState {
+                playing: !self.submitted.is_empty() && !self.cancelled,
+                job: self.submitted.len() as u64,
+                chunks: self.submitted.len() as u64,
+                ..Default::default()
+            }
+        }
+
+        fn media_cancel(&mut self) -> bool {
+            let playing = !self.submitted.is_empty() && !self.cancelled;
+            self.cancelled = true;
+            playing
         }
     }
 
@@ -826,6 +868,42 @@ mod tests {
         assert_eq!(pcm.len(), n * 2);
         assert!(pcm[..n - 1].iter().all(|s| *s == 0), "hz 0 is a rest");
         assert!(pcm[n..].iter().any(|s| s.abs() > 1000), "and the note after it still sounds");
+    }
+
+    /// `async: true` hands the buffer to the player and answers; nothing is written on the
+    /// calling thread, which is the whole point of the option.
+    #[test]
+    fn an_async_melody_is_handed_to_the_player_instead_of_written() {
+        let mut speaker = Speaker { id: "speaker".into() };
+        let mut ear = Ear::default();
+        let score: Vec<Value> =
+            twinkle().into_iter().map(|(hz, ms)| json!({ "hz": hz as i64, "ms": ms })).collect();
+
+        let started = std::time::Instant::now();
+        let out = speaker
+            .call("speaker_play", &json!({ "notes": score, "volume": 30, "async": true }), &mut ear)
+            .expect("an async melody is accepted");
+        let elapsed = started.elapsed().as_millis();
+
+        assert_eq!(out["queued"], true, "{out}");
+        assert_eq!(out["ms"], json!(5600), "{out}");
+        assert_eq!(out["job"], json!(1), "{out}");
+        assert_eq!(ear.submitted, vec![134_400], "the player got the whole melody");
+        assert!(ear.writes.is_empty(), "nothing was written on the calling thread");
+        assert!(elapsed < 100, "5.6 s of audio was accepted in {elapsed} ms");
+    }
+
+    /// The same score without `async` still writes, so the old behaviour is the default and
+    /// nothing that worked before changed.
+    #[test]
+    fn the_default_is_still_the_blocking_write() {
+        let mut speaker = Speaker { id: "speaker".into() };
+        let mut ear = Ear::default();
+        speaker
+            .call("speaker_play", &json!({ "notes": [{ "hz": 440, "ms": 100 }], "volume": 20 }), &mut ear)
+            .expect("plays");
+        assert!(ear.submitted.is_empty(), "no job was queued");
+        assert_eq!(ear.writes, vec![2_400], "100 ms at 24 kHz, written here");
     }
 
     /// The whole point of the score form: 5 s of music reaches the amplifier in **one**

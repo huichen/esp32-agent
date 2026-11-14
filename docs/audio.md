@@ -508,3 +508,37 @@ is the bug this whole section exists to prevent.
   runs down-right means the driver and the panel agree; a pattern repeated or torn in
   stripes means addressing or row count, and half of it means `oled.height`. This needs no
   file on the bench, so it still works after a reflash or a wipe.
+
+## Asynchronous playback
+
+`speaker_play {async: true}` hands the synthesized buffer to a player that owns the I2S
+transmit channel and answers immediately with `{queued, job, ms}`. The player is a task of
+its own (6 KiB stack in internal RAM): it takes one job at a time from a bounded queue and
+writes 4 KiB chunks, so the caller keeps the thread it was on. That is what makes audio stop
+waiting for everything else — before, a 12 s tune held the agent thread, and frames and note
+chunks took turns on that one thread, which is what the ear heard as stutter.
+
+`media_status` reports what it is doing (`playing`, `job`, `duration_ms`, `remaining_ms`,
+`chunks`, `queued`, `jobs_done`, `cancelled`); `media_cancel` stops it within one chunk
+(about 170 ms at 24 kHz). Both are tools, so a script can start a tune, keep working, and ask
+how it went:
+
+```text
+let tune = tool("speaker_play", {notes: [{hz: 523, ms: 400}, {hz: 784, ms: 800}], async: true})
+tool("display", {command: "oled_text", arguments: {text: "playing", line: 0}})
+tool("media_status", {})
+```
+
+The default is still the blocking write: `async` is opt-in, so nothing that worked before
+changed behaviour, and a one-note tone has nothing to gain from a queue.
+
+**Video is not asynchronous, on purpose.** The OLED is written through `i2c_write` on a bus
+shared with other chips, so a task drawing frames would need a second owner of that bus. What
+the split buys instead is the property that matters: audio no longer waits for the panel, and
+a script can draw while a tune plays. `media_play` (audio and frames paced together) is still
+synchronous and still paces itself on chunk boundaries.
+
+Two rules keep this from becoming the lock cycle this board has already paid for twice: the
+player takes only its own queue and state mutexes and **never** the App lock, and the two
+writers (the player task and a blocking call) share one mutex around the channel so their DMA
+writes cannot interleave.

@@ -1130,7 +1130,7 @@ fn description() -> String {
          no `;`, no `$( )`, no variable expansion, no background job. `rm` and `mv` need \
          `--confirm` on the command line (`rm /notes/a.txt --confirm`): the confirmation is \
          part of the command, not a field of this tool. Not every \
-         shell command exists — this is the list. `{{\"help\": true}}` prints it with a usage \
+         shell command exists — this is the list. `sh <path> [args…]` runs a board script file through the `script` tool's interpreter, so a file can be run from the shell too. `{{\"help\": true}}` prints it with a usage \
          line for each, and `help <command>` prints one.",
         names.join(" ")
     )
