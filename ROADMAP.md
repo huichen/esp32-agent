@@ -98,9 +98,11 @@ what is not done or not verified.
    call — but playback is still synchronous and competes for shared tool/device
    resources. Further tool parallelism needs separate device/workspace ownership and
    resource locks; the shared `Mutex<App>` has not been removed. Public
-   status/cancellation reads have an independent control plane;
-   this is not background media, and recording still has one tool budget. `media_play` paces
-   a bounded score and OLED frames in one synchronous call; it is not background playback.
+   status/cancellation reads have an independent control plane. Background playback **is**
+   implemented for audio and for audio-plus-frames (`speaker_play {async:true}`,
+   `media_play {async:true}`, board-verified: 8/8 frames, `max_late_ms: 0` in stream time,
+   submit returns in ~0.6 s for a 2 s score); what is missing is runtime sample-rate changes,
+   overlapping uploads and recording beyond one tool budget.
    On-board Opus/ADPCM encoding is
    deferred pending an actual build and measurements; the old 5–6 kB SRAM reading is not
    evidence that a codec cannot fit. See [audio](docs/audio.md).
