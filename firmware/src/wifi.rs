@@ -593,7 +593,6 @@ fn apply_static_ip(ip: &str, netmask: &str, gateway: &str, dns: &str) {
         if let Some(dns_n) = parse(dns) {
             let mut dns_info: esp_idf_sys::esp_netif_dns_info_t = core::mem::zeroed();
             dns_info.ip.u_addr.ip4.addr = dns_n;
-            dns_info.ip.type_ = esp_idf_sys::esp_ip_addr_type_t_ESP_IPADDR_TYPE_V4;
             let _ = esp_idf_sys::esp_netif_set_dns_info(
                 handle,
                 esp_idf_sys::esp_netif_dns_type_t_ESP_NETIF_DNS_MAIN,
