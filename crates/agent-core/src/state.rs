@@ -73,6 +73,15 @@ pub struct Runtime {
     /// board over MCP alone could not check it, and was told to try. `board status` reports
     /// this.
     pub store_stats: Value,
+    /// What the board's own agent is doing: `runs`, `history`, `pending`, `last_error`.
+    ///
+    /// Published by the agent, not sampled by the tool: `App::with_agent` moves the `Agent`
+    /// out of the app while a turn runs (so it can borrow the app as its own tool host), so a
+    /// tool handler that looked at `App::agent` during a turn would see a fresh placeholder.
+    /// The two *live* readings — whether a turn is on, and which tool it is inside — come from
+    /// the `RunGate` instead, which is written at exactly those moments and locks nothing
+    /// else.
+    pub agent: Value,
     /// Portal tokens minted by `POST /api/auth`: `(token, expires_at_ms)`. They live in
     /// RAM, so a reboot revokes every one of them — which is the right default for a
     /// device whose PIN can be changed from the same page.
