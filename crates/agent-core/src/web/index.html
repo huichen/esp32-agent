@@ -258,6 +258,12 @@
         <p class="hint">Whole hours only. It decides when a daily task fires and what the clock reads; half-hour zones cannot be expressed and are refused rather than rounded.</p>
         <div class="buttons"><button id="settings-save" class="btn primary">Save</button></div>
         <p id="settings-result" class="hint"></p>
+        <p class="hint">A blank field keeps what is stored — that is what <code>__set__</code> means. To remove a credential there are buttons, because "empty" cannot mean both "keep it" and "delete it".</p>
+        <div class="buttons">
+          <button id="auth-clear-pin" class="btn ghost">Clear the portal PIN</button>
+          <button id="auth-clear-token" class="btn ghost">Clear the MCP token</button>
+        </div>
+        <p id="auth-clear-result" class="hint"></p>
       </div>
       <div class="card">
         <h3>Restart</h3>

@@ -183,4 +183,46 @@ mod tests {
         assert!(APP_JS.contains("tool_result") && APP_JS.contains("result: "));
         assert!(STYLE_CSS.contains("details.tool") || STYLE_CSS.contains(".tool"), "the row needs a style");
     }
+
+    /// A blank credential field means "keep the stored one", so removing a PIN or a token
+    /// needs its own control. Without it the only way to clear one was to speak the API.
+    #[test]
+    fn a_credential_can_be_cleared_from_the_access_card() {
+        assert!(INDEX_HTML.contains("id=\"auth-clear-pin\""), "no way to clear the PIN");
+        assert!(INDEX_HTML.contains("id=\"auth-clear-token\""), "no way to clear the MCP token");
+        assert!(
+            APP_JS.contains("body.auth[field] = \"\""),
+            "an explicit empty string is what clears a credential; __set__ keeps it"
+        );
+        for field in ["portal_pin", "mcp_token"] {
+            assert!(APP_JS.contains(&format!("clearCredential(\"{field}\"")), "{field} has no handler");
+        }
+    }
+
+    /// `tz_offset_h` is written to `/api/config` and edited on the Settings panel, so the
+    /// Settings panel fills it from the config it already fetched. It used to be filled by
+    /// the Agent panel from the agent document, which never carried it: Settings showed 0 on
+    /// every visit while the board held the right value.
+    #[test]
+    fn the_timezone_is_read_from_the_panel_that_edits_it() {
+        let settings = APP_JS
+            .split("async function loadSettings")
+            .nth(1)
+            .and_then(|tail| tail.split("async function").next())
+            .expect("loadSettings exists");
+        assert!(
+            settings.contains("$('#auth-tz')") || settings.contains("$(\"#auth-tz\")"),
+            "the Settings panel has to fill the timezone field"
+        );
+        assert!(settings.contains("tz_offset_h"), "from the config document");
+        let agent = APP_JS
+            .split("async function loadAgent")
+            .nth(1)
+            .and_then(|tail| tail.split("async function").next())
+            .expect("loadAgent exists");
+        assert!(
+            !agent.contains("$('#auth-tz').value =") && !agent.contains("$(\"#auth-tz\").value ="),
+            "the Agent panel is not where the timezone field is filled"
+        );
+    }
 }
