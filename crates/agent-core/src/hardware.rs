@@ -95,6 +95,32 @@ pub fn threads_json(tasks: Vec<serde_json::Value>) -> Vec<serde_json::Value> {
 /// A pool is a set of capability flags, not an address range — `internal_8bit` and `dma`
 /// overlap on every chip — so the numbers here are answers to "how much RAM satisfies this
 /// request", which is the question a new stack or a DMA buffer actually asks.
+/// What the background audio player is doing.
+///
+/// Reported instead of assumed: without this, `queued: true` is the last thing a caller
+/// ever learns, and "did it play?" becomes a question about the speaker rather than about
+/// the board. `chunks` is the only number here that comes from the writer itself, so a
+/// player that accepted a buffer and wrote nothing cannot look healthy.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct MediaState {
+    /// Job that is playing now, `0` when idle.
+    pub job: u64,
+    pub playing: bool,
+    /// How many jobs are waiting behind it.
+    pub queued: u64,
+    /// Total length of the job that is playing, in milliseconds.
+    pub duration_ms: u64,
+    /// How much of it is still to write.
+    pub remaining_ms: u64,
+    pub rate_hz: u32,
+    /// Chunks the writer has put on the wire for this job.
+    pub chunks: u64,
+    /// Set by `media_cancel` until the next job starts.
+    pub cancelled: bool,
+    /// Jobs that ran to the end since boot.
+    pub jobs_done: u64,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct HeapPool {
     /// The name of the pool, as the board spells it: `internal_8bit`, `dma`, `iram_8bit`,
@@ -319,6 +345,35 @@ pub trait Hardware: Send {
     /// to internal RAM: stacks, DMA descriptors and every flash-safe allocation come from
     /// there, and quietly spending it on a 2 MB clip is how a board loses the RAM it needs
     /// to answer.
+    // ------------------------------------------------------------ asynchronous audio
+    //
+    // Playback used to be a blocking call: the tool wrote every 4 KiB chunk before it
+    // returned, so a tune owned the thread that also answers the portal and draws the
+    // panel, and audio only progressed between frames. `media_submit` hands the samples to
+    // a player that owns the I2S channel and runs on its own task, so the caller is free
+    // the moment the buffer is accepted.
+    //
+    // The player is deliberately audio-only. The OLED is not a device this trait owns — it
+    // is written through `i2c_write` on a bus shared with other chips — so a background
+    // task drawing frames would need a second owner of that bus. What that buys instead is
+    // the property that matters: a script can start a tune and keep drawing, and the audio
+    // no longer waits for the panel.
+    /// Play `samples` in the background; returns a job id. `Err(unsupported)` means this
+    /// board has no asynchronous player and the caller must use the blocking path.
+    fn media_submit(&mut self, _samples: &[i16], _rate_hz: u32) -> Result<u64> {
+        Err(McpError::unsupported("this board has no asynchronous audio player"))
+    }
+
+    /// What the background player is doing, if there is one.
+    fn media_state(&mut self) -> MediaState {
+        MediaState::default()
+    }
+
+    /// Stop the background player and drop whatever is queued. `false` = nothing was playing.
+    fn media_cancel(&mut self) -> bool {
+        false
+    }
+
     fn media_buffer(&mut self, len: usize) -> Option<(Vec<u8>, &'static str)> {
         Some((Vec::with_capacity(len), "internal"))
     }
