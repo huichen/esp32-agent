@@ -12,6 +12,8 @@ JSON으로 새 센서를 선언할 수 있습니다.
 > 에이전트 루프는 [FutureOS](https://github.com/futuregene/future-os)의 방식을 따릅니다.
 > 대화 기록, 도구 저널, 스트림 이벤트, 프로토콜 어댑터, 메모리 인덱스가 포함됩니다.
 
+![Four panels of the web console: the board showing the devices it found and an I2C scan, a skill it wrote and then ran from the shell, a melody playing while a starfield animates, and one DFT computed two ways.](docs/images/features-quad.jpg)
+
 | 기능 | 상세 |
 |---|---|
 | 보드의 에이전트 | 루프, 도구, 메모리, 대화 기록은 펌웨어에 있으며, 모델은 OpenAI 호환 또는 Anthropic 엔드포인트라면 무엇이든 사용할 수 있습니다. [모델](docs/model.md) |

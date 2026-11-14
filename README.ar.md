@@ -12,6 +12,8 @@
 > حلقة الوكيل تتبع [FutureOS](https://github.com/futuregene/future-os): سجل المحادثة، سجل
 > استدعاءات الأدوات، أحداث التدفق، مهايئات البروتوكول، فهرس الذاكرة.
 
+![Four panels of the web console: the board showing the devices it found and an I2C scan, a skill it wrote and then ran from the shell, a melody playing while a starfield animates, and one DFT computed two ways.](docs/images/features-quad.jpg)
+
 | ما | بالتفصيل |
 |---|---|
 | وكيل يعمل على اللوحة | الحلقة والأدوات والذاكرة وسجل المحادثة كلها في البرنامج الثابت؛ والنموذج أي نقطة نهاية متوافقة مع OpenAI أو مع Anthropic. [كيف تعطيه نموذجا](docs/model.md) |
