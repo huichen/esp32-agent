@@ -260,7 +260,7 @@ fn run(
         let gateway = sta_info
             .as_ref()
             .filter(|i| !i.ip.is_unspecified())
-            .map(|i| i.subnet.gw.to_string())
+            .map(|i| i.subnet.gateway.to_string())
             .unwrap_or_default();
         let dns: Vec<String> = sta_info
             .as_ref()
