@@ -204,8 +204,8 @@ pub struct VirtualBoard {
     pub scan: Vec<WifiAp>,
     pub wifi: WifiStatus,
     pub log: Vec<String>,
-    /// `(job, started, duration_ms, rate_hz)` while something is "playing".
-    media: Option<(u64, std::time::Instant, u64, u64)>,
+    /// Playing and queued jobs: `(job, started, duration_ms, rate_hz)`.
+    media: std::collections::VecDeque<(u64, std::time::Instant, u64, u64)>,
     media_next: u64,
     media_done: u64,
     media_cancelled: bool,
@@ -265,7 +265,7 @@ impl VirtualBoard {
             },
             log: Vec::new(),
             hw_calls: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
-            media: None,
+            media: std::collections::VecDeque::new(),
             media_next: 0,
             media_done: 0,
             media_cancelled: false,
@@ -352,47 +352,58 @@ impl Hardware for VirtualBoard {
         Some((Vec::with_capacity(len), "psram"))
     }
 
-    /// The simulator has no amplifier, so the "player" is a clock: accepting a buffer starts
-    /// a job, and asking for its state computes how far that clock has run. That is enough to
-    /// prove what a caller depends on — the submit returns immediately, the state moves
-    /// playing -> done, and a cancel is visible — without pretending to make sound.
+    /// The simulator has no amplifier, so the "player" is a queue of jobs and a clock: each
+    /// job plays for its own duration in turn, and the state is derived from how far the
+    /// clock has run. A one-slot model would let a second submit silently replace the job
+    /// that is playing, which is the bug the board had — the fake must not be able to hide it.
     fn media_submit(&mut self, samples: &[i16], rate_hz: u32) -> Result<u64> {
         let rate = rate_hz.max(1) as u64;
         let duration_ms = (samples.len() as u64).saturating_mul(1000) / rate;
+        if self.media.len() >= 4 {
+            return Err(crate::error::McpError::invalid_params(
+                "the player already has four jobs queued; wait or cancel",
+            ));
+        }
         self.media_next = self.media_next.saturating_add(1);
-        self.media = Some((self.media_next, std::time::Instant::now(), duration_ms, rate));
+        self.media.push_back((self.media_next, std::time::Instant::now(), duration_ms, rate));
         self.media_cancelled = false;
         Ok(self.media_next)
     }
 
     fn media_state(&mut self) -> crate::hardware::MediaState {
+        // Retire every job whose clock has run out, in order.
+        while let Some((_, started, duration_ms, _)) = self.media.front().copied() {
+            if started.elapsed().as_millis() as u64 >= duration_ms {
+                self.media.pop_front();
+                self.media_done = self.media_done.saturating_add(1);
+            } else {
+                break;
+            }
+        }
         let mut state = crate::hardware::MediaState {
             jobs_done: self.media_done,
             cancelled: self.media_cancelled,
+            queued: self.media.len().saturating_sub(1) as u64,
             ..Default::default()
         };
-        let Some((job, started, duration_ms, rate_hz)) = self.media else { return state };
+        let Some((job, started, duration_ms, rate_hz)) = self.media.front().copied() else {
+            return state;
+        };
         let elapsed = started.elapsed().as_millis() as u64;
         state.job = job;
         state.duration_ms = duration_ms;
         state.rate_hz = rate_hz as u32;
-        if elapsed >= duration_ms {
-            state.playing = false;
-            state.remaining_ms = 0;
-            self.media = None;
-            self.media_done = self.media_done.saturating_add(1);
-            state.jobs_done = self.media_done;
-        } else {
-            state.playing = !self.media_cancelled;
-            state.remaining_ms = duration_ms - elapsed;
-            state.chunks = (elapsed * rate_hz / 1000) / 4096 + 1;
-        }
+        state.playing = true;
+        // Derived here, not stored: the same reason the board derives it — a number written
+        // once per chunk is stale the moment it is written.
+        state.remaining_ms = duration_ms.saturating_sub(elapsed);
+        state.chunks = (elapsed * rate_hz / 1000) / 4096 + 1;
         state
     }
 
     fn media_cancel(&mut self) -> bool {
-        let playing = self.media.is_some();
-        self.media = None;
+        let playing = !self.media.is_empty();
+        self.media.clear();
         if playing {
             self.media_cancelled = true;
         }

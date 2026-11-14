@@ -11917,6 +11917,43 @@ mod tests {
         }
     }
 
+    /// `remaining_ms` has to follow the clock, not the last thing the writer published.
+    ///
+    /// The board reported "259 ms left" on a 4 second tune because the number was written
+    /// once per chunk and left stale in between — and worse, a queued job could leave the
+    /// previous job's number behind. The state is now derived at read time, so two reads a
+    /// known interval apart must differ by that interval.
+    #[test]
+    fn the_reported_remaining_time_follows_the_clock() {
+        let mut hw = crate::virtual_board::VirtualBoard::new();
+        // 1 second at 24 kHz.
+        let samples = vec![0i16; 24_000];
+        let job = crate::hardware::Hardware::media_submit(&mut hw, &samples, 24_000).unwrap();
+        assert!(job >= 1);
+
+        let first = crate::hardware::Hardware::media_state(&mut hw);
+        assert!(first.playing, "{first:?}");
+        assert_eq!(first.duration_ms, 1000);
+        std::thread::sleep(std::time::Duration::from_millis(180));
+        let second = crate::hardware::Hardware::media_state(&mut hw);
+        let fell = first.remaining_ms.saturating_sub(second.remaining_ms);
+        assert!(
+            (120..=400).contains(&fell),
+            "remaining went from {} to {} in 180 ms",
+            first.remaining_ms,
+            second.remaining_ms
+        );
+
+        // A job queued behind it must not rewrite the playing job's numbers.
+        let second_job = crate::hardware::Hardware::media_submit(&mut hw, &vec![0i16; 48_000], 24_000);
+        assert!(second_job.is_ok());
+        let third = crate::hardware::Hardware::media_state(&mut hw);
+        assert_eq!(
+            third.duration_ms, 1000,
+            "the queued 2 s job overwrote the 1 s job that is playing: {third:?}"
+        );
+    }
+
     #[test]
     fn shell_sh_runs_a_script_file_with_arguments() {
         let mut app = empty_workspace_app();
