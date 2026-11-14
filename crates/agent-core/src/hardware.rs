@@ -403,6 +403,7 @@ pub trait Hardware: Send {
         _samples: &[i16],
         _rate_hz: u32,
         _pictures: &[MediaPicture],
+        _panel: Option<(u8, u8)>,
     ) -> Result<u64> {
         Err(McpError::unsupported("this board cannot play audio and frames in the background"))
     }

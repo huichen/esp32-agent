@@ -302,7 +302,13 @@ fn play_with_wait(
                 pictures.push(MediaPicture { at_ms: frame.at_ms, page });
             }
         }
-        let job = ctx.hw.media_submit_av(&samples, AMP_RATE_HZ, &pictures)?;
+        let coords = plan.panel.as_deref().and_then(|id| {
+            ctx.devices.infos().into_iter().find(|d| d.id == id).map(|d| {
+                let bus = d.detail.get("bus").and_then(|v| v.as_u64()).unwrap_or(0) as u8;
+                (bus, d.address.unwrap_or(0x3C))
+            })
+        });
+        let job = ctx.hw.media_submit_av(&samples, AMP_RATE_HZ, &pictures, coords)?;
         return Ok(json!({
             "ok": true,
             "queued": true,
@@ -490,10 +496,11 @@ mod tests {
             samples: &[i16],
             rate_hz: u32,
             pictures: &[crate::hardware::MediaPicture],
+            panel: Option<(u8, u8)>,
         ) -> Result<u64> {
             // The recording harness is the inner board plus a clock and a frame log, so the
             // async path is forwarded and tested against the same fake as everything else.
-            self.0.lock().unwrap().board.media_submit_av(samples, rate_hz, pictures)
+            self.0.lock().unwrap().board.media_submit_av(samples, rate_hz, pictures, panel)
         }
 
         fn media_state(&mut self) -> crate::hardware::MediaState {

@@ -118,6 +118,9 @@ pub fn board_tools() -> Vec<ToolDef> {
                 "rate_hz": state.rate_hz,
                 "chunks": state.chunks,
                 "jobs_done": state.jobs_done,
+                "frames_done": state.frames_done,
+                "frames_total": state.frames_total,
+                "max_late_ms": state.max_late_ms,
                 "cancelled": state.cancelled,
                 "note": if state.playing {
                     "played by the board's own task: the caller that queued it already returned"

@@ -416,6 +416,7 @@ impl Hardware for VirtualBoard {
         samples: &[i16],
         rate_hz: u32,
         pictures: &[crate::hardware::MediaPicture],
+        _panel: Option<(u8, u8)>,
     ) -> Result<u64> {
         let job = self.media_submit(samples, rate_hz)?;
         self.media_pictures.insert(job, pictures.iter().map(|p| p.at_ms).collect());
