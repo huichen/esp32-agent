@@ -1119,9 +1119,32 @@ fn accept_loop(
     let (returned, returns) = sync_channel(MAX_CONNECTIONS);
     let mut pending: Vec<PendingConnection> = Vec::new();
     let mut refused: u32 = 0;
+    // TLS connections that were admitted but found no free worker lane. Bounded by
+    // the connection budget, and abandoned after TLS_WAIT_TTL so a dead peer cannot
+    // hold a slot forever.
+    let mut tls_waiting: Vec<(PendingConnection, Handshake)> = Vec::new();
+    const TLS_WAIT_TTL: std::time::Duration = std::time::Duration::from_secs(6);
     while !stop.load(Ordering::SeqCst) {
         while let Ok(conn) = returns.try_recv() {
             pending.push(conn);
+        }
+        // Hand a waiting TLS connection to a lane as soon as one is free. This runs on the
+        // accept thread between passes, so it never blocks a handshake that is going well.
+        let mut waiting_index = 0;
+        while waiting_index < tls_waiting.len() {
+            let stale = tls_waiting[waiting_index].0.idle_since.elapsed() > TLS_WAIT_TTL;
+            let (waiting, handshake) = tls_waiting.swap_remove(waiting_index);
+            match dispatch(waiting, Some(handshake.clone()), &routes, &log, &stop, &pool, &returned) {
+                Some(back) => {
+                    if !stale {
+                        tls_waiting.push((back, handshake));
+                        waiting_index += 1;
+                    } else {
+                        log.warn("http", "dropped a tls connection that waited too long for a lane");
+                    }
+                }
+                None => {}
+            }
         }
         for (listener, tls) in &listeners {
             // Bound each pass so a flood cannot starve the other listener.
@@ -1149,30 +1172,22 @@ fn accept_loop(
                             _connection: connection,
                         };
                         if let Some(handshake) = tls {
-                            // A refused admission means the workers are busy, not that the
-                            // connection is hopeless. Dropping it here is what a browser
-                            // reports as `net::ERR` on a stylesheet it will never ask for
-                            // again, so wait a little before giving up: four tries, 20 ms
-                            // apart, is 80 ms of accept loop at worst.
-                            let mut waiting = conn;
-                            let mut tries = 0;
-                            loop {
-                                match dispatch(
-                                    waiting,
-                                    Some(handshake.clone()),
-                                    &routes,
-                                    &log,
-                                    &stop,
-                                    &pool,
-                                    &returned,
-                                ) {
-                                    Some(back) if tries < 4 => {
-                                        waiting = back;
-                                        tries += 1;
-                                        std::thread::sleep(std::time::Duration::from_millis(20));
-                                    }
-                                    _ => break,
-                                }
+                            // Only MAX_NORMAL_WORKERS TLS connections can be served at once,
+                            // and a handshake takes about a second, so a browser's parallel
+                            // subresource fetches are refused for as long as it takes. The
+                            // answer is to wait for a lane, not to drop the connection: a
+                            // browser never re-asks for a stylesheet it lost, so dropping it
+                            // is what the user sees as an unstyled page.
+                            if let Some(back) = dispatch(
+                                conn,
+                                Some(handshake.clone()),
+                                &routes,
+                                &log,
+                                &stop,
+                                &pool,
+                                &returned,
+                            ) {
+                                tls_waiting.push((back, handshake.clone()));
                             }
                         } else if conn.stream.set_nonblocking(true).is_ok() {
                             pending.push(conn);
