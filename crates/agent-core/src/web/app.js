@@ -1488,6 +1488,8 @@ async function loadSettings() {
     $("#wifi-gateway").value = d.wifi.gateway || "";
     $("#wifi-dns").value = d.wifi.dns || "";
     $("#wifi-password").value = "";
+    $("#set-keep-ap").checked = d.wifi && d.wifi.keep_ap === true;
+    $("#set-plain-http").checked = !(d.mcp && d.mcp.plain_http === false);
     // Where the board is right now, not only where it is trying to go.
     const s = await api("/api/status");
     if (s && s.wifi && s.wifi.ip) {
@@ -2125,12 +2127,17 @@ function init() {
     }
     const pin = $("#auth-pin").value.trim();
     if (pin) body.auth = { portal_pin: pin };
+    // Neither of these can be rebound at runtime: the access point is built when the
+    // radio task starts and the listeners when the server does, so the page says
+    // restart instead of pretending the change is live.
+    body.wifi = { keep_ap: $("#set-keep-ap").checked };
+    body.mcp = { plain_http: $("#set-plain-http").checked };
     try {
       await api("/api/config", { method: "POST", body });
       $("#auth-pin").value = "";
       // A new PIN invalidates the token the page is holding.
       if (pin) { S.token = ""; localStorage.removeItem("esp32-agent.token"); }
-      toast("applied; save queued");
+      toast("applied; restart to apply the network changes");
     } catch (e) { toast(e.message); }
   };
 
