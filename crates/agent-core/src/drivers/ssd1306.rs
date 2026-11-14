@@ -20,6 +20,14 @@ const DATA: u8 = 0x40;
 /// the public bitmap/rectangle/text switches before using it; a frame needs one flush,
 /// not an intermediate picture for every rectangle. Generic dispatch cannot expose it.
 pub(crate) const MEDIA_FRAME_TOOL: &str = "__media_frame";
+/// Internal: draw a frame into the frame buffer and return the page bytes **without**
+/// touching the panel.
+///
+/// `media_play {async: true}` pre-renders every frame this way and hands the bytes to the
+/// board's player, which owns the panel for the duration. Drawing them here as well would
+/// change the screen now and again later, and the whole point is that the picture and the
+/// sound start together.
+pub(crate) const MEDIA_RENDER_TOOL: &str = "__media_render";
 pub(crate) const MAX_FRAME_RECTS: usize = 64;
 
 pub(crate) struct MediaFrame {
@@ -610,6 +618,27 @@ impl Device for Ssd1306 {
                 self.draw_rect(x, y, w, h, fill, on);
                 self.flush(hw)?;
                 Ok(json!({ "ok": true, "x": x, "y": y, "w": w, "h": h }))
+            }
+            MEDIA_RENDER_TOOL => {
+                let frame = MediaFrame::parse(args, self.width, self.height)?;
+                if let Some(bitmap) = frame.bitmap {
+                    self.fb.copy_from_slice(&bitmap);
+                } else {
+                    self.clear();
+                    for rect in frame.rects {
+                        self.draw_rect(rect.x, rect.y, rect.w, rect.h, rect.fill, true);
+                    }
+                    if let Some(text) = frame.text {
+                        self.text(0, frame.line * 8, &text, true);
+                    }
+                }
+                // Deliberately no `flush`: the caller gets the pixels, the panel keeps
+                // showing whatever it was showing.
+                Ok(json!({
+                    "ok": true,
+                    "image_b64": crate::util::b64_encode(&self.fb),
+                    "bytes": self.fb.len(),
+                }))
             }
             MEDIA_FRAME_TOOL => {
                 // Re-check before changing the framebuffer even though the media planner

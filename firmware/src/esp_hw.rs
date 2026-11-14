@@ -48,6 +48,9 @@ pub struct EspHw {
     player: std::sync::Arc<crate::media::Player>,
     /// Held while a blocking write is in flight, so the two writers cannot interleave.
     media_writing: std::sync::Mutex<()>,
+    /// The panel the background player draws on, created the first time a job needs it.
+    /// `None` until then, so a board with no display pays nothing.
+    panel: std::sync::Mutex<Option<std::sync::Arc<crate::media::Panel>>>,
 }
 
 // The handles are opaque pointers owned by ESP-IDF. They are only used from the
@@ -74,6 +77,7 @@ impl EspHw {
             i2s_tx: std::ptr::null_mut(),
             player: crate::media::Player::new(),
             media_writing: std::sync::Mutex::new(()),
+            panel: std::sync::Mutex::new(None),
         };
         for (bus, sda, scl, freq) in buses {
             if let Err(e) = hw.open_bus(*bus, *sda, *scl, *freq) {
@@ -687,6 +691,30 @@ impl Hardware for EspHw {
 
     fn media_cancel(&mut self) -> bool {
         self.player.cancel()
+    }
+
+    /// Asynchronous audio **and** video: the frames arrive pre-rendered, so this only has to
+    /// hand the player a way to reach the glass without the App lock.
+    ///
+    /// That way is one `Panel` (its own I2C device handle plus the bus mutex the blocking
+    /// path also takes). It is created the first time a job needs it and cached: reopening a
+    /// device handle per tune would be a leak with a polite name.
+    fn media_submit_av(
+        &mut self,
+        samples: &[i16],
+        rate_hz: u32,
+        pictures: &[esp32_agent_core::hardware::MediaPicture],
+        panel: Option<(u8, u8)>,
+    ) -> Result<u64> {
+        let (bus, addr) = panel
+            .ok_or_else(|| McpError::invalid_params("an asynchronous frame needs a panel to draw on"))?;
+        let handle = self.device(bus, addr)? as usize;
+        let shared = {
+            let mut slot = self.panel.lock().unwrap_or_else(|p| p.into_inner());
+            slot.get_or_insert_with(|| std::sync::Arc::new(crate::media::Panel::new(handle))).clone()
+        };
+        let pages: Vec<(u64, Vec<u8>)> = pictures.iter().map(|p| (p.at_ms, p.page.clone())).collect();
+        self.player.submit_av(samples, rate_hz, &pages, Some(shared))
     }
 
     fn wifi_scan(&mut self) -> Result<Vec<WifiAp>> {
