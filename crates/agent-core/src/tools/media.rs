@@ -6,9 +6,9 @@
 
 use crate::device::Devices;
 use crate::drivers::audio::{self, AMP_RATE_HZ, MAX_MELODY_MS, MAX_MELODY_NOTES, MAX_NOTE_MS, MIN_NOTE_MS};
-use crate::drivers::ssd1306::{MediaFrame, MAX_FRAME_RECTS, MEDIA_FRAME_TOOL};
+use crate::drivers::ssd1306::{MediaFrame, MAX_FRAME_RECTS, MEDIA_FRAME_TOOL, MEDIA_RENDER_TOOL};
 use crate::error::{McpError, Result};
-use crate::hardware::Hardware;
+use crate::hardware::{Hardware, MediaPicture};
 use crate::json as j;
 use crate::tool::{boolean, integer, object_schema, string, ToolCtx, ToolDef};
 use serde_json::{json, Value};
@@ -79,6 +79,7 @@ pub fn tools(devices: &Devices) -> Vec<ToolDef> {
                 },
             })),
             ("volume", integer(0, 100, "amplitude percent, default 30")),
+            ("async", boolean("return at once and let the board play this in the background; frames are then drawn at their own deadlines instead of inside the audio write")),
             ("fps", integer(1, 30, "idle pacing hint, derived from timestamp spacing by default; clamped 1-30, at_ms stays authoritative")),
         ],
         &[],
@@ -86,7 +87,7 @@ pub fn tools(devices: &Devices) -> Vec<ToolDef> {
     schema["anyOf"] = json!([{"required": ["notes"]}, {"required": ["frames"]}]);
     vec![ToolDef::new(
         "media_play",
-        "Play a score and OLED frames on one clock in one synchronous call. Optional notes use speaker_play's 64-note / 12 s budget; frames use at_ms slots (0-12000), replace the panel with a bitmap or rectangles plus text in one flush, and accept at most 32 KiB of decoded bitmap arguments per call. All frames are validated before playback. Audio is synthesized once and written in 4096-sample chunks split at frame deadlines, so a frame is drawn when its own slot is due rather than after the chunk that covered it; the result reports frames_drawn, frames_late and max_late_ms as the residual, which is the time a draw itself takes and not a 170 ms chunk. This holds the caller; background playback is not implemented (docs/audio.md).",
+        "Play a score and OLED frames on one clock in one synchronous call. Optional notes use speaker_play's 64-note / 12 s budget; frames use at_ms slots (0-12000), replace the panel with a bitmap or rectangles plus text in one flush, and accept at most 32 KiB of decoded bitmap arguments per call. All frames are validated before playback. Audio is synthesized once and written in 4096-sample chunks split at frame deadlines, so a frame is drawn when its own slot is due rather than after the chunk that covered it; the result reports frames_drawn, frames_late and max_late_ms as the residual, which is the time a draw itself takes and not a 170 ms chunk. `async: true` returns immediately instead: every frame is pre-rendered into the panel's page bytes (PSRAM), handed to the board's player with the audio, and drawn at its own deadline by that task, so nothing holds the caller and the picture is not confined to the 170 ms audio-chunk boundary. `media_status` then reports frames_done and max_late_ms, and `media_cancel` stops it.",
     )
     .title("Play sound and picture")
     .category("audio")
@@ -241,6 +242,13 @@ impl Progress {
     }
 }
 
+/// Total length of a plan: its melody, or its last frame when there are only pictures.
+fn progress_duration_ms(plan: &Plan) -> u64 {
+    let melody: u64 = plan.score.iter().map(|(_, ms)| u64::from(*ms)).sum();
+    let last = plan.frames.last().map(|f| f.at_ms).unwrap_or(0);
+    melody.max(last)
+}
+
 fn draw_due(
     ctx: &mut ToolCtx<'_>,
     plan: &Plan,
@@ -278,6 +286,36 @@ fn play_with_wait(
     let plan = prepare(ctx, args)?;
     let mut progress = Progress { notes: plan.score.len(), ..Default::default() };
     let synthesis = ctx.hw.millis();
+    if j::opt_bool(args, "async").unwrap_or(false) {
+        let samples = audio::melody(&plan.score, plan.volume);
+        let synth_ms = ctx.hw.millis().saturating_sub(synthesis);
+        // Pre-render every frame into the panel's own page bytes. Nothing is drawn here:
+        // the player will put each picture on the glass at its deadline, and drawing them
+        // now as well would show the first frame for the length of the tune.
+        let mut pictures: Vec<MediaPicture> = Vec::with_capacity(plan.frames.len());
+        if let Some(panel) = plan.panel.as_deref() {
+            for frame in &plan.frames {
+                let rendered = ctx.devices.call(panel, MEDIA_RENDER_TOOL, &frame.arguments, ctx.hw)?;
+                let encoded = j::str_arg(&rendered, "image_b64")?;
+                let mut page = Vec::new();
+                crate::util::b64_decode(&encoded, &mut page)?;
+                pictures.push(MediaPicture { at_ms: frame.at_ms, page });
+            }
+        }
+        let job = ctx.hw.media_submit_av(&samples, AMP_RATE_HZ, &pictures)?;
+        return Ok(json!({
+            "ok": true,
+            "queued": true,
+            "job": job,
+            "notes": plan.score.len(),
+            "frames": pictures.len(),
+            "samples": samples.len(),
+            "ms": progress_duration_ms(&plan),
+            "synth_ms": synth_ms,
+            "rate_hz": AMP_RATE_HZ,
+            "next": "the board plays audio and frames on one clock in the background; `media_status` reports frames_done and max_late_ms, `media_cancel` stops it",
+        }));
+    }
     let samples = audio::melody(&plan.score, plan.volume);
     progress.synth_ms = ctx.hw.millis().saturating_sub(synthesis);
     // Synthesis is preparation, not part of the shared playback timeline.
@@ -445,6 +483,25 @@ mod tests {
 
         fn i2s_setup(&mut self, mic: Option<I2sPins>, amp: Option<I2sPins>) -> Result<()> {
             self.0.lock().unwrap().board.i2s_setup(mic, amp)
+        }
+
+        fn media_submit_av(
+            &mut self,
+            samples: &[i16],
+            rate_hz: u32,
+            pictures: &[crate::hardware::MediaPicture],
+        ) -> Result<u64> {
+            // The recording harness is the inner board plus a clock and a frame log, so the
+            // async path is forwarded and tested against the same fake as everything else.
+            self.0.lock().unwrap().board.media_submit_av(samples, rate_hz, pictures)
+        }
+
+        fn media_state(&mut self) -> crate::hardware::MediaState {
+            self.0.lock().unwrap().board.media_state()
+        }
+
+        fn media_cancel(&mut self) -> bool {
+            self.0.lock().unwrap().board.media_cancel()
         }
 
         fn i2s_out_write(&mut self, samples: &[i16]) -> Result<()> {
@@ -935,6 +992,44 @@ mod tests {
     }
 
     #[test]
+    /// `async: true` pre-renders the frames and returns; the board reports them from its own
+    /// clock. This is the contract the firmware player has to keep.
+    #[test]
+    fn an_async_media_plan_returns_at_once_and_the_frames_follow_the_clock() {
+        let (mut app, board) = fixture();
+        let started = app.hw.millis();
+        let reply = run(
+            &mut app,
+            &json!({
+                "notes": [{"hz": 523, "ms": 400}, {"hz": 784, "ms": 400}],
+                "frames": [
+                    {"at_ms": 0, "rects": [{"x": 0, "y": 0, "w": 8, "h": 8}]},
+                    {"at_ms": 300, "text": "TWO", "line": 1},
+                    {"at_ms": 600, "rects": [{"x": 10, "y": 10, "w": 4, "h": 4}]},
+                ],
+                "async": true,
+            }),
+        )
+        .expect("an async plan is accepted");
+        let elapsed = app.hw.millis().saturating_sub(started);
+
+        assert_eq!(reply["queued"], true, "{reply}");
+        assert_eq!(reply["frames"], 3, "every frame was pre-rendered: {reply}");
+        assert_eq!(reply["ms"], 800, "the melody is the timeline: {reply}");
+        assert!(elapsed < 400, "the call blocked for {elapsed} ms");
+        // Nothing was drawn on the way here: the player does that on its own clock.
+        assert!(
+            board.0.lock().unwrap().frames.is_empty(),
+            "the synchronous path drew {} frame(s)",
+            board.0.lock().unwrap().frames.len()
+        );
+
+        let state = app.hw.media_state();
+        assert!(state.playing, "the board is playing: {state:?}");
+        assert_eq!(state.frames_total, 3, "{state:?}");
+        assert_eq!(state.frames_done, 1, "only the frame at 0 ms is due: {state:?}");
+    }
+
     fn rectangles_clip_and_text_shares_one_frame_flush() {
         let (mut app, board) = fixture();
         let result = run(&mut app, &json!({"frames": [{
