@@ -144,7 +144,19 @@ fn run(
     };
     log::info!("radio driver created");
 
-    let (ssid, password, ap_ssid, ap_password, ap_fallback, keep_ap, auto_reconnect) = {
+    let (
+        ssid,
+        password,
+        ap_ssid,
+        ap_password,
+        ap_fallback,
+        keep_ap,
+        auto_reconnect,
+        static_ip,
+        static_netmask,
+        static_gateway,
+        static_dns,
+    ) = {
         let guard = app.lock().map_err(|_| anyhow::anyhow!("poisoned"))?;
         (
             guard.cfg.wifi.ssid.clone(),
@@ -154,6 +166,10 @@ fn run(
             guard.cfg.wifi.ap_fallback,
             guard.cfg.wifi.keep_ap,
             guard.cfg.wifi.auto_reconnect,
+            guard.cfg.wifi.ip.clone(),
+            guard.cfg.wifi.netmask.clone(),
+            guard.cfg.wifi.gateway.clone(),
+            guard.cfg.wifi.dns.clone(),
         )
     };
     let mut ssid = ssid;
@@ -205,6 +221,7 @@ fn run(
         "radio up: access point `{ap_ssid}` on http://192.168.4.1/, station {}",
         if ssid.is_empty() { "not configured".to_string() } else { format!("joining `{ssid}`") }
     );
+    apply_static_ip(&static_ip, &static_netmask, &static_gateway, &static_dns);
 
     let mut last_state = String::new();
     let mut reconnect_ticks = 0u32;
@@ -232,6 +249,7 @@ fn run(
                 ap_ssid = "esp32-agent-setup".into();
                 // A new join starts over: the AP may be needed again while it associates.
                 ap_closed = false;
+                apply_static_ip(&static_ip, &static_netmask, &static_gateway, &static_dns);
             }
             Ok(WifiCmd::Scan(reply)) => {
                 let result = scan_now(&mut wifi).map_err(|e| McpError::hardware(format!("{e}")));
@@ -515,6 +533,75 @@ fn scan_now(wifi: &mut EspWifi<'static>) -> anyhow::Result<Vec<WifiAp>> {
             auth: format!("{:?}", ap.auth_method.unwrap_or(AuthMethod::None)),
         })
         .collect())
+}
+
+/// Put a configured address on the station, or leave DHCP alone.
+///
+/// `esp-idf-svc` 0.53 exposes `get_ip_info` but no setter, so this goes through
+/// `esp-netif` directly. Order matters: the DHCP client has to stop first, otherwise the
+/// lease it is about to receive overwrites the address a few milliseconds later. A bad
+/// address is refused with a log line instead of half-applying — a board that quietly
+/// keeps DHCP while the console shows a static address is worse than one that says no.
+fn apply_static_ip(ip: &str, netmask: &str, gateway: &str, dns: &str) {
+    let ip = ip.trim();
+    if ip.is_empty() || ip == "0.0.0.0" {
+        return;
+    }
+    let parse = |v: &str| -> Option<u32> {
+        let mut parts = v.trim().split('.');
+        let mut octets = [0u8; 4];
+        for slot in octets.iter_mut() {
+            *slot = parts.next()?.parse().ok()?;
+        }
+        if parts.next().is_some() {
+            return None;
+        }
+        Some(u32::from_be_bytes(octets).to_be())
+    };
+    let mask = if netmask.trim().is_empty() { "255.255.255.0" } else { netmask };
+    let (Some(ip_n), Some(mask_n)) = (parse(ip), parse(mask)) else {
+        log::error!("wifi: static address `{ip}` or netmask `{mask}` is not dotted-quad; staying on DHCP");
+        return;
+    };
+    let Some(gw_n) = parse(gateway) else {
+        log::error!("wifi: static address `{ip}` has no usable gateway; staying on DHCP");
+        return;
+    };
+    if (ip_n & mask_n) != (gw_n & mask_n) {
+        log::error!("wifi: static address `{ip}` is outside the gateway's subnet; staying on DHCP");
+        return;
+    }
+    unsafe {
+        let handle = esp_idf_sys::esp_netif_get_handle_from_ifkey(
+            b"WIFI_STA_DEF\0".as_ptr() as *const core::ffi::c_char,
+        );
+        if handle.is_null() {
+            log::error!("wifi: no station netif to configure");
+            return;
+        }
+        let _ = esp_idf_sys::esp_netif_dhcpc_stop(handle);
+        let info = esp_idf_sys::esp_netif_ip_info_t {
+            ip: esp_idf_sys::esp_ip4_addr_t { addr: ip_n },
+            netmask: esp_idf_sys::esp_ip4_addr_t { addr: mask_n },
+            gw: esp_idf_sys::esp_ip4_addr_t { addr: gw_n },
+        };
+        let rc = esp_idf_sys::esp_netif_set_ip_info(handle, &info);
+        if rc != 0 {
+            log::error!("wifi: esp_netif_set_ip_info failed ({rc}); staying on DHCP");
+            return;
+        }
+        if let Some(dns_n) = parse(dns) {
+            let mut dns_info: esp_idf_sys::esp_netif_dns_info_t = core::mem::zeroed();
+            dns_info.ip.u_addr.ip4.addr = dns_n;
+            dns_info.ip.type_ = esp_idf_sys::esp_ip_addr_type_t_ESP_IPADDR_TYPE_V4;
+            let _ = esp_idf_sys::esp_netif_set_dns_info(
+                handle,
+                esp_idf_sys::esp_netif_dns_type_t_ESP_NETIF_DNS_MAIN,
+                &mut dns_info,
+            );
+        }
+        log::info!("wifi: static address `{ip}` applied, DHCP client stopped");
+    }
 }
 
 fn client_config(ssid: &str, password: &str) -> ClientConfiguration {
