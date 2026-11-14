@@ -31,6 +31,7 @@ interface is a single string.
 | Hashing and encoding | `sha256sum md5sum base64enc base64dec` |
 | The registry | `type which help` |
 | The agent itself | `system_prompt get\|set\|append\|clear` |
+| Scripts | `sh <path> [args…]` — run a board script file through the same interpreter as the `script` tool; `--name value` becomes `args.name`, the rest is `argv` |
 
 Names follow NuttX's shell where one exists, so anyone who has used it can guess correctly.
 `cat` is `read` under the other name — NuttX has both and both get typed. `xd` is

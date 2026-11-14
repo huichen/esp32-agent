@@ -353,6 +353,12 @@ pub struct App {
     pub tool_specs_cache: std::cell::RefCell<Option<(u64, Value)>>,
     /// Monotonic counter for script run ids; not persisted.
     pub script_seq: u64,
+    /// True while the interpreter is running on this thread.
+    ///
+    /// The recursion guard: `tool("script", …)` is refused by the script host, and this
+    /// covers the second way in — `tool("shell", {command: "sh file"})`. One flag, checked
+    /// at both entrances, instead of trusting every path to remember.
+    pub in_script: bool,
     /// Outbound HTTP for the `net_*` tools. The platform layer attaches it once; host
     /// tests leave it empty so nothing reaches the net. It is deliberately **not** the
     /// transport the model call uses: that one is owned by whoever drives the turn
@@ -547,6 +553,7 @@ impl App {
             rules: Vec::new(),
             tool_specs_cache: std::cell::RefCell::new(None),
             script_seq: 0,
+            in_script: false,
             workspace: AppWorkspace::default(),
             shell_env: std::collections::BTreeMap::new(),
             tool_transport: None,
@@ -1595,11 +1602,21 @@ impl App {
     /// for `POST /api/script {async:true}`; when that route went, the job pool, the poll
     /// route and the state machine it needed went with it.
     pub fn submit_script(&mut self, source: &str) -> ScriptJob {
+        match self.submit_script_call(&json!({ "source": source })) {
+            Ok(job) => job,
+            Err(e) => ScriptJob { state: "failed".into(), error: e, ..Default::default() },
+        }
+    }
+
+    /// The same thing for a full tool-arguments object, so `sh <file>` and `script {path}`
+    /// share one path into the interpreter instead of two that can drift.
+    pub fn submit_script_call(&mut self, args: &Value) -> std::result::Result<ScriptJob, String> {
         let id = format!("s{}", self.script_seq + 1);
         self.script_seq += 1;
         let started = now_ms();
+        let source = args.get("source").and_then(|v| v.as_str()).unwrap_or("");
         let mut job = ScriptJob { id, source: source.to_string(), ..Default::default() };
-        match self.run_script(&json!({ "source": source })) {
+        match self.run_script(args) {
             Ok(value) => {
                 job.state = "done".to_string();
                 job.result = value.get("result").cloned().unwrap_or(Value::Null);
@@ -1610,14 +1627,15 @@ impl App {
                     .unwrap_or_default();
                 job.steps = value.get("steps").and_then(|s| s.as_u64()).unwrap_or(0);
                 job.ms = now_ms().saturating_sub(started);
+                Ok(job)
             }
             Err(e) => {
                 job.state = "failed".to_string();
                 job.ms = now_ms().saturating_sub(started);
                 job.error = e.message;
+                Ok(job)
             }
         }
-        job
     }
 
     fn run_script(&mut self, args: &Value) -> Result<Value> {
@@ -1683,9 +1701,14 @@ impl App {
         // The script runs inside this tool call, so it gets what is left of that call's
         // budget rather than a fresh one of its own.
         let budget = self.remaining_tool_ms();
+        // Guard the second entrance into the interpreter (`shell sh`); the first one,
+        // `tool("script")`, is refused in the host below.
+        self.in_script = true;
         let mut host = Host { app: self };
         let started = now_ms();
-        match crate::script::run_with_budget(&source, &mut host, &args, budget) {
+        let outcome = crate::script::run_with_budget(&source, &mut host, &args, budget);
+        host.app.in_script = false;
+        match outcome {
             Ok(outcome) => {
                 self.log.info(
                     "script",
@@ -5330,6 +5353,9 @@ impl App {
             "shell_wget" => self.run_curl("wget", inner),
             "shell_ping" => self.run_ping(inner).map(|v| v.to_string()),
             "shell_ifconfig" => Ok(self.ifconfig_json().to_string()),
+            // `sh <file>`: run a workspace script the way a shell runs a file, instead of
+            // making the caller read it into `script {source: ...}` first.
+            "shell_sh" => self.shell_sh(inner),
             "shell_df" => Ok(self.shell_df()),
             "shell_free" => Ok(self.shell_free()),
             "shell_uptime" => Ok(self.shell_uptime()),
@@ -5730,15 +5756,74 @@ impl App {
         .to_string()
     }
 
+    /// `date`: UTC and the board's local time.
+    ///
+    /// Reporting only UTC is what made a model compute "UTC+8" by hand in a reply and get
+    /// the weekday from its own guess. The offset is a setting now, so the local reading is
+    /// as trustworthy as the UTC one.
     fn shell_date(&mut self) -> String {
         let ms = now_ms();
+        let offset_h = self.cfg.tz_offset_h;
+        let local_s = (ms / 1000) as i64 + i64::from(offset_h) * 3_600;
         serde_json::json!({
             "unix_s": ms / 1000,
             "synced": ms > 1_700_000_000_000,
             "utc": utc_string(ms / 1000),
-            "note": "before SNTP syncs this is time since boot, and https certificates read as not yet valid",
+            "local": utc_string(local_s.max(0) as u64),
+            "tz_offset_h": offset_h,
+            "zone": if offset_h == 0 { "UTC".to_string() } else { format!("UTC{offset_h:+}") },
+            "note": "before SNTP syncs these are time since boot, and https certificates read as not yet valid",
         })
         .to_string()
+    }
+
+    /// `sh <path> [args…]`: run a script file from the workspace.
+    ///
+    /// The `script` tool already took a `path`, but a person or a model reaches for a shell
+    /// first, and `cat x.bh | …` cannot run one. Arguments become the script's `args`/`argv`,
+    /// the same as `script {args: …}`.
+    ///
+    /// Refused inside a script: `tool("shell", {command: "sh …"})` would otherwise be a
+    /// second way to recurse into the interpreter, and the inner script would draw on the
+    /// outer one's time budget with nothing to stop it repeating.
+    fn shell_sh(&mut self, args: &Value) -> std::result::Result<String, String> {
+        if self.in_script {
+            return Err(
+                "a script may not run another script through `shell sh`; use `script {path: …}` instead"
+                    .into(),
+            );
+        }
+        let positional = args.get("args").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+        let path = positional
+            .first()
+            .and_then(|v| v.as_str())
+            .or_else(|| args.get("path").and_then(|v| v.as_str()))
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        if path.is_empty() {
+            // The same line `shell help` prints, so the correction is in the error.
+            let line = crate::tools::shell::usage("sh").unwrap_or("sh <path> [args…]");
+            return Err(format!("usage: {line}"));
+        }
+        // Through the script tool, so the file is read, the args are wired and the budget
+        // logic are exactly the ones `script {path: …}` uses.
+        let rest: Vec<Value> = positional.iter().skip(1).cloned().collect();
+        let mut call = json!({ "path": path });
+        if !rest.is_empty() {
+            call["args"] = Value::Array(rest);
+        }
+        let job = self.submit_script_call(&call)?;
+        Ok(serde_json::json!({
+            "path": path,
+            "state": job.state,
+            "result": job.result,
+            "output": job.output,
+            "steps": job.steps,
+            "ms": job.ms,
+            "error": if job.error.is_empty() { Value::Null } else { Value::String(job.error) },
+        })
+        .to_string())
     }
 
     fn shell_uname(&mut self) -> String {
@@ -8985,6 +9070,78 @@ mod tests {
     }
 
     #[test]
+    fn repeated_grow_and_compact_cycles_degrade_the_archive_instead_of_growing_it() {
+        // The question this answers: is compaction idempotent, and what happens over
+        // repeated grow -> compact -> grow -> compact cycles?
+        //
+        // Idempotent in the narrow sense: a second pass over an unchanged transcript removes
+        // nothing. Not a fixed point across cycles: each cycle drops the exchanges that grew
+        // in the meantime, the archive absorbs one line per message, and the archive has its
+        // own caps - so the *beginning* of the conversation is eventually evicted. Nothing
+        // comes back; the index is bounded, the transcript is not restored.
+        let mut app = test_app();
+        let mut rows = Vec::new();
+        for cycle in 0..6u32 {
+            for turn in 0..6u32 {
+                let at = u64::from(cycle * 10 + turn);
+                app.agent.history.push(crate::agent::Message::user(
+                    &format!("cycle{cycle} question {turn}"),
+                    "http",
+                    at,
+                ));
+                app.agent.history.push(crate::agent::Message::assistant(
+                    &format!("cycle{cycle} answer {turn}"),
+                    vec![],
+                    at,
+                ));
+            }
+            let r = app.agent.compact_now(Some(1));
+            rows.push((
+                cycle,
+                r.messages_before,
+                r.messages_after,
+                r.removed,
+                r.archive_lines,
+                r.bytes_after,
+            ));
+        }
+        for (cycle, before, after, removed, lines, bytes) in &rows {
+            println!(
+                "cycle {cycle}: {before} -> {after} messages, {removed} dropped, {lines} archive lines, {bytes} bytes"
+            );
+        }
+
+        // The transcript holds exactly the kept exchange after every cycle, so the growth is
+        // 12 messages per cycle (six exchanges) and the drop is what arrived in it. The
+        // first cycle starts empty, so it sees 12 before, not 14.
+        for (cycle, before, after, removed, _, _) in &rows {
+            assert_eq!(*after, 2, "one exchange survives each cycle");
+            assert_eq!(*before, if *cycle == 0 { 12 } else { 14 }, "kept exchange plus six new ones");
+            assert_eq!(*removed, *before - 2, "everything older than the kept exchange goes");
+        }
+        // A second pass over the same transcript is a no-op.
+        let again = app.agent.compact_now(Some(1));
+        assert_eq!(again.removed, 0, "compaction of an unchanged transcript is idempotent");
+
+        // The archive is bounded by lines and bytes, not by how many cycles ran.
+        assert!(app.agent.archive.len() <= crate::agent::ARCHIVE_MAX_LINES, "{}", app.agent.archive.len());
+        let bytes: usize = app.agent.archive.iter().map(|l| l.len()).sum();
+        assert!(bytes <= crate::agent::ARCHIVE_MAX_BYTES, "{bytes}");
+
+        // And the degradation is real: the earliest question is gone, the newest kept one is
+        // there. This is the part to know before running compaction in a loop.
+        assert!(
+            !app.agent.archive.iter().any(|l| l.contains("cycle0 question 0")),
+            "the first question should have been evicted: {:?}",
+            app.agent.archive.first()
+        );
+        assert!(app.agent.archive.iter().any(|l| l.contains("question 4")), "{:?}", app.agent.archive);
+        // At least one row shows the archive no longer growing: that is where the loss starts.
+        let lines: Vec<usize> = rows.iter().map(|r| r.4).collect();
+        assert_eq!(lines.last(), Some(&crate::agent::ARCHIVE_MAX_LINES), "{lines:?}");
+    }
+
+    #[test]
     fn manual_compaction_reports_what_it_dropped_and_keeps_the_newest_exchange() {
         let mut app = test_app();
         // Four exchanges, and a tool call inside the oldest one: the archive has to carry
@@ -11722,6 +11879,93 @@ mod tests {
                 ),
             }
         }
+    }
+
+    #[test]
+    fn shell_sh_runs_a_script_file_with_arguments() {
+        let mut app = empty_workspace_app();
+        write_file(&mut app, "/hello.bh", "log(\"hi \" + str(args.who))\n21 * 2");
+        let raw = ToolHost::call_tool(&mut app, "shell", &json!({ "command": "sh /hello.bh --who world" }))
+            .expect("sh runs the file");
+        let out: Value = serde_json::from_str(&raw).expect("json");
+        assert_eq!(out["state"], "done", "{out}");
+        assert_eq!(out["result"], 42);
+        assert_eq!(out["output"], json!(["hi world"]));
+        assert_eq!(out["path"], "/hello.bh");
+
+        // A missing file is an error about the file, not a silent no-op.
+        let missing = ToolHost::call_tool(&mut app, "shell", &json!({ "command": "sh /nope.bh" }));
+        assert!(
+            missing.is_err()
+                || serde_json::from_str::<Value>(&missing.unwrap()).unwrap()["state"] == "failed"
+        );
+    }
+
+    #[test]
+    fn a_script_cannot_reach_the_interpreter_through_shell_sh() {
+        let mut app = empty_workspace_app();
+        write_file(&mut app, "/inner.bh", "1 + 1");
+        // The second way into the interpreter: the script host refuses `script`, and this
+        // is the same guard for `shell sh`.
+        let out = ToolHost::call_tool(
+            &mut app,
+            "script",
+            &json!({ "source": "tool(\"shell\", {command: \"sh /inner.bh\"})" }),
+        );
+        let reply = match out {
+            Ok(v) => v.to_string(),
+            Err(e) => e,
+        };
+        assert!(reply.contains("may not run another script"), "{reply}");
+        // And the flag is cleared, so the next ordinary `sh` still works.
+        let raw = ToolHost::call_tool(&mut app, "shell", &json!({ "command": "sh /inner.bh" })).unwrap();
+        assert_eq!(serde_json::from_str::<Value>(&raw).unwrap()["result"], 2);
+    }
+
+    #[test]
+    fn a_script_defers_tool_calls_and_collects_them_without_running_twice() {
+        let mut app = empty_workspace_app();
+        let source = r#"
+let first = async_tool("schedule", {action: "add", id: "deferred-a", prompt: "x", every_s: 86400})
+let queued = task_state(first)
+let a = await(first)
+let again = await(first)
+let second = async_tool("schedule", {action: "add", id: "deferred-b", prompt: "y", every_s: 86400})
+str(queued) + "/" + str(a.ok) + "/" + str(again.ok) + "/" + str(task_state(second))
+"#;
+        let job = app.submit_script(source);
+        assert_eq!(job.state, "done", "{job:?}");
+        assert_eq!(job.result, "queued/true/true/queued", "{:?}", job.output);
+        // The first call ran once: a second execution would have been refused as a duplicate
+        // task id, and `again.ok` would be false.
+        let sched = body_json(&app.route(&get("/api/sched")));
+        let ids: Vec<&str> =
+            sched["tasks"].as_array().unwrap().iter().filter_map(|t| t["id"].as_str()).collect();
+        assert!(ids.contains(&"deferred-a"), "{ids:?}");
+        // The second was never awaited, so the drain at the end of the script ran it.
+        assert!(ids.contains(&"deferred-b"), "a fire-and-forget call must still happen: {ids:?}");
+        assert_eq!(ids.iter().filter(|id| **id == "deferred-a").count(), 1);
+    }
+
+    #[test]
+    fn a_deferred_failure_is_reported_in_the_output_rather_than_vanishing() {
+        let mut app = empty_workspace_app();
+        let job = app.submit_script(
+            "let h = async_tool(\"board\", {command: \"no_such_command\"})\n\"script finished\"",
+        );
+        // A tool error is not a script error unless it was awaited: the script's own result
+        // stands, and the failure is written where a reader will see it.
+        assert_eq!(job.state, "done", "{job:?}");
+        assert_eq!(job.result, "script finished");
+        assert!(job.output.iter().any(|l| l.contains("deferred board failed")), "{:?}", job.output);
+    }
+
+    #[test]
+    fn run_now_reports_a_script_task_and_shell_sh_share_one_interpreter_path() {
+        let mut app = empty_workspace_app();
+        write_file(&mut app, "/count.bh", "len(argv)");
+        let one = app.submit_script_call(&json!({ "path": "/count.bh", "args": ["--a", "1"] }));
+        assert_eq!(one.unwrap().result, 2, "one flag pair becomes one named argument");
     }
 
     // ---- pipes and redirection ----

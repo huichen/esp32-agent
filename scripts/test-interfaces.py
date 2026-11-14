@@ -718,7 +718,14 @@ def default_tool_arguments(path="/tool.txt"):
             "schedule": {"action": "list"}, "script": {"source": "1 + 2"}, "shell": {"command": "echo fixture"},
             "write": {"path": path, "text": "fixture"}, "read": {"path": path},
             "edit": {"path": path, "find": "fixture", "replace": "changed"},
-            "device_invoke": {"device": "bme280", "tool": "bme280_read", "arguments": {}}}
+            "device_invoke": {"device": "bme280", "tool": "bme280_read", "arguments": {}},
+            # The three tools an outside agent got in #108. Without entries here the
+            # suite's own invariant (every advertised tool has a safe fixture) fails on
+            # main, which is what it did before this line was added.
+            "agent_config_set": {"patch": {"max_steps": 4}},
+            "agent_forget": {"keep": 999},
+            "agent_say": {"text": "fixture ping"},
+            }
 
 
 def tools(rec, sim, fake):
@@ -1454,6 +1461,16 @@ def transport(rec, sim, fake):
         rec.equal(protocol + ".catalog-wire-result-ids", sorted(outputs), sorted(results))
         for ident, name, _ in calls:
             result = results.get(ident, {})
+            if name == "agent_forget":
+                # Every tool in the catalogue is called from inside a model turn, and
+                # cutting the conversation from there is refused on purpose: the question
+                # being answered would be gone. What must hold is the refusal, named.
+                rec.check(protocol + ".catalog-exec:agent_forget-refused-mid-run",
+                          result.get("is_error") is True
+                          and "a model turn is running" in result.get("text", ""), short(result))
+                rec.equal(protocol + ".catalog-wire-result:" + name,
+                          json.loads(outputs.get(ident, "null")), json.loads(result.get("text", "null")))
+                continue
             rec.check(protocol + ".catalog-exec:" + name, bool(result) and not result.get("is_error"), short(result))
             rec.equal(protocol + ".catalog-wire-result:" + name,
                       json.loads(outputs.get(ident, "null")), json.loads(result.get("text", "null")))

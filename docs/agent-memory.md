@@ -120,6 +120,35 @@ retry after `run_end`.
 the dropped part is still on flash, so a reboot restores it. It happens when
 `persist_transcript` is off or the store queue rejected the write.
 
+### What repeated compaction does
+
+Compaction is idempotent **per transcript**: a second pass over an unchanged conversation
+removes nothing (`removed: 0`). It is not a fixed point across cycles, and that is worth
+knowing before calling it in a loop.
+
+Each cycle of "grow the conversation, compact, grow again, compact" behaves like this
+(measured on the host, six cycles of six exchanges with `keep: 1`):
+
+| Cycle | Before | After | Dropped | Archive lines |
+|---|---|---|---|---|
+| 1 | 12 | 2 | 10 | 10 |
+| 2 | 14 | 2 | 12 | 22 |
+| 3 | 14 | 2 | 12 | 34 |
+| 4 | 14 | 2 | 12 | 40 |
+| 5 | 14 | 2 | 12 | 40 |
+| 6 | 14 | 2 | 12 | 40 |
+
+The transcript never grows past the exchange that was kept, and the archive stops at its
+own caps: 40 lines and 96 KiB. So the cost is not memory — it is **the beginning of the
+conversation**: from cycle 4 onward the oldest archive lines are evicted, and a question
+from cycle 1 is gone entirely. Nothing brings it back; the index is bounded on purpose and
+the transcript is not restored from it.
+
+The practical consequence: compact when you mean it. A loop that keeps compacting the same
+conversation keeps the newest exchange readable and progressively loses the earlier detail,
+which is exactly what a *summary* would also do — except that here it is mechanical, so what
+survives is whatever fits, not whatever mattered.
+
 ## 3. Forgetting
 
 `POST /api/agent/forget {"keep": N}`
