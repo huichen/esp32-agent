@@ -14,6 +14,8 @@ marcha.
 > El bucle de agente sigue a [FutureOS](https://github.com/futuregene/future-os): transcripción,
 > diario de herramientas, eventos de flujo, adaptadores de protocolo, índice de memoria.
 
+![Four panels of the web console: the board showing the devices it found and an I2C scan, a skill it wrote and then ran from the shell, a melody playing while a starfield animates, and one DFT computed two ways.](docs/images/features-quad.jpg)
+
 | Qué | En detalle |
 |---|---|
 | Un agente se ejecuta en la placa | El bucle, las herramientas, la memoria y la transcripción son firmware; el modelo es cualquier endpoint compatible con OpenAI o de Anthropic. [Cómo darle un modelo](docs/model.md) |

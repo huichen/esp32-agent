@@ -13,6 +13,8 @@
 > Цикл агента следует [FutureOS](https://github.com/futuregene/future-os): транскрипт, журнал
 > вызовов инструментов, события потока, адаптеры протоколов, индекс памяти.
 
+![Four panels of the web console: the board showing the devices it found and an I2C scan, a skill it wrote and then ran from the shell, a melody playing while a starfield animates, and one DFT computed two ways.](docs/images/features-quad.jpg)
+
 | Что | В подробностях |
 |---|---|
 | Агент работает на плате | Цикл, инструменты, память и транскрипт — это прошивка; модель — любой эндпоинт, совместимый с OpenAI, или Anthropic. [Как задать модель](docs/model.md) |
