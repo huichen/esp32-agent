@@ -1134,16 +1134,15 @@ fn accept_loop(
         while waiting_index < tls_waiting.len() {
             let stale = tls_waiting[waiting_index].0.idle_since.elapsed() > TLS_WAIT_TTL;
             let (waiting, handshake) = tls_waiting.swap_remove(waiting_index);
-            match dispatch(waiting, Some(handshake.clone()), &routes, &log, &stop, &pool, &returned) {
-                Some(back) => {
-                    if !stale {
-                        tls_waiting.push((back, handshake));
-                        waiting_index += 1;
-                    } else {
-                        log.warn("http", "dropped a tls connection that waited too long for a lane");
-                    }
+            if let Some(back) =
+                dispatch(waiting, Some(handshake.clone()), &routes, &log, &stop, &pool, &returned)
+            {
+                if !stale {
+                    tls_waiting.push((back, handshake));
+                    waiting_index += 1;
+                } else {
+                    log.warn("http", "dropped a tls connection that waited too long for a lane");
                 }
-                None => {}
             }
         }
         for (listener, tls) in &listeners {
