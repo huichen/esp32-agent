@@ -175,6 +175,9 @@ Only these, plus `tool`:
   print/echo    aliases of log
   sleep(ms)     wait against the call's remaining time budget (see below)
   tool(name, args)   call any board tool; args is a map; returns its JSON
+  async_tool(name, args) -> handle; await(h) runs it once, wait_all([h…]) awaits many,
+                task_state(h) is "queued"|"done"|"failed". Deferred, not parallel:
+                one dispatcher, one mutex, one bus. Unawaited calls still run at the end.
 
 `sleep` really waits: the thread is in the scheduler's hands, not spinning,
 but the portal still answers only after the script returns. How long it may
@@ -1141,6 +1144,19 @@ enum Flow {
     Return(Val),
 }
 
+/// One queued tool call and what became of it.
+struct AsyncTask {
+    name: String,
+    args: serde_json::Value,
+    state: TaskState,
+}
+
+enum TaskState {
+    Queued,
+    Done(Val),
+    Failed(String),
+}
+
 struct Run<'a> {
     host: &'a mut dyn ScriptHost,
     scopes: Vec<BTreeMap<String, Val>>,
@@ -1151,6 +1167,15 @@ struct Run<'a> {
     steps: u64,
     depth: usize,
     output: Vec<String>,
+    /// Deferred tool calls: `async_tool` queues one, `await` runs it.
+    ///
+    /// The calls do **not** overlap. Everything the board exposes runs through one
+    /// dispatcher behind one mutex (and one I2C bus), so a second execution context would
+    /// serialise on the same lock and only add a thread to the failure modes. What this buys
+    /// is deferral: a script can queue the slow calls it knows it will need, do its own work
+    /// in between, and collect them at a point it chooses — and the queue is drained at the
+    /// end, so "fire and forget" still happens instead of being silently dropped.
+    tasks: Vec<AsyncTask>,
     /// The moment this script must stop, in the same milliseconds-since-boot clock.
     deadline_ms: u64,
     /// The budget that deadline came from, so a refusal can quote the number rather
@@ -1221,12 +1246,19 @@ pub fn run_with_budget(
         steps: 0,
         depth: 0,
         output: Vec::new(),
+        tasks: Vec::new(),
         deadline_ms: started.saturating_add(budget),
         budget_ms: budget,
     };
-    runner.execute(program)
+    let mut outcome = runner.execute(program)?;
+    // Fire-and-forget has to fire: anything queued with `async_tool` and never awaited runs
+    // here, in the order it was queued, and a failure is written into the output instead of
+    // vanishing with the handle.
+    runner.drain_tasks();
+    outcome.output.extend(std::mem::take(&mut runner.output));
+    outcome.steps = runner.steps;
+    Ok(outcome)
 }
-
 pub fn run(source: &str, host: &mut dyn ScriptHost) -> Result<Outcome, String> {
     run_with(source, host, &serde_json::Value::Null)
 }
@@ -1259,6 +1291,55 @@ impl<'a> Run<'a> {
             }
         }
         Ok(Outcome { result: last.to_json(), output: std::mem::take(&mut self.output), steps: self.steps })
+    }
+
+    /// Run a queued call now (or return what it already produced).
+    ///
+    /// Called from `await`/`wait_all` and from the drain at the end of the script, so a
+    /// deferred call that was never awaited still happens — a `speaker_play` nobody waited
+    /// for must not be silently dropped.
+    fn resolve(&mut self, id: usize) -> Result<Val, String> {
+        let task = self.tasks.get(id).ok_or_else(|| format!("no deferred call {id}"))?;
+        match &task.state {
+            TaskState::Done(v) => return Ok(v.clone()),
+            TaskState::Failed(e) => return Err(e.clone()),
+            TaskState::Queued => {}
+        }
+        let (name, args) = {
+            let task = &self.tasks[id];
+            (task.name.clone(), task.args.clone())
+        };
+        self.tick()?;
+        let outcome = self.host.call_tool(&name, &args).map(|v| Val::from_json(&v));
+        // Store before returning: a second `await` on the same handle must not run the tool
+        // twice — a replay of `led_set` is harmless, a replay of `write` is not.
+        match outcome {
+            Ok(v) => {
+                self.tasks[id].state = TaskState::Done(v.clone());
+                Ok(v)
+            }
+            Err(e) => {
+                self.tasks[id].state = TaskState::Failed(e.clone());
+                Err(e)
+            }
+        }
+    }
+
+    /// Finish every call nobody awaited, reporting failures into the output.
+    ///
+    /// Errors are appended rather than returned: the script already produced its result,
+    /// and turning a fire-and-forget failure into "the whole script failed" would lose it.
+    /// Silence is the outcome to avoid, so it is written where a reader will see it.
+    fn drain_tasks(&mut self) {
+        for id in 0..self.tasks.len() {
+            if !matches!(self.tasks[id].state, TaskState::Queued) {
+                continue;
+            }
+            let name = self.tasks[id].name.clone();
+            if let Err(e) = self.resolve(id) {
+                self.output.push(clip(format!("deferred {name} failed: {e}")));
+            }
+        }
     }
 
     fn tick(&mut self) -> Result<(), String> {
@@ -1709,10 +1790,92 @@ impl<'a> Run<'a> {
                 let out = self.host.call_tool(&name, &args)?;
                 Ok(Val::from_json(&out))
             }
+            // ---------------------------------------------------------------- deferred calls
+            //
+            // `async_tool` queues; `await` runs. Deferred, not parallel: see `Run::tasks`.
+            "async_tool" | "spawn_tool" => {
+                let name = match values.first() {
+                    Some(Val::Str(s)) => s.clone(),
+                    Some(other) => {
+                        return Err(format!(
+                            "async_tool() needs a tool name, got a {}",
+                            other.type_name()
+                        ))
+                    }
+                    None => return Err("async_tool() needs a tool name".into()),
+                };
+                if name == "script" {
+                    return Err("a script may not call `script`".into());
+                }
+                let args = values.get(1).map(|v| v.to_json()).unwrap_or_else(|| json!({}));
+                let id = self.tasks.len() as f64;
+                self.tasks.push(AsyncTask { name, args, state: TaskState::Queued });
+                // A handle is an ordinary map, so it can live in a list or a field like
+                // any other value; `await` on something that is not a handle is a no-op.
+                Ok(Val::Map(BTreeMap::from([("$async".to_string(), Val::Num(id))])))
+            }
+            "await" | "wait" => {
+                let handle = match values.first() {
+                    Some(v) => v.clone(),
+                    None => return Err("await() needs a handle from async_tool()".into()),
+                };
+                match async_id(&handle) {
+                    Some(id) => self.resolve(id),
+                    // Awaiting a plain value is not an error: it makes `await` usable
+                    // without the caller having to know whether a call was deferred.
+                    None => Ok(handle),
+                }
+            }
+            "wait_all" => {
+                let handles = match values.first() {
+                    Some(Val::List(items)) => items.clone(),
+                    Some(other) => {
+                        return Err(format!(
+                            "wait_all() needs a list of handles, got a {}",
+                            other.type_name()
+                        ))
+                    }
+                    None => return Err("wait_all() needs a list of handles".into()),
+                };
+                let mut out = Vec::with_capacity(handles.len());
+                for handle in handles {
+                    match async_id(&handle) {
+                        Some(id) => out.push(self.resolve(id)?),
+                        None => out.push(handle),
+                    }
+                }
+                Ok(Val::List(out))
+            }
+            // What a handle is doing, without running it: `queued`, `done` or `failed`.
+            "task_state" | "async_state" => match values.first().and_then(async_id) {
+                Some(id) => {
+                    let task = self
+                        .tasks
+                        .get(id)
+                        .ok_or_else(|| format!("no deferred call {id}"))?;
+                    Ok(Val::Str(match &task.state {
+                        TaskState::Queued => "queued".to_string(),
+                        TaskState::Done(_) => "done".to_string(),
+                        TaskState::Failed(_) => "failed".to_string(),
+                    }))
+                }
+                None => Err("task_state() needs a handle from async_tool()".into()),
+            },
             other => {
-                Err(format!("unknown function `{other}` (builtins: len, str, num, type, log, sleep, tool)"))
+                Err(format!(
+                    "unknown function `{other}` (builtins: len, str, num, type, log, sleep, tool, async_tool, await, wait_all, task_state)"
+                ))
             }
         }
+    }
+}
+
+/// The task id inside a handle, or `None` for any other value.
+fn async_id(value: &Val) -> Option<usize> {
+    let Val::Map(map) = value else { return None };
+    match map.get("$async") {
+        Some(Val::Num(n)) if *n >= 0.0 => Some(*n as usize),
+        _ => None,
     }
 }
 
@@ -1918,6 +2081,7 @@ mod tests {
             steps: 0,
             depth: 0,
             output: Vec::new(),
+            tasks: Vec::new(),
             deadline_ms: started,
             budget_ms: 0,
         };
