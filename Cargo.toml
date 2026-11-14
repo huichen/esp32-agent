@@ -1,4 +1,4 @@
-[workspace]
+﻿[workspace]
 resolver = "2"
 members = ["crates/agent-core", "crates/agent-sim"]
 # The firmware is a separate Cargo project: it needs the Xtensa/RISC-V ESP
@@ -6,7 +6,7 @@ members = ["crates/agent-core", "crates/agent-sim"]
 exclude = ["firmware"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 license = "MIT"
 rust-version = "1.77"
