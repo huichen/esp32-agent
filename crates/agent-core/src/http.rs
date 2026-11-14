@@ -1134,15 +1134,31 @@ fn accept_loop(
                             _connection: connection,
                         };
                         if let Some(handshake) = tls {
-                            let _ = dispatch(
-                                conn,
-                                Some(handshake.clone()),
-                                &routes,
-                                &log,
-                                &stop,
-                                &pool,
-                                &returned,
-                            );
+                            // A refused admission means the workers are busy, not that the
+                            // connection is hopeless. Dropping it here is what a browser
+                            // reports as `net::ERR` on a stylesheet it will never ask for
+                            // again, so wait a little before giving up: four tries, 20 ms
+                            // apart, is 80 ms of accept loop at worst.
+                            let mut waiting = conn;
+                            let mut tries = 0;
+                            loop {
+                                match dispatch(
+                                    waiting,
+                                    Some(handshake.clone()),
+                                    &routes,
+                                    &log,
+                                    &stop,
+                                    &pool,
+                                    &returned,
+                                ) {
+                                    Some(back) if tries < 4 => {
+                                        waiting = back;
+                                        tries += 1;
+                                        std::thread::sleep(std::time::Duration::from_millis(20));
+                                    }
+                                    _ => break,
+                                }
+                            }
                         } else if conn.stream.set_nonblocking(true).is_ok() {
                             pending.push(conn);
                         }
