@@ -4593,6 +4593,7 @@ impl App {
                     "tokens_after": report.tokens_after,
                     "archive_lines": report.archive_lines,
                     "demoted_answers": report.demoted_answers,
+                    "index_bytes": report.index_bytes,
                     // Freeing RAM is a different state from telling flash about it.
                     "stored": stored,
                 }))
@@ -9120,9 +9121,12 @@ mod tests {
         // 12 messages per cycle (six exchanges) and the drop is what arrived in it. The
         // first cycle starts empty, so it sees 12 before, not 14.
         for (cycle, before, after, removed, _, _) in &rows {
-            assert_eq!(*after, 2, "one exchange survives each cycle");
-            assert_eq!(*before, if *cycle == 0 { 12 } else { 14 }, "kept exchange plus six new ones");
-            assert_eq!(*removed, *before - 2, "everything older than the kept exchange goes");
+            assert_eq!(*after, 3, "one exchange survives each cycle, behind the index");
+            assert_eq!(*before, if *cycle == 0 { 12 } else { 15 }, "index + kept exchange + six new ones");
+            // What this pass drained: everything except the kept exchange. From the second
+            // cycle on, the previous index is replaced rather than drained, so it is not in
+            // this count — which is why cycle 0 drops one fewer.
+            assert_eq!(*removed, if *cycle == 0 { 10 } else { 12 }, "cycle {cycle}");
         }
         // A second pass over the same transcript is a no-op.
         let again = app.agent.compact_now(Some(1));
@@ -9167,8 +9171,16 @@ mod tests {
         ));
         app.agent.history.push(crate::agent::Message::tool_result("c0", "ok", false, 0));
         for turn in 0..4u64 {
-            app.agent.history.push(crate::agent::Message::user(&format!("question {turn}"), "http", turn));
-            app.agent.history.push(crate::agent::Message::assistant(&format!("answer {turn}"), vec![], turn));
+            app.agent.history.push(crate::agent::Message::user(
+                &format!("question {turn} {}", "detail ".repeat(40)),
+                "http",
+                turn,
+            ));
+            app.agent.history.push(crate::agent::Message::assistant(
+                &format!("answer {turn} {}", "detail ".repeat(40)),
+                vec![],
+                turn,
+            ));
         }
         assert_eq!(app.agent.history.len(), 10, "four exchanges plus the call/result pair");
 
@@ -9178,7 +9190,7 @@ mod tests {
         assert_eq!(body["ok"], true);
         assert_eq!(body["kept_turns"], 1);
         assert_eq!(body["messages_before"], 10);
-        assert_eq!(body["messages_after"], 2, "one exchange survives verbatim");
+        assert_eq!(body["messages_after"], 3, "one exchange survives verbatim, behind the index message");
         assert_eq!(body["removed"], 8);
         assert!(body["bytes_after"].as_u64().unwrap() < body["bytes_before"].as_u64().unwrap());
         assert!(body["tokens_after"].as_u64().unwrap() < body["tokens_before"].as_u64().unwrap());
@@ -9187,10 +9199,19 @@ mod tests {
         // What survives is the newest exchange, and it is still a valid request: the first
         // message is the question, never an orphaned tool result.
         let messages = app.agent_history_json(0)["messages"].as_array().unwrap().clone();
-        assert_eq!(messages.len(), 2);
-        assert_eq!(messages[0]["role"], "user");
-        assert_eq!(messages[0]["text"], "question 3");
-        assert_eq!(messages[1]["text"], "answer 3");
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[0]["checkpoint"], true, "the index leads the kept tail: {messages:?}");
+        assert!(messages[0]["text"].as_str().unwrap().contains("[Context compaction:"));
+        assert_eq!(messages[1]["role"], "user");
+        assert!(
+            messages[1]["text"].as_str().unwrap().starts_with("question 3 "),
+            "the kept question survives whole: {}",
+            messages[1]["text"]
+        );
+        assert!(
+            messages[2]["text"].as_str().unwrap().starts_with("answer 3 "),
+            "the kept answer survives whole"
+        );
 
         // The dropped part is not gone silently: the tool call it contained is in the
         // index, which is what stops a model repeating a call it already made.
@@ -9207,7 +9228,7 @@ mod tests {
         // saving.
         let again = body_json(&app.route(&post("/api/agent/compact", "{}")));
         assert_eq!(again["removed"], 0);
-        assert_eq!(again["messages_after"], 2);
+        assert_eq!(again["messages_after"], 3, "the index message is not duplicated");
     }
 
     #[test]
@@ -9251,7 +9272,7 @@ mod tests {
         }
         let body = body_json(&app.route(&post("/api/agent/compact", r#"{"keep":2}"#)));
         assert_eq!(body["removed"], 8);
-        assert_eq!(body["messages_after"], 4, "the last two complete exchanges");
+        assert_eq!(body["messages_after"], 5, "the index plus the last two complete exchanges");
         // The conversation continues: the next question goes out with a transcript that
         // still starts at a question, and it is the one the model is being asked.
         app.agent.push_user("the task that matters", "http", 6);
@@ -9260,7 +9281,12 @@ mod tests {
                 let sent = messages.as_array().unwrap();
                 assert_eq!(sent[0]["role"], "system");
                 assert_eq!(sent[1]["role"], "user", "no orphaned tool result leads the request");
-                assert_eq!(sent[1]["content"], "task 4");
+                assert!(
+                    sent[1]["content"].as_str().unwrap().contains("[Context compaction:"),
+                    "the index is the first thing after the system prompt: {}",
+                    sent[1]["content"]
+                );
+                assert_eq!(sent[2]["content"], "task 4");
                 assert_eq!(sent[sent.len() - 1]["content"], "the task that matters");
             }
             AgentStep::Done(..) => panic!("the conversation should continue"),
@@ -11909,6 +11935,67 @@ mod tests {
             missing.is_err()
                 || serde_json::from_str::<Value>(&missing.unwrap()).unwrap()["state"] == "failed"
         );
+    }
+
+    #[test]
+    fn shell_sh_reports_a_failing_script_as_a_failed_job_not_a_crash() {
+        let mut app = empty_workspace_app();
+        write_file(&mut app, "/bad.bh", "1 +");
+        let raw = ToolHost::call_tool(&mut app, "shell", &json!({ "command": "sh /bad.bh" })).unwrap();
+        let out: Value = serde_json::from_str(&raw).expect("json");
+        assert_eq!(out["state"], "failed");
+        assert!(
+            out["error"].as_str().unwrap().contains("unexpected token"),
+            "the parse error travels with the job: {out}"
+        );
+        assert!(out["result"].is_null());
+        // The interpreter is usable again afterwards: a syntax error is not a broken tool.
+        write_file(&mut app, "/good.bh", "6 * 7");
+        let raw = ToolHost::call_tool(&mut app, "shell", &json!({ "command": "sh /good.bh" })).unwrap();
+        assert_eq!(serde_json::from_str::<Value>(&raw).unwrap()["result"], 42);
+    }
+
+    #[test]
+    fn shell_sh_passes_arguments_as_args_and_argv() {
+        let mut app = empty_workspace_app();
+        write_file(&mut app, "/args.bh", "str(args.who) + \"/\" + str(len(argv))");
+        let raw =
+            ToolHost::call_tool(&mut app, "shell", &json!({ "command": "sh /args.bh --who ada extra" }))
+                .unwrap();
+        let out: Value = serde_json::from_str(&raw).unwrap();
+        // `--who ada` becomes one named argument; the bare word stays positional, so it lands
+        // in `argv` next to the flag's value and the path is consumed as the file.
+        assert_eq!(out["state"], "done", "{out}");
+        assert_eq!(out["result"], "ada/3", "{out}");
+    }
+
+    #[test]
+    fn shell_sh_reads_the_file_once_and_a_missing_one_names_the_path() {
+        let mut app = empty_workspace_app();
+        let raw = ToolHost::call_tool(&mut app, "shell", &json!({ "command": "sh /ghost.bh" })).unwrap();
+        let out: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(out["state"], "failed");
+        assert!(out["error"].as_str().unwrap().contains("/ghost.bh"), "the refusal names the path: {out}");
+        // `sh` with no argument is a usage error, not a silent success.
+        let err = ToolHost::call_tool(&mut app, "shell", &json!({ "command": "sh" })).unwrap_err();
+        assert!(err.contains("usage: sh <path>"), "{err}");
+    }
+
+    #[test]
+    fn shell_sh_runs_a_script_that_calls_tools_and_returns_their_shape() {
+        let mut app = empty_workspace_app();
+        write_file(
+            &mut app,
+            "/scan.bh",
+            "let d = tool(\"devices_list\", {})\nlet n = len(d.devices)\nlog(\"seen \" + str(n))\nn",
+        );
+        let raw = ToolHost::call_tool(&mut app, "shell", &json!({ "command": "sh /scan.bh" })).unwrap();
+        let out: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(out["state"], "done", "{out}");
+        assert!(out["result"].as_u64().is_some(), "the last expression is the result: {out}");
+        assert_eq!(out["output"].as_array().unwrap().len(), 1, "{out}");
+        assert!(out["output"][0].as_str().unwrap().starts_with("seen "), "{out}");
+        assert!(out["steps"].as_u64().unwrap() > 0);
     }
 
     #[test]
@@ -17105,7 +17192,9 @@ str(queued) + "/" + str(a.ok) + "/" + str(again.ok) + "/" + str(task_state(secon
         let system = body["system"].as_str().expect("system");
         assert!(system.contains("## Memory (/MEMORY.md)"), "{system}");
         assert!(system.contains("/memory/pins.md"), "{system}");
-        assert!(system.contains("Earlier in this conversation"), "{system}");
+        // The index is a message now, so it is absent from the prompt — and the endpoint
+        // still reports how many lines it holds, which is what the console shows.
+        assert!(!system.contains("Earlier in this conversation"), "{system}");
         assert_eq!(body["archive_lines"], 1);
     }
 

@@ -157,7 +157,7 @@ partial effect. See [storage](storage.md#workspace-publication-and-rollback).
 | GET | `/api/agent/prompt` | The system prompt as the model receives it, memory and skills included ([context layers](context.md)) |
 | POST | `/api/agent/prompt` | The standing orders: `{action: set\|append\|clear, text}` |
 | POST | `/api/agent/forget` | `{keep: N}`, keep the last N exchanges and drop the rest ([memory](agent-memory.md)); `409` under the same rule as `reset` |
-| POST | `/api/agent/compact` | Compress the conversation now instead of waiting for the token budget: `{keep?: N}` exchanges stay verbatim, the rest become archive lines. `409` under the same rule as `reset`. Costs no model call — see [agent memory](agent-memory.md) |
+| POST | `/api/agent/compact` | Compress the conversation now instead of waiting for the token budget: `{keep?: N}` exchanges stay verbatim, the rest become archive lines; the index it produces is a message at the boundary, not part of the system prompt. `409` under the same rule as `reset`. Costs no model call — see [agent memory](agent-memory.md) |
 | GET | `/api/agent/events?after=<seq>` | The run journal as JSON (polling) |
 | GET | `/api/agent/stream?after=<seq>` | The same journal as **SSE**: replay, then follow. 503 with `Retry-After: 5` when two streams are already open |
 | GET | `/api/sched` | Scheduled tasks and sensor rules |

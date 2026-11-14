@@ -601,13 +601,17 @@ pub fn script_specs() -> Value {
         "type": "function",
         "function": {
             "name": "script",
-            "description": "Run a small script on the board — the way to write a loop or a condition the fixed tools cannot express: `let`, assignment, `if`/`else`, `while` with `break`, `for`, `fn`, numbers, strings, bools, nil, lists, maps, and `tool(name, args)` to call any other board tool. The program's result is the value of its last expression (a map is returned as a map), and `return` ends it early. `args` is optional: a map, or a list of words, and the program reads it back as the globals `args` and `argv`, so one script can be run with different values without being rewritten. `{\"help\": true}` (or `section`: overview|builtins|examples) returns the syntax reference; `{\"lint\": true}` checks `source` without running it. Bounded by 30 s and 5 000 000 steps.",
+            "description": "Run a small script on the board — the way to write a loop or a condition the fixed tools cannot express: `let`, assignment, `if`/`else`, `while` with `break`, `for`, `fn`, numbers, strings, bools, nil, lists, maps, and `tool(name, args)` to call any other board tool. To defer a call instead of blocking on it, use `async_tool(name, args)` and collect it later with `await(handle)`, `wait_all([handles])` or `task_state(handle)` — deferred calls still run one at a time (one dispatcher, one bus) and are drained at the end of the script if never awaited. The program's result is the value of its last expression (a map is returned as a map), and `return` ends it early. `source` or `path`: a workspace file can be run instead of pasting it in. `args` is optional: a map, or a list of words, and the program reads it back as the globals `args` and `argv`, so one script can be run with different values without being rewritten. `{\"help\": true}` (or `section`: overview|builtins|examples) returns the syntax reference; `{\"lint\": true}` checks `source` without running it. Bounded by 30 s and 5 000 000 steps.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "source": {
                         "type": "string",
-                        "description": "the program"
+                        "description": "the program, or leave it empty and give `path`"
+                    },
+                    "path": {
+                        "type": "string",
+                        "description": "run a script file from the workspace instead of pasting `source`"
                     },
                     "lint": {
                         "type": "boolean",
