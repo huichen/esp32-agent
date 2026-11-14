@@ -9075,10 +9075,14 @@ mod tests {
         // repeated grow -> compact -> grow -> compact cycles?
         //
         // Idempotent in the narrow sense: a second pass over an unchanged transcript removes
-        // nothing. Not a fixed point across cycles: each cycle drops the exchanges that grew
-        // in the meantime, the archive absorbs one line per message, and the archive has its
-        // own caps - so the *beginning* of the conversation is eventually evicted. Nothing
-        // comes back; the index is bounded, the transcript is not restored.
+        // nothing. Not a fixed point across cycles: each cycle converts the exchanges that
+        // grew into index lines, and the index has its own caps.
+        //
+        // What the caps take is now a policy question rather than "the oldest first": a
+        // question states what was wanted and an answer is prose the model wrote, so the
+        // answers are what a full index gives up first. At this scale every question from
+        // every cycle survives while only the answers are dropped - which is the property
+        // the eviction order exists for.
         let mut app = test_app();
         let mut rows = Vec::new();
         for cycle in 0..6u32 {
@@ -9128,13 +9132,18 @@ mod tests {
         let bytes: usize = app.agent.archive.iter().map(|l| l.len()).sum();
         assert!(bytes <= crate::agent::ARCHIVE_MAX_BYTES, "{bytes}");
 
-        // And the degradation is real: the earliest question is gone, the newest kept one is
-        // there. This is the part to know before running compaction in a loop.
+        // The policy, measured: questions outlive answers. The first cycle's question is
+        // still here even though 30 exchanges have passed through the index, and the lines
+        // that went are answers.
+        let questions = app.agent.archive.iter().filter(|l| l.starts_with("user: ")).count();
+        let answers = app.agent.archive.iter().filter(|l| l.starts_with("answer: ")).count();
+        println!("final archive: {questions} questions, {answers} answers");
         assert!(
-            !app.agent.archive.iter().any(|l| l.contains("cycle0 question 0")),
-            "the first question should have been evicted: {:?}",
-            app.agent.archive.first()
+            app.agent.archive.iter().any(|l| l.contains("cycle0 question 0")),
+            "a question was evicted before the answers: {:?}",
+            app.agent.archive.iter().take(3).collect::<Vec<_>>()
         );
+        assert!(questions > answers, "{questions} questions vs {answers} answers");
         assert!(app.agent.archive.iter().any(|l| l.contains("question 4")), "{:?}", app.agent.archive);
         // At least one row shows the archive no longer growing: that is where the loss starts.
         let lines: Vec<usize> = rows.iter().map(|r| r.4).collect();
