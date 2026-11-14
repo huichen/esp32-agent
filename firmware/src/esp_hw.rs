@@ -684,7 +684,7 @@ impl Hardware for EspHw {
         if self.i2s_rx.is_null() {
             return None;
         }
-        Some(Box::new(EspMicReader { rx: self.i2s_rx }))
+        Some(Box::new(EspMicReader { rx: self.i2s_rx, raw: Vec::new() }))
     }
 
     fn media_submit(&mut self, samples: &[i16], rate_hz: u32) -> Result<u64> {
@@ -892,7 +892,7 @@ fn i2s_channel(
         // from 33.9 s of wall clock back into 30.0 s (measured 2026-11-14 against the same
         // media, `audio.pcm` from `D:\esp32s3-probe`).
         chan.dma_desc_num = 8;
-        chan.dma_frame_num = if rx { 200 } else { 512 };
+        chan.dma_frame_num = if rx { I2S_RX_FRAMES } else { 512 };
         // A DMA descriptor keeps being replayed, so a tone whose writer went away loops
         // forever — the amplifier screams until someone sends silence. Clearing the TX
         // buffer after each send makes an interrupted tone decay to silence instead.
@@ -949,6 +949,11 @@ fn i2s_channel(
     }
 }
 
+/// Frames in one RX DMA descriptor. The microphone stream reads exactly this many samples
+/// per call (`MicReader::block_samples`), so a read fills one descriptor instead of straddling
+/// two: 200 frames of stereo 32-bit is 1600 bytes, 12.5 ms at 16 kHz.
+const I2S_RX_FRAMES: u32 = 200;
+
 /// The microphone, for `GET /api/mic/pcm`, without the application lock.
 ///
 /// The stream asks for this once and then reads every 20 ms from an HTTP worker. Sharing
@@ -956,6 +961,9 @@ fn i2s_channel(
 /// and the driver serializes what it can.
 struct EspMicReader {
     rx: sys::i2s_chan_handle_t,
+    /// Kept across calls: a fresh `Vec` per 12.5 ms block was an allocation the stream did
+    /// not need, on the one resource this board is short of.
+    raw: Vec<i32>,
 }
 
 // The handle is an opaque driver pointer; the driver is thread-safe for one reader and
@@ -970,13 +978,16 @@ impl esp32_agent_core::hardware::MicReader for EspMicReader {
     ) -> esp32_agent_core::error::Result<usize> {
         // Stereo frames, the microphone's data in the left word and zeros in the right:
         // read whole frames and keep every other word, as `i2s_mic_read` does.
-        let mut raw = vec![0i32; out.len().saturating_mul(2)];
+        let want = out.len().saturating_mul(2);
+        if self.raw.len() < want {
+            self.raw.resize(want, 0);
+        }
         let mut got: usize = 0;
         let rc = unsafe {
             sys::i2s_channel_read(
                 self.rx,
-                raw.as_mut_ptr() as *mut core::ffi::c_void,
-                raw.len() * core::mem::size_of::<i32>(),
+                self.raw.as_mut_ptr() as *mut core::ffi::c_void,
+                want * core::mem::size_of::<i32>(),
                 &mut got,
                 timeout_ms,
             )
@@ -986,9 +997,13 @@ impl esp32_agent_core::hardware::MicReader for EspMicReader {
         }
         let frames = (got / (2 * core::mem::size_of::<i32>())).min(out.len());
         for i in 0..frames {
-            out[i] = raw[i * 2];
+            out[i] = self.raw[i * 2];
         }
         Ok(frames)
+    }
+
+    fn block_samples(&self) -> usize {
+        I2S_RX_FRAMES as usize
     }
 }
 

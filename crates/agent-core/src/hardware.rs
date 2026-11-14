@@ -188,6 +188,17 @@ impl PinMode {
 /// 32, the way the INMP441 sends it; the stream shifts down to 16.
 pub trait MicReader: Send {
     fn read(&mut self, out: &mut [i32], timeout_ms: u32) -> Result<usize>;
+
+    /// Mono samples that fill exactly one DMA descriptor.
+    ///
+    /// A read that asks for more than this straddles a descriptor boundary and waits on it
+    /// before it can copy the rest, which costs a slice of every call: with 320-sample reads
+    /// into 200-frame descriptors the stream delivered 10.6 k samples/s instead of the
+    /// microphone's 16 k. The stream sizes its buffer from this, so the platform's ring and
+    /// the stream's blocks cannot drift apart.
+    fn block_samples(&self) -> usize {
+        320
+    }
 }
 
 pub trait Hardware: Send {

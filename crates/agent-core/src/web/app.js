@@ -2111,7 +2111,15 @@ function init() {
       });
       await api("/api/wifi/connect", {
         method: "POST",
-        body: { ssid: $("#wifi-ssid").value.trim(), password: $("#wifi-password").value },
+        // An empty field means "keep the stored password" — the hint above the input says so,
+        // and `apply_patch` reads an explicit empty string as *clear it*. Sending the blank
+        // field wiped the stored password, and a board with no password cannot associate with
+        // a WPA2 network again: it reports "no suitable AP" for ever, on its own access point
+        // only. `__set__` is the value that keeps it.
+        body: {
+          ssid: $("#wifi-ssid").value.trim(),
+          password: $("#wifi-password").value === "" ? "__set__" : $("#wifi-password").value,
+        },
       });
       $("#wifi-result").textContent = "credentials queued; the board is joining";
       // The address arrives a second or two after the association, and it is the one thing a

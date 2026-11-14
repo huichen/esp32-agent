@@ -308,6 +308,7 @@ fn run(
 
     let mut last_state = String::new();
     let mut reconnect_ticks = 0u32;
+    let mut reconnect_attempts = 0u32;
     let mut overrides_due = 0u32;
     // The setup AP is closed once, the first time the station gets an address. Closing it on
     // every tick would fight the driver; closing it again after a reconnect would flap.
@@ -565,18 +566,33 @@ fn run(
         overrides_due = (overrides_due + 1) % 30;
 
         // `esp_wifi` only tries once per `connect()`; without this a router that
-        // reboots leaves the board off the network until somebody reboots it too.
+        // reboots leaves the board off the network until somebody reboots it too. And a
+        // `connect()` after a failed one reuses the driver's stale scan state, which repeats
+        // "no suitable AP" for ever: every fourth attempt stops and starts the station so the
+        // next scan is a real one. That is what a board that had lost its network looked like
+        // on the bench on 2026-11-14 — reachable only on its own access point until it was
+        // flashed again.
         if live.auto_reconnect && !ssid.is_empty() && !sta_connected {
             reconnect_ticks += 1;
             if reconnect_ticks >= 15 {
                 reconnect_ticks = 0;
-                log::info!("wifi state: reconnecting to `{ssid}`");
+                reconnect_attempts += 1;
+                if reconnect_attempts % 4 == 0 {
+                    log.info("wifi", format!("restarting the station to force a fresh scan for `{ssid}`"));
+                    let _ = wifi.stop();
+                    if let Err(e) = wifi.start() {
+                        log.error("wifi", format!("station restart failed: {e}"));
+                    }
+                } else {
+                    log::info!("wifi state: reconnecting to `{ssid}`");
+                }
                 if let Err(e) = wifi.connect() {
                     log::info!("wifi state: connect retry failed: {e}");
                 }
             }
         } else {
             reconnect_ticks = 0;
+            reconnect_attempts = 0;
         }
     }
     Ok(())
