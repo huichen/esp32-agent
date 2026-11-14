@@ -974,3 +974,58 @@ button.btn.term-clear { padding: 6px 11px; font-size: 12px; }
 @media (prefers-reduced-motion: reduce) {
   .term-line:focus-within .term-prompt { animation: none; }
 }
+
+/* ---- desktop --------------------------------------------------------------
+   The page is mobile-first because the phone is what is always in a hand, but a
+   phone column stretched across a monitor is not a layout: the transcript becomes
+   one very long line to read back and forth, and the sheet covers a whole screen
+   to ask for one field. From 900 px there is a reading column and the sheet is a
+   side panel. Nothing here changes the phone: every rule is inside the query. */
+@media (min-width: 900px) {
+  :root { --column: 880px; }
+
+  body { font-size: 16px; }
+
+  /* One centred column, the same width for the bar, the transcript and the composer,
+     so the three line up instead of each picking its own max-width. */
+  .bar,
+  .chat,
+  .composer {
+    width: 100%;
+    max-width: var(--column);
+    margin-left: auto;
+    margin-right: auto;
+  }
+
+  .bar { border-bottom: 1px solid var(--line); }
+
+  .chat { padding: 20px 18px 16px; gap: 12px; }
+
+  /* A bubble on a wide screen is a paragraph, not a wall: 640 px is roughly the
+     measure that reads comfortably, and the rest of the row stays empty on purpose. */
+  .bubble { max-width: min(76%, 680px); }
+
+  .composer { padding: 10px 10px 14px; }
+
+  /* The sheet is a panel beside the conversation, not a second full screen. 440 px
+     fits the widest form in it (the WiFi card) without wrapping. */
+  .sheet {
+    left: auto;
+    right: 0;
+    width: 440px;
+    max-width: 440px;
+    border-left: 1px solid var(--line);
+    box-shadow: -18px 0 40px rgba(0, 0, 0, 0.45);
+    animation: slide-in 0.16s ease-out;
+  }
+  @keyframes slide-in { from { transform: translateX(24px); opacity: 0.7; } }
+
+  /* A pointer can hover, so hover means something; on a phone these would only flicker. */
+  .btn:hover { border-color: var(--accent); }
+  .send:hover { filter: brightness(1.08); }
+  .row .bubble a:hover { text-decoration-thickness: 2px; }
+
+  /* Keyboards do not shrink a desktop viewport, so the visual-viewport binding is only
+     an approximation there; give the composer a real gap from the bottom edge. */
+  .composer { padding-bottom: 18px; }
+}
