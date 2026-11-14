@@ -579,11 +579,12 @@ impl App {
         // firmware carries are installed here, and in `seed_default_skills`'s other caller.
         app.seed_default_skills();
         app.refresh_hw_view();
-        // The two readings `board status` reports about things it does not own, filled once at
-        // boot so the first call answers with numbers rather than null: the store's counters and
-        // the agent's.
+        // The readings `board status` and `board tls` report about things a tool handler cannot
+        // reach — the store's counters, the agent's own numbers, the certificate — filled once
+        // at boot so the first call answers rather than returning null.
         app.sample_store();
         app.publish_agent_stats();
+        app.runtime.tls = app.tls.json();
         app
     }
 
@@ -4100,7 +4101,15 @@ impl App {
             "resources/list" => Ok(self.resources_list()),
             "resources/read" => self.on_resources_read(&msg.params),
             "resources/templates/list" => Ok(json!({ "resourceTemplates": [] })),
-            "prompts/list" => Ok(json!({ "prompts": [] })),
+            "prompts/list" => Ok(self.prompts_list()),
+            "prompts/get" => self.on_prompts_get(&msg.params),
+            // A client asking the board to stop a turn. The MCP way to say what
+            // `POST /api/agent/cancel` says; the gate is what makes it reachable while the
+            // App lock is held by the very turn being stopped.
+            "notifications/cancelled" => {
+                self.request_cancel();
+                Ok(json!({}))
+            }
             "logging/setLevel" => Ok(json!({})),
             "completion/complete" => Ok(json!({ "completion": { "values": [], "total": 0 } })),
             other => Err(McpError::new(
@@ -4115,6 +4124,52 @@ impl App {
                 (!msg.is_notification).then(|| protocol::err(id, e.code, &e.message, e.data))
             }
         }
+    }
+
+    /// The board's skills, as MCP prompts.
+    ///
+    /// A skill is a written procedure the board's model is given (the same index that reaches
+    /// its system prompt), so it is exactly what an MCP prompt is: a named instruction set a
+    /// client can list and fetch. Advertising `prompts/list` while answering `[]` was a
+    /// capability that did nothing; answering it with the skills is the honest version, and it
+    /// hands an outside agent the conventions this board was told to follow.
+    fn prompts_list(&self) -> Value {
+        let skills: Vec<Value> = crate::tools::knowledge::index(&self.workspace)
+            .into_iter()
+            .map(|s| {
+                json!({
+                    "name": s.name,
+                    "description": s.description,
+                    "arguments": [],
+                })
+            })
+            .collect();
+        json!({ "prompts": skills })
+    }
+
+    fn on_prompts_get(&mut self, params: &Value) -> Result<Value> {
+        let name = params.get("name").and_then(|n| n.as_str()).unwrap_or("").trim();
+        if !crate::tools::knowledge::is_skill_name(name) {
+            return Err(McpError::invalid_params(
+                "`name` is required: one of the names `prompts/list` returned",
+            ));
+        }
+        let skill =
+            crate::tools::knowledge::index(&self.workspace).into_iter().find(|s| s.name == name).ok_or_else(
+                || McpError::not_found(format!("no skill `{name}`; `prompts/list` has the ones that exist")),
+            )?;
+        // The body without its front matter: the YAML header is metadata the prompt already
+        // carries as `description`, and a caller asking for a procedure wants the procedure.
+        let text = crate::tools::fs::Workspace::read(&self.workspace, &skill.path)
+            .map_err(|e| McpError::internal(format!("skill `{name}` could not be read: {e}")))?;
+        let body = crate::tools::knowledge::split_front_matter(&text).1;
+        Ok(json!({
+            "description": skill.description,
+            "messages": [{
+                "role": "user",
+                "content": { "type": "text", "text": body },
+            }],
+        }))
     }
 
     fn on_initialize(&mut self, params: &Value, session: Option<&str>, scheme: &str) -> Value {
@@ -15455,6 +15510,12 @@ mod tests {
             "a pool has to name itself and its numbers: {status}"
         );
 
+        // The certificate the board made for itself: a caller told to compare a fingerprint
+        // needs to be able to read it.
+        let tls = app.call_tool("board", &json!({ "command": "tls" })).unwrap();
+        assert!(tls["enabled"].is_boolean(), "{tls}");
+        assert!(tls["how_to_check"].is_string(), "{tls}");
+
         // A turn queued from outside the agent shows up without the board starting it: that
         // is the question "should I wait" an outside caller asks.
         app.route(&post("/api/agent/message", r#"{"text":"are you busy"}"#));
@@ -15529,6 +15590,59 @@ mod tests {
         app.run_gate.set_active(true);
         let refused = app.call_tool("agent_forget", &json!({ "keep": 0 })).unwrap_err();
         assert!(refused.message.contains("turn is running"), "{refused:?}");
+        app.run_gate.set_active(false);
+    }
+
+    /// `prompts/list` used to answer `[]` — a capability that did nothing. The board's skills
+    /// are written procedures for its own model, which is what an MCP prompt is, so listing
+    /// them hands an outside agent the conventions this board follows.
+    #[test]
+    fn the_prompts_are_the_boards_skills() {
+        let mut app = test_app();
+        let listed = app
+            .handle_rpc(&json!({"jsonrpc":"2.0","id":1,"method":"prompts/list"}).to_string(), None)
+            .expect("a reply");
+        let prompts = listed["result"]["prompts"].as_array().expect("prompts");
+        assert!(!prompts.is_empty(), "the board seeds skills, so a prompt exists: {listed}");
+        let name = prompts[0]["name"].as_str().expect("a name").to_string();
+        assert!(!prompts[0]["description"].as_str().unwrap_or("").is_empty(), "{listed}");
+
+        let got = app
+            .handle_rpc(
+                &json!({"jsonrpc":"2.0","id":2,"method":"prompts/get","params":{"name":name}}).to_string(),
+                None,
+            )
+            .expect("a reply");
+        let text = got["result"]["messages"][0]["content"]["text"].as_str().expect("the skill body");
+        assert!(!text.trim().is_empty(), "the body is the point: {got}");
+        assert!(!text.starts_with("---"), "the front matter is metadata, not the procedure: {text}");
+
+        let missing = app
+            .handle_rpc(
+                &json!({"jsonrpc":"2.0","id":3,"method":"prompts/get","params":{"name":"nope"}}).to_string(),
+                None,
+            )
+            .expect("a reply");
+        assert!(missing["error"].is_object(), "an unknown prompt is an error: {missing}");
+    }
+
+    /// The MCP way to stop a turn, which used to have no handler at all: a client that sent it
+    /// got `method not found` and had to fall back to `POST /api/agent/cancel`.
+    #[test]
+    fn a_client_can_stop_a_turn_the_mcp_way() {
+        let mut app = test_app();
+        app.run_gate.set_active(true);
+        let reply = app.handle_rpc(
+            &json!({
+                "jsonrpc": "2.0",
+                "method": "notifications/cancelled",
+                "params": { "requestId": 7, "reason": "changed my mind" }
+            })
+            .to_string(),
+            None,
+        );
+        assert!(reply.is_none(), "a notification has no reply: {reply:?}");
+        assert!(app.run_gate.cancelled(), "the gate is what the loop checks between steps");
         app.run_gate.set_active(false);
     }
 

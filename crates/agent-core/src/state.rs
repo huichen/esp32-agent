@@ -82,6 +82,9 @@ pub struct Runtime {
     /// the `RunGate` instead, which is written at exactly those moments and locks nothing
     /// else.
     pub agent: Value,
+    /// What the certificate says. Published once at boot: it does not change while the board
+    /// is up, and the portal route and the `board tls` command must answer the same thing.
+    pub tls: Value,
     /// Portal tokens minted by `POST /api/auth`: `(token, expires_at_ms)`. They live in
     /// RAM, so a reboot revokes every one of them — which is the right default for a
     /// device whose PIN can be changed from the same page.
