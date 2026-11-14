@@ -515,8 +515,13 @@ pub fn system_tools() -> Vec<ToolDef> {
             // switch and the log ring's allocation. WiFi settings are live now — the radio
             // thread reads them every tick — so restarting for them was a reboot the board did
             // not need.
-            let needs_restart =
-                touched.iter().any(|t| t == "mcp.port" || t == "mcp.enabled" || t == "log.ring");
+            let needs_restart = touched.iter().any(|t| {
+                t == "mcp.port"
+                    || t == "mcp.enabled"
+                    || t == "log.ring"
+                    // On top of the listener that was never bound: see `patch_config`.
+                    || (t == "mcp.plain_http" && ctx.cfg.mcp.plain_http)
+            });
             if needs_restart {
                 ctx.runtime.restart_requested = true;
             }

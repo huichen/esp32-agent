@@ -5049,7 +5049,11 @@ impl App {
                     // The ring is allocated at boot with its capacity, so a new `log.ring`
                     // cannot be honoured in place. Until this was listed the portal answered
                     // "applied" and nothing changed, at all, ever.
-                    || before.log.ring != self.cfg.log.ring;
+                    || before.log.ring != self.cfg.log.ring
+                    // Turning plain HTTP *off* is a per-request gate, so it lands at once.
+                    // Turning it *on* needs a listener that was never opened, and a socket
+                    // cannot be bound by a request that arrives on the other one.
+                    || (!before.mcp.plain_http && self.cfg.mcp.plain_http);
                 if needs_restart {
                     self.runtime.restart_requested = true;
                 }
@@ -9969,6 +9973,26 @@ mod tests {
         let resp = app.route(&over_tls);
         assert_eq!(resp.status, 200, "{:?}", body_json(&resp));
         assert!(app.cfg.mcp.plain_http);
+    }
+
+    /// Turning plain HTTP off is a per-request gate and lands at once. Turning it on cannot:
+    /// the port-80 listener was never bound, and no request on 443 can bind it. The reply has
+    /// to say restart, or an owner turns it on, reads "applied", and finds the port still shut
+    /// — which is exactly what happened on the bench.
+    #[test]
+    fn turning_plain_http_on_asks_for_the_listener_it_never_had() {
+        let mut app = test_app();
+        // Off is a per-request gate, so it lands without a restart.
+        let off = body_json(&app.route(&post("/api/config", r#"{"mcp":{"plain_http":false}}"#)));
+        assert_eq!(off["restart_required"], json!(false), "off is enforced per request");
+
+        // Turning it back on has to come over TLS: with the switch off, a plain-http request
+        // is refused before it reaches the handler (see `plain_http_can_be_turned_off_and...`).
+        let mut over_tls = post("/api/config", r#"{"mcp":{"plain_http":true}}"#);
+        over_tls.scheme = "https";
+        let body = body_json(&app.route(&over_tls));
+        assert_eq!(body["restart_required"], json!(true), "{body}");
+        assert!(app.runtime.restart_requested, "the platform has to be told");
     }
 
     /// The REST script route is gone. `script` is an MCP tool and the tool already waits
