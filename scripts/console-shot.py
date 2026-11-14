@@ -1,22 +1,21 @@
 #!/usr/bin/env python3
 """Screenshot the board's web console at an exact viewport size.
 
-Chrome's `--window-size` has a floor (measured on this machine: asking for 390 px gives a
-534 px layout) and `--screenshot` then captures only the requested width — so every "phone"
-capture came back with the right-hand 144 px missing. The page was fine; the picture was
-cropped, which is worse, because it looks like a layout bug.
+Two things this has to get right, both learned the hard way:
 
-This wraps the page in an iframe of exactly the requested size (an iframe *is* a viewport),
-captures at a window size the browser will accept, and crops to the frame. Chrome and the
-crop are the only dependencies; Pillow is used when present, and its absence is reported
-rather than guessed at.
+* **The viewport.** Chrome will not make a window narrower than about 534 px whatever
+  `--window-size` says, while `--screenshot` captures the width it was asked for — so a
+  "390 px" capture was the left 390 px of a 534 px layout, with everything on the right
+  missing. An iframe *is* a viewport, so the page is framed at exactly the requested size
+  and the PNG is cropped to it.
+* **Same origin.** The portal keeps its state in `localStorage` and follows its journal over
+  `EventSource`. In a third-party iframe Chrome blocks the first and the page never leaves
+  "connecting…". So the harness and the page are served through one local proxy, which makes
+  the frame same-origin with the harness and the API calls same-origin with the page.
 
     python scripts/console-shot.py --url http://192.168.3.7 --out chat.png
-    python scripts/console-shot.py --url 'http://192.168.3.7/?panel=devices' --out panel.png \\
-        --size 900x1200
-
-`--panel` is a shortcut for the deep link, which exists because a headless browser cannot
-click a tab.
+    python scripts/console-shot.py --url http://192.168.3.7 --out devices.png \\
+        --size 390x900 --panel devices
 """
 import argparse
 import os
@@ -26,29 +25,67 @@ import subprocess
 import sys
 import tempfile
 import threading
+import urllib.error
+import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 HARNESS = """<!doctype html>
 <html><head><meta charset="utf-8"><title>shot</title>
-<style>html,body{margin:0;padding:0;background:#000;overflow:hidden}
+<style>html,body{margin:0;padding:0;background:#0b0f14;overflow:hidden}
 iframe{border:0;display:block}</style></head>
-<body><iframe src="TARGET" width="WIDTH" height="HEIGHT"></iframe></body></html>
+<body><iframe src="FRAME_SRC" width="WIDTH" height="HEIGHT"></iframe></body></html>
 """
 
 
-class Handler(BaseHTTPRequestHandler):
-    page = b""
+class Proxy(BaseHTTPRequestHandler):
+    board = ""
+    harness = b""
 
     def log_message(self, *args):
         pass
 
     def do_GET(self):
-        self.send_response(200)
-        self.send_header("Content-Type", "text/html; charset=utf-8")
-        self.send_header("Content-Length", str(len(self.page)))
-        self.end_headers()
-        self.wfile.write(self.page)
+        self.forward("GET", None)
+
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length") or 0)
+        self.forward("POST", self.rfile.read(length) if length else None)
+
+    def forward(self, method, body):
+        if self.path == "/":
+            self.reply(200, "text/html; charset=utf-8", self.harness)
+            return
+        # `/page` is the board's own console, served from this origin so that its
+        # localStorage and EventSource are first-party.
+        path = "/" + self.path[6:] if self.path.startswith("/page") else self.path
+        url = self.board.rstrip("/") + path
+        req = urllib.request.Request(url, data=body, method=method)
+        for header in ("Content-Type", "Accept", "Authorization", "X-Portal-Pin"):
+            value = self.headers.get(header)
+            if value:
+                req.add_header(header, value)
+        try:
+            with urllib.request.urlopen(req, timeout=30) as response:
+                data = response.read()
+                status = response.status
+                ctype = response.headers.get("Content-Type", "application/octet-stream")
+        except urllib.error.HTTPError as exc:
+            data, status, ctype = exc.read(), exc.code, exc.headers.get("Content-Type", "text/plain")
+        except Exception as exc:
+            data, status, ctype = str(exc).encode(), 502, "text/plain"
+        # The SSE stream never ends; buffering it would hang the request.
+        self.reply(status, ctype, data)
+
+    def reply(self, status, ctype, data):
+        try:
+            self.send_response(status)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
 
 
 def browser():
@@ -69,82 +106,62 @@ def browser():
             "/Applications/Chromium.app/Contents/MacOS/Chromium",
         ]
     else:
-        candidates += [shutil.which(n) for n in ("google-chrome", "google-chrome-stable", "chromium")]
+        candidates += [shutil.which(n) for n in ("google-chrome", "chrome", "chromium")]
     for path in candidates:
         if path and os.path.exists(path):
             return path
     raise SystemExit("no Chrome/Chromium found; set ESP32_AGENT_BROWSER")
 
 
-def parse_size(text):
-    try:
-        w, h = text.lower().split("x", 1)
-        return int(w), int(h)
-    except ValueError:
-        raise SystemExit(f"--size must look like 390x844, not {text!r}")
-
-
 def png_size(path):
-    with open(path, "rb") as f:
-        head = f.read(33)
+    with open(path, "rb") as handle:
+        head = handle.read(33)
     return struct.unpack(">II", head[16:24])
-
-
-def crop(path, width, height):
-    try:
-        from PIL import Image
-    except ImportError:
-        print("Pillow is not installed, so the image was not cropped; its size is "
-              f"{png_size(path)} and the page occupies the top-left {width}x{height}",
-              file=sys.stderr)
-        return False
-    with Image.open(path) as image:
-        image.crop((0, 0, min(width, image.width), min(height, image.height))).save(path)
-    return True
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--url", required=True, help="page to capture, e.g. http://192.168.3.7")
+    parser.add_argument("--url", required=True, help="board base URL, e.g. http://192.168.3.7")
     parser.add_argument("--out", required=True, help="PNG to write")
-    parser.add_argument("--size", default="390x844", help="viewport, WIDTHxHEIGHT (default 390x844)")
-    parser.add_argument("--wait", type=int, default=4000,
-                        help="milliseconds of page time before the shot (default 4000); the "
-                             "console fetches its history, so too short a wait captures nothing")
-    parser.add_argument("--scale", type=float, default=2.0,
-                        help="device scale factor (default 2, so the PNG is readable in a README)")
-    parser.add_argument("--panel", help="shortcut for ?panel=<name> (devices, tools, agent, ...)")
+    parser.add_argument("--size", default="390x844", help="viewport, WIDTHxHEIGHT")
+    parser.add_argument("--panel", help="open a panel: devices, tools, agent, files, terminal, settings")
+    parser.add_argument("--wait", type=int, default=8000,
+                        help="milliseconds of page time before the shot (default 8000); the "
+                             "console fetches its history and opens its journal stream")
+    parser.add_argument("--scale", type=float, default=2.0, help="device scale factor")
     args = parser.parse_args()
 
-    width, height = parse_size(args.size)
-    url = args.url
-    if args.panel:
-        url += ("&" if "?" in url else "?") + "panel=" + args.panel
+    try:
+        width, height = (int(part) for part in args.size.lower().split("x", 1))
+    except ValueError:
+        raise SystemExit(f"--size must look like 390x844, not {args.size!r}")
 
-    Handler.page = (HARNESS.replace("TARGET", url)
-                    .replace("WIDTH", str(width)).replace("HEIGHT", str(height))).encode()
-    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    frame = "/page"
+    if args.panel:
+        frame += "?panel=" + urllib.parse.quote(args.panel)
+    Proxy.board = args.url
+    Proxy.harness = (HARNESS.replace("FRAME_SRC", frame)
+                     .replace("WIDTH", str(width)).replace("HEIGHT", str(height))).encode()
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Proxy)
+    server.daemon_threads = True
     port = server.server_address[1]
     threading.Thread(target=server.serve_forever, daemon=True).start()
 
     out = os.path.abspath(args.out)
     os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
-    # The window must be wider than the browser's floor, or the harness itself is cropped
-    # before the frame is even considered. 700 is comfortably above the 534 measured here.
-    window_w = max(700, width)
-    window_h = max(600, height)
+    # Wider than the browser's floor, so the harness itself is never the thing cropped.
     with tempfile.TemporaryDirectory(prefix="console-shot-") as profile:
         result = subprocess.run(
             [browser(), "--headless=new", "--disable-gpu", "--hide-scrollbars",
              "--no-first-run", "--no-default-browser-check",
              f"--user-data-dir={profile}",
-             f"--window-size={window_w},{window_h}",
+             f"--window-size={max(700, width)},{max(600, height)}",
              f"--force-device-scale-factor={args.scale}",
              f"--virtual-time-budget={args.wait}",
              f"--screenshot={out}",
              f"http://127.0.0.1:{port}/"],
-            capture_output=True, timeout=180,
+            capture_output=True, timeout=240,
         )
     if not os.path.exists(out):
         sys.stderr.write(result.stderr.decode("utf-8", "replace")[-800:])
@@ -152,11 +169,14 @@ def main():
 
     want = (round(width * args.scale), round(height * args.scale))
     had = png_size(out)
-    cropped = crop(out, want[0], want[1])
+    try:
+        from PIL import Image
+    except ImportError:
+        print(f"{out}  {had[0]}x{had[1]} (Pillow missing, not cropped to {want[0]}x{want[1]})")
+        return
+    with Image.open(out) as image:
+        image.crop((0, 0, min(want[0], image.width), min(want[1], image.height))).save(out)
     print(f"{out}  {width}x{height} @{args.scale}x -> {want[0]}x{want[1]}")
-    if had != want:
-        print(f"  chrome produced {had[0]}x{had[1]}; "
-              f"{'cropped' if cropped else 'NOT cropped'} to the frame", file=sys.stderr)
 
 
 if __name__ == "__main__":
