@@ -67,9 +67,26 @@ class Proxy(BaseHTTPRequestHandler):
                 req.add_header(header, value)
         try:
             with urllib.request.urlopen(req, timeout=30) as response:
-                data = response.read()
                 status = response.status
                 ctype = response.headers.get("Content-Type", "application/octet-stream")
+                # The journal stream never ends. Buffering it waits forever, the EventSource
+                # never opens, and every panel then sits on "connecting..."; pass it through.
+                if ctype.startswith("text/event-stream"):
+                    self.send_response(status)
+                    self.send_header("Content-Type", ctype)
+                    self.send_header("Cache-Control", "no-cache")
+                    self.end_headers()
+                    try:
+                        while True:
+                            chunk = response.read1(4096)
+                            if not chunk:
+                                break
+                            self.wfile.write(chunk)
+                            self.wfile.flush()
+                    except (BrokenPipeError, ConnectionResetError, OSError):
+                        pass
+                    return
+                data = response.read()
         except urllib.error.HTTPError as exc:
             data, status, ctype = exc.read(), exc.code, exc.headers.get("Content-Type", "text/plain")
         except Exception as exc:
