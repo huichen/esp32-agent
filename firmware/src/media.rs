@@ -326,15 +326,19 @@ pub fn start(player: Arc<Player>) {
                     completed = false;
                     break;
                 }
-                // Frames due by now, checked *before* the write: `write_chunk` blocks
-                // until the DMA ring has room (~140 ms for the first buffer), so a frame
-                // due at t=0 used to be drawn that late.
-                let now_ms = started.elapsed().as_millis() as u64;
+                // Frames due by this point in the stream, checked *before* the write: the
+                // deadline is the audio position, not the wall clock. `write_chunk` blocks
+                // until the DMA ring has room, so wall time ran ahead of what had been sent
+                // and every picture landed about one buffer late (169 ms on the bench).
+                // `written` is the position after this write, so a frame is put on the glass
+                // as the samples it belongs to enter the ring — early by the ring depth
+                // (about 42 ms), which is inside what an eye tolerates, instead of late.
+                let stream_ms = (written as u64).saturating_mul(1000) / u64::from(job.rate_hz.max(1));
                 while let Some((at_ms, page)) = job.pictures.get(drawn as usize) {
-                    if *at_ms > now_ms {
+                    if *at_ms > stream_ms {
                         break;
                     }
-                    let late = now_ms.saturating_sub(*at_ms);
+                    let late = stream_ms.saturating_sub(*at_ms);
                     if let Some(panel) = job.panel.as_ref() {
                         if panel.blit(page) {
                             worst_late = worst_late.max(late);
