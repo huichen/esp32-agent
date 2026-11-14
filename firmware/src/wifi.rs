@@ -300,6 +300,7 @@ fn run(
     // was stored, documented as "start the setup AP after this long without a station", and
     // read by nothing: a board with `ap_fallback` off that missed its network was simply gone.
     let mut no_station_ticks = 0u32;
+    let mut ap_open_ticks = 0u32;
 
     let mut last_state = String::new();
     let mut reconnect_ticks = 0u32;
@@ -430,7 +431,38 @@ fn run(
         // means "it had one". Once the AP is closed the status must say so; a board that
         // reports `ap+sta` with 192.168.4.1 after closing the AP is the kind of lie this
         // whole session keeps tripping over.
-        let ap_up = ap_ip.is_some() && !ap_closed;
+        // `ap_netif` keeps its address after the interface is stopped, so the address says
+        // nothing about whether the access point is on the air. The WiFi mode does, and the
+        // close path already sets it by hand: this is the bit that decides `ap+sta` in the
+        // status, so it is the bit that is read back.
+        let ap_mode = unsafe {
+            let mut mode: sys::wifi_mode_t = 0;
+            if sys::esp_wifi_get_mode(&mut mode) == 0 {
+                mode & sys::wifi_mode_t_WIFI_MODE_AP != 0
+            } else {
+                false
+            }
+        };
+        let ap_up = ap_mode && !ap_closed;
+        // `wifi.keep_ap` on means the access point stays up beside the station — including
+        // when it is switched on while the board is already joined, which is the case that
+        // used to be saved, acknowledged and never applied. Opening it is retried every ten
+        // seconds, so a driver refusal does not become a line of log per tick.
+        if live.keep_ap && !ap_up && !ssid.is_empty() {
+            ap_open_ticks = ap_open_ticks.saturating_add(1);
+            if ap_open_ticks >= 10 {
+                ap_open_ticks = 0;
+                match ap_switch(&mut wifi, true, &live, &ssid, &password) {
+                    Ok(note) => {
+                        ap_closed = false;
+                        log.info("wifi", format!("access point {note} (wifi.keep_ap is on)"));
+                    }
+                    Err(e) => log.error("wifi", format!("could not open the setup AP: {e}")),
+                }
+            }
+        } else {
+            ap_open_ticks = 0;
+        }
         // The access point exists to get the board onto a network. Once the station has an
         // address it is closed — the portal shows that address, so there is nothing left for
         // the AP to do. `wifi.keep_ap` asks for both networks on purpose.
