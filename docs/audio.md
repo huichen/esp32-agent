@@ -153,6 +153,23 @@ The amplifier itself needs no new handling: `i2s_out_write` already duplicates m
 slots and clears the TX descriptor afterwards, which is what keeps a finished stream from
 replaying its last DMA buffer forever (the bench bug in `firmware/src/esp_hw.rs`).
 
+**Writing in descriptor-sized pieces is what makes it stream at real time.** A write that
+straddles a DMA descriptor boundary makes `i2s_channel_write` wait on the boundary before it
+can copy the rest, and a socket hands over a few hundred bytes at a time. On 2026-11-14 the
+same 30 s clip (`D:\esp32s3-probe\media\audio.pcm`) took 33.9 s of wall clock that way — heard
+as a slowed, dragging soundtrack, and 37.7 s with its 362 frames on top. `write_chunk` now
+splits into 512-sample blocks (one descriptor) and the TX ring is 8 x 512 frames, matching the
+bench firmware that plays this hardware in real time (`D:\esp32s3-probe\README.md` §10.7):
+
+```
+POST /audio/pcm, 30.00 s, 1 440 000 B      33.85 s  ->  30.22 s
+POST /av, same 30 s + 362 frames           37.68 s  ->  30.54 s
+```
+
+The cost is internal RAM: 8 descriptors of 512 frames is 16 KB, and `memory.internal_kb` fell
+from 76 to 55 kB on this board. `4 x 512` is the fallback if that headroom is needed
+elsewhere — the block alignment is the half that fixes the rate.
+
 The MIME essence must be exactly `audio/pcm`; parameters are allowed, prefix matches are
 not. Odd final bytes and incomplete HTTP framing return `400` / `ok: false`; a hardware
 write failure returns `500`. Successful responses count samples submitted to the driver,
