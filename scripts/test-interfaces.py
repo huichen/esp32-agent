@@ -1253,23 +1253,35 @@ def agent(rec, sim, fake):
     # Compressing on request, between turns, with an explicit tail width. This runs at a
     # window wide enough that the automatic trigger stays out of the way, so the numbers
     # below are the manual pass's work and not the ring's.
-    url = fake.fixture("/compact-manual", [model_reply(text="manual answer")], dialect="chat")
+    # Long messages on purpose: the index is a cost, so a compaction only shrinks the
+    # transcript when what it drops is bigger than what it writes back. Tiny fixtures made
+    # "bytes_after < bytes_before" a statement about a 200-byte transcript.
+    long_answer = "manual answer " + ("detail " * 40)
+    url = fake.fixture("/compact-manual", [model_reply(text=long_answer)], dialect="chat")
     sim.post("/api/agent/reset", {})
     sim.post("/api/agent/config", {"base_url": url, "context_tokens": 262144, "max_output_tokens": 128})
     for n in range(4):
-        run_turn(sim, "manual question " + str(n))
+        run_turn(sim, "manual question " + str(n) + " " + ("detail " * 40))
     before = sim.get("/api/agent/history")["messages"]
     rec.equal("no-compaction-below-the-budget", sim.get("/api/agent/prompt")["archive_lines"], 0)
     manual = sim.post("/api/agent/compact", {"keep": 1})
     rec.equal("manual-compact-ok", manual["ok"], True)
     rec.equal("manual-compact-kept-turns", manual["kept_turns"], 1)
     rec.equal("manual-compact-messages-before", manual["messages_before"], len(before))
-    rec.check("manual-compact-removed", manual["removed"] == len(before) - manual["messages_after"] > 0, short(manual))
+    # `removed` counts the messages this pass dropped; `messages_after` includes the index
+    # message that was written back, so the two are one apart.
+    rec.check("manual-compact-removed",
+              manual["removed"] == len(before) - manual["messages_after"] + 1 > 1, short(manual))
     rec.check("manual-compact-shrinks-bytes", manual["bytes_after"] < manual["bytes_before"], short(manual))
     rec.check("manual-compact-shrinks-tokens", manual["tokens_after"] < manual["tokens_before"], short(manual))
     rec.equal("manual-compact-stored", manual["stored"], True)
     kept = sim.get("/api/agent/history")["messages"]
-    rec.equal("manual-compact-keeps-one-exchange", len(kept), 2)
+    # The index message leads the kept exchange: 1 + 2.
+    rec.equal("manual-compact-keeps-one-exchange", len(kept), 3)
+    rec.equal("manual-compact-index-leads", kept[0].get("checkpoint"), True)
+    rec.check("manual-compact-index-is-a-message",
+              "[Context compaction:" in kept[0]["text"], kept[0]["text"][:60])
+    rec.check("manual-compact-prices-the-index", manual.get("index_bytes", 0) > 0, short(manual))
     rec.check("manual-compact-pairing", paired(kept))
     rec.check("manual-compact-archive-follows", sim.get("/api/agent/prompt")["archive_lines"] >= 1)
     rec.equal("manual-compact-idempotent", sim.post("/api/agent/compact", {})["removed"], 0)

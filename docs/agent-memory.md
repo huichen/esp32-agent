@@ -89,9 +89,6 @@ serialized arguments, attachment payloads/metadata, IDs and source; an oversized
 message can remain as an explicit exception. The 2 MiB ceiling is not a measured peak-heap
 guarantee.
 
-The index is rendered into the system prompt under *Earlier in this conversation*, with one
-instruction that matters: a tool call listed there has already been made.
-
 ### Compressing on request
 
 `POST /api/agent/compact {"keep": N}` runs the same projection before the budget is
@@ -102,73 +99,42 @@ compresses again. With it, the last `N` exchanges stay verbatim.
 | Field | Meaning |
 |---|---|
 | `kept_turns` | exchanges left verbatim |
-| `removed` | messages moved into the archive (`0` means there was nothing to drop) |
-| `messages_before` / `messages_after` | message counts either side |
+| `removed` | messages this pass dropped (`0` means there was nothing to drop) |
+| `messages_before` / `messages_after` | message counts either side, index message included |
 | `bytes_before` / `bytes_after` | payload bytes either side |
 | `tokens_before` / `tokens_after` | the same estimate the trigger uses |
 | `archive_lines`, `demoted_answers` | how much index the model now gets |
+| `index_bytes` | bytes the index message itself adds back to the transcript |
 | `stored` | whether flash accepted the shorter transcript |
 
 The call is refused with `409` while a model turn is running: that turn is answering a
 question this would remove from under it. It is a **command, not a tool the model can
 call** — the model does not know where the task boundary is, and compacting its own live
-context mid-turn is how an agent loses the instruction it was working from. `409` also
-covers the case where the operator forgot to wait; the console and any client should
-retry after `run_end`.
+context mid-turn is how an agent loses the instruction it was working from.
 
 `stored: false` is a real state, not a rounding: the conversation is smaller in RAM but
 the dropped part is still on flash, so a reboot restores it. It happens when
 `persist_transcript` is off or the store queue rejected the write.
 
-### What a full index gives up, and in what order
+### Where the index lives
 
-Eviction is by **value**, not by age. The most valuable line in the index is the question
-somebody asked: it states what was wanted and nothing else in the index says it. The least
-valuable is the JSON a tool returned — the model has already used it, and the call can be run
-again to get it back. So when the index is full the order is:
+The index is a **message in the transcript**, not part of the system prompt. It sits at the
+boundary between what was dropped and what is still verbatim: a `user` message whose text
+begins `[Context compaction: deterministic index, no model summary …],` flagged as
+`checkpoint` so nothing treats it as a question (it does not count as an exchange, is never
+archived back into itself, and `/api/agent/history` marks it).
 
-| Order | Line | Why it can go first |
-|---|---|---|
-| 1st | `result: …` | a machine result, already consumed, reproducible by calling again |
-| 2nd | `called: …` | which tools ran; the useful part usually reappears in the reply |
-| 3rd | `note: …` | system notes |
-| 4th | `answer: …` | prose the model wrote, already reduced to one line |
-| last | `user: …` | what was asked; nothing replaces it |
+That placement is the host agent's, and it is the same choice for the same reasons:
 
-Reasoning is not in the index at all: it is dropped with the message that carried it, so
-"delete the thinking first" is not a policy call here — it is what already happens.
+| Why not the system prompt | What the message buys |
+|---|---|
+| its size would depend on how long the conversation had run, so the prompt could not be cached | the prompt is byte-identical across turns |
+| it would be rebuilt from an in-RAM field, so a reboot would lose it | it travels with the transcript and is restored with it |
+| the model would read the index *before* the instructions that govern it | it reads it after the questions it replaces, where it belongs |
 
-A question is also never demoted to a shorter line: it keeps its full budget however old it
-is, and the space for that comes from the tool lines above. Only when a conversation is
-*all* questions is an older question evicted, oldest first, and only to stay under the byte
-cap.
-
-### What repeated compaction does
-
-Compaction is idempotent **per transcript**: a second pass over an unchanged conversation
-removes nothing (`removed: 0`). It is not a fixed point across cycles, and that is worth
-knowing before calling it in a loop. Measured on the host, six cycles of six exchanges with
-`keep: 1`:
-
-| Cycle | Before | After | Dropped | Archive lines |
-|---|---|---|---|---|
-| 1 | 12 | 2 | 10 | 10 |
-| 2 | 14 | 2 | 12 | 22 |
-| 3 | 14 | 2 | 12 | 34 |
-| 4 | 14 | 2 | 12 | 40 |
-| 5 | 14 | 2 | 12 | 40 |
-| 6 | 14 | 2 | 12 | 40 |
-
-The transcript never grows past the exchange that was kept, and the archive stops at its own
-caps: 40 lines and 96 KiB. What the caps take is the interesting part — after those six
-cycles the index holds **35 questions and 5 answers**, and the question from cycle 1 is still
-there. Repeated compaction therefore costs the tool traffic and the prose, not the
-questions: the same order a reader would choose by hand.
-
-How much survives verbatim: `keep_recent_tokens` is a third of the trigger (it was a
-quarter), so at the default 256k window about 68k tokens of the tail stay untouched instead
-of 51k. Compaction itself still starts at 80% of the window — the budget that protects the
-next request from being refused — so on a default board it is a rare event, not a routine.
+The framing in the text is deliberate too: historical data, not instructions; reordered
+rather than a timeline; a tool call listed there has already been made, so repeating it is
+wasted work.
 
 ## 3. Forgetting
 
