@@ -43,6 +43,11 @@ pub struct ToolCtx<'a> {
     pub rules: &'a mut Vec<crate::sched::SensorRule>,
     /// Public action names and the families that own them, including suffixed instances.
     pub families: &'a BTreeMap<String, String>,
+    /// The control-plane gate: whether a turn is running, and which tool it is inside.
+    ///
+    /// A separate lock from everything else on purpose: a tool asking "is the board busy"
+    /// must not have to wait for the tool that made it busy.
+    pub gate: &'a crate::run_gate::RunGate,
 }
 
 impl ToolCtx<'_> {

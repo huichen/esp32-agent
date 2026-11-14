@@ -1240,6 +1240,7 @@ mod tests {
         let mut manifest = Manifest::default();
         let mut tasks = Vec::new();
         let mut rules = Vec::new();
+        let gate = crate::run_gate::RunGate::default();
         let result = run_tool(
             t,
             &mut ToolCtx {
@@ -1256,6 +1257,7 @@ mod tests {
                 tasks: &mut tasks,
                 rules: &mut rules,
                 families: &std::collections::BTreeMap::new(),
+                gate: &gate,
             },
             args,
         );

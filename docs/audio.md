@@ -298,14 +298,18 @@ nothing and draws nothing, even if earlier frames were valid. Action/family disa
 (including `oled_bitmap`) are respected; manifest-policy-wrapped actions are refused,
 not bypassed.
 
-The melody is synthesized **once**, then played in **4096-sample chunks**. One monotonic
-clock checks frame deadlines before the first write and between writes. Frames are
-stably sorted by `at_ms`, drawn once even at equal timestamps, and never dropped for
-being late. Remaining frames are waited for and drawn even after the sound ends. A full
-chunk is about **171 ms** at 24 kHz `[source: arithmetic]`, so this is chunk-boundary
-pacing, not exact audiovisual synchronisation. `fps` defaults to the rate implied by the
-shortest positive slot spacing, clamped **1–30** (1 without spacing). It bounds idle
-wakeups, not `at_ms` slots, and does not discard frames to enforce a rate.
+The melody is synthesized **once**, then played in **4096-sample chunks that are split at
+frame deadlines**: the audio is written only up to the next frame's slot, that slot is waited
+for, and the frame is drawn. One monotonic clock checks frame deadlines before the first
+write and between writes. Frames are stably sorted by `at_ms`, drawn once even at equal
+timestamps, and never dropped for being late. Remaining frames are waited for and drawn even
+after the sound ends. A write returns as soon as the DMA queue takes the samples, which is
+ahead of the sound — hence the wait before the draw, which is what makes a slot mean
+something. `[source: bench 2026-11-14, 128×32 panel]` a frame due 20 ms into a 171 ms chunk
+used to be drawn **57 ms** late; on its own slot it is late by the draw itself. `fps` defaults
+to the rate implied by the shortest positive slot spacing, clamped **1–30** (1 without
+spacing). It bounds idle wakeups, not `at_ms` slots, and does not discard frames to enforce a
+rate.
 
 The result is `{ok, notes, frames_drawn, frames_late, played_ms, synth_ms, write_ms,
 max_late_ms}`: score-entry count, completed flushes, flushes completed after their slots
