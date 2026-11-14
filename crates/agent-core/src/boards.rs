@@ -95,7 +95,10 @@ pub static PROFILES: &[BoardProfile] = &[
         amp: Some(I2sPins { bclk: 15, ws: 16, din: -1, dout: 7 }),
         adc_pins: &[1, 2, 3, 4, 5, 6, 7, 8, 9],
         reserved: &[19, 20, 43, 44],
-        notes: "OLED SSD1306 on SDA41/SCL42, INMP441 mic, MAX98357A amp, strip on GPIO18.",
+        notes:
+            "OLED SSD1306 on SDA41/SCL42, INMP441 mic (BCLK5/WS4/DIN6), MAX98357A amp (BCLK15/WS16/DOUT7), \
+                the devkit's ws2812 on GPIO48. A strip on GPIO18 is wired on this bench but is a manifest \
+                device, not part of this profile.",
     },
     BoardProfile {
         id: "esp32dev",
@@ -226,6 +229,29 @@ mod tests {
         let (p, ok) = resolve("nope", &i);
         assert!(!ok);
         assert_eq!(p.id, "esp32s3-devkitc1-n16r8");
+    }
+
+    /// The note has to agree with the pins the profile itself declares.
+    ///
+    /// `esp32s3-xiaozhi-bread` said "strip on GPIO18" while wiring its LED to 48, so `inventory`
+    /// answered two different things: a device list with the ws2812 on 48, and a note naming 18.
+    /// The GPIO18 strip is real — it is a manifest device on this bench, not profile wiring —
+    /// and a note that does not say so sends the reader looking for a device that is not there.
+    #[test]
+    fn the_bench_profile_note_names_the_led_pin_it_wires() {
+        let p = find("esp32s3-xiaozhi-bread").expect("the bench profile");
+        let led = p.led.expect("this profile wires an LED");
+        assert!(
+            p.notes.contains(&format!("GPIO{}", led.pin)),
+            "the note does not name GPIO{}: {}",
+            led.pin,
+            p.notes
+        );
+        assert!(
+            p.notes.contains("GPIO18") && p.notes.contains("manifest"),
+            "the strip on 18 is wired here and is not the profile's: {}",
+            p.notes
+        );
     }
 
     #[test]

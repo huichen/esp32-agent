@@ -464,6 +464,9 @@ mod tests {
     }
 
     fn run(app: &mut App, args: &Value) -> Result<Value> {
+        // A gate of its own: nothing is running in a unit test, and this keeps the test off
+        // the App's private control plane.
+        let gate = crate::run_gate::RunGate::default();
         let mut ctx = ToolCtx {
             hw: &mut *app.hw,
             devices: &mut app.devices,
@@ -478,11 +481,13 @@ mod tests {
             tasks: &mut app.tasks,
             rules: &mut app.rules,
             families: &app.family_members,
+            gate: &gate,
         };
         play_with_wait(&mut ctx, args, |hw, ms| hw.delay_us((ms * 1000) as u32))
     }
 
     fn planned_fps(app: &mut App, args: &Value) -> u64 {
+        let gate = crate::run_gate::RunGate::default();
         let ctx = ToolCtx {
             hw: &mut *app.hw,
             devices: &mut app.devices,
@@ -497,6 +502,7 @@ mod tests {
             tasks: &mut app.tasks,
             rules: &mut app.rules,
             families: &app.family_members,
+            gate: &gate,
         };
         prepare(&ctx, args).unwrap().fps
     }

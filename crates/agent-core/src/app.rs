@@ -318,6 +318,12 @@ pub struct App {
     pub tls: TlsInfo,
     /// The on-board agent: transcript, the one-slot queue and the last error.
     pub agent: Agent,
+    /// True while `with_agent` has the `Agent` moved out of this struct.
+    ///
+    /// A tool handler runs *inside* that window, so anything that samples the agent for a
+    /// caller (`board status`) must know whether it is looking at the real agent or at the
+    /// empty placeholder that stands in for it while a turn runs.
+    agent_out: bool,
     status_views: crate::status_view::StatusViews,
     run_gate: crate::run_gate::RunGate,
     /// Where the model lives and how far one run may go. `api_key` is kept in
@@ -533,6 +539,7 @@ impl App {
             active_attachments: None,
             tls: TlsInfo::default(),
             agent: Agent::new(),
+            agent_out: false,
             status_views: Default::default(),
             run_gate: Default::default(),
             llm: LlmConfig::default(),
@@ -572,6 +579,11 @@ impl App {
         // firmware carries are installed here, and in `seed_default_skills`'s other caller.
         app.seed_default_skills();
         app.refresh_hw_view();
+        // The two readings `board status` reports about things it does not own, filled once at
+        // boot so the first call answers with numbers rather than null: the store's counters and
+        // the agent's.
+        app.sample_store();
+        app.publish_agent_stats();
         app
     }
 
@@ -1467,7 +1479,7 @@ impl App {
     /// this. Both readings are needed to apply a rule like "≥ max(2 × peak, peak + 4 kB)",
     /// which is why the size stays in the source instead of being guessed from here.
     fn threads_json(&mut self) -> Vec<Value> {
-        Self::threads_from(self.hw.tasks())
+        crate::hardware::threads_json(self.hw.tasks())
     }
 
     /// Sample the hardware's view into plain data. Called at construction and once per tick by
@@ -1478,27 +1490,6 @@ impl App {
         let internal = self.hw.heap_internal();
         let threads = self.threads_json();
         self.hw_view = HwView { info, wifi, internal, threads };
-    }
-
-    fn threads_from(tasks: Vec<Value>) -> Vec<Value> {
-        tasks
-            .into_iter()
-            .map(|t| {
-                json!({
-                    "name": t["name"],
-                    "state": t["state"],
-                    "priority": t["priority"],
-                    // Which core the task sits on. Not every platform schedules (the host
-                    // has one, the simulator says 0), which is why it is passed through
-                    // rather than invented here.
-                    "core": t["core"],
-                    // One decimal: a 4 KB stack's answer has to be readable as 2.1, not 2.
-                    "high_water_kb": t["stack_free_bytes"]
-                        .as_u64()
-                        .map(|bytes| ((bytes as f64 / 1024.0) * 10.0).round() / 10.0),
-                })
-            })
-            .collect()
     }
 
     /// True while the board is waiting to be told which WiFi to join.
@@ -2163,6 +2154,7 @@ impl App {
                 tasks,
                 rules,
                 family_members,
+                run_gate,
                 ..
             } = self;
             let def = match tools.get(name) {
@@ -2189,6 +2181,7 @@ impl App {
                 tasks,
                 rules,
                 families: family_members,
+                gate: run_gate,
             };
             (def.handler)(&mut ctx, args)
         };
@@ -2263,6 +2256,9 @@ impl App {
         // taken here, on the only thread that owns both — `board status` then has an answer to
         // "did the change reach flash?" that an MCP caller can actually see.
         self.sample_store();
+        // Same reason, one field over: a turn that was queued outside the agent (`/api/agent/
+        // message`, a schedule) changes `pending` without another step starting.
+        self.publish_agent_stats();
         let manifest_changed = self.runtime.manifest_dirty;
         if manifest_changed {
             self.runtime.manifest_dirty = false;
@@ -2656,6 +2652,9 @@ impl App {
             return false;
         }
         self.persist_pending_message();
+        // A queued turn that has not started is exactly what `board status` reports as
+        // `pending`, and this is the moment it becomes true.
+        self.publish_agent_stats();
         true
     }
 
@@ -2685,6 +2684,7 @@ impl App {
         if self.store.get(NVS_KEY_PENDING_MESSAGE).is_some() && !self.store.remove(NVS_KEY_PENDING_MESSAGE) {
             self.log.warn("agent", "could not queue removal of the stored pending user message");
         }
+        self.publish_agent_stats();
     }
 
     fn load_pending_message(&mut self) {
@@ -2916,9 +2916,36 @@ impl App {
     /// sees the transcript between phases.
     fn with_agent<R>(&mut self, run: impl FnOnce(&mut Agent, &mut App) -> R) -> R {
         let mut agent = std::mem::replace(&mut self.agent, Agent::new());
+        self.agent_out = true;
         let out = run(&mut agent, self);
         self.agent = agent;
+        self.agent_out = false;
+        // The only place the real agent comes back, so the only place its numbers can be
+        // published for a caller that is not the agent itself.
+        self.publish_agent_stats();
         out
+    }
+
+    /// What the board's own agent is doing, as plain data for a caller.
+    ///
+    /// `run_active` and `active_tool` are not here: they come from the `RunGate`, which is
+    /// live while a turn runs. Everything in this snapshot is as of the last step boundary,
+    /// which is the honest reading — the numbers a turn is in the middle of producing are
+    /// not finished numbers.
+    fn publish_agent_stats(&mut self) {
+        if self.agent_out {
+            return;
+        }
+        let stats = {
+            let a = &self.agent;
+            json!({
+                "runs": a.runs,
+                "history": a.history.len(),
+                "pending": a.pending.is_some(),
+                "last_error": &a.last_error,
+            })
+        };
+        self.runtime.agent = stats;
     }
 
     /// Evaluate the schedule once and queue whatever came due.
@@ -15284,7 +15311,6 @@ mod tests {
     }
 
     /// The one reading a writing tool leaves open: did the queued change reach flash?
-    ///
     /// `write` and `edit` answer `saved: false` and point at the store's own counters. Those
     /// lived on `/api/status` only, which is a portal route — an agent driving the board
     /// through MCP was told to check something it had no way to read.
@@ -15301,6 +15327,46 @@ mod tests {
             store["pending"].as_u64().unwrap() >= 1,
             "a write that was only queued has to show as owed work: {store}"
         );
+    }
+
+    #[test]
+    fn board_status_reports_the_agent_its_threads_and_the_pools() {
+        // The three readings that only `/api/status` used to carry. An agent driving this
+        // board over MCP has no portal route, so "is the board busy", "which tool is it in",
+        // "does another stack fit" and "how much RAM can this pool still give" were all out
+        // of reach.
+        let mut app = test_app();
+        let status = app.call_tool("board", &json!({ "command": "status" })).unwrap();
+
+        let agent = &status["agent"];
+        assert_eq!(agent["run_active"], json!(false), "an idle board is not running: {status}");
+        assert_eq!(agent["pending"], json!(false), "{status}");
+        // `active_tool` names the synchronous tool in flight — which, for a `board status` call,
+        // is this one. It says nothing about a turn, and `run_active` is what does.
+        assert_eq!(agent["active_tool"]["name"], json!("board"), "{status}");
+        assert_eq!(agent["runs"], json!(app.agent.runs), "{status}");
+        assert!(
+            agent["history"].as_u64().unwrap_or(u64::MAX) == app.agent.history.len() as u64,
+            "history disagrees with the transcript: {status}"
+        );
+        assert!(agent["last_error"].is_string(), "{status}");
+
+        let threads = status["threads"].as_array().expect("threads");
+        assert_eq!(threads.len(), 3, "the virtual board reports three tasks: {status}");
+        assert!(threads.iter().all(|t| t["high_water_kb"].as_f64().is_some()), "{status}");
+
+        let pools = status["memory"]["pools"].as_array().expect("memory pools");
+        assert!(!pools.is_empty(), "the virtual board has pools: {status}");
+        assert!(
+            pools.iter().all(|p| p["pool"].is_string() && p["free_kb"].is_number()),
+            "a pool has to name itself and its numbers: {status}"
+        );
+
+        // A turn queued from outside the agent shows up without the board starting it: that
+        // is the question "should I wait" an outside caller asks.
+        app.route(&post("/api/agent/message", r#"{"text":"are you busy"}"#));
+        let status = app.call_tool("board", &json!({ "command": "status" })).unwrap();
+        assert_eq!(status["agent"]["pending"], json!(true), "{status}");
     }
 
     #[test]

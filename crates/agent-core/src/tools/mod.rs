@@ -54,7 +54,11 @@ pub fn board_tools() -> Vec<ToolDef> {
         }),
         ToolDef::new(
             "board_status",
-            "Board status: chip, firmware, uptime, die temperature, heap and internal RAM, WiFi, detected device count, tool counters, and what the store still owes — `pending`, `failed`, `last_failure`. The first call on an unfamiliar board",
+            "Board status: chip, firmware, uptime, die temperature, heap and internal RAM, WiFi, \
+             detected device count, tool counters, what the store still owes (`pending`, `failed`, \
+             `last_failure`), the agent's own turn (`run_active`, `active_tool`, `runs`, `history`, \
+             `pending`), every thread's stack headroom and the memory pools. The first call on an \
+             unfamiliar board",
         )
         .title("Board status")
         .category("board")
@@ -97,6 +101,24 @@ pub fn board_tools() -> Vec<ToolDef> {
                 // "Did the write reach flash?" — the one reading a tool that answers "queued"
                 // leaves open. Sampled by `App::settle` after every call.
                 "store": ctx.runtime.store_stats,
+                // The board's own turn: `run_active` and `active_tool` are live (the control
+                // gate is written at exactly those moments), the counters are as of the last
+                // step boundary. `mcp://` callers have no `/api/status`, so this is their only
+                // view of whether the board is busy.
+                "agent": {
+                    "run_active": ctx.gate.active(),
+                    "active_tool": ctx.gate.tool_activity().map(|t| serde_json::to_value(t).unwrap_or(Value::Null)),
+                    "runs": ctx.runtime.agent["runs"].clone(),
+                    "history": ctx.runtime.agent["history"].clone(),
+                    "pending": ctx.runtime.agent["pending"].clone(),
+                    "last_error": ctx.runtime.agent["last_error"].clone(),
+                },
+                // The two readings that decide whether another stack or buffer fits: what each
+                // thread's stack has left, and how much RAM each capability pool can still give.
+                "threads": crate::hardware::threads_json(ctx.hw.tasks()),
+                "memory": {
+                    "pools": serde_json::to_value(ctx.hw.heap_pools()).unwrap_or(Value::Null),
+                },
             }))
         }),
         ToolDef::new(
