@@ -411,6 +411,54 @@ impl Default for LogCfg {
     }
 }
 
+/// The first pin in a config patch that the board profile reserves, with the reason.
+///
+/// Config is persisted, so a pin that crashes the board does not crash it once: it does it at
+/// every boot, and the only way back is erasing the chip over serial. Both edges that accept a
+/// patch call this — `POST /api/config` (where the owner can still change what they like, but
+/// not that) and the `config_set` tool.
+pub fn reserved_pin_problem(profile: &crate::boards::BoardProfile, patch: &Value) -> Option<String> {
+    if let Some(pins) = patch.get("pins").and_then(|v| v.as_object()) {
+        for (name, value) in pins {
+            let Some(pin) = value.as_i64() else { continue };
+            if let Some(why) = profile.pin_problem(pin as i32) {
+                return Some(format!("`pins.{name}`: {why}"));
+            }
+        }
+    }
+    if let Some(buses) = patch.get("bus").and_then(|b| b.get("i2c")).and_then(|v| v.as_array()) {
+        for bus in buses {
+            for key in ["sda", "scl"] {
+                let Some(pin) = bus.get(key).and_then(|v| v.as_i64()) else { continue };
+                if let Some(why) = profile.pin_problem(pin as i32) {
+                    return Some(format!("`bus.i2c.{key}`: {why}"));
+                }
+            }
+        }
+    }
+    if let Some(pins) = patch.get("bus").and_then(|b| b.get("onewire_pins")).and_then(|v| v.as_array()) {
+        for pin in pins.iter().filter_map(|v| v.as_i64()) {
+            if let Some(why) = profile.pin_problem(pin as i32) {
+                // A 1-Wire reset pulse on the flash lines is the same crash by another name.
+                return Some(format!("`bus.onewire_pins`: {why}"));
+            }
+        }
+    }
+    None
+}
+
+/// True when a patch would set a credential the caller would then be the only one to know.
+pub fn sets_a_credential(patch: &Value) -> Option<&'static str> {
+    let auth = patch.get("auth").and_then(|v| v.as_object())?;
+    for key in ["portal_pin", "mcp_token"] {
+        let sets = auth.get(key).and_then(|v| v.as_str()).is_some_and(|s| s != "__set__");
+        if sets {
+            return Some(if key == "portal_pin" { "portal_pin" } else { "mcp_token" });
+        }
+    }
+    None
+}
+
 impl Config {
     pub fn to_json_string(&self) -> String {
         serde_json::to_string(self).unwrap_or_else(|_| "{}".into())
