@@ -53,6 +53,55 @@ pub fn board_tools() -> Vec<ToolDef> {
             }))
         }),
         ToolDef::new(
+            "media_status",
+            "What the background audio player is doing: the job it is playing, how much is \
+             left, how many chunks it has written, what is queued and whether anything was \
+             cancelled. `speaker_play {async: true}` returns before the sound starts, so this \
+             is how you find out whether it finished",
+        )
+        .title("Background audio")
+        .category("board")
+        .schema(object_schema(&[], &[]))
+        .bind(|ctx, _args| {
+            let state = ctx.hw.media_state();
+            Ok(json!({
+                "playing": state.playing,
+                "job": state.job,
+                "queued": state.queued,
+                "duration_ms": state.duration_ms,
+                "remaining_ms": state.remaining_ms,
+                "rate_hz": state.rate_hz,
+                "chunks": state.chunks,
+                "jobs_done": state.jobs_done,
+                "cancelled": state.cancelled,
+                "note": if state.playing {
+                    "played by the board's own task: the caller that queued it already returned"
+                } else {
+                    "nothing is playing; `speaker_play` without `async` waits and needs no status"
+                },
+            }))
+        }),
+        ToolDef::new(
+            "media_cancel",
+            "Stop the background audio player and drop what is queued. The visible stop \
+             happens within one chunk (about 170 ms at 24 kHz), not instantly",
+        )
+        .title("Stop background audio")
+        .category("board")
+        .schema(object_schema(&[], &[]))
+        .bind(|ctx, _args| {
+            let playing = ctx.hw.media_cancel();
+            Ok(json!({
+                "ok": true,
+                "was_playing": playing,
+                "note": if playing {
+                    "the player stops after the chunk it is writing"
+                } else {
+                    "nothing was playing"
+                },
+            }))
+        }),
+        ToolDef::new(
             "board_status",
             "Board status: chip, firmware, uptime, die temperature, heap and internal RAM, WiFi, \
              detected device count, tool counters, what the store still owes (`pending`, `failed`, \

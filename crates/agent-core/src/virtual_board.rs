@@ -204,6 +204,11 @@ pub struct VirtualBoard {
     pub scan: Vec<WifiAp>,
     pub wifi: WifiStatus,
     pub log: Vec<String>,
+    /// `(job, started, duration_ms, rate_hz)` while something is "playing".
+    media: Option<(u64, std::time::Instant, u64, u64)>,
+    media_next: u64,
+    media_done: u64,
+    media_cancelled: bool,
     /// Every hardware access a tool performs, so a test can assert that a rejected
     /// call never reached the board.
     pub hw_calls: std::sync::Arc<std::sync::atomic::AtomicU32>,
@@ -260,6 +265,10 @@ impl VirtualBoard {
             },
             log: Vec::new(),
             hw_calls: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            media: None,
+            media_next: 0,
+            media_done: 0,
+            media_cancelled: false,
             start: Instant::now(),
             rebooted: false,
         };
@@ -341,6 +350,53 @@ impl Hardware for VirtualBoard {
     /// the bench board reports, so "where did the bytes land" is exercised on the host too.
     fn media_buffer(&mut self, len: usize) -> Option<(Vec<u8>, &'static str)> {
         Some((Vec::with_capacity(len), "psram"))
+    }
+
+    /// The simulator has no amplifier, so the "player" is a clock: accepting a buffer starts
+    /// a job, and asking for its state computes how far that clock has run. That is enough to
+    /// prove what a caller depends on — the submit returns immediately, the state moves
+    /// playing -> done, and a cancel is visible — without pretending to make sound.
+    fn media_submit(&mut self, samples: &[i16], rate_hz: u32) -> Result<u64> {
+        let rate = rate_hz.max(1) as u64;
+        let duration_ms = (samples.len() as u64).saturating_mul(1000) / rate;
+        self.media_next = self.media_next.saturating_add(1);
+        self.media = Some((self.media_next, std::time::Instant::now(), duration_ms, rate));
+        self.media_cancelled = false;
+        Ok(self.media_next)
+    }
+
+    fn media_state(&mut self) -> crate::hardware::MediaState {
+        let mut state = crate::hardware::MediaState {
+            jobs_done: self.media_done,
+            cancelled: self.media_cancelled,
+            ..Default::default()
+        };
+        let Some((job, started, duration_ms, rate_hz)) = self.media else { return state };
+        let elapsed = started.elapsed().as_millis() as u64;
+        state.job = job;
+        state.duration_ms = duration_ms;
+        state.rate_hz = rate_hz as u32;
+        if elapsed >= duration_ms {
+            state.playing = false;
+            state.remaining_ms = 0;
+            self.media = None;
+            self.media_done = self.media_done.saturating_add(1);
+            state.jobs_done = self.media_done;
+        } else {
+            state.playing = !self.media_cancelled;
+            state.remaining_ms = duration_ms - elapsed;
+            state.chunks = (elapsed * rate_hz / 1000) / 4096 + 1;
+        }
+        state
+    }
+
+    fn media_cancel(&mut self) -> bool {
+        let playing = self.media.is_some();
+        self.media = None;
+        if playing {
+            self.media_cancelled = true;
+        }
+        playing
     }
 
     /// Two pools, because the point of the reading is that the firmware asks instead of

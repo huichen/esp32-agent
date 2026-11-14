@@ -43,6 +43,11 @@ pub struct EspHw {
     tsens: sys::temperature_sensor_handle_t,
     i2s_rx: sys::i2s_chan_handle_t,
     i2s_tx: sys::i2s_chan_handle_t,
+    /// The background player: it owns the transmit channel's timing, and this struct only
+    /// hands it buffers (see `media.rs`).
+    player: std::sync::Arc<crate::media::Player>,
+    /// Held while a blocking write is in flight, so the two writers cannot interleave.
+    media_writing: std::sync::Mutex<()>,
 }
 
 // The handles are opaque pointers owned by ESP-IDF. They are only used from the
@@ -67,6 +72,8 @@ impl EspHw {
             tsens: std::ptr::null_mut(),
             i2s_rx: std::ptr::null_mut(),
             i2s_tx: std::ptr::null_mut(),
+            player: crate::media::Player::new(),
+            media_writing: std::sync::Mutex::new(()),
         };
         for (bus, sda, scl, freq) in buses {
             if let Err(e) = hw.open_bus(*bus, *sda, *scl, *freq) {
@@ -621,6 +628,10 @@ impl Hardware for EspHw {
         if amp.is_some() && self.i2s_tx.is_null() {
             let pins = amp.unwrap();
             self.i2s_tx = i2s_channel(false, 1, 24_000, 16, pins.bclk, pins.ws, pins.dout)?;
+            // The player writes to the same channel from its own task; it needs the handle
+            // and one start, both of which are idempotent so a rebuilt device list is safe.
+            self.player.set_channel(self.i2s_tx);
+            crate::media::start(self.player.clone());
         }
         Ok(())
     }
@@ -660,39 +671,22 @@ impl Hardware for EspHw {
         if self.i2s_tx.is_null() {
             return Err(McpError::unsupported("no I2S speaker on this board"));
         }
-        // Stereo frames, the same sample in both slots: the amplifier plays one channel,
-        // and a mono framing here shifts the frame by half a slot (the bench firmware does
-        // the same duplication).
-        let mut frames: Vec<i16> = Vec::with_capacity(samples.len() * 2);
-        for s in samples {
-            frames.push(*s);
-            frames.push(*s);
-        }
-        // One call can be short: the driver returns as soon as the DMA has taken what it can,
-        // and a 1000 ms timeout ends the call even with audio still queued. Dropping the rest
-        // is not "normal under load" - it is a gap in the music - so keep writing until every
-        // sample is out.
-        let total = frames.len();
-        let mut done = 0usize;
-        while done < total {
-            let mut written: usize = 0;
-            let rc = unsafe {
-                sys::i2s_channel_write(
-                    self.i2s_tx,
-                    frames[done..].as_ptr() as *const core::ffi::c_void,
-                    (total - done) * core::mem::size_of::<i16>(),
-                    &mut written,
-                    1000,
-                )
-            };
-            if written < core::mem::size_of::<i16>() {
-                return Err(McpError::hardware(format!(
-                    "i2s write stalled after {done} of {total} samples (rc {rc}, wrote {written} bytes)"
-                )));
-            }
-            done += written / core::mem::size_of::<i16>();
-        }
-        Ok(())
+        // One writer at a time: the background player may be mid-chunk, and two streams
+        // interleaved into one DMA ring is noise, not a race that resolves itself.
+        let _busy = self.media_writing.lock().unwrap_or_else(|p| p.into_inner());
+        crate::media::write_chunk(self.i2s_tx, samples)
+    }
+
+    fn media_submit(&mut self, samples: &[i16], rate_hz: u32) -> Result<u64> {
+        self.player.submit(samples, rate_hz)
+    }
+
+    fn media_state(&mut self) -> esp32_agent_core::hardware::MediaState {
+        self.player.state()
+    }
+
+    fn media_cancel(&mut self) -> bool {
+        self.player.cancel()
     }
 
     fn wifi_scan(&mut self) -> Result<Vec<WifiAp>> {
