@@ -5,7 +5,7 @@ what is not done or not verified.
 
 ## Verified / unverified
 
-- ✅ `agent-core`: 964 unit tests and 9 integration tests (protocol, HTTP, manifest
+- ✅ `agent-core`: 965 unit tests and 9 integration tests (protocol, HTTP, manifest
   validation, driver conversion, capability filtering, auth, hot reload, the agent loop,
   shell and script, the file tools, sched, SSE streams, a streamed request body)
 - ✅ Simulator end to end: the PowerShell smoke gate; `scripts/smoke.sh` is the Unix
@@ -66,7 +66,7 @@ what is not done or not verified.
   played `frames_drawn: 2` in 1001 ms at 2 fps; `clip_drop` returned the pool to 7519 kB.
   `tools/list` showed 24 tools, the 6 clip ones with generated `args:` suffixes. The sound
   was not judged by ear and nothing was played longer than 1 s
-- ⚠️ Historical media bench (2026-11-12, recorded in `e7a9643`): `POST /audio/pcm` and `POST /av`
+- ⚠️ Historical media bench (2026-11-12, recorded in `e7a9653`): `POST /audio/pcm` and `POST /av`
   played on the board; a 30.00 s clip
   with 362 frames completed in 30.19 s with the sound judged correct by ear, and its audio
   alone in 30.03 s. What the 128×32 panel *shows* of a dithered video has not been judged

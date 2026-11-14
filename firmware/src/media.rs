@@ -44,6 +44,11 @@ struct Job {
 }
 
 pub struct Player {
+    /// When the job that is playing now started. `remaining_ms` is derived from this on
+    /// every read instead of being left at whatever the last chunk published: a published
+    /// number is stale the moment it is written, and a stale "259 ms left" on a 4 s tune is
+    /// the kind of reading this board keeps having to apologise for.
+    started: Mutex<Option<std::time::Instant>>,
     /// The channel, as the driver's opaque pointer. Held as a number so the queue and this
     /// field can live in one struct without `unsafe impl Send` on this module.
     tx: Mutex<usize>,
@@ -57,7 +62,10 @@ pub struct Player {
 
 impl Player {
     pub fn new() -> Arc<Self> {
+        // A fresh player has nothing playing, so nothing has started either.
+        let started = Mutex::new(None);
         Arc::new(Self {
+            started,
             tx: Mutex::new(0),
             queue: Mutex::new(VecDeque::new()),
             state: Mutex::new(MediaState::default()),
@@ -119,14 +127,22 @@ impl Player {
     }
 
     pub fn state(&self) -> MediaState {
-        match self.state.lock() {
+        let mut state = match self.state.lock() {
             Ok(state) => state.clone(),
             Err(p) => p.into_inner().clone(),
+        };
+        if state.playing {
+            if let Some(started) = *self.started.lock().unwrap_or_else(|p| p.into_inner()) {
+                let elapsed = started.elapsed().as_millis() as u64;
+                state.remaining_ms = state.duration_ms.saturating_sub(elapsed);
+            }
         }
+        state
     }
 
     pub fn cancel(&self) -> bool {
         let playing = self.state().playing;
+        *self.started.lock().unwrap_or_else(|p| p.into_inner()) = None;
         self.stop.store(true, Ordering::Relaxed);
         let mut queue = self.queue.lock().unwrap_or_else(|p| p.into_inner());
         let queued = queue.len();
@@ -212,6 +228,7 @@ pub fn start(player: Arc<Player>) {
                 state.chunks = 0;
             });
             let started = std::time::Instant::now();
+            *player.started.lock().unwrap_or_else(|p| p.into_inner()) = Some(started);
             let mut completed = true;
             for (index, piece) in job.samples.chunks(CHUNK).enumerate() {
                 if player.stop.load(Ordering::Relaxed) {
@@ -230,6 +247,7 @@ pub fn start(player: Arc<Player>) {
                     state.remaining_ms = state.duration_ms.saturating_sub(done_ms);
                 });
             }
+            *player.started.lock().unwrap_or_else(|p| p.into_inner()) = None;
             if completed {
                 let done = u64::from(player.jobs_done.fetch_add(1, Ordering::Relaxed)) + 1;
                 player.publish(|state| {
