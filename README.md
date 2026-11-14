@@ -118,6 +118,7 @@ ENOSPC behaviour and the audio/camera paths are still unverified, as `ROADMAP.md
 A new peripheral starts as a manifest fragment under `examples/manifests/`; a Rust driver is
 needed only for timing, calibration or state. `CATALOG` is where a driver registers itself.
 Conventions are in [AGENTS.md](AGENTS.md) and [CONTRIBUTING.md](CONTRIBUTING.md).
+What a change is judged against, and what this project refuses to become, is in [VISION.md](VISION.md).
 
 ## License
 

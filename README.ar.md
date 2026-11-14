@@ -113,6 +113,7 @@ bash scripts/build-firmware.sh --flash --port /dev/ttyACM0
 الطرفية الجديدة تبدأ كجزء بيان في `examples/manifests/`؛ ولا يُحتاج إلى مشغّل Rust إلا للتوقيت أو
 المعايرة أو الحالة. `CATALOG` هو المكان الذي يسجّل فيه المشغّل نفسه. الأعراف في
 [AGENTS.md](AGENTS.md) و[CONTRIBUTING.md](CONTRIBUTING.md).
+ما يُقاس به التغيير، وما يرفض هذا المشروع أن يصير إليه، في [VISION.md](VISION.md).
 
 ## الترخيص
 
