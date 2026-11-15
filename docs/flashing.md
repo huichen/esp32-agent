@@ -19,6 +19,22 @@ esptool.py --chip esp32s3 write_flash 0x0 esp32-agent-v<version>.bin
 If you would rather not merge, flash the ELF directly with the command in section 1 — that
 one passes the partition table explicitly, which matters (section 2).
 
+Both forms write the image across `0x0`-`0x32A000`, and that range **contains the `nvs`
+partition at `0x9000`**. A board that already had WiFi credentials, a console PIN, a model
+key or a schedule comes up in setup mode after this, exactly like a new one — the image
+holds no credentials, so this is what you want the first time and a surprise the fifth.
+Measured on the bench board: writing the 0.2.2 release image at `0x0` left the serial log
+saying `radio up: access point esp32-agent-setup ..., station not configured`. To keep a
+board's configuration, either save the region and put it back
+
+```bash
+python -m esptool -p COM3 read-flash 0x9000 0x6000 nvs.bin     # before
+python -m esptool -p COM3 write-flash 0x9000 nvs.bin           # after
+```
+
+or flash the ELF with section 1's command, which writes only the bootloader, the partition
+table and the application partition and leaves `0x9000` and the `storage` partition alone.
+
 Either way, jump to section 4: the board raises the `esp32-agent-setup` access point when it
 has no credentials, and provisioning is the same.
 
