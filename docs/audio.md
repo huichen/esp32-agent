@@ -206,9 +206,22 @@ Four things make it usable rather than a firehose:
   That is the microphone's rate: a recording is no longer behind the person speaking, and
   `curl -N > mic.pcm` is a real-time capture.
 
+  Timing the frames themselves on the same board the same day: one chunk is 400 B — a
+  single 200-frame descriptor, 12.5 ms of audio — with a median gap of 12.5 ms, p95
+  18.7 ms and a worst gap of 66 ms over 9 s, at 32 145 B/s against the 32 000 B/s the
+  format implies (100.5%), and the first frame 13-16 ms after the request. A reader is
+  one descriptor plus the LAN behind the microphone, not one buffer behind it.
+
+  What the far side of the loop costs: a 150 ms burst the board plays into its own
+  speaker comes back through this stream 47-304 ms later (median 96 ms, five bursts of
+  880 Hz), which is the amplifier, the air and the microphone added to the numbers above.
+  The coupling on this breadboard is weak — 1 kHz and 2.5 kHz bursts never cleared the
+  noise floor — so read the round trip as an order, not a precise figure.
+
 - **It never takes the application lock.** The platform hands out a `MicReader` that owns
-  the I²S handle (the same trick the background player uses for transmit), so a 20 ms read
-  does not hold the portal, `/api/status` or the agent thread for the length of a stream.
+  the I²S handle (the same trick the background player uses for transmit), so a 12.5 ms
+  descriptor read does not hold the portal, `/api/status` or the agent thread for the
+  length of a stream.
 - **One reader.** A second client is refused with `503` and `Retry-After: 5` instead of being
   given half the samples; the slot returns as soon as the first stream ends.
 - **A budget.** One connection lasts at most 120 s and then closes. The console reconnects,
