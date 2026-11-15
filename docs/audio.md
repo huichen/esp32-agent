@@ -192,6 +192,20 @@ curl -N -H 'X-Portal-Pin: …' http://<board>/api/mic/pcm > mic.pcm
 
 Four things make it usable rather than a firehose:
 
+- **It reads one DMA descriptor at a time.** `MicReader::block_samples()` states the descriptor
+  size (200 frames on this board, from the same constant the channel is built from) and the
+  stream sizes its buffer from it. A read that asks for more straddles a descriptor boundary
+  and waits on it: with 320-sample reads the stream delivered 10.6 k samples/s. Measured on the
+  bench board on 2026-11-15, after the fix, over the LAN:
+
+  ```
+  GET /api/mic/pcm, 10 s window
+    323 584 bytes in 10.12 s -> 15 985 samples/s of 16 000 (100%), first byte at 0.12 s
+  ```
+
+  That is the microphone's rate: a recording is no longer behind the person speaking, and
+  `curl -N > mic.pcm` is a real-time capture.
+
 - **It never takes the application lock.** The platform hands out a `MicReader` that owns
   the I²S handle (the same trick the background player uses for transmit), so a 20 ms read
   does not hold the portal, `/api/status` or the agent thread for the length of a stream.
