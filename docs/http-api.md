@@ -124,7 +124,7 @@ is on that list, because neither is offered anywhere — see
 | GET | `/api/files/tree` | The whole workspace in one answer: every directory (derived from the paths) and file with `size_bytes`, plus `total_bytes` / `total_max` / `file_max`. What the portal's Files tab reads |
 | GET | `/api/files/read?path=<file>` | One file as text |
 | POST | `/audio/pcm` | Play PCM as it arrives: raw PCM16LE mono at 24000 Hz, chunked or with `Content-Length`, at most 30 s, never buffered ([streaming playback](audio.md#6-streaming-playback-post-audiopcm)) |
-| GET | `/api/mic/pcm` | The microphone as a chunked stream: `audio/pcm`, 16-bit mono at 16000 Hz, 20 ms per chunk, one reader at a time, 120 s per connection ([the other direction](audio.md#the-microphone-the-other-way-get-apimicpcm)) |
+| GET | `/api/mic/pcm` | The microphone as a chunked stream: `audio/pcm`, 16-bit mono at 16000 Hz, one 200-frame descriptor per chunk (12.5 ms, 400 B), one reader at a time, 120 s per connection ([the other direction](audio.md#the-microphone-the-other-way-get-apimicpcm)) |
 | POST | `/av` | Play audio and draw frames from one body: `tag|u16le len|payload` records — `A` audio, `F` a 512-byte 128x32 or 1024-byte 128x64 bitmap, `E` end — in order ([sound with a picture](audio.md#8-sound-with-a-picture-post-av)) |
 | GET | `/api/attachment/<name>` | The file attached to the last message, with its own mime type ([attachments](#5-attachments)) |
 | POST | `/api/auth` | `{pin}`, check the console PIN |
