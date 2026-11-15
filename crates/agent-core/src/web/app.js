@@ -1494,7 +1494,7 @@ async function loadSettings() {
     $("#wifi-netmask").value = d.wifi.netmask || "";
     $("#wifi-static").checked = staticIp !== "";
     $("#wifi-dhcp").checked = staticIp === "";
-    $("#wifi-static-fields").hidden = staticIp === "";
+    showAddressFields();
     $("#wifi-password").value = "";
     $("#set-keep-ap").checked = d.wifi && d.wifi.keep_ap === true;
     $("#set-plain-http").checked = !(d.mcp && d.mcp.plain_http === false);
@@ -2088,6 +2088,16 @@ function init() {
       toast("task added");
     } catch (e) { toast(e.message); }
   };
+
+  // Choosing an address type has to reveal the fields it owns. The radios set nothing on
+  // change, so "Static" left the panel with Gateway and DNS and no place to type an address —
+  // and "Save and join" then refused with "a static address needs an IP". The only way to fill
+  // them in was to have a static address configured already.
+  function showAddressFields() {
+    $("#wifi-static-fields").hidden = !$("#wifi-static").checked;
+  }
+  $("#wifi-dhcp").onchange = showAddressFields;
+  $("#wifi-static").onchange = showAddressFields;
 
   $("#wifi-connect").onclick = async () => {
     $("#wifi-result").textContent = "joining…";

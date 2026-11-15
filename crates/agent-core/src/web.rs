@@ -226,6 +226,27 @@ mod tests {
         );
     }
 
+    /// Choosing "Static" has to reveal the IP and netmask inputs. The radios set nothing on
+    /// change, so the panel showed Gateway and DNS only, and the join then refused with "a
+    /// static address needs an IP" — the fields existed but nothing could make them visible.
+    #[test]
+    fn choosing_a_static_address_reveals_its_fields() {
+        assert!(INDEX_HTML.contains("id=\"wifi-static-fields\""), "the fields exist");
+        assert!(INDEX_HTML.contains("id=\"wifi-ip\"") && INDEX_HTML.contains("id=\"wifi-netmask\""));
+        assert!(
+            APP_JS.contains("$('#wifi-static').onchange") || APP_JS.contains("$(\"#wifi-static\").onchange"),
+            "the Static radio needs a handler"
+        );
+        assert!(
+            APP_JS.contains("$('#wifi-dhcp').onchange") || APP_JS.contains("$(\"#wifi-dhcp\").onchange"),
+            "and so does DHCP, or the fields stay visible on the way back"
+        );
+        assert!(
+            APP_JS.contains("wifi-static-fields\").hidden = !"),
+            "the handler decides visibility from the radio, not from the stored address"
+        );
+    }
+
     /// "Save and join" used to send the password field as-is, and a blank field is an explicit
     /// empty string to `apply_patch` — which clears the stored password. A board with no
     /// password cannot associate with a WPA2 network, so that button could quietly take the
